@@ -2013,8 +2013,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     }
 
     s_perf_pso_calls++;
+    /* Keyed on the code, not on where it lives. The compiled shader reads its
+     * inline constants from the draw's own fp_addr (fp_k[], refilled per draw),
+     * so a program's pipeline is the same wherever the title puts it. God of
+     * War HD uploads its fragment programs into a ring every frame: keyed on the
+     * address, every draw of every frame missed and went through a full
+     * decompile + D3DCompile (179 draws -> seconds per frame on its menu). */
     for (int i = 0; i < s_d3d.vp_fp_n; i++)
-        if (s_d3d.vp_fp[i].fp_addr != fp_addr) continue;   /* cheap reject first */
+        if (s_d3d.vp_fp[i].ucode_hash != uhash) continue;   /* cheap reject first */
         else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&

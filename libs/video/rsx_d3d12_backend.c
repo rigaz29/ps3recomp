@@ -2079,11 +2079,20 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
                     fp_addr, cube_mask, ns, 10); } } }
     static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
-    /* Signature changed when the newer decompiler was adopted: the third
-     * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
-     * backend does not track that register, so let the decompiler infer it. */
-    (void)exp32;
-    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+    /* The third parameter is the SET_SHADER_CONTROL word; its 0x40 bit picks
+     * the export registers (r0/r2/r3/r4 for 32-bit, h0/h4/h6/h8 for 16-bit).
+     * Each draw records that bit (fp_exp32, also part of the pipeline key), so
+     * pass it rather than letting the decompiler guess from "was r0 written".
+     * The guess fails on a program that uses r0 as a temp and exports through
+     * h0: God of War HD's 2x-AA resolve computes (B-A)/2 in r0 and the average
+     * in h0, and with r0 exported every 3D frame came out black. The depth
+     * export bits aren't recorded, so they stay off as before.
+     * RSX_FP_CTRL_AUTO=1 restores the guess. */
+    static int ctrl_auto = -1;
+    if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+    u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO
+                            : (exp32 ? CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS : 0u);
+    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible

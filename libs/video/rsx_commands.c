@@ -462,7 +462,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value);
+          /* Each distinct mask once more, however late: a depth-only clear
+           * first shows up long after the boot screens used up the 12. */
+          static u32 seen[16]; static int ns = 0; int k = 0;
+          while (k < ns && seen[k] != data) k++;
+          if (k == ns && ns < 16) { seen[ns++] = data;
+              if (_c > 12) fprintf(stderr, "[RSX] CLEAR_SURFACE new mask=0x%X color=0x%08X\n",
+                                   data, state->color_clear_value); } }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;

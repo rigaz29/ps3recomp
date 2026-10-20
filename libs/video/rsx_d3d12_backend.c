@@ -135,6 +135,9 @@ typedef struct {
      * legacy replay pass skips them. */
     int   is_clear;
     float cc[4];
+    u32   clear_mask;   /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 colour */
+    float clear_z;
+    u8    clear_s;
 } D3D12DrawRecord;
 
 /* Offscreen render target (render-to-texture). Persistent across frames --
@@ -4559,6 +4562,18 @@ static void render_frame(void)
                      * If the surface comes back magenta the clears land and the
                      * draws are writing black; if it stays black, nothing
                      * reaches it at all. */
+                    /* Depth/stencil part: one depth buffer serves every
+                     * target, and it is reset whenever the pass switches
+                     * targets; a clear inside a pass has to land here. */
+                    if (dr->clear_mask & 0x3u) {
+                        D3D12_CLEAR_FLAGS zf = (D3D12_CLEAR_FLAGS)
+                            (((dr->clear_mask & 0x1u) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
+                             ((dr->clear_mask & 0x2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
+                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
+                            zf, dr->clear_z, dr->clear_s, 0, NULL);
+                    }
+                    if (!(dr->clear_mask & 0xF0u))
+                        continue;
                     { static int cd = -1;
                       if (cd < 0) { const char* e = getenv("RT_CLEARDBG"); cd = e ? atoi(e) : 0; }
                       if (cd && cur_rt >= 0) {
@@ -5194,9 +5209,6 @@ static void d3d12_present(void* ud, u32 buffer_id)
 static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
     (void)ud;
-    (void)flags;
-    (void)depth;
-    (void)stencil;
 
     /* Convert RSX ARGB u32 to float[4] RGBA */
     float cc[4];
@@ -5217,8 +5229,12 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 
     /* An OFFSCREEN clear is just an ordered op in the current frame's pass
      * chain (demosaic clears each effect pass's surface) -- record it, don't
-     * touch the frame boundary. */
-    if (rt != 0) {
+     * touch the frame boundary. So is a clear with no colour bits, wherever
+     * it lands: God of War HD clears depth (mask 0x1/0x3) between compositing
+     * its scene into the final surface and drawing the HUD over it, and
+     * clearing colour there wiped the scene -- the menu came out black. It is
+     * not a frame boundary either. */
+    if (rt != 0 || !(flags & 0xF0u)) {
         if (s_d3d.draw_count < MAX_DRAWS) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
             memset(dr, 0, sizeof(*dr));
@@ -5227,6 +5243,9 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->rt_w = rt_w; dr->rt_h = rt_h;
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
             memcpy(dr->cc, cc, sizeof(cc));
+            dr->clear_mask = flags;
+            dr->clear_z = depth;
+            dr->clear_s = stencil;
         }
         return;
     }

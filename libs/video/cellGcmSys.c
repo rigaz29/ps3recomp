@@ -901,6 +901,32 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
 #define GCM_RECYCLE_MARGIN 0x20000u
 static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
+/* Backward JUMPs the walker has taken. The ring recycle waits for this to move:
+ * it is the walker following the JUMP-to-begin the recycle wrote, i.e. having
+ * consumed the whole tail. g_gcm_fifo_drained_ea == begin cannot say that on its
+ * own, because it is also begin before the walker has moved at all. */
+static volatile u32 s_fifo_back_jumps = 0;
+/* Set while the title's buffer-full callback (cellGcm_fifo_recycle) is waiting
+ * for the walker. Its context still reads current == end then, which is exactly
+ * what the drain's own overrun recycle looks for; firing that under the
+ * callback teleports get to begin and drops the tail the callback is waiting on. */
+static volatile int s_fifo_recycle_waiting = 0;
+
+/* Bytes the walker is behind the writer. Linear while put >= get. Once the
+ * title's ring wraps, put sits BEHIND get and the backlog is the rest of the
+ * ring plus everything from its start to put -- nearly the whole ring, not
+ * nothing. Only computed when both pointers lie inside the title's own ring;
+ * any other layout (segments linked by JUMPs) reports 0, as before. */
+static u32 gcm_fifo_backlog(u32 put, u32 get)
+{
+    if (put >= get) return put - get;
+    if (!s_gcm_context_ea) return 0;
+    u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x0));
+    u32 e = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x4));
+    if (b == 0xFFFFFFFFu || e == 0xFFFFFFFFu || e <= b) return 0;
+    if (get < b || get > e || put < b || put > e) return 0;
+    return (e - get) + (put - b);
+}
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
 
@@ -1757,9 +1783,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     u32 start_off = s_fifo_getoff;
+    /* GCM_DRAINDBG: log one drain pass in GCM_DRAINDBG_EVERY (default 60). */
+    static int s_drain_every = -1;
+    if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
+                             s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
-        if (n++ % 60 == 0)
+        if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
                    s_fifo_getoff, put, vm_read32(GCM_CONTROL_GUEST_ADDR + 8),
                    vm_read32(s_gcm_context_ea + 0x8));
@@ -1891,8 +1921,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * "Command Buffer Overflow" forever. Past the threshold keep
              * draining -- the intermediate presents are frames we are too far
              * behind to show anyway. No-op for a title that is keeping up. */
-            if (put < s_fifo_getoff ||
-                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+            /* A wrapped ring has put behind get, and that is the most
+             * backlogged it can be, not the least: God of War HD fills its
+             * 3 MB ring at boot, wraps, and a walker stopping at every flip
+             * then crawled ~1 KB a tick while the title wrote over the
+             * commands ahead of it. */
+            if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
                 { why = "flip"; break; }
             continue;
         }
@@ -1945,6 +1979,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   s_park_pass = 1;
                   break;
               }
+              if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
               s_fifo_getoff = tgt;
               /* get is the RSX's fetch pointer: a title polling it sees the
                * GPU leave a segment as soon as the JUMP out of it is taken.
@@ -2284,7 +2319,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * the drained EA. */
     if (getenv("GCM_DRAINDBG")) {
         static int n2 = 0;
-        if (n2++ % 60 == 0)
+        if (n2++ % s_drain_every == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
     }
@@ -2353,7 +2388,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * overruns first, so the first overrun is recycled by the path above
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
-        if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        if (s_fifo_recycle_waiting) head_consumed = 0;   /* its callback is recycling */
+        else if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
@@ -2429,6 +2465,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * consumes the tail, follows the jump, and idles at begin; then it's safe
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
+    const u32 back_jumps0 = s_fifo_back_jumps;
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2440,17 +2477,39 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     }
 
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
-    int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
-    if (spins >= 2000) {
+     * no commands are lost; a stalled ticker degrades to dropped commands.
+     * "Took the jump" is a backward JUMP counted after the one written above.
+     * Comparing the drained EA with begin let the wait through at once when
+     * the walker had not moved yet (drained starts at begin), and the title
+     * then overwrote megabytes of commands the RSX had never read. */
+    /* The bound is on the walker making no progress, not on the total wait: a
+     * title that fills a 3 MB ring with hundreds of tiny frames at boot (God of
+     * War HD) leaves a backlog the draw engine needs tens of seconds to execute,
+     * and giving up after 2 s handed the title megabytes of commands to write
+     * over. A walker that has stopped moving still ends the wait after 2 s, and
+     * 60 s caps the whole thing. */
+    int spins = 0, idle = 0;
+    u32 last_get = s_fifo_getoff;
+    s_fifo_recycle_waiting = 1;
+    while (io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 &&
+           idle < 2000 && spins < 60000) {
+        Sleep(1); spins++;
+        if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
+        else idle++;
+        if (s_recdbg && spins % 1000 == 0)
+            fprintf(stderr, "[REC~] %d ms: walker get=%08X put=%08X back_jumps=%u\n",
+                    spins, s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+                    s_fifo_back_jumps);
+    }
+    if (s_fifo_back_jumps == back_jumps0 && io_begin != 0xFFFFFFFFu) {
         static int warned = 0;
         if (warned++ < 4)
-            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
-                   g_gcm_fifo_drained_ea, begin);
+            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X, %d ms)\n",
+                   g_gcm_fifo_drained_ea, begin, spins);
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+    s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",

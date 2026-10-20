@@ -3145,7 +3145,11 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         fprintf(stderr, "[VPMVP] slot=%u lastNZ=c%d  c260=(%g %g %g %g) c467=(%g %g %g %g)\n",
                 slot, last_nz,
                 c[260*4+0], c[260*4+1], c[260*4+2], c[260*4+3],
-                c[467*4+0], c[467*4+1], c[467*4+2], c[467*4+3]); } }
+                c[467*4+0], c[467*4+1], c[467*4+2], c[467*4+3]);
+        fprintf(stderr, "[VPMVP]   c464=(%g %g %g %g) c465=(%g %g %g %g) c466=(%g %g %g %g)\n",
+                c[464*4+0], c[464*4+1], c[464*4+2], c[464*4+3],
+                c[465*4+0], c[465*4+1], c[465*4+2], c[465*4+3],
+                c[466*4+0], c[466*4+1], c[466*4+2], c[466*4+3]); } }
     /* RSX_DBG_CB=<hex tex0 offset>: the constants as they land in the per-draw
      * constant buffer for that texture's draws -- i.e. exactly what the shader
      * samples, not what the CPU-side rsx_state holds. Those two agreeing is an
@@ -5971,9 +5975,11 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
 }
 
 /* Indexed TRIANGLE_STRIP / TRIANGLE_FAN, expanded CPU-side into a triangle
- * list (the whole VP path draws lists; CullMode is NONE so strip parity
- * winding doesn't matter). DeferredShading's spline tube meshes -- the
- * octopus tentacles -- are indexed strips. */
+ * list (the whole VP path draws lists). DeferredShading's spline tube meshes
+ * -- the octopus tentacles -- are indexed strips. Odd strip triangles swap
+ * two vertices, as in upload_strip_vp: guest culling is honoured now, and
+ * without the swap every second triangle comes out back-facing (God of War
+ * HD's fullscreen 4-index quads lost their lower-right half). */
 static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count, int fan)
 {
     extern uint8_t* vm_base;
@@ -5988,9 +5994,11 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     u32 o = 0;
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
-        read_vp_vertex(state, read_guest_index(state, first + i0),    &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 1), &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 2), &out[o*16]); o++;
+        u32 i1 = t + 1, i2 = t + 2;
+        if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+        read_vp_vertex(state, read_guest_index(state, first + i0), &out[o*16]); o++;
+        read_vp_vertex(state, read_guest_index(state, first + i1), &out[o*16]); o++;
+        read_vp_vertex(state, read_guest_index(state, first + i2), &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;

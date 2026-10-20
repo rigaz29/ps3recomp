@@ -619,6 +619,8 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -653,6 +655,11 @@ static DWORD WINAPI samp_thread(LPVOID p)
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -736,6 +743,7 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -881,6 +889,33 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
+/* An SPU atomic commit (PUTLLC, PUTLLUC) writes a whole 128-byte line, and the
+ * PPU's reservation granule is that line, so every PPU reservation inside it
+ * is lost, whichever word it covers. Breaking only reservations on the same
+ * word let a lwarx/stwcx. sequence succeed across an SPU commit to a
+ * neighbouring word -- with whatever it read from that word in between now
+ * stale. A SPURS LFQueue keeps its counters and its waiter fields in one
+ * line: a PPU push that read "no waiter" just before the SPU consumer
+ * registered as one completed anyway and sent no signal, and the consumer
+ * slept for good (God of War HD, an occasional hang before the menu).
+ * Called by the SPU side under the lock-line lock; PPU_RESV_WORD=1 restores
+ * word-only breaking. */
+static void ppu_resv_break_line(uint32_t ea)
+{
+    static int word = -1;
+    if (word < 0) word = getenv("PPU_RESV_WORD") ? 1 : 0;
+    if (word) return;
+    uint32_t line = ea & ~127u;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~127u) == line)
+            c->reserve_addr = PPU_RESV_INVALID;
+    }
+}
+extern "C" void (*g_spu_commit_breaks_ppu_resv)(uint32_t ea);
+static const int s_register_resv_break = (g_spu_commit_breaks_ppu_resv = ppu_resv_break_line, 0);
+
 static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
@@ -952,6 +987,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
+    /* Re-check under the lock-line lock: an SPU commit to this line between
+     * the check above and here has broken the reservation (see
+     * ppu_resv_break_line). */
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1023,6 +1064,9 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);

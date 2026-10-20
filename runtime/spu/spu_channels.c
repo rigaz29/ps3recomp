@@ -70,6 +70,10 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* Set by the PPU side (ppu_loader.cpp): an SPU atomic commit breaks every PPU
+ * reservation in the line. Called under the lock-line lock. Null when the PPU
+ * runtime isn't linked (SPU-only tests). */
+void (*g_spu_commit_breaks_ppu_resv)(uint32_t ea) = 0;
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -655,6 +659,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            if (g_spu_commit_breaks_ppu_resv) g_spu_commit_breaks_ppu_resv(ea);
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -752,6 +757,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        if (g_spu_commit_breaks_ppu_resv) g_spu_commit_breaks_ppu_resv(ea);
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a
@@ -2130,9 +2136,14 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
+            /* The count restarts with every policy-module run, and a job
+             * manager runs dozens of times a second, so these lines follow the
+             * RUN/END trace: SPURS_PM_TRACE=1. */
+            { static SPU_THREAD_LOCAL int s_t = -1;
+              if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t && (n <= 4 || (n % 4096) == 0))
+                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                          n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

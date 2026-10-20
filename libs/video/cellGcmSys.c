@@ -1700,8 +1700,22 @@ void cellGcm_ref_on_poll(void)
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
 
+/* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+volatile unsigned long g_gcm_drain_tid;
+
+/* Debug switches read on every drain pass (about a thousand a second) go
+ * through this rather than getenv, which takes the CRT environment lock and
+ * scans every variable each time. */
+static int gcm_env_on(const char* name, int* cache)
+{
+    if (*cache < 0) *cache = getenv(name) ? 1 : 0;
+    return *cache;
+}
+static int s_env_rate = -1, s_env_ctxdbg = -1, s_env_draindbg = -1, s_env_scanref = -1;
+
 void cellGcm_rsx_process_fifo(void)
 {
+    g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
@@ -1726,7 +1740,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      if (gcm_env_on("GCM_RATE", &s_env_rate)) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1767,7 +1781,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    if (gcm_env_on("GCM_CTXDBG", &s_env_ctxdbg) && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -1787,7 +1801,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int s_drain_every = -1;
     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
                              s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
-    if (getenv("GCM_DRAINDBG")) {
+    if (gcm_env_on("GCM_DRAINDBG", &s_env_draindbg)) {
         static int n = 0;
         if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1800,7 +1814,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      if (!scanned && gcm_env_on("GCM_SCANREF", &s_env_scanref) && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2317,7 +2331,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (gcm_env_on("GCM_DRAINDBG", &s_env_draindbg)) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",

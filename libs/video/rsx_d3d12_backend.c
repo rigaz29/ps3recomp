@@ -2091,7 +2091,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     { static int fl = -1; if (fl < 0) fl = getenv("FP_LIST") ? 1 : 0;
       if (fl) fprintf(stderr, "[FPLIST] fp=0x%08X instrs=%d hlsl=%u bytes%c",
                       fp_addr, n, (unsigned)strlen(hlsl), 10); }
-    if (getenv("FP_DUMP")) { static int _d=0; if (_d++ < 4) {
+    /* FP_DUMP=<n>: the first n compiled programs (1 = the old default of 4). */
+    if (getenv("FP_DUMP")) { static int _d=0, _cap=-1;
+      if (_cap < 0) { _cap = atoi(getenv("FP_DUMP")); if (_cap <= 1) _cap = 4; }
+      if (_d++ < _cap) {
         FILE* f = fopen("fp_dump.hlsl", _d==1 ? "w" : "a");
         if (f) {
             const u8* uc = vm_base + off;

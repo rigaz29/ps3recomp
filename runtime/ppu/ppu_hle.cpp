@@ -179,6 +179,45 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+
+/* PS3_HLE_TOP=<seconds>: the most-called HLE imports over each window, with
+ * the guest thread and caller of the last call. PS3_HLE_TRACE logs the first N
+ * calls from boot, which says nothing about a stall ten minutes in; this says
+ * what every thread is doing now (polling a pad, spinning on a lwcond, feeding
+ * a decoder that never takes the data). Counts are unlocked: a lost increment
+ * can't change which import is on top. */
+extern "C" unsigned long long ps3_qpc_us(void);
+static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx, long window_s)
+{
+    enum { HT_MAX = 256 };
+    static uint32_t ht_nid[HT_MAX]; static const char* ht_name[HT_MAX];
+    static unsigned ht_n[HT_MAX], ht_tid[HT_MAX], ht_lr[HT_MAX];
+    static int ht_used = 0;
+    static unsigned long long ht_t0 = 0;
+    int i = 0;
+    for (; i < ht_used; i++) if (ht_nid[i] == nid) break;
+    if (i == ht_used && ht_used < HT_MAX) { ht_nid[i] = nid; ht_name[i] = name; ht_used++; }
+    if (i < HT_MAX) {
+        ht_n[i]++;
+        ht_tid[i] = (unsigned)ctx->thread_id;
+        ht_lr[i] = (unsigned)ctx->lr;
+    }
+    unsigned long long now = ps3_qpc_us();
+    if (!ht_t0) { ht_t0 = now; return; }
+    if (now - ht_t0 < (unsigned long long)window_s * 1000000ull) return;
+    ht_t0 = now;
+    fprintf(stderr, "--- HLE calls (last %lds) ---\n", window_s);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int j = 0; j < ht_used; j++)
+            if (ht_n[j] && (best < 0 || ht_n[j] > ht_n[best])) best = j;
+        if (best < 0) break;
+        fprintf(stderr, "  %8u  %-36s tid=%-3u lr=0x%08X\n",
+                ht_n[best], ht_name[best], ht_tid[best], ht_lr[best]);
+        ht_n[best] = 0;
+    }
+    for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
+}
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
@@ -711,6 +750,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    { static long s_ht = -1;
+      if (s_ht < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht = ev ? atol(ev) : 0;
+                      if (s_ht < 0) s_ht = 0; }
+      if (s_ht > 0) hle_top_note(nid, e->name, ctx, s_ht); }
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }

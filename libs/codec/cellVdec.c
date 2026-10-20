@@ -52,7 +52,14 @@ typedef struct {
     u32 qHead, qCount;
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
+    /* MPEG-2 sequence header / sequence extension fields, from the last ones
+     * seen in the stream; reported in every picture's CellVdecMpeg2Info. */
+    u8  m2Aspect;       /* aspect_ratio_information */
+    u8  m2FrameRate;    /* frame_rate_code */
+    u8  m2Progressive;  /* progressive_sequence */
 } VdecSlot;
+
+static void vdec_scan_mpeg2_headers(VdecSlot* v, const u8* p, u32 size);
 
 static VdecSlot s_vdec[MAX_VDEC];
 
@@ -66,6 +73,14 @@ static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return;
     const VdecSlot* v = &s_vdec[handle];
+    /* VDEC_TRACE=<n>: log the first n callbacks (handle, message, queue depth). */
+    { static int s_left = -1;
+      if (s_left < 0) { const char* e = getenv("VDEC_TRACE"); s_left = e ? atoi(e) : 0; }
+      if (s_left > 0) {
+          s_left--;
+          printf("[cellVdec] notify handle=%u msg=%u data=0x%X cb=0x%08X arg=0x%08X queued=%u\n",
+                 handle, msg_type, (u32)msg_data, v->cbFunc, v->cbArg, v->qCount);
+      } }
     if (!v->cbFunc || !g_ps3_guest_caller) return;
     g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
                        (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
@@ -279,6 +294,9 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
            handle, au.startAddr, au.size,
            (unsigned long long)au.pts);
 
+    if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2 && au.size)
+        vdec_scan_mpeg2_headers(v, vm_ptr8(au.startAddr), au.size);
+
     if (v->ff) {
         if (v->qCount >= VDEC_BUSY_AT)
             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
@@ -359,6 +377,31 @@ static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
     vm_write32(it + 0x48, info);
     vm_write16(info + 0, p->width);
     vm_write16(info + 2, p->height);
+    /* CellVdecMpeg2Info +4 aspect_ratio_information, +5 frame_rate_code,
+     * +6 progressive_sequence. Titles pace playback from frame_rate_code:
+     * God of War HD looks its fps up in a table by it, and with the code left
+     * 0 (forbidden) it got 0 fps and never advanced past the first picture. */
+    if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+        vm_write8(info + 4, v->m2Aspect);
+        vm_write8(info + 5, v->m2FrameRate);
+        vm_write8(info + 6, v->m2Progressive);
+    }
+}
+
+/* Pick up sequence_header (00 00 01 B3) and sequence_extension (00 00 01 B5,
+ * extension id 1) fields from an MPEG-2 access unit. */
+static void vdec_scan_mpeg2_headers(VdecSlot* v, const u8* p, u32 size)
+{
+    for (u32 i = 0; i + 8 <= size; i++) {
+        if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 1) continue;
+        const u8* b = p + i + 4;
+        if (p[i + 3] == 0xB3) {
+            v->m2Aspect    = (u8)(b[3] >> 4);
+            v->m2FrameRate = (u8)(b[3] & 0x0F);
+        } else if (p[i + 3] == 0xB5 && (b[0] >> 4) == 1) {
+            v->m2Progressive = (u8)((b[1] >> 3) & 1);
+        }
+    }
 }
 
 /* The decoder path also reports the picture type.
@@ -429,6 +472,15 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
 
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
+    /* VDEC_TRACE also times every picture taken, to measure playback rate. */
+    { static int s_on = -1;
+      if (s_on < 0) s_on = getenv("VDEC_TRACE") ? 1 : 0;
+      if (s_on && handle < MAX_VDEC) {
+          extern unsigned long long ps3_ms_now(void);
+          static unsigned s_n = 0;
+          printf("[cellVdec] GetPicture #%u t=%llums queued=%u\n", ++s_n,
+                 ps3_ms_now(), s_vdec[handle].qCount);
+      } }
     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;

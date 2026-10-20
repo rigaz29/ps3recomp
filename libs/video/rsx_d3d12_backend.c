@@ -31,15 +31,17 @@
 #endif
 #include <windows.h>
 
+/* We need these GUIDs — define them here to avoid uuid.lib dependency.
+ * initguid.h only turns DEFINE_GUID into a definition for headers included
+ * after it, so it has to come first. */
+#include <initguid.h>
+
 /* D3D12 headers */
 #include <d3d12.h>
 #include <d3d12sdklayers.h>   /* ID3D12Debug / ID3D12InfoQueue */
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
-
-/* We need these GUIDs — define them here to avoid uuid.lib dependency */
-#include <initguid.h>
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")

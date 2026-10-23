@@ -12,6 +12,8 @@ uint32_t ppu_hle_inject_base = 0x20000000u;
 uint32_t ppu_load_elf(const char*);
 /* These subsystems are inactive in a loader-only fixture. */
 int spu_coh_is_reserved(uint32_t) { return 0; }
+unsigned char g_spu_coh_bitmap[1];   /* read inline by the store path; never armed here */
+int g_spu_coh_armed;
 void spu_coh_notify_write(uint32_t) { std::abort(); }
 void spu_lockline_lock(void) { std::abort(); }
 void spu_lockline_unlock(void) { std::abort(); }

@@ -770,17 +770,6 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * work was posted. spu_coh_is_reserved reads a global that stays zero until an
  * SPU reserves its first line, so an ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
-/* The same test inline, for the path every guest store takes. The bitmap (one
- * bit per 128-byte line) and its armed flag live in spu_coherency.c; calling
- * across for each store was ~3% of God of War HD's main thread. */
-extern "C" unsigned char g_spu_coh_bitmap[];
-extern "C" int g_spu_coh_armed;
-static inline int ppu_coh_reserved(uint32_t a)
-{
-    if (!g_spu_coh_armed) return 0;
-    const uint32_t line = a >> 7;
-    return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
-}
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
@@ -1484,7 +1473,7 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (ppu_coh_reserved((uint32_t)(a))) {                                \
+        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \

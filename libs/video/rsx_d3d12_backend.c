@@ -5993,6 +5993,134 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     return o;
 }
 
+/* Per-draw fetch plan for the indexed path. read_vp_vertex calls
+ * rsx_fetch_attrib for all 16 slots of every vertex, in another file: 16 calls,
+ * an address resolve per enabled attribute, and the constant register copied
+ * into each of the 11-12 slots a draw leaves disabled. The plan resolves each
+ * enabled array's base once (local memory is base + offset), keeps the slots
+ * that only carry the constant register as a template, and converts the 4-5
+ * enabled attributes inline. Same conversions as rsx_vertex_fetch.c, bit for
+ * bit: VTX_PLAN_CHECK=1 compares every vertex against read_vp_vertex.
+ * VTX_PLAN=0 turns it off. Instanced arrays (frequency > 1) and VTX_POS keep
+ * the generic fetch. */
+typedef struct {
+    int ok, n;
+    struct { u32 slot, type, comps, stride, off; const u8* base; } a[16];
+    VPSlot tmpl[16];
+    u16 active;   /* bit per slot that carries an array */
+} VPFetchPlan;
+
+static inline float vf_bef(const u8* p)
+{
+    u32 w; memcpy(&w, p, 4);
+    w = ((w >> 24) & 0xFFu) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | ((w << 24) & 0xFF000000u);
+    float f; memcpy(&f, &w, 4); return f;
+}
+static inline float vf_half(const u8* p)
+{
+    const u16 h = (u16)((p[0] << 8) | p[1]);
+    const u32 sgn = (h >> 15) & 1u, ex = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+    u32 f;
+    if (ex == 0)        f = sgn << 31;
+    else if (ex == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
+    else                f = (sgn << 31) | ((ex - 15u + 127u) << 23) | (man << 13);
+    float o; memcpy(&o, &f, 4); return o;
+}
+
+static void vp_plan_build(const rsx_state* st, VPFetchPlan* pl)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    static int off = -1, pos = -1;
+    if (off < 0) { const char* e = getenv("VTX_PLAN"); off = (e && e[0] == '0') ? 1 : 0; }
+    if (pos < 0) pos = getenv("VTX_POS") ? 1 : 0;
+    pl->ok = 0; pl->n = 0; pl->active = 0;
+    if (off || pos || !vm_base) return;
+    for (int i = 0; i < 16; i++) {
+        memcpy(pl->tmpl[i].v, st->vertex_data4f[i], sizeof pl->tmpl[i].v);
+        const rsx_vertex_attrib* a = &st->vertex_attribs[i];
+        if (!a->enabled || a->stride == 0) continue;
+        if (a->frequency > 1) return;
+        u32 c = a->size ? a->size : 4; if (c > 4) c = 4;
+        const u32 o = a->offset & 0x7FFFFFFFu;
+        pl->a[pl->n].slot = (u32)i;
+        pl->a[pl->n].type = a->type;
+        pl->a[pl->n].comps = c;
+        pl->a[pl->n].stride = a->stride;
+        pl->a[pl->n].off = o;
+        /* Local memory resolves as localAddress + offset, so one base serves
+         * every vertex. Main memory goes through the IO table per vertex. */
+        pl->a[pl->n].base = (a->offset & 0x80000000u) ? NULL : vm_base + cellGcmResolveLocated(1, o);
+        pl->active |= (u16)(1u << i);
+        pl->n++;
+    }
+    pl->ok = 1;
+}
+
+static inline void vp_plan_attr(const VPFetchPlan* pl, int j, u32 vi, float* out)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    const u32 stride = pl->a[j].stride, c = pl->a[j].comps;
+    const u8* p = pl->a[j].base ? pl->a[j].base + (u64)vi * stride
+                                : vm_base + cellGcmResolveLocated(0, pl->a[j].off + vi * stride);
+    switch (pl->a[j].type) {
+    case 2: for (u32 k = 0; k < c; k++) out[k] = vf_bef(p + k * 4); break;
+    case 3: for (u32 k = 0; k < c; k++) out[k] = vf_half(p + k * 2); break;
+    case 4: for (u32 k = 0; k < c; k++) out[k] = p[k] / 255.0f; break;
+    case 1: for (u32 k = 0; k < c; k++) { s16 s = (s16)((p[k*2] << 8) | p[k*2+1]); out[k] = (float)s / 32767.0f; } break;
+    case 5: for (u32 k = 0; k < c; k++) out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
+    case 7: for (u32 k = 0; k < c; k++) out[k] = (float)p[k]; break;
+    case 6: {
+        const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+        s32 x = (s32)(w & 0x7FF);          if (x & 0x400) x -= 0x800;
+        s32 y = (s32)((w >> 11) & 0x7FF); if (y & 0x400) y -= 0x800;
+        s32 z = (s32)((w >> 22) & 0x3FF); if (z & 0x200) z -= 0x400;
+        out[0] = (float)x / 1023.0f; out[1] = (float)y / 1023.0f;
+        out[2] = (float)z / 511.0f;  out[3] = 1.0f;
+        break; }
+    default: for (u32 k = 0; k < c; k++) out[k] = vf_bef(p + k * 4); break;
+    }
+}
+
+/* One vertex, every slot written once and in order (the destination is the
+ * write-combined upload heap). */
+static inline void vp_plan_fetch(const VPFetchPlan* pl, u32 vi, VPSlot* out16)
+{
+    int j = 0;
+    for (int s = 0; s < 16; s++) {
+        if (pl->active & (1u << s)) {
+            VPSlot t = pl->tmpl[s];
+            vp_plan_attr(pl, j++, vi, t.v);
+            memcpy(&out16[s], &t, sizeof t);
+        } else {
+            memcpy(&out16[s], &pl->tmpl[s], sizeof pl->tmpl[s]);
+        }
+    }
+}
+
+static void vp_fetch_vertex(const rsx_state* state, const VPFetchPlan* pl, u32 vi, VPSlot* out16)
+{
+    if (!pl->ok) { read_vp_vertex(state, vi, out16); return; }
+    if (s_vs_on > 0) s_vs.conv++;
+    vp_plan_fetch(pl, vi, out16);
+    { static int chk = -1; if (chk < 0) chk = getenv("VTX_PLAN_CHECK") ? 1 : 0;
+      if (chk) { static unsigned long long n, bad; VPSlot ref[16];
+          read_vp_vertex(state, vi, ref); n++;
+          if (memcmp(ref, out16, sizeof ref)) {
+              if (bad < 8) {
+                  for (int s = 0; s < 16; s++)
+                      if (memcmp(&ref[s], &out16[s], sizeof ref[s]))
+                          fprintf(stderr, "[vtx-plan-check] vi=%u slot %d: plan (%g %g %g %g) ref (%g %g %g %g)%c", vi, s,
+                                  out16[s].v[0], out16[s].v[1], out16[s].v[2], out16[s].v[3],
+                                  ref[s].v[0], ref[s].v[1], ref[s].v[2], ref[s].v[3], 10);
+              }
+              bad++;
+          }
+          if ((n & 0xFFFFF) == 0)
+              fprintf(stderr, "[vtx-plan-check] %llu vertices, %llu mismatches%c", n, bad, 10); } }
+}
+
 /* Indexed TRIANGLES without the list expansion: each distinct vertex of the
  * draw is converted once, straight into the vertex buffer, and the draw keeps
  * its indices (DrawIndexedInstanced). The expansion wrote 256 bytes per index
@@ -6050,6 +6178,8 @@ static u32 upload_tris_vp_ix(const rsx_state* state, u32 first, u32 count, int c
     const int local = ((state->index_array_dma & 0xF) == 0);
     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
     const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
+    VPFetchPlan pl;
+    vp_plan_build(state, &pl);
     u32 n = s_ix_nverts;
     for (u32 k = 0; k < count; k++) {
         const u32 kk = first + k;
@@ -6066,7 +6196,7 @@ static u32 upload_tris_vp_ix(const rsx_state* state, u32 first, u32 count, int c
         if (s_ix_stamp[ix] != s_ix_gen) {
             s_ix_stamp[ix] = s_ix_gen;
             s_ix_slot[ix] = n;
-            read_vp_vertex(state, ix, &vb[(u64)(s_ix_vbase + n) * 16]);
+            vp_fetch_vertex(state, &pl, ix, &vb[(u64)(s_ix_vbase + n) * 16]);
             n++;
         }
         ib[k] = s_ix_slot[ix];

@@ -1584,8 +1584,10 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 }
 
 /* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
- * probes, so they run only while no read diagnostic is armed. */
+ * probes, so they run only while no read diagnostic is armed; its inline
+ * stores (vm_write*_inl) likewise for the store diagnostics. */
 extern "C" int vm_inline_ok = 0;
+extern "C" int vm_inline_st_ok = 0;
 static struct VmInlineInit {
     VmInlineInit() {
         static const char* const vars[] = {
@@ -1594,6 +1596,10 @@ static struct VmInlineInit {
         int d = 0;
         for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
         vm_inline_ok = !d;
+        static const char* const svars[] = { "PPU_WVAL", "PPU_WWATCH", "PT", 0 };
+        int sd = 0;
+        for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
+        vm_inline_st_ok = !sd;
     }
 } s_vm_inline_init;
 

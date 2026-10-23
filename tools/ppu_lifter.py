@@ -208,11 +208,79 @@ static inline uint64_t vm_read64_inl(uint64_t a)
         return __builtin_bswap64(v); }
     return vm_read64(a);
 }
+/* Inline guest-store fast paths, the store side of the loads above: every
+ * lifted store was an out-of-line call, about a fifth of God of War HD's main
+ * thread. A store the out-of-line path treats specially still goes there:
+ * anything vm_inl_ok turns away, any armed store diagnostic (vm_inline_st_ok,
+ * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
+ * reservation on, which has to take the lock-line lock and raise the
+ * lost-reservation event. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int                  vm_inline_st_ok;
+extern uint32_t             g_barrier_sync_watch;
+extern uint32_t             g_null_sweep_hi;
+extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
+#ifdef __cplusplus
+}
+#endif
+static inline int vm_inl_st_ok(uint32_t ea, uint32_t n)
+{
+    if (!vm_inl_ok(ea, n) || !__builtin_expect(vm_inline_st_ok, 1) ||
+        __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
+        return 0;
+    const unsigned char* bits = g_spu_coh_bits;
+    if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
+    return 1;
+}
+static inline void vm_write8_inl(uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_st_ok(ea, 1)) { __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED); return; }
+    vm_write8(a, v);
+}
+static inline void vm_write16_inl(uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_st_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+        const uint16_t be = __builtin_bswap16(v);
+        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
+        else memcpy(vm_base + ea, &be, 2);
+        return; }
+    vm_write16(a, v);
+}
+static inline void vm_write32_inl(uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_st_ok(ea, 4)) {
+        const uint32_t be = __builtin_bswap32(v);
+        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
+        else memcpy(vm_base + ea, &be, 4);
+        return; }
+    vm_write32(a, v);
+}
+static inline void vm_write64_inl(uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_st_ok(ea, 8)) {
+        const uint64_t be = __builtin_bswap64(v);
+        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
+        else memcpy(vm_base + ea, &be, 8);
+        return; }
+    vm_write64(a, v);
+}
 #ifndef PPU_NO_INLINE_LOADS
 #define vm_read8(a)  vm_read8_inl(a)
 #define vm_read16(a) vm_read16_inl(a)
 #define vm_read32(a) vm_read32_inl(a)
 #define vm_read64(a) vm_read64_inl(a)
+#endif
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
+#define vm_write8(a, v)  vm_write8_inl(a, v)
+#define vm_write16(a, v) vm_write16_inl(a, v)
+#define vm_write32(a, v) vm_write32_inl(a, v)
+#define vm_write64(a, v) vm_write64_inl(a, v)
 #endif
 
 /* Syscall handler */

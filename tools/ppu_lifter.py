@@ -212,7 +212,7 @@ static inline int vm_mm_in(int64_t span, uint32_t ea, uint32_t n)
 }
 static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-    return __builtin_expect(vm_mm_in(m->ld_span, ea, n), 1);
+    return vm_mm_in(m->ld_span, ea, n);
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
@@ -226,13 +226,13 @@ static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_ok(m, ea, 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
+    if (__builtin_expect(vm_mm_ok(m, ea, 1), 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
     return vm_read8(a);
 }
 static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_ok(m, ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint16_t v;
         if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 2);
@@ -242,7 +242,7 @@ static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_ok(m, ea, 4) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint32_t v;
         if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 4);
@@ -252,7 +252,7 @@ static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_ok(m, ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 8), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint64_t v;
         if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 8);
@@ -262,13 +262,13 @@ static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
 static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_st_ok(m, ea, 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); return; }
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 1), 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); return; }
     vm_write8(a, v);
 }
 static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_st_ok(m, ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
         const uint16_t be = __builtin_bswap16(v);
         if (!(ea & 1u)) __atomic_store_n((uint16_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 2);
@@ -278,7 +278,7 @@ static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
 static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_st_ok(m, ea, 4)) {
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
         const uint32_t be = __builtin_bswap32(v);
         if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 4);
@@ -288,7 +288,7 @@ static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
 static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_st_ok(m, ea, 8)) {
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 8), 1)) {
         const uint64_t be = __builtin_bswap64(v);
         if (!(ea & 7u)) __atomic_store_n((uint64_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 8);

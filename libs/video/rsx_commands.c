@@ -74,6 +74,10 @@ void rsx_state_init(rsx_state* state)
     state->cull_face = 1; /* BACK */
     state->front_face = 0; /* CW */
 
+    /* Colour target A, as libgcm sets up. With 0 (NONE) a title that never
+     * writes the register would look like it draws depth only. */
+    state->color_target = 1;
+
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
 

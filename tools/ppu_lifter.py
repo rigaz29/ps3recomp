@@ -167,7 +167,7 @@ extern uint32_t ppu_hle_inject_base;
 /* Inline guest-store fast paths, the store side of the loads below: every
  * lifted store was an out-of-line call, about a fifth of God of War HD's main
  * thread. A store the out-of-line path treats specially still goes there:
- * anything vm_mm_ok turns away, any armed store diagnostic (vm_inline_st_ok,
+ * anything outside the inline range, any armed store diagnostic (vm_inline_st_ok,
  * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
  * reservation on, which has to take the lock-line lock and raise the
  * lost-reservation event. */
@@ -180,27 +180,43 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
 /* The memory-model globals that are set before any guest code runs, copied
  * into a local. A guest store goes through a byte pointer the compiler cannot
  * tell apart from these globals, so code that reads them directly reloads
- * all five after every store. Each lifted function takes one copy at entry
+ * all of them after every store. Each lifted function takes one copy at entry
  * (PPU_MM_SNAP, emitted by the lifter) and its loads and stores use that.
  * What can change while a function runs -- the SPU reservation bitmap and the
- * store watches -- is still read from the globals. */
-typedef struct ppu_mm { uint8_t* vb; uint32_t vs, ib; int lok, sok; } ppu_mm;
+ * store watches -- is still read from the globals.
+ *
+ * The copy holds the inline range as one span from 0x10000: not the null
+ * page, not the raw SPU windows from 0xE0000000, nothing past the end of the
+ * mapping, and a span of 0 while a diagnostic is armed. An access then takes
+ * one compare. The range is the old checks' or narrower. The one address
+ * they also turned away, the gcm ref-poll word, is only special to vm_read32,
+ * so only the 32-bit load still tests it. */
+typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
 static inline ppu_mm ppu_mm_take(void)
 {
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    const int64_t span = hi > 0x10000u ? (int64_t)(hi - 0x10000u) : 0;
     ppu_mm m;
-    m.vb = vm_base; m.vs = ppu_vm_size; m.ib = ppu_hle_inject_base;
-    m.lok = vm_inline_ok; m.sok = vm_inline_st_ok;
+    m.vb = vm_base;
+    m.ld_span = vm_inline_ok ? span : 0;
+    m.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
+    m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
     return m;
+}
+/* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
+ * subtraction wraps past any span. Signed, so span - n is computed once per
+ * function and a span of 0 still turns everything away. */
+static inline int vm_mm_in(int64_t span, uint32_t ea, uint32_t n)
+{
+    return (int64_t)(uint32_t)(ea - 0x10000u) <= span - (int64_t)n;
 }
 static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-    return __builtin_expect(m->lok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
-           ea != m->ib + 0x2008u &&
-           (m->vs == 0 || (uint64_t)ea + n <= m->vs);
+    return __builtin_expect(vm_mm_in(m->ld_span, ea, n), 1);
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-    if (!vm_mm_ok(m, ea, n) || !__builtin_expect(m->sok, 1) ||
+    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
         __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
         return 0;
     const unsigned char* bits = g_spu_coh_bits;
@@ -226,7 +242,7 @@ static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_mm_ok(m, ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
+    if (vm_mm_ok(m, ea, 4) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint32_t v;
         if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 4);

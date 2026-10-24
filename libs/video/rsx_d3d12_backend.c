@@ -85,7 +85,7 @@ typedef struct {
     int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
-    int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
+    u32 fp_ctrl;        /* SET_SHADER_CONTROL export bits at draw time (FP_CTRL_BITS) */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
     u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
@@ -256,7 +256,7 @@ typedef struct {
     u32 blend;              /* packed guest blend key (enable+factors+eq, PSO key) */
     int nrt;                /* bound colour target count (PSO key)       */
     u32 rtfmt;              /* DXGI format of the colour targets (PSO key) */
-    int exp32;              /* 32-bit-exports control bit (PSO key)       */
+    u32 ctrl;               /* SHADER_CONTROL export bits (PSO key)       */
     u32 ucode_hash;         /* FNV-1a of the FP ucode: apps re-patch inline
                              * constants per frame (wave's stamp position/
                              * amplitude) -- address-only keying served the
@@ -2635,7 +2635,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
+                                          DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, int raw, u64 zs)
 {
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
@@ -2693,7 +2693,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
-            s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
+            s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].ctrl == ctrl &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
@@ -2748,17 +2748,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
     /* The third parameter is the SET_SHADER_CONTROL word; its 0x40 bit picks
      * the export registers (r0/r2/r3/r4 for 32-bit, h0/h4/h6/h8 for 16-bit).
-     * Each draw records that bit (fp_exp32, also part of the pipeline key), so
+     * Each draw records that bit (fp_ctrl, also part of the pipeline key), so
      * pass it rather than letting the decompiler guess from "was r0 written".
      * The guess fails on a program that uses r0 as a temp and exports through
      * h0: God of War HD's 2x-AA resolve computes (B-A)/2 in r0 and the average
      * in h0, and with r0 exported every 3D frame came out black. The depth
-     * export bits aren't recorded, so they stay off as before.
+     * export bits come with it: the same resolve writes the scene depth it
+     * reads from the AA depth surface into the resolved one, and without them
+     * it wrote the quad's own depth there, so every depth-tested pass after it
+     * (shadows, fog, rain, glows) was rejected.
      * RSX_FP_CTRL_AUTO=1 restores the guess. */
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
-    u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO
-                            : (exp32 ? CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS : 0u);
+    u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
@@ -3088,7 +3090,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].blend   = blend;
     s_d3d.vp_fp[s_d3d.vp_fp_n].nrt     = nrt;
     s_d3d.vp_fp[s_d3d.vp_fp_n].rtfmt   = (u32)rtfmt;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].exp32   = exp32;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].ctrl    = ctrl;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
@@ -3954,6 +3956,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
         vpx[2] = 1.0f; vpx[6] = 0.0f;
     }
+}
+
+/* The SET_SHADER_CONTROL bits a guest FP's translation depends on. */
+#define FP_CTRL_BITS (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT)
+static u32 rec_fp_ctrl(void)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    return st ? (st->shader_control & FP_CTRL_BITS) : CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
 }
 
 /* The draw's depth surface (none when the surface format has no depth), and
@@ -5231,7 +5241,7 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
+                                       dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
                                        dr->zs_key);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
@@ -5615,7 +5625,7 @@ static void render_frame(void)
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask, dr->cull,
+                                                dr->fp_ctrl, dr->cmask, dr->cull,
                                                 dr_cube_mask(dr), dr->raw, dr->zs_key) : NULL;
                 if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
@@ -7677,8 +7687,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->textured       = s_d3d.tex_bound;
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-                dr->fp_exp32 = s_d3d.current_rsx_state ?
-                    ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+                dr->fp_ctrl = rec_fp_ctrl();
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -7799,8 +7808,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->textured       = s_d3d.tex_bound;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-            dr->fp_exp32 = s_d3d.current_rsx_state ?
-                ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+            dr->fp_ctrl = rec_fp_ctrl();
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -8001,8 +8009,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-        dr->fp_exp32 = s_d3d.current_rsx_state ?
-            ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+        dr->fp_ctrl = rec_fp_ctrl();
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;

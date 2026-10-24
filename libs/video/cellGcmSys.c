@@ -3369,7 +3369,12 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
-        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        /* Written only when it changes: this runs for every local address a
+         * title converts (God of War HD: tens of thousands a second), and a
+         * store of the same byte still takes the line from the drain thread,
+         * which reads it in cellGcmResolveLocated. */
+        if ((loff >> 20) < sizeof(s_local_offset_page) && !s_local_offset_page[loff >> 20])
+            s_local_offset_page[loff >> 20] = 1;
         vm_write32(off_ea, loff);
         return CELL_OK;
     }

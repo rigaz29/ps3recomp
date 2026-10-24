@@ -161,115 +161,133 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
+extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
-#ifdef __cplusplus
-}
-#endif
-static inline int vm_inl_ok(uint32_t ea, uint32_t n)
-{
-    return __builtin_expect(vm_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
-           ea != ppu_hle_inject_base + 0x2008u &&
-           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size);
-}
-static inline uint8_t vm_read8_inl(uint64_t a)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);
-    return vm_read8(a);
-}
-static inline uint16_t vm_read16_inl(uint64_t a)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
-        uint16_t v;
-        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 2);
-        return __builtin_bswap16(v); }
-    return vm_read16(a);
-}
-static inline uint32_t vm_read32_inl(uint64_t a)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
-        uint32_t v;
-        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 4);
-        return __builtin_bswap32(v); }
-    return vm_read32(a);
-}
-static inline uint64_t vm_read64_inl(uint64_t a)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
-        uint64_t v;
-        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 8);
-        return __builtin_bswap64(v); }
-    return vm_read64(a);
-}
-/* Inline guest-store fast paths, the store side of the loads above: every
+/* Inline guest-store fast paths, the store side of the loads below: every
  * lifted store was an out-of-line call, about a fifth of God of War HD's main
  * thread. A store the out-of-line path treats specially still goes there:
- * anything vm_inl_ok turns away, any armed store diagnostic (vm_inline_st_ok,
+ * anything vm_mm_ok turns away, any armed store diagnostic (vm_inline_st_ok,
  * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
  * reservation on, which has to take the lock-line lock and raise the
  * lost-reservation event. */
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern int                  vm_inline_st_ok;
 extern uint32_t             g_barrier_sync_watch;
 extern uint32_t             g_null_sweep_hi;
 extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
 #ifdef __cplusplus
 }
 #endif
-static inline int vm_inl_st_ok(uint32_t ea, uint32_t n)
+/* The memory-model globals that are set before any guest code runs, copied
+ * into a local. A guest store goes through a byte pointer the compiler cannot
+ * tell apart from these globals, so code that reads them directly reloads
+ * all five after every store. Each lifted function takes one copy at entry
+ * (PPU_MM_SNAP, emitted by the lifter) and its loads and stores use that.
+ * What can change while a function runs -- the SPU reservation bitmap and the
+ * store watches -- is still read from the globals. */
+typedef struct ppu_mm { uint8_t* vb; uint32_t vs, ib; int lok, sok; } ppu_mm;
+static inline ppu_mm ppu_mm_take(void)
 {
-    if (!vm_inl_ok(ea, n) || !__builtin_expect(vm_inline_st_ok, 1) ||
+    ppu_mm m;
+    m.vb = vm_base; m.vs = ppu_vm_size; m.ib = ppu_hle_inject_base;
+    m.lok = vm_inline_ok; m.sok = vm_inline_st_ok;
+    return m;
+}
+static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    return __builtin_expect(m->lok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
+           ea != m->ib + 0x2008u &&
+           (m->vs == 0 || (uint64_t)ea + n <= m->vs);
+}
+static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    if (!vm_mm_ok(m, ea, n) || !__builtin_expect(m->sok, 1) ||
         __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
         return 0;
     const unsigned char* bits = g_spu_coh_bits;
     if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
     return 1;
 }
-static inline void vm_write8_inl(uint64_t a, uint8_t v)
+static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_st_ok(ea, 1)) { __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED); return; }
+    if (vm_mm_ok(m, ea, 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
+    return vm_read8(a);
+}
+static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_ok(m, ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+        uint16_t v;
+        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 2);
+        return __builtin_bswap16(v); }
+    return vm_read16(a);
+}
+static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_ok(m, ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
+        uint32_t v;
+        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 4);
+        return __builtin_bswap32(v); }
+    return vm_read32(a);
+}
+static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_ok(m, ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
+        uint64_t v;
+        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 8);
+        return __builtin_bswap64(v); }
+    return vm_read64(a);
+}
+static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_st_ok(m, ea, 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); return; }
     vm_write8(a, v);
 }
-static inline void vm_write16_inl(uint64_t a, uint16_t v)
+static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_st_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+    if (vm_mm_st_ok(m, ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
         const uint16_t be = __builtin_bswap16(v);
-        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
-        else memcpy(vm_base + ea, &be, 2);
+        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 2);
         return; }
     vm_write16(a, v);
 }
-static inline void vm_write32_inl(uint64_t a, uint32_t v)
+static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_st_ok(ea, 4)) {
+    if (vm_mm_st_ok(m, ea, 4)) {
         const uint32_t be = __builtin_bswap32(v);
-        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
-        else memcpy(vm_base + ea, &be, 4);
+        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 4);
         return; }
     vm_write32(a, v);
 }
-static inline void vm_write64_inl(uint64_t a, uint64_t v)
+static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_st_ok(ea, 8)) {
+    if (vm_mm_st_ok(m, ea, 8)) {
         const uint64_t be = __builtin_bswap64(v);
-        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(vm_base + ea), be, __ATOMIC_RELAXED);
-        else memcpy(vm_base + ea, &be, 8);
+        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 8);
         return; }
     vm_write64(a, v);
 }
+/* Outside a lifted function: a fresh copy per access. */
+static inline uint8_t  vm_read8_inl (uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read8_mm(&m, a); }
+static inline uint16_t vm_read16_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read16_mm(&m, a); }
+static inline uint32_t vm_read32_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read32_mm(&m, a); }
+static inline uint64_t vm_read64_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read64_mm(&m, a); }
+static inline void vm_write8_inl (uint64_t a, uint8_t  v) { const ppu_mm m = ppu_mm_take(); vm_write8_mm(&m, a, v); }
+static inline void vm_write16_inl(uint64_t a, uint16_t v) { const ppu_mm m = ppu_mm_take(); vm_write16_mm(&m, a, v); }
+static inline void vm_write32_inl(uint64_t a, uint32_t v) { const ppu_mm m = ppu_mm_take(); vm_write32_mm(&m, a, v); }
+static inline void vm_write64_inl(uint64_t a, uint64_t v) { const ppu_mm m = ppu_mm_take(); vm_write64_mm(&m, a, v); }
 #ifndef PPU_NO_INLINE_LOADS
 #define vm_read8(a)  vm_read8_inl(a)
 #define vm_read16(a) vm_read16_inl(a)
@@ -366,6 +384,12 @@ static inline double ppu_fp_default_qnan(void)
     memcpy(&d, &q, 8);
     return d;
 }
+/* PPU_FAST_FP drops the NaN checks below and takes the host's NaN instead:
+ * the same value when one operand is a NaN, but the host picks which of two
+ * NaN operands propagates, the negating fmadd forms flip a NaN's sign, and a
+ * new NaN (inf - inf, 0 * inf) has its sign bit set. Only for a title whose
+ * output does not depend on NaN bits. */
+#ifndef PPU_FAST_FP
 static inline double ppu_fp_bin(double a, double b, double r)
 {
     if (a != a) return ppu_fp_quiet(a);
@@ -373,6 +397,9 @@ static inline double ppu_fp_bin(double a, double b, double r)
     if (r != r) return ppu_fp_default_qnan();
     return r;
 }
+#else
+static inline double ppu_fp_bin(double a, double b, double r) { (void)a; (void)b; return r; }
+#endif
 static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
 static inline double ppu_fsub(double a, double b) { return ppu_fp_bin(a, b, a - b); }
 static inline double ppu_fmul(double a, double b) { return ppu_fp_bin(a, b, a * b); }
@@ -381,11 +408,15 @@ static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / 
  * NaN priority: FRA, FRB, FRC (negations never apply to propagated NaNs). */
 static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
 {
+#ifndef PPU_FAST_FP
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
     if (c != c) return ppu_fp_quiet(c);
     double r = fma(a, c, neg_b ? -b : b);
     if (r != r) return ppu_fp_default_qnan();
+#else
+    double r = fma(a, c, neg_b ? -b : b);
+#endif
     return neg_res ? -r : r;
 }
 /* Round to single: the result must be representable in single format, NaNs
@@ -554,6 +585,30 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
         _tf((void*)(ctx)); \\
     } \\
 } while(0)
+
+/* Each lifted function opens with PPU_MM_SNAP; its loads and stores use that
+ * copy of the memory model (ppu_mm in ppu_recomp.h). */
+#define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;
+#ifndef PPU_NO_INLINE_LOADS
+#undef vm_read8
+#undef vm_read16
+#undef vm_read32
+#undef vm_read64
+#define vm_read8(a)  vm_read8_mm(&_mm, a)
+#define vm_read16(a) vm_read16_mm(&_mm, a)
+#define vm_read32(a) vm_read32_mm(&_mm, a)
+#define vm_read64(a) vm_read64_mm(&_mm, a)
+#endif
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
+#undef vm_write8
+#undef vm_write16
+#undef vm_write32
+#undef vm_write64
+#define vm_write8(a, v)  vm_write8_mm(&_mm, a, v)
+#define vm_write16(a, v) vm_write16_mm(&_mm, a, v)
+#define vm_write32(a, v) vm_write32_mm(&_mm, a, v)
+#define vm_write64(a, v) vm_write64_mm(&_mm, a, v)
+#endif
 
 """
 
@@ -4034,6 +4089,7 @@ class PPULifter:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+        lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 

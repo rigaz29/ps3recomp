@@ -333,6 +333,93 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+/* NV4097_SET_TRANSFORM_PROGRAM[i]: one microcode word at the write cursor. */
+static inline void rsx_vp_ucode_word(rsx_state* state, u32 data)
+{
+    u32 w = state->vp_ucode_write;
+    if (w + 4 <= sizeof(state->vp_ucode)) {
+        /* data is host-endian already; store as little-endian bytes. */
+        /* Titles upload a draw's program before every draw, mostly the
+         * one already there. Only a changed word changes the program
+         * (vp_dirty lets the backend skip looking it up again). */
+        const u8 b[4] = { (u8)data, (u8)(data >> 8), (u8)(data >> 16), (u8)(data >> 24) };
+        if (memcmp(&state->vp_ucode[w], b, 4) != 0) {
+            memcpy(&state->vp_ucode[w], b, 4);
+            state->vp_dirty = 1;
+        }
+        state->vp_ucode_write = w + 4;
+        if (w + 4 > state->vp_ucode_bytes) { state->vp_ucode_bytes = w + 4; state->vp_dirty = 1; }
+    }
+}
+
+/* NV4097_SET_TRANSFORM_CONSTANT[reg_offset]: one lane of a vertex constant. */
+static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
+{
+    u32 slot = state->transform_constant_load + (reg_offset >> 2);
+    u32 lane = reg_offset & 3;
+    if (slot < RSX_MAX_VERTEX_CONSTANTS) {
+        float f;
+        memcpy(&f, &data, 4);
+        { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+          static int _n=0;
+          static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+          int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
+          if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+        state->vertex_constants[slot][lane] = f;
+        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
+            fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+        if (!state->vertex_constants_dirty) {
+            state->vertex_constants_lo = slot;
+            state->vertex_constants_hi = slot;
+            state->vertex_constants_dirty = 1;
+        } else {
+            if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
+            if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
+        }
+    }
+}
+
+/* An incrementing run of `count` data words from guest memory (big-endian,
+ * `src` at the first) for methods `method`, `method` + 4, ... Vertex-program
+ * microcode and constants are most of a frame's words, and every one of them
+ * was a call through the FIFO walker and another into rsx_process_method:
+ * God of War HD re-uploads each draw's program and constants, about five
+ * million microcode words a second. Runs that stay inside the microcode or
+ * the constant window (a constant run may open with the load slot) are
+ * handled here in one call. Returns 0, having done nothing, for any other run
+ * and while RSX_TRACE is on. */
+int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{
+    static int tr = -1;
+    if (tr < 0) tr = getenv("RSX_TRACE") ? 1 : 0;
+    if (tr || !count) return 0;
+    const u32 end = method + count * 4;
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM && end <= NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        for (u32 i = 0; i < count; i++) {
+            u32 v; memcpy(&v, src + i * 4, 4);
+            rsx_vp_ucode_word(state, __builtin_bswap32(v));
+        }
+        return 1;
+    }
+    if (method >= NV4097_SET_TRANSFORM_CONSTANT_LOAD &&
+        end <= NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
+        u32 i = 0;
+        if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+            u32 v; memcpy(&v, src, 4);
+            rsx_process_method(state, method, __builtin_bswap32(v));   /* the load slot */
+            i = 1;
+        } else if (method < NV4097_SET_TRANSFORM_CONSTANT) {
+            return 0;
+        }
+        for (; i < count; i++) {
+            u32 v; memcpy(&v, src + i * 4, 4);
+            rsx_vp_const_word(state, (method + i * 4 - NV4097_SET_TRANSFORM_CONSTANT) / 4, __builtin_bswap32(v));
+        }
+        return 1;
+    }
+    return 0;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -358,20 +445,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * backend can decompile the real VP (4 words = one NV40 instruction). */
     if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
-        u32 w = state->vp_ucode_write;
-        if (w + 4 <= sizeof(state->vp_ucode)) {
-            /* data is host-endian already; store as little-endian bytes. */
-            /* Titles upload a draw's program before every draw, mostly the
-             * one already there. Only a changed word changes the program
-             * (vp_dirty lets the backend skip looking it up again). */
-            const u8 b[4] = { (u8)data, (u8)(data >> 8), (u8)(data >> 16), (u8)(data >> 24) };
-            if (memcmp(&state->vp_ucode[w], b, 4) != 0) {
-                memcpy(&state->vp_ucode[w], b, 4);
-                state->vp_dirty = 1;
-            }
-            state->vp_ucode_write = w + 4;
-            if (w + 4 > state->vp_ucode_bytes) { state->vp_ucode_bytes = w + 4; state->vp_dirty = 1; }
-        }
+        rsx_vp_ucode_word(state, data);
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
@@ -389,29 +463,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * SET_TRANSFORM_CONSTANT_LOAD before each block. */
     if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
         method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
-        u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
-        u32 slot = state->transform_constant_load + (reg_offset >> 2);
-        u32 lane = reg_offset & 3;
-        if (slot < RSX_MAX_VERTEX_CONSTANTS) {
-            float f;
-            memcpy(&f, &data, 4);
-            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
-              static int _n=0;
-              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
-              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
-              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
-            state->vertex_constants[slot][lane] = f;
-            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
-                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
-            if (!state->vertex_constants_dirty) {
-                state->vertex_constants_lo = slot;
-                state->vertex_constants_hi = slot;
-                state->vertex_constants_dirty = 1;
-            } else {
-                if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
-                if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
-            }
-        }
+        rsx_vp_const_word(state, (method - NV4097_SET_TRANSFORM_CONSTANT) / 4, data);
         return 0;
     }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX

@@ -1769,10 +1769,47 @@ static int gcm_word_diag(void)
 {
     static int on = -1;
     if (on < 0)
-        on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") ||
+        on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
               getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
               rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
     return on;
+}
+
+/* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+ * plus the methods whose answer the walker writes itself. */
+static void gcm_3d_method(rsx_state* st, u32 m, u32 v)
+{
+    extern u32 g_rsx_last_reference;
+    rsx_process_method(st, m, v);
+    /* NV406E_SET_REFERENCE: queue the fence value for PACED
+     * publication (gcm_ref_publish below) instead of letting a
+     * later fence in the same batch overwrite it. */
+    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    /* NV4097_GET_REPORT: (type << 24) | offset into the report
+     * area. Sample counts are not measured, so a ZPASS query
+     * reports "visible" -- the conservative answer; reading 0
+     * tells the title every queried object is occluded. */
+    if (m == 0x1A8) s_report_dma = v;
+    if (m == 0x1800) {
+        const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+        const u64 ts = gcm_report_timestamp();
+        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+        if (main_mem) {
+            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+            const u32 rea = gcm_io2ea(off);
+            if (rea) {
+                vm_write32(rea, (u32)(ts >> 32));
+                vm_write32(rea + 4u, (u32)ts);
+                vm_write32(rea + 8u, val);
+                vm_write32(rea + 12u, 0u);
+            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+            s_report_data[idx].timestamp = ts;
+            s_report_data[idx].value = val;
+        }
+    }
 }
 
 static void gcm_rsx_process_fifo_unlocked(void)
@@ -1960,6 +1997,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   fprintf(stderr, "\n");
                   nop = hdr = jmp = cal = ret = 0; t0 = now;
               } } }
+        /* A run of NOP words. God of War HD builds command blocks on SPUs into
+         * fixed-size reservations and leaves the rest of each one zero: in
+         * gameplay about 4.6 million NOPs a second against 1.2 million command
+         * headers, and each NOP went through the whole decode below. The RSX
+         * does nothing for them, so the run is passed over at once, up to
+         * `put` or the end of this 1 MB IO page (the next word may map
+         * elsewhere). */
+        if (!w && !wdiag) {
+            const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
+            const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
+            u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
+            while (off < lim && !vm_read32(nea)) { off += 4u; nea += 4u; }
+            if (s_fifo_getoff < put) s_last_ring_off = off;
+            s_fifo_getoff = off;
+            continue;
+        }
         u32 type = w >> 29;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
@@ -2188,6 +2241,28 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            static int s1_2d = -1;
+            if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+            /* A run of 3D methods inside one 1 MB IO page, with no per-word
+             * diagnostic on: its words are contiguous in guest memory, so the
+             * offset is translated once and the per-word checks below, none of
+             * which can match, are skipped. Most of a frame's words come this
+             * way (God of War HD: about five million vertex-program microcode and
+             * constant words a second). */
+            if (!wdiag && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
+                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
+                const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
+                if (dea) {
+                    if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
+                        s_fifo_getoff += 4 + count * 4;
+                        continue;
+                    }
+                    for (u32 i = 0; i < count; i++)
+                        gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method, vm_read32(dea + i * 4));
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2248,8 +2323,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * for every draw in the game. Treat the subchannels the 2D path
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 if (wdiag) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -2338,36 +2411,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
-                    /* NV406E_SET_REFERENCE: queue the fence value for PACED
-                     * publication (gcm_ref_publish below) instead of letting a
-                     * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-                    /* NV4097_GET_REPORT: (type << 24) | offset into the report
-                     * area. Sample counts are not measured, so a ZPASS query
-                     * reports "visible" -- the conservative answer; reading 0
-                     * tells the title every queried object is occluded. */
-                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
-                    if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
-                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                        const u64 ts = gcm_report_timestamp();
-                        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
-                        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-                        if (main_mem) {
-                            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
-                            const u32 rea = gcm_io2ea(off);
-                            if (rea) {
-                                vm_write32(rea, (u32)(ts >> 32));
-                                vm_write32(rea + 4u, (u32)ts);
-                                vm_write32(rea + 8u, val);
-                                vm_write32(rea + 12u, 0u);
-                            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
-                        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = ts;
-                            s_report_data[idx].value = val;
-                        }
-                    }
+                    gcm_3d_method(&s_state, m, vm_read32(dea));
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }

@@ -747,7 +747,11 @@ u32 cellGcmGetFlipStatus(void)
 #ifdef _WIN32
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
-#define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
+/* Wakes one guest thread blocked in a semaphore wait, which then pumps (see
+ * cellGcm_wait_pump). Auto-reset; NULL until the first such wait. */
+static HANDLE s_gcm_pump_ev = NULL;
+static void gcm_pump_wake(void) { if (s_gcm_pump_ev) SetEvent(s_gcm_pump_ev); }
+#define GCM_PENDING_SET(bits)  (InterlockedOr(&s_gcm_pending, (bits)), gcm_pump_wake())
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 static volatile LONG s_gcm_pumping = 0;
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
@@ -808,6 +812,27 @@ void cellGcm_request_tick(void)
  * may both pump, and newer causes must not overtake already claimed callbacks.
  * A nonblocking guard also prevents nested callbacks from reentering. Leave
  * pending notifications untouched when another pump is active. */
+#ifdef _WIN32
+/* For sys_semaphore_wait. A guest thread blocked there also waits on this
+ * event and, when it fires, runs *pump (ppu_gcm_pump) to deliver what is
+ * pending, as a timer sleep or an HLE call does. Without it a flip handler
+ * waits for some guest thread to reach one of those: about 1 ms a frame in
+ * God of War HD, whose main thread sits in a semaphore wait until its flip
+ * handler posts that semaphore. */
+void ppu_gcm_pump(void);
+void* cellGcm_wait_pump(void (**pump)(void))
+{
+    if (!s_gcm_pump_ev) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (e && InterlockedCompareExchangePointer((PVOID volatile*)&s_gcm_pump_ev, e, NULL) != NULL)
+            CloseHandle(e);
+        if (s_gcm_pending || s_user_pending) gcm_pump_wake();
+    }
+    *pump = ppu_gcm_pump;
+    return (void*)s_gcm_pump_ev;
+}
+#endif
+
 void ppu_gcm_pump(void)
 {
     /* Every HLE call and timer sleep pumps, tens of thousands of times a
@@ -4096,6 +4121,9 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+#ifdef _WIN32
+    gcm_pump_wake();
+#endif
 }
 
 /* Invalidate a tile region (unbind + clear) */

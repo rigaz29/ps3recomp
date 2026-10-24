@@ -6181,9 +6181,13 @@ skip_dump_consider: ;
         }
       } }
 
-    /* Present */
-    if (s_present_this_frame)
-        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+    /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
+     * title past the display's rate. Skipped for an offscreen-only batch. */
+    if (s_present_this_frame) {
+        static int s_vsync = -1;
+        if (s_vsync < 0) { const char* e = getenv("D3D12_VSYNC"); s_vsync = !(e && *e == '0'); }
+        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)s_vsync, 0);
+    }
     rdoc_frame_end();
 
     move_to_next_frame();

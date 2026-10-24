@@ -2127,35 +2127,39 @@ static const char s_vp_raw_hlsl[] =
     "                                         : (s | ((e + 112u) << 23) | (m << 13)));\n"
     "    return asfloat(f);\n"
     "}\n"
-    /* The components go through a real loop, and vp_vs_raw calls this from
-     * one loop over the inputs the program reads: unrolled and inlined per
-     * input, the format switch made the shader ~54 KB of bytecode and FXC
-     * took 0.7-0.9 s over it, a stall on the drain thread at the program's
-     * first draw. As loops: ~12-15 KB and 0.25-0.3 s. */
+    /* vp_vs_raw calls this from one loop over the inputs the program reads.
+     * Inlined once per input, with the format switch unrolled over four
+     * components, the shader was ~54 KB of bytecode and FXC took 0.7-0.9 s
+     * over it, a stall on the drain thread at the program's first draw; from
+     * the loop, ~22-25 KB and 0.4-0.45 s. The components stay unrolled: a
+     * second loop over them, writing a local array, compiled faster again
+     * but drew some programs wrong (God of War HD's HUD shrank to a few
+     * pixels), two nested loops over indexable temporaries. */
     "float4 vp_fetch(uint i, uint vid) {\n"
     "    float4 r = vp_fk[i];\n"
     "    uint4 d = vp_fa[i];\n"
-    "    [branch] if (d.w == 0u) return r;\n"
+    "    if (d.w == 0u) return r;\n"
     "    uint a = vp_raw.Load(vp_seg + i * 4u) + vid * d.y;\n"
     "    uint t = d.z & 15u; uint c = d.z >> 4;\n"
-    "    [branch] if (t == 6u) {\n"
+    "    if (t == 6u) {\n"
     "        uint w = vp_be32(a);\n"
     "        return float4((float)(((int)(w << 21)) >> 21) / 1023.0,\n"
     "                      (float)(((int)(w << 10)) >> 21) / 1023.0,\n"
     "                      (float)(((int)w) >> 22) / 511.0, 1.0);\n"
     "    }\n"
-    "    float rr[4] = { r.x, r.y, r.z, r.w };\n"
-    "    [loop] for (uint k = 0u; k < c && k < 4u; k++) {\n"
-    "        float f;\n"
-    "        [branch] if (t == 3u) f = vp_half(vp_be16(a + k * 2u));\n"
-    "        else if (t == 4u) f = (float)(vp_ld(a + k) & 0xFFu) / 255.0;\n"
-    "        else if (t == 7u) f = (float)(vp_ld(a + k) & 0xFFu);\n"
-    "        else if (t == 1u) f = (float)vp_s16(a + k * 2u) / 32767.0;\n"
-    "        else if (t == 5u) f = (float)vp_s16(a + k * 2u);\n"
-    "        else              f = asfloat(vp_be32(a + k * 4u));\n"
-    "        rr[k] = f;\n"
+    "    [unroll] for (uint k = 0u; k < 4u; k++) {\n"
+    "        if (k < c) {\n"
+    "            float f;\n"
+    "            if (t == 3u)      f = vp_half(vp_be16(a + k * 2u));\n"
+    "            else if (t == 4u) f = (float)(vp_ld(a + k) & 0xFFu) / 255.0;\n"
+    "            else if (t == 7u) f = (float)(vp_ld(a + k) & 0xFFu);\n"
+    "            else if (t == 1u) f = (float)vp_s16(a + k * 2u) / 32767.0;\n"
+    "            else if (t == 5u) f = (float)vp_s16(a + k * 2u);\n"
+    "            else              f = asfloat(vp_be32(a + k * 4u));\n"
+    "            r[k] = f;\n"
+    "        }\n"
     "    }\n"
-    "    return float4(rr[0], rr[1], rr[2], rr[3]);\n"
+    "    return r;\n"
     "}\n";
 
 static ID3DBlob* vp_vs_raw(int vs_idx)

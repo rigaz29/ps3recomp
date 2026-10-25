@@ -541,6 +541,36 @@ static void test_decode_g8b8_swizzled(void)
         }
 }
 
+/* Every size up to 128x128, square or not. The decoder steps the swizzled
+ * offset along a row instead of interleaving each texel's bits; once the
+ * shorter side's bits run out, the longer side's go on above them, and the
+ * stepping has to carry across that. Each texel holds its raster index, two
+ * bytes so that every index is distinct. */
+static void test_decode_swizzled_sizes(void)
+{
+    static u8 src[128 * 128 * 2], dst[128 * 128 * 2];
+    for (u32 l2w = 0; l2w <= 7; l2w++)
+        for (u32 l2h = 0; l2h <= 7; l2h++) {
+            const u32 w = 1u << l2w, h = 1u << l2h;
+            rsx_tex_layout L;
+            rsx_texture_layout(FMT_G8B8, w, h, &L);
+            CHECK(L.swizzled);
+            for (u32 y = 0; y < h; y++)
+                for (u32 x = 0; x < w; x++) {
+                    const u32 o = rsx_swizzle_offset(x, y, l2w, l2h) * 2, i = y * w + x;
+                    src[o + 0] = (u8)(i >> 8);
+                    src[o + 1] = (u8)i;
+                }
+            memset(dst, 0xA5, sizeof dst);
+            rsx_texture_decode(dst, w * 2, src, w, h, &L, 0);
+            u32 bad = 0;
+            for (u32 i = 0; i < w * h; i++)
+                if (dst[i * 2] != (u8)(i >> 8) || dst[i * 2 + 1] != (u8)i) bad++;
+            if (bad) printf("  %ux%u: %u texels misplaced\n", w, h, bad);
+            CHECK_EQ(bad, 0);
+        }
+}
+
 /* Compressed payload is copied verbatim -- BC1/2/3 are bit-identical to
  * DXT1/23/45 -- with only the row stride changing. */
 static void test_decode_compressed_is_verbatim(void)
@@ -782,6 +812,7 @@ int main(void)
     test_decode_argb_linear();
     test_decode_swizzled();
     test_decode_g8b8_swizzled();
+    test_decode_swizzled_sizes();
     test_decode_compressed_is_verbatim();
     test_decode_rejects_nonsense();
     test_remap_identity();

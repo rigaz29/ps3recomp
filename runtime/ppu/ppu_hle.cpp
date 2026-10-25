@@ -86,6 +86,36 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
     }
 }
 
+/* Leaf imports that can finish without the dispatcher: no guest code, no
+ * change to r2, no blocking. The module that implements one registers a fast
+ * form beside the full handler. ps3_hle_call tries it first, and the fast form
+ * returns 0 to take the full call instead (a contended lock that has to wait,
+ * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
+ * allocator, when a wave spawns), and the dispatcher's guard and bookkeeping
+ * were a large part of each. Registered at init, before guest threads run.
+ * Fast calls do not show in PS3_FTRACE. */
+typedef int (*hle_fast_fn)(ppu_context*);
+#define HLE_FAST_N 64u
+static struct { uint32_t nid; hle_fast_fn fn; } g_hle_fast[HLE_FAST_N];
+extern "C" void ps3_hle_register_fast(uint32_t nid, hle_fast_fn fn)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn || e.nid == nid) { e.nid = nid; e.fn = fn; return; }
+    }
+}
+static inline hle_fast_fn hle_fast(uint32_t nid)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        const auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn) return nullptr;
+        if (e.nid == nid) return e.fn;
+    }
+    return nullptr;
+}
+
 /* Is this NID implemented here? Lets a host boot harness that owns its own
  * import table decide, per import, whether to dispatch into these libraries or
  * fall back to its own stub -- without calling ps3_hle_call and getting an
@@ -251,6 +281,9 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    if (const hle_fast_fn f = hle_fast(nid))
+        if (f(ctx)) return;
+
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --

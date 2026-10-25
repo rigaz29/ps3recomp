@@ -25,6 +25,7 @@
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+extern "C" void ps3_hle_register_fast(uint32_t nid, int (*fn)(ppu_context*));
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -291,6 +292,32 @@ static void sys_lwmutex_lock(ppu_context* ctx)
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
+}
+/* Fast forms for ps3_hle_call (see ps3_hle_register_fast): a lock that is
+ * free or already ours, and any unlock. A lock that has to wait, and every
+ * call while PS3_LWMUTEX_TRACE is on, take the full handler. */
+static int sys_lwmutex_lock_fast(ppu_context* ctx)
+{
+    const uint32_t lwm = (uint32_t)ctx->gpr[3];
+    struct LwmSlot* sl = lwm_slot(lwm);
+    if (!sl || lwm_trace()) return 0;
+    const uint32_t self = LWM_SELF(ctx);
+    if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0)
+        vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+    else if (lwm_try(sl)) {
+        vm_write32(lwm + LWM_OWNER, self);
+        vm_write32(lwm + LWM_RECUR, 1);
+    } else
+        return 0;
+    ctx->gpr[3] = 0;
+    return 1;
+}
+static void sys_lwmutex_unlock(ppu_context* ctx);
+static int sys_lwmutex_unlock_fast(ppu_context* ctx)
+{
+    if (lwm_trace()) return 0;
+    sys_lwmutex_unlock(ctx);
+    return 1;
 }
 static void sys_lwmutex_trylock(ppu_context* ctx)
 {
@@ -929,6 +956,8 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_lock"),   sys_lwmutex_lock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_unlock"), sys_lwmutex_unlock_fast);
 
     /* Spinlocks. One guest word each, no kernel object; see the block above. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);

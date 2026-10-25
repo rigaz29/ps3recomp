@@ -302,14 +302,26 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
 
     /* Morton order interleaves the low bits of x and y, so a swizzled image
      * has to be walked texel by texel; so does anything the host cannot take
-     * as stored. */
+     * as stored. x's and y's bits land on separate positions of the swizzled
+     * offset, so it is the OR of a y part, computed once a row, and an x part
+     * stepped with the dilated increment (d - mask) & mask. Interleaving every
+     * texel's bits afresh was most of the decode in God of War HD's texture
+     * bursts. */
+    const u32 xmask = tl->swizzled ? rsx_swizzle_offset((1u << l2w) - 1u, 0, l2w, l2h) : 0;
     for (u32 y = 0; y < h; y++) {
         u8* drow = d + (size_t)y * dst_pitch;
-        for (u32 x = 0; x < w; x++) {
-            const u8* s = tl->swizzled
-                ? src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * sbpp
-                : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
-            decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+        if (tl->swizzled) {
+            const u32 yoff = rsx_swizzle_offset(0, y, l2w, l2h);
+            u32 xoff = 0;
+            for (u32 x = 0; x < w; x++) {
+                decode_texel(tl, src + (size_t)(xoff | yoff) * sbpp,
+                             drow + (size_t)x * dbpp, argb_as_rgba);
+                xoff = (xoff - xmask) & xmask;
+            }
+        } else {
+            const u8* srow = src + (size_t)y * tl->row_bytes;
+            for (u32 x = 0; x < w; x++)
+                decode_texel(tl, srow + (size_t)x * sbpp, drow + (size_t)x * dbpp, argb_as_rgba);
         }
     }
 }

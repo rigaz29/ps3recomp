@@ -21,6 +21,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -286,11 +287,16 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
+    /* It also closes the PS3_FTRACE span of the call: a thread blocked in an
+     * import (a file read, a SPURS wait) shows up nowhere else. */
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr;
+                      if (ft0) { const uint64_t t1 = ps3_ft_now();
+                                 if (t1 - ft0 >= ps3_ft_min_ns())
+                                     ps3_ft_span(PS3_FT_HLE, t, nid, lr, ft0, t1); } }
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */

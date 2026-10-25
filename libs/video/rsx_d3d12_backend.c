@@ -219,13 +219,23 @@ typedef struct {
                          * shift it, so keying on off never matches the raw offset
                          * a later draw arrives with, and every draw re-uploads. */
     int used;           /* referenced this frame */
+    u32 last_frame;     /* frame_count when last referenced: the slot least
+                         * recently used is the one given to a new texture */
 } VPTexSlot;
 /* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
  * frame but not for a scene: this title binds ~20 distinct textures per frame,
  * so every draw past the fourth got slot -1 from vp_upload_tex_slot ("out of
  * slots") and drew UNTEXTURED. That reads as a correctly-lit but solid black
  * object, which is indistinguishable from a missing texture upload. */
-#define VP_TEX_SLOTS 96
+#define VP_TEX_SLOTS 192
+/* Guest texture uploads are staged in one persistently mapped upload buffer,
+ * a part per frame in flight, reset when that frame's command allocator is
+ * (the GPU has finished its copies by then). A committed upload buffer per
+ * texture cost about two thirds of a texture burst in God of War HD: 50 new
+ * textures in one report interval spent 41 ms creating their upload buffers.
+ * A texture that does not fit in what is left of the part uses its own buffer,
+ * as before. */
+#define TEX_RING_PART (32u << 20)
 
 /* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
  * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
@@ -366,6 +376,9 @@ typedef struct {
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
+    ID3D12Resource*       tex_ring;             /* texture upload ring, FRAME_COUNT parts */
+    u8*                   tex_ring_ptr;         /* persistently mapped           */
+    u64                   tex_ring_used[FRAME_COUNT];
     VPVSEntry             vp_vs[VP_VS_CACHE];   /* per-draw decompiled VS cache  */
     int                   vp_vs_n;
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
@@ -3221,6 +3234,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         VPTexSlot* c = &s_d3d.vp_tex[i];
         if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
             && c->cube == cube) {
+            c->last_frame = s_d3d.frame_count;
             if (c->used) return i;                /* already bound this frame */
             { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
               if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
@@ -3234,7 +3248,13 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             if (cs == c->csum) { c->used = 1; return i; }
             slot = i; break;                      /* stale: fall through and redo */
         }
-        if (!c->used && freeslot < 0) freeslot = i;
+        /* A new texture takes an empty slot, else the one used least
+         * recently. Taking the first slot not used this frame evicted
+         * textures the next frame needed again. */
+        if (!c->used && (freeslot < 0 ||
+                         (s_d3d.vp_tex[freeslot].res &&
+                          (!c->res || c->last_frame < s_d3d.vp_tex[freeslot].last_frame))))
+            freeslot = i;
     }
     /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
      * Measured on the Rubber Ducky demo: at the bind offset every texture reads
@@ -3335,7 +3355,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
           fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
                   start_delta, w * h * bpp, 10); } } }
     if (slot < 0) slot = freeslot;
+    if (slot < 0) return -1;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
+    t->last_frame = s_d3d.frame_count;
     /* The upload buffer's rows hold the DECODED image, so they are sized from
      * dst_row_bytes -- w * bpp is the source row, which is narrower for any
      * format rsx_texture_decode unpacks. */
@@ -3364,24 +3386,57 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
             return -1;
+        fresh = 1;
+    }
+    /* Stage the decoded image in the ring, or in the slot's own upload
+     * buffer when the ring is full or could not be made. */
+    const u64 up_bytes = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
+    const u32 fi = s_d3d.frame_index;
+    if (!s_d3d.tex_ring) {
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
+        bd.Width = (u64)TEX_RING_PART * FRAME_COUNT;
         bd.Height = 1; bd.DepthOrArraySize = 1;
         bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        void* rp = NULL; D3D12_RANGE nr0 = {0, 0};
+        if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&t->up))) {
-            t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
+                &IID_ID3D12Resource, (void**)&s_d3d.tex_ring))) {
+            if (SUCCEEDED(s_d3d.tex_ring->lpVtbl->Map(s_d3d.tex_ring, 0, &nr0, &rp)) && rp)
+                s_d3d.tex_ring_ptr = (u8*)rp;
+            else { s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring); s_d3d.tex_ring = NULL; }
         }
-        fresh = 1;
+    }
+    ID3D12Resource* up_res = NULL;
+    u64 up_base = 0;
+    const u64 ring_at = (s_d3d.tex_ring_used[fi] + 511u) & ~(u64)511u;   /* placement alignment */
+    if (s_d3d.tex_ring_ptr && ring_at + up_bytes <= TEX_RING_PART) {
+        up_res = s_d3d.tex_ring;
+        up_base = (u64)fi * TEX_RING_PART + ring_at;
+        s_d3d.tex_ring_used[fi] = ring_at + up_bytes;
+    } else {
+        if (!t->up) {
+            D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd = {0};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = up_bytes;
+            bd.Height = 1; bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                    &IID_ID3D12Resource, (void**)&t->up)))
+                return -1;
+        }
+        up_res = t->up;
     }
     rdoc_name((ID3D12Object*)t->res, "gtex 0x%08X fmt %02X %ux%u%s", off, fmt, w, h, cube ? " cube" : "");
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
-    if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
+    if (up_res == s_d3d.tex_ring) mapped = s_d3d.tex_ring_ptr + up_base;
+    else if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
     { static int _tp=0; if (env_str("RTT_DUMP", &s_env_rtt_dump) && PS3_LOG_FIRST(_tp, 6)) {
         const u8* sp = vm_base + off;
         fprintf(stderr, "[TEXUP] off=0x%X fmt=0x%X row0:", off, fmt);
@@ -3692,7 +3747,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
       } }
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
-    t->up->lpVtbl->Unmap(t->up, 0, NULL);
+    if (up_res != s_d3d.tex_ring) t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
         D3D12_RESOURCE_BARRIER b = {0};
@@ -3705,7 +3760,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = t->up;  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.pResource = up_res; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Footprint.Format   = dxfmt;
     src.PlacedFootprint.Footprint.Width    = w;
     src.PlacedFootprint.Footprint.Height   = h;
@@ -3713,7 +3768,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     src.PlacedFootprint.Footprint.RowPitch = pitch;
     for (u32 _f = 0; _f < _nfaces; _f++) {
         dst.SubresourceIndex        = _f;      /* cube face = array slice */
-        src.PlacedFootprint.Offset  = (u64)_f * pitch * _face_rows;
+        src.PlacedFootprint.Offset  = up_base + (u64)_f * pitch * _face_rows;
         s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
     }
     {
@@ -4792,6 +4847,7 @@ static void render_frame(void)
     /* Reset command allocator and list */
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    s_d3d.tex_ring_used[fi] = 0;   /* this frame index's copies are done */
 
     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
      * The atlas is a linear 8-bit coverage map, so a straight row copy (no
@@ -8388,6 +8444,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
+    if (s_d3d.tex_ring) s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);

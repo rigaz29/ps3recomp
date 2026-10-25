@@ -19,6 +19,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -241,6 +242,7 @@ typedef struct {
  * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
  * vs dbgfont-gcm's text VP); compiling only the first left later draws
  * transformed by the wrong program (text offscreen). */
+struct ShaderJob;
 typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
     ID3DBlob* vs;
@@ -248,6 +250,8 @@ typedef struct {
     char* hlsl;             /* the decompiled source, for vp_vs_raw */
     ID3DBlob* vs_raw;       /* raw-fetch variant, compiled on first use */
     int raw_failed;
+    struct ShaderJob* job;     /* vs still building (D3D12_ASYNC_SHADERS) */
+    struct ShaderJob* raw_job; /* vs_raw still building */
 } VPVSEntry;
 #define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
@@ -280,6 +284,7 @@ typedef struct {
     int raw;                /* raw-fetch VS, no input layout (PSO key) */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
     ID3D12PipelineState* pso;
+    struct ShaderJob* job;  /* pso still building (D3D12_ASYNC_SHADERS) */
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
  * distinct (fp, vs, blend, rt, cmask, ucode-hash) combinations than that in a
@@ -797,6 +802,209 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
     return hr;
+}
+
+/* The disk cache's program for this source, referenced, or NULL: no compile. */
+static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
+{
+    ID3DBlob* b = NULL;
+    AcquireSRWLockExclusive(&s_shc_lock);
+    if (s_shc_on < 0) shc_open();
+    if (s_shc_on && s_shc_cap) {
+        ShaderCacheEntry* e = shc_slot(shc_key(src, len, target, shc_flags()), (u32)len);
+        if (e->blob) {
+            e->blob->lpVtbl->AddRef(e->blob);
+            b = e->blob;
+            s_shc_stat_hits++;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    return b;
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest shaders built off the drain thread (D3D12_ASYNC_SHADERS=<workers>)
+ *
+ * A guest program the drain has not seen before used to be compiled, and a
+ * fragment program's pipeline created, on the drain thread when a draw first
+ * needed it, and nothing drew until that was done. God of War HD's raw-fetch
+ * vertex programs take 0.4-0.8 s in D3DCompile: the first fight's aftermath
+ * stopped for 0.9 s on two of them. Now the drain still decompiles (cheap),
+ * then hands the source to a worker, and the draws that need it are skipped
+ * until it is built: a new effect turns up a few frames late instead of the
+ * picture stopping. A build that finishes inside the wait budget is used at
+ * once: the drain may wait D3D12_ASYNC_WAIT_MS (default 3) in every 16 ms.
+ * Default 2 workers; 0 builds everything on the drain thread, as before. A
+ * program already in the disk cache needs no compile and is used at once
+ * (its pipeline is still created by a worker).
+ * -----------------------------------------------------------------------*/
+typedef struct ShaderJob {
+    struct ShaderJob* next;         /* queue link */
+    volatile LONG refs;             /* the owner's and the worker's; the last release frees it */
+    volatile LONG done;             /* results below are final */
+    char* src; size_t len;          /* HLSL, owned */
+    const char* name; const char* target;
+    ID3DBlob* vs;                   /* pipeline jobs: the vertex shader, referenced */
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;   /* pipeline jobs: all but the pixel shader */
+    HRESULT hr;
+    ID3DBlob* blob;                 /* the compiled program */
+    ID3D12PipelineState* pso;       /* pipeline jobs: the pipeline */
+    char err[160];                  /* the start of a compile error */
+} ShaderJob;
+
+static int s_sj_workers = -1;
+static SRWLOCK s_sj_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_sj_work = CONDITION_VARIABLE_INIT;   /* a job queued */
+static CONDITION_VARIABLE s_sj_done = CONDITION_VARIABLE_INIT;   /* a job finished */
+static ShaderJob *s_sj_head, *s_sj_tail;
+static int s_sj_quit;
+static HANDLE s_sj_thread[8];
+static int s_sj_nowait;             /* set while render_frame only queues builds */
+static int s_pso_pending;           /* vp_get_fp_pso returned NULL: still building */
+static u32 s_sj_stat_jobs, s_sj_stat_skipped;   /* PERF=1 report */
+
+static void sj_release(ShaderJob* j)
+{
+    if (!j || InterlockedDecrement(&j->refs)) return;
+    if (j->blob) j->blob->lpVtbl->Release(j->blob);
+    if (j->pso)  j->pso->lpVtbl->Release(j->pso);
+    if (j->vs)   j->vs->lpVtbl->Release(j->vs);
+    free(j->src);
+    free(j);
+}
+
+static void sj_build(ShaderJob* j)
+{
+    ID3DBlob* err = NULL;
+    j->hr = d3d_compile_cached(j->src, j->len, j->name, j->target, &j->blob, &err);
+    if (err) {
+        snprintf(j->err, sizeof j->err, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
+        err->lpVtbl->Release(err);
+    }
+    if (FAILED(j->hr) || !j->blob || !j->vs) return;
+    j->pd.PS.pShaderBytecode = j->blob->lpVtbl->GetBufferPointer(j->blob);
+    j->pd.PS.BytecodeLength  = j->blob->lpVtbl->GetBufferSize(j->blob);
+    const double t0 = perf_now();
+    j->hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, &j->pd, &IID_ID3D12PipelineState, (void**)&j->pso);
+    const double dt = perf_now() - t0;
+    AcquireSRWLockExclusive(&s_shc_lock);
+    s_shc_stat_pso++;
+    s_shc_stat_pso_s += dt;
+    ReleaseSRWLockExclusive(&s_shc_lock);
+}
+
+static DWORD WINAPI sj_worker(LPVOID arg)
+{
+    ps3_thread_name("shader build %d", (int)(intptr_t)arg);
+    for (;;) {
+        AcquireSRWLockExclusive(&s_sj_lock);
+        while (!s_sj_head && !s_sj_quit)
+            SleepConditionVariableSRW(&s_sj_work, &s_sj_lock, INFINITE, 0);
+        if (s_sj_quit) { ReleaseSRWLockExclusive(&s_sj_lock); return 0; }
+        ShaderJob* j = s_sj_head;
+        s_sj_head = j->next;
+        if (!s_sj_head) s_sj_tail = NULL;
+        ReleaseSRWLockExclusive(&s_sj_lock);
+        if (j->refs > 1) sj_build(j);   /* else its entry was evicted while it waited */
+        AcquireSRWLockExclusive(&s_sj_lock);
+        j->done = 1;
+        WakeAllConditionVariable(&s_sj_done);
+        ReleaseSRWLockExclusive(&s_sj_lock);
+        sj_release(j);
+    }
+}
+
+/* Workers in use, started on first call; 0 = build on the drain thread. */
+static int sj_workers(void)
+{
+    if (s_sj_workers >= 0) return s_sj_workers;
+    const char* e = getenv("D3D12_ASYNC_SHADERS");
+    int n = e ? atoi(e) : 2;
+    if (n < 0) n = 0;
+    if (n > (int)(sizeof s_sj_thread / sizeof s_sj_thread[0])) n = (int)(sizeof s_sj_thread / sizeof s_sj_thread[0]);
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        s_sj_thread[started] = CreateThread(NULL, 0, sj_worker, (LPVOID)(intptr_t)i, 0, NULL);
+        if (s_sj_thread[started]) started++;
+    }
+    s_sj_workers = started;
+    printf("[d3d12] guest shaders built by %d worker thread%s%c", started, started == 1 ? "" : "s", 10);
+    return s_sj_workers;
+}
+
+/* Queue a compile of src; with vs and pd, also the pipeline for that vertex
+ * shader and the compiled program as pixel shader. The caller owns one
+ * reference (sj_release). */
+static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const char* target,
+                            ID3DBlob* vs, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+{
+    ShaderJob* j = (ShaderJob*)calloc(1, sizeof *j);
+    if (!j) return NULL;
+    j->src = (char*)malloc(len + 1);
+    if (!j->src) { free(j); return NULL; }
+    memcpy(j->src, src, len);
+    j->src[len] = 0;
+    j->len = len; j->name = name; j->target = target;
+    j->refs = 2;
+    if (vs && pd) {
+        vs->lpVtbl->AddRef(vs);
+        j->vs = vs;
+        j->pd = *pd;
+        j->pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
+        j->pd.VS.BytecodeLength  = vs->lpVtbl->GetBufferSize(vs);
+    }
+    AcquireSRWLockExclusive(&s_sj_lock);
+    if (s_sj_tail) s_sj_tail->next = j; else s_sj_head = j;
+    s_sj_tail = j;
+    WakeConditionVariable(&s_sj_work);
+    ReleaseSRWLockExclusive(&s_sj_lock);
+    s_sj_stat_jobs++;
+    return j;
+}
+
+/* j->done with a full barrier: its results are read after it. */
+static int sj_is_done(ShaderJob* j)
+{
+    return InterlockedCompareExchange(&j->done, 0, 0) != 0;
+}
+
+/* 1 once j is built, waiting for it out of this 16 ms window's budget. */
+static int sj_wait(ShaderJob* j)
+{
+    if (sj_is_done(j)) return 1;
+    if (s_sj_nowait) return 0;
+    static double budget = -1.0, win0, used;
+    if (budget < 0.0) {
+        const char* e = getenv("D3D12_ASYNC_WAIT_MS");
+        budget = (e ? atof(e) : 3.0) / 1000.0;
+    }
+    const double t0 = perf_now();
+    if (t0 - win0 > 0.016) { win0 = t0; used = 0.0; }
+    if (used >= budget) return 0;
+    AcquireSRWLockExclusive(&s_sj_lock);
+    for (;;) {
+        if (j->done) break;
+        const double left = budget - used - (perf_now() - t0);
+        if (left <= 0.0) break;
+        SleepConditionVariableSRW(&s_sj_done, &s_sj_lock, (DWORD)(left * 1000.0) + 1, 0);
+    }
+    ReleaseSRWLockExclusive(&s_sj_lock);
+    used += perf_now() - t0;
+    return sj_is_done(j);
+}
+
+/* At shutdown: let the workers finish what they are building, and stop. */
+static void sj_stop(void)
+{
+    if (s_sj_workers <= 0) return;
+    AcquireSRWLockExclusive(&s_sj_lock);
+    s_sj_quit = 1;
+    WakeAllConditionVariable(&s_sj_work);
+    ReleaseSRWLockExclusive(&s_sj_lock);
+    WaitForMultipleObjects((DWORD)s_sj_workers, s_sj_thread, TRUE, 5000);
+    for (int i = 0; i < s_sj_workers; i++) CloseHandle(s_sj_thread[i]);
+    s_sj_workers = 0;
 }
 /* Debug switches read on every draw, quad or bind go through this: getenv
  * takes the CRT environment lock and scans every variable, and a dozen of
@@ -2228,24 +2436,38 @@ static int vp_get_vs(const rsx_state* st)
             at += n;
         }
     }
-    ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb, &e);
-    if (e) e->lpVtbl->Release(e);
-    if (FAILED(hr) || !vb) {
-        static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
-        return -1;
+    /* A worker builds it unless the disk cache has it (D3D12_ASYNC_SHADERS);
+     * the draws that use it wait for it in vp_get_fp_pso. */
+    ID3DBlob* vb = NULL;
+    ShaderJob* vjob = NULL;
+    if (sj_workers() > 0) {
+        vb = shc_find(hlsl, strlen(hlsl), "vs_5_0");
+        if (!vb) vjob = sj_submit(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", NULL, NULL);
+    }
+    if (!vb && !vjob) {
+        ID3DBlob* e = NULL;
+        HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb, &e);
+        if (e) e->lpVtbl->Release(e);
+        if (FAILED(hr) || !vb) {
+            static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
+            return -1;
+        }
     }
     int slot;
     if (s_d3d.vp_vs_n < VP_VS_CACHE) slot = s_d3d.vp_vs_n++;
     else {  /* evict slot 0 */
         if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
         if (s_d3d.vp_vs[0].vs_raw) s_d3d.vp_vs[0].vs_raw->lpVtbl->Release(s_d3d.vp_vs[0].vs_raw);
+        sj_release(s_d3d.vp_vs[0].job);
+        sj_release(s_d3d.vp_vs[0].raw_job);
         free(s_d3d.vp_vs[0].hlsl);
         memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
         slot = VP_VS_CACHE - 1;
     }
     s_d3d.vp_vs[slot].hash = hash;
     s_d3d.vp_vs[slot].vs   = vb;
+    s_d3d.vp_vs[slot].job  = vjob;
+    s_d3d.vp_vs[slot].raw_job = NULL;
     { const size_t hn = strlen(hlsl) + 1;
       s_d3d.vp_vs[slot].hlsl = (char*)malloc(hn);
       if (s_d3d.vp_vs[slot].hlsl) memcpy(s_d3d.vp_vs[slot].hlsl, hlsl, hn); }
@@ -2332,11 +2554,41 @@ static const char s_vp_raw_hlsl[] =
     "    return r;\n"
     "}\n";
 
+/* The entry's vertex shader, taking over a finished worker build: NULL while
+ * it builds (within the wait budget) or if it failed. */
+static ID3DBlob* vp_vs_ready(VPVSEntry* e)
+{
+    if (!e->job) return e->vs;
+    if (!sj_wait(e->job)) return NULL;
+    ShaderJob* j = e->job;
+    e->job = NULL;
+    if (SUCCEEDED(j->hr) && j->blob) { e->vs = j->blob; j->blob = NULL; }
+    else { static int _e = 0;
+           if (PS3_LOG_FIRST(_e, 4))
+               printf("[VP] per-draw VS compile FAIL (hash=0x%08X): %s\n", e->hash, j->err); }
+    sj_release(j);
+    return e->vs;
+}
+
 static ID3DBlob* vp_vs_raw(int vs_idx)
 {
     if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
     VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
     if (e->vs_raw || e->raw_failed || !e->hlsl) return e->vs_raw;
+    /* A worker is building it: until then the draw takes the indexed path,
+     * which needs no raw variant. */
+    if (e->raw_job) {
+        if (!sj_is_done(e->raw_job)) return NULL;
+        ShaderJob* j = e->raw_job;
+        e->raw_job = NULL;
+        if (SUCCEEDED(j->hr) && j->blob) { e->vs_raw = j->blob; j->blob = NULL; }
+        else { e->raw_failed = 1;
+               static int _e = 0;
+               if (PS3_LOG_FIRST(_e, 4))
+                   printf("[VP] raw-fetch VS compile FAIL (hash=0x%08X): %s\n", e->hash, j->err); }
+        sj_release(j);
+        return e->vs_raw;
+    }
     e->raw_failed = 1;                      /* until it compiles */
     static const char cb_end[] = "    float4 vp_posoffset;\n};\n";
     static const char v_last[] = "v[15]=input.a15;\n";
@@ -2395,6 +2647,21 @@ static ID3DBlob* vp_vs_raw(int vs_idx)
 #undef VP_RAW_PUT
     out[o] = 0;
     ID3DBlob* vb = NULL; ID3DBlob* err = NULL;
+    if (sj_workers() > 0) {
+        vb = shc_find(out, o, "vs_5_0");
+        if (vb) {
+            free(out);
+            e->vs_raw = vb;
+            e->raw_failed = 0;
+            return vb;
+        }
+        e->raw_job = sj_submit(out, o, "guest_vp_raw", "vs_5_0", NULL, NULL);
+        if (e->raw_job) {
+            free(out);
+            e->raw_failed = 0;
+            return NULL;
+        }
+    }
     HRESULT hr = d3d_compile_cached(out, o, "guest_vp_raw", "vs_5_0", &vb, &err);
     if (FAILED(hr) || !vb) {
         static int _e = 0;
@@ -2674,10 +2941,38 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* The entry's pipeline, taking over a finished worker build. NULL with
+ * s_pso_pending set while it builds (within the wait budget); NULL alone if
+ * the build failed. */
+static ID3D12PipelineState* vp_fp_ready(VPFPEntry* q)
+{
+    if (!q->job) return q->pso;
+    if (!sj_wait(q->job)) { s_pso_pending = 1; return NULL; }
+    ShaderJob* j = q->job;
+    q->job = NULL;
+    if (SUCCEEDED(j->hr) && j->pso) {
+        q->pso = j->pso;
+        j->pso = NULL;
+        { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", q->fp_addr); }
+        rdoc_name((ID3D12Object*)q->pso, "pso fp 0x%08X ucode %08X vs %d", q->fp_addr, q->ucode_hash, q->vs_idx);
+    } else {
+        static int _e = 0;
+        if (PS3_LOG_FIRST(_e, 16))
+            printf("[FP] %s FAIL (fp=0x%08X, 0x%08lX): %s\n", j->blob ? "PSO" : "PS compile",
+                   q->fp_addr, (unsigned long)j->hr, j->err);
+    }
+    sj_release(j);
+    return q->pso;
+}
+
+/* NULL with s_pso_pending set: a shader or pipeline this draw needs is still
+ * being built by a worker (D3D12_ASYNC_SHADERS), and the draw should be
+ * skipped rather than drawn with another program. */
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, int raw, u64 zs)
 {
+    s_pso_pending = 0;
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
@@ -2687,7 +2982,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Resolve the VS: the draw's cached per-VP blob, else the primary. */
     ID3DBlob* vsb = NULL; u32 vs_hash = 0;
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
-        vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
+        VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+        vs_hash = ve->hash;
+        if (!raw) {
+            vsb = vp_vs_ready(ve);
+            /* Still building: wait for this program, not draw with the primary one. */
+            if (ve->job) { s_pso_pending = 1; return NULL; }
+        }
     }
     if (raw) { vsb = vp_vs_raw(vs_idx); if (!vsb) return NULL; }
     if (!vsb) { vsb = s_d3d.vp_vs_blob; vs_idx = -1; }
@@ -2738,7 +3039,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].zs == zs)
-            return s_d3d.vp_fp[i].pso;
+            return vp_fp_ready(&s_d3d.vp_fp[i]);
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -2998,31 +3299,41 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         char* rp = strstr(hlsl, "return r[0];");
         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
     }
+    /* With workers, the program is compiled and the pipeline created by one
+     * (sj_build), from the description below. */
+    const int async = sj_workers() > 0;
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
-    if (FAILED(hr) || !pb) {
-        static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
-            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
-                   e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
+    HRESULT hr = S_OK;
+    if (!async) {
+        hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
+        if (FAILED(hr) || !pb) {
+            static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
+                printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
+                       e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
+            if (e) e->lpVtbl->Release(e);
+            return NULL;
+        }
         if (e) e->lpVtbl->Release(e);
-        return NULL;
     }
-    if (e) e->lpVtbl->Release(e);
 
-    D3D12_INPUT_ELEMENT_DESC il[16];
-    for (int _i = 0; _i < 16; _i++) {
-        il[_i].SemanticName = "ATTR"; il[_i].SemanticIndex = _i;
-        il[_i].Format = DXGI_FORMAT_R32G32B32A32_FLOAT; il[_i].InputSlot = 0;
-        il[_i].AlignedByteOffset = (UINT)(_i * 16);
-        il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-        il[_i].InstanceDataStepRate = 0;
-    }
+    /* Static: a worker may create the pipeline after this returns. */
+    static D3D12_INPUT_ELEMENT_DESC il[16];
+    if (!il[0].SemanticName)
+        for (int _i = 0; _i < 16; _i++) {
+            il[_i].SemanticName = "ATTR"; il[_i].SemanticIndex = _i;
+            il[_i].Format = DXGI_FORMAT_R32G32B32A32_FLOAT; il[_i].InputSlot = 0;
+            il[_i].AlignedByteOffset = (UINT)(_i * 16);
+            il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+            il[_i].InstanceDataStepRate = 0;
+        }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
     pd.pRootSignature = s_d3d.vp_root_sig;
     pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
     pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
-    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
-    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    if (pb) {
+        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    }
     pd.InputLayout.pInputElementDescs = raw ? NULL : il; pd.InputLayout.NumElements = raw ? 0 : 16;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     /* Guest face culling. CULL_OFF=1 forces double-sided, the old
@@ -3105,21 +3416,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
-    { const double t0 = perf_now();
-      hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-          s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
-      s_shc_stat_pso++; s_shc_stat_pso_s += perf_now() - t0; }
-    pb->lpVtbl->Release(pb);
-    if (FAILED(hr)) {
-        static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
-        return NULL;
+    ShaderJob* job = NULL;
+    if (async) {
+        job = sj_submit(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", vsb, &pd);
+        if (!job) return NULL;
+    } else {
+        { const double t0 = perf_now();
+          hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+              s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+          s_shc_stat_pso++; s_shc_stat_pso_s += perf_now() - t0; }
+        pb->lpVtbl->Release(pb);
+        if (FAILED(hr)) {
+            static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+            return NULL;
+        }
+        { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+        rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
     }
-    { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
-    rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
 
     /* insert (evict oldest when full) */
     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
         if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
+        sj_release(s_d3d.vp_fp[0].job);
         memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
         s_d3d.vp_fp_n = VP_FP_CACHE - 1;
     }
@@ -3138,8 +3456,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].job     = job;
     s_d3d.vp_fp_n++;
-    return pso;
+    return job ? vp_fp_ready(&s_d3d.vp_fp[s_d3d.vp_fp_n - 1]) : pso;
 }
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
@@ -5320,12 +5639,16 @@ static void render_frame(void)
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
+        /* Queue every build the frame needs before waiting for any: the draw
+         * pass below waits, within the budget, for the ones still running. */
+        s_sj_nowait = 1;
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
                                        dr->zs_key);
+        s_sj_nowait = 0;
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5710,6 +6033,9 @@ static void render_frame(void)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
                                                 dr_cube_mask(dr), dr->raw, dr->zs_key) : NULL;
+                /* Its program is still being built: skip the draw this frame
+                 * rather than draw it with another one. */
+                if (dr->fp_addr && !dpso && s_pso_pending) { s_sj_stat_skipped++; continue; }
                 if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
@@ -5933,6 +6259,11 @@ static void render_frame(void)
                         s_shc_stat_pso, s_shc_stat_pso_s * 1000.0, 10);
                 s_shc_stat_compiled = s_shc_stat_hits = s_shc_stat_pso = 0;
                 s_shc_stat_compile_s = s_shc_stat_pso_s = 0.0;
+            }
+            if (s_sj_stat_jobs || s_sj_stat_skipped) {
+                fprintf(stderr, "[PERF] shader builds: %u queued to workers, %u draws skipped"
+                                " waiting for one%c", s_sj_stat_jobs, s_sj_stat_skipped, 10);
+                s_sj_stat_jobs = s_sj_stat_skipped = 0;
             }
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
@@ -8458,6 +8789,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
+    sj_stop();   /* a worker may be creating a pipeline on the device */
 
     /* Release D3D12 resources */
     if (s_d3d.vertex_buffer) {

@@ -234,17 +234,34 @@ static void pad_poll_keyboard(void)
 }
 #endif
 
+/* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+ * a connected one), and the backend is polled at least once a frame: three
+ * empty slots beside one pad were 0.6 ms of every frame on God of War HD's
+ * main thread. An empty slot is looked at again once a second, which is how
+ * soon a pad plugged in there is seen; the slots are staggered so one poll
+ * never pays for all of them. */
+#define PAD_EMPTY_RECHECK_MS 1000
+static unsigned long long s_pad_empty_until[PAD_MAX_HOST_PORTS];
+
 static void pad_poll_xinput(void)
 {
+    const unsigned long long now = pad_now_ms();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        if (s_pad_empty_until[i] && now < s_pad_empty_until[i]) {
+            s_host_state[i].connected = 0;
+            continue;
+        }
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
 
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
+            s_pad_empty_until[i] = now + PAD_EMPTY_RECHECK_MS
+                                 + (unsigned long long)i * (PAD_EMPTY_RECHECK_MS / PAD_MAX_HOST_PORTS);
             continue;
         }
+        s_pad_empty_until[i] = 0;
 
         s_host_state[i].connected = 1;
         XINPUT_GAMEPAD* gp = &state.Gamepad;

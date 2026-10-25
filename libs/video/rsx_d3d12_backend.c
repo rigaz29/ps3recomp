@@ -303,6 +303,7 @@ typedef struct {
     ID3D12Device*              device;
     ID3D12CommandQueue*        cmd_queue;
     IDXGISwapChain3*           swap_chain;
+    int                        tearing;     /* D3D12_VSYNC=0 and the swap chain allows tearing */
     ID3D12DescriptorHeap*      rtv_heap;
     u32                        rtv_descriptor_size;
     ID3D12Resource*            render_targets[FRAME_COUNT];
@@ -883,6 +884,15 @@ static HWND create_window(u32 width, u32 height, const char* title)
  * D3D12 initialization
  * -----------------------------------------------------------------------*/
 
+/* D3D12_VSYNC=0: present without waiting for the vblank, for measuring a title
+ * past the display's rate. Read once. */
+static int d3d12_vsync_off(void)
+{
+    static int off = -1;
+    if (off < 0) { const char* e = getenv("D3D12_VSYNC"); off = e && *e == '0'; }
+    return off;
+}
+
 static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
@@ -982,6 +992,23 @@ static int init_d3d12(u32 width, u32 height)
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sc_desc.BufferCount = FRAME_COUNT;
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    /* D3D12_VSYNC=0 presents with a sync interval of 0, but a windowed
+     * flip-model swap chain still waits for the compositor, which runs at the
+     * display's rate, unless it allows tearing. So allow it where DXGI can. */
+    if (d3d12_vsync_off()) {
+        IDXGIFactory5* factory5 = NULL;
+        BOOL tear = FALSE;
+        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
+                factory, &IID_IDXGIFactory5, (void**)&factory5))) {
+            if (FAILED(factory5->lpVtbl->CheckFeatureSupport(
+                    factory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tear, sizeof tear)))
+                tear = FALSE;
+            factory5->lpVtbl->Release(factory5);
+        }
+        s_d3d.tearing = tear ? 1 : 0;
+        if (tear) sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        printf("[D3D12] D3D12_VSYNC=0: tearing %s\n", tear ? "allowed" : "not supported");
+    }
 
     IDXGISwapChain1* swap_chain1 = NULL;
     hr = factory->lpVtbl->CreateSwapChainForHwnd(
@@ -6240,9 +6267,11 @@ skip_dump_consider: ;
     /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
      * title past the display's rate. Skipped for an offscreen-only batch. */
     if (s_present_this_frame) {
-        static int s_vsync = -1;
-        if (s_vsync < 0) { const char* e = getenv("D3D12_VSYNC"); s_vsync = !(e && *e == '0'); }
-        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)s_vsync, 0);
+        if (!d3d12_vsync_off())
+            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+        else
+            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
+                                              s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     }
     rdoc_frame_end();
 

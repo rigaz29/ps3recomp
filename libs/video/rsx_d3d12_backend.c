@@ -6798,8 +6798,18 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
              * in one present. Gauged against the running MAX frame size (not
              * the last, which a leaked tiny batch would poison), so it
              * self-scales per title with no fixed threshold. */
-            if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4)
-                return;   /* intermediate: keep accumulating, flip stays pending */
+            if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4) {
+                /* A second flip with the batch still small, though, is not an
+                 * intermediate: the title's frames have become small. God of
+                 * War HD plays a movie inside the game as one quad a frame
+                 * after hundreds of draws of game, and holding those back until
+                 * a quarter of the game's size had piled up presented one frame
+                 * every four seconds or so while the movie's sound played on.
+                 * Take the new size as the title's frame size. */
+                if (fc - s_last_present_flip < 2u)
+                    return;   /* intermediate: keep accumulating, flip stays pending */
+                s_frame_draws_max = s_d3d.draw_count;
+            }
             s_last_present_flip = fc;
         }
     }

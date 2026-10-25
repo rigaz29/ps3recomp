@@ -331,9 +331,9 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 /* libs/video/cellGcmSys.c: an event to wait on besides the semaphore, and the
  * pump to run when it fires, so a flip handler that posts this semaphore runs
  * as soon as the flip completes. Weak: the runtime also links without GCM. */
-void* cellGcm_wait_pump(void (**pump)(void));
-void* cellGcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL; }
-#pragma comment(linker, "/alternatename:cellGcm_wait_pump=cellGcm_wait_pump_absent")
+void* ppu_gcm_wait_pump(void (**pump)(void));
+void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL; }
+#pragma comment(linker, "/alternatename:ppu_gcm_wait_pump=ppu_gcm_wait_pump_absent")
 #endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
@@ -412,7 +412,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         /* Bounded slices keep timed waits on the QPC deadline. */
         DWORD ms = (timeout_us == 0) ? INFINITE : 1;
         void (*pump)(void) = NULL;
-        HANDLE pump_ev = (HANDLE)cellGcm_wait_pump(&pump);
+        HANDLE pump_ev = (HANDLE)ppu_gcm_wait_pump(&pump);
         if (pump_ev && pump) {
             HANDLE hs[2] = { s->sem_handle, pump_ev };
             if (WaitForMultipleObjects(2, hs, FALSE, ms) == WAIT_OBJECT_0 + 1)

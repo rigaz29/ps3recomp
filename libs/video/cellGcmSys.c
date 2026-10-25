@@ -748,7 +748,7 @@ u32 cellGcmGetFlipStatus(void)
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 /* Wakes one guest thread blocked in a semaphore wait, which then pumps (see
- * cellGcm_wait_pump). Auto-reset; NULL until the first such wait. */
+ * ppu_gcm_wait_pump). Auto-reset; NULL until the first such wait. */
 static HANDLE s_gcm_pump_ev = NULL;
 static void gcm_pump_wake(void) { if (s_gcm_pump_ev) SetEvent(s_gcm_pump_ev); }
 #define GCM_PENDING_SET(bits)  (InterlockedOr(&s_gcm_pending, (bits)), gcm_pump_wake())
@@ -820,7 +820,7 @@ void cellGcm_request_tick(void)
  * God of War HD, whose main thread sits in a semaphore wait until its flip
  * handler posts that semaphore. */
 void ppu_gcm_pump(void);
-void* cellGcm_wait_pump(void (**pump)(void))
+void* ppu_gcm_wait_pump(void (**pump)(void))
 {
     if (!s_gcm_pump_ev) {
         HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);

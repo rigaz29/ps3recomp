@@ -1,4 +1,4 @@
-/* The NEON integer/permute helpers, and the SSE4.1 forms of the first 27,
+/* The NEON integer/permute helpers, and the SSE4.1 forms of the first 33,
  * must be bit-identical to their scalar references (spu_*_ref) for random
  * operands and every shift amount. Build on arm64, or on x86-64 with -msse4.1:
  *   cc -O2 [-msse4.1] -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
@@ -45,9 +45,11 @@ int main(void)
         check("selb", spu_selb(a, b, c), spu_selb_ref(a, b, c), a, b, 0);
         CI(shlqbyi, sh); CI(rotqbyi, sh); CI(rotqmbyi, sh); CI(cwd, sh);
         C2(shlqby); C2(rotqby); C2(shlqbybi); C2(rotqbybi); C2(rotqmby); C2(rotqmbybi);
+        /* The quadword bit shifts: SSE4.1 forms only (scalar on NEON). */
+        C2(shlqbi); C2(rotqbi); C2(rotqmbi); CI(shlqbii, sh); CI(rotqbii, sh); CI(rotqmbii, sh);
     }
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches\n", s_bad); return 1; }
-    printf("test_spu_int_neon: ok (%ld random cases x 27 ops)\n", N);
+    printf("test_spu_int_neon: ok (%ld random cases x 33 ops)\n", N);
 #if defined(__ARM_NEON)
 
     /* The per-lane ops vectorised for tests/bench/spu. Shift and rotate counts come per lane,

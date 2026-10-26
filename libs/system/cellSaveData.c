@@ -55,15 +55,26 @@ static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
 /* $PS3_GAMEDATA_ROOT replaces the cwd-relative "./gamedata", so a port can keep
  * the player's saves in one fixed place (e.g. ~/Library/Application Support/...)
- * no matter which directory the game was launched from. */
+ * no matter which directory the game was launched from.
+ *
+ * Without it, $PS3_HDD0_ROOT -- the host directory sys_fs maps /dev_hdd0 to --
+ * holds the saves as well, where the guest's own /dev_hdd0/home paths point. A
+ * port that set only that one kept its saves under whatever directory the game
+ * was started from, apart from the rest of /dev_hdd0: God of War HD's first
+ * save landed in the build directory when the executable was started there. */
 static void adopt_gamedata_root(void)
 {
     static int s_done = 0;
     if (s_done) return;
     s_done = 1;
     const char* env = getenv("PS3_GAMEDATA_ROOT");
-    if (env && *env)
+    if (env && *env) {
         snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
+        return;
+    }
+    const char* hdd0 = getenv("PS3_HDD0_ROOT");
+    if (hdd0 && *hdd0)
+        snprintf(s_save_root, sizeof(s_save_root), "%s/home/00000001/savedata", hdd0);
 }
 
 /* Ensure directory (and parents) exist */

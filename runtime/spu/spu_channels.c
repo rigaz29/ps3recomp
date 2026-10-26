@@ -759,7 +759,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);   /* commit local store, head last */
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -856,7 +856,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock();
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
-        memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);       /* unconditional store, head last */
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a

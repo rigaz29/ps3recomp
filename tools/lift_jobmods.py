@@ -77,6 +77,13 @@ CODE_END = {
 EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
+# Extra function entries for one module only (--extra-funcs NAME=ADDR,...),
+# keyed by module name. Several modules of one title can span the same LS
+# addresses, and an address that is code in one is data in another: offered to
+# every module, a return point inside one job became a "function" made of
+# another job's constant tables.
+MODULE_EXTRA_FUNCS = {}
+
 
 def manual_link_targets(raw, base=BASE):
     """Return targets built into the link register by hand:
@@ -211,6 +218,7 @@ def module_code_end(raw, name, base=BASE):
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
     seeds |= {int(a, 0) for a in EXTRA_FUNCS}
+    seeds |= {int(a, 0) for a in MODULE_EXTRA_FUNCS.get(name, [])}
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
     while True:
         seen = reachable(raw, seeds, hi, base)
@@ -223,10 +231,11 @@ def module_code_end(raw, name, base=BASE):
     return max(seen) + 4
 
 
-def module_seeds(raw, base=BASE):
+def module_seeds(raw, base=BASE, name=None):
     """Extra function entries offered to the lifter for one module."""
     # Only offer addresses that fall inside THIS module's image.
-    inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
+    inside = [a for a in EXTRA_FUNCS + MODULE_EXTRA_FUNCS.get(name, [])
+              if base <= int(a, 0) < base + len(raw)]
     # The module's first function starts right after the 0x30-byte header
     # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
     # reached by a branch and found anyway, but in two modules it is a bare
@@ -268,7 +277,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         cmd += ["--code-end", hex(end)]
     if merge_chunks:
         cmd += ["--merge-chunks"]
-    inside = module_seeds(raw, base)
+    inside = module_seeds(raw, base, name)
     if code_end:
         inside = [a for a in inside if int(a, 0) < code_end]
     if inside:
@@ -345,6 +354,10 @@ def main():
     ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
                     help="C symbol prefix for the registration functions, so two "
                          "ports linked in one tree cannot collide (default: port).")
+    ap.add_argument("--extra-funcs", action="append", default=[], metavar="NAME=ADDR[,ADDR...]",
+                    help="Extra function entries (LS addresses) for the module named NAME "
+                         "only. Repeatable. For indirect-branch targets and return points "
+                         "the function finder doesn't reach.")
     ap.add_argument("--merge-chunks", action="store_true",
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
@@ -353,8 +366,16 @@ def main():
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
+    for spec in args.extra_funcs:
+        name, _, addrs = spec.partition("=")
+        if not name or not addrs:
+            sys.exit(f"--extra-funcs: expected NAME=ADDR[,ADDR...], got {spec!r}")
+        MODULE_EXTRA_FUNCS.setdefault(name.strip(), []).extend(
+            hex(int(a, 0)) for a in addrs.split(",") if a.strip())
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
+    for name, addrs in sorted(MODULE_EXTRA_FUNCS.items()):
+        print(f"  extra function entries for {name}: {', '.join(addrs)}")
     if args.engine_elf:
         return lift_engine_elf(args, register_c)
     JOBMODS = args.jobmods

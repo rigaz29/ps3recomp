@@ -19,6 +19,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_settings.h"
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -186,12 +187,27 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
+/* input.device: auto (the pads, and the keyboard as slot 0 when it has no
+ * pad), pad (no keyboard; also PAD_NO_KEYBOARD) or keyboard (no pads). */
+enum { PAD_DEV_AUTO, PAD_DEV_PAD, PAD_DEV_KEYBOARD };
+static int pad_device(void)
+{
+    static int d = -1;
+    if (d >= 0) return d;
+    const char* v = ps3_settings_str("input", "device", NULL, "auto");
+    if (getenv("PAD_NO_KEYBOARD"))               d = PAD_DEV_PAD;
+    else if (ps3_settings_ieq(v, "pad"))         d = PAD_DEV_PAD;
+    else if (ps3_settings_ieq(v, "keyboard"))    d = PAD_DEV_KEYBOARD;
+    else {
+        if (!ps3_settings_ieq(v, "auto"))
+            printf("[cellPad] input.device = %s is not auto, pad or keyboard; using auto\n", v);
+        d = PAD_DEV_AUTO;
+    }
+    return d;
+}
+
 static void pad_poll_keyboard(void)
 {
-    static int off = -1;
-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (off) return;
-
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
@@ -515,13 +531,16 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    const int dev = pad_device();
+    if (dev != PAD_DEV_KEYBOARD) {
 #if PAD_BACKEND_XINPUT
-    pad_poll_xinput();
+        pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
-    pad_poll_sdl2();
+        pad_poll_sdl2();
 #endif
+    }
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    if (dev != PAD_DEV_PAD && !s_host_state[0].connected) pad_poll_keyboard();
 #endif
 }
 

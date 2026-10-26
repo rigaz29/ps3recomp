@@ -6,6 +6,7 @@
  */
 
 #include "cellSysutil.h"
+#include "ps3emu/ps3_settings.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -386,18 +387,19 @@ static s32 sysutil_language(void)
         {"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB}, {"tr", CELL_SYSUTIL_LANG_TURKISH},
     };
     lang = CELL_SYSUTIL_LANG_ENGLISH_US;
-    const char* e = getenv("PS3_LANG");
+    /* system.language (PS3_LANG); auto = the host's language. */
+    const char* e = ps3_settings_str("system", "language", "PS3_LANG", "auto");
     const char* from = "default";
-    if (e && *e) {
+    if (e && *e && !ps3_settings_ieq(e, "auto")) {
         char* end = NULL;
         long n = strtol(e, &end, 10);
-        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = "PS3_LANG"; }
+        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = "the setting"; }
         else {
             unsigned i;
             for (i = 0; i < sizeof k / sizeof k[0]; i++)
-                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; from = "PS3_LANG"; break; }
+                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; from = "the setting"; break; }
             if (i == sizeof k / sizeof k[0])
-                printf("[cellSysutil] PS3_LANG=%s not recognised, using English\n", e);
+                printf("[cellSysutil] system.language = %s not recognised, using English\n", e);
         }
     } else {
         char host[8];

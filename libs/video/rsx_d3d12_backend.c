@@ -19,6 +19,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_settings.h"
 #include "ps3emu/thread_name.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
@@ -723,10 +724,11 @@ static void shc_write(FILE* f, u64 key, u32 srclen, ID3DBlob* b)
     fwrite(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f);
 }
 
+/* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. */
 static void shc_open(void)
 {
-    const char* path = getenv("D3D12_SHADER_CACHE");
-    s_shc_on = path && *path && strcmp(path, "0") != 0;
+    const char* path = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
+    s_shc_on = path && *path && strcmp(path, "0") != 0 && !ps3_settings_ieq(path, "off");
     if (!s_shc_on) return;
     u32 loaded = 0;
     int clean = 0;
@@ -915,12 +917,12 @@ static DWORD WINAPI sj_worker(LPVOID arg)
     }
 }
 
-/* Workers in use, started on first call; 0 = build on the drain thread. */
+/* Workers in use, started on first call; 0 = build on the drain thread.
+ * graphics.async_shaders (D3D12_ASYNC_SHADERS), 2 by default. */
 static int sj_workers(void)
 {
     if (s_sj_workers >= 0) return s_sj_workers;
-    const char* e = getenv("D3D12_ASYNC_SHADERS");
-    int n = e ? atoi(e) : 2;
+    int n = (int)ps3_settings_int("graphics", "async_shaders", "D3D12_ASYNC_SHADERS", 2);
     if (n < 0) n = 0;
     if (n > (int)(sizeof s_sj_thread / sizeof s_sj_thread[0])) n = (int)(sizeof s_sj_thread / sizeof s_sj_thread[0]);
     int started = 0;
@@ -1092,12 +1094,12 @@ static HWND create_window(u32 width, u32 height, const char* title)
  * D3D12 initialization
  * -----------------------------------------------------------------------*/
 
-/* D3D12_VSYNC=0: present without waiting for the vblank, for measuring a title
- * past the display's rate. Read once. */
+/* display.vsync off (D3D12_VSYNC=0): present without waiting for the vblank,
+ * for measuring a title past the display's rate. Read once. */
 static int d3d12_vsync_off(void)
 {
     static int off = -1;
-    if (off < 0) { const char* e = getenv("D3D12_VSYNC"); off = e && *e == '0'; }
+    if (off < 0) off = !ps3_settings_bool("display", "vsync", "D3D12_VSYNC", 1);
     return off;
 }
 

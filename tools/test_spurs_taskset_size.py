@@ -23,6 +23,7 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
+void spu_taskset2_register(uint32_t ea) {(void)ea;}
 static _Alignas(128) uint8_t memory[0x10000];
 #define PTR(type, ea) ((type*)(uintptr_t)(ea))
 static void expect(int ok, const char* what) {
@@ -68,6 +69,15 @@ int main(void) {
     expect(cellSpursCreateTaskset(spurs,ts,0,NULL,0)==0,"plain creation");
     expect(vm_read32(0x4000+CSTS_SIZE_FIELD)==0x1900,"plain creation uses full default guest size");
     clean(0x1900);
+    memset(memory+0x3FFF,0xA5,0x2902);
+    expect(_cellSpursTasksetAttribute2Initialize(0x2000,1)==0,"attribute2 init");
+    expect(vm_read32(0x2000)==1 && memory[0x2010]==1 && memory[0x2017]==1 &&
+           vm_read32(0x2018)==8,"attribute2 defaults");
+    expect(cellSpursCreateTaskset2(spurs,ts,0x2000)==0,"taskset2 creation");
+    expect(vm_read32(0x4000+CSTS_SIZE_FIELD)==0x2900,"taskset2 uses the extended size");
+    clean(0x2900);
+    expect((uint32_t)cellSpursCreateTaskset2(spurs,PTR(CellSpursTaskset,0x4040),0)==
+           (uint32_t)CELL_SPURS_TASK_ERROR_ALIGN,"taskset2 alignment");
     puts("PASS: real taskset requested-size retention and initialization");
 }
 '''

@@ -333,14 +333,17 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    /* The wall clock, in seconds since 1970 as on the console and as the
+     * CLOCK_REALTIME branch below returns. This used QueryPerformanceCounter,
+     * i.e. the time since the PC started: God of War HD stamps its saves with
+     * this call and its load screen showed every one as Jan 1, 1970. FILETIME
+     * counts 100 ns units since 1601. */
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    const uint64_t t100 = (((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime)
+                        - 116444736000000000ULL;
+    sec  = t100 / 10000000ULL;
+    nsec = (t100 % 10000000ULL) * 100ULL;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

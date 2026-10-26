@@ -576,6 +576,73 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* ===========================================================================
+ * Idle lock-line polls
+ *
+ * A guest that waits for work by re-reading one lock line (GETLLAR, look,
+ * GETLLAR again) costs nothing on a real SPU, which shares its core with no
+ * one. Here every SPU is a host thread, and God of War HD's two particle job
+ * SPUs spend about half their time in exactly that loop: a million GETLLARs a
+ * second each, nearly all of them reading back the line unchanged, holding two
+ * host cores at 100% with nothing to do.
+ *
+ * A GETLLAR is idle when the reservation from this context's previous GETLLAR
+ * of the same line is still valid (PUTLLC and PUTLLUC always drop it, and so
+ * does any store reported to the line) and the line still matches the
+ * snapshot. Once idle GETLLARs have run back to back for the spin window, the
+ * thread parks on its channel CV until a store to the line wakes it -- every
+ * writer reports one: PPU stores through the reserved-line bitmap, SPU
+ * PUTLLC/PUTLLUC and DMA puts -- or until SPU_LLAR_WAIT_MS passes. It then
+ * returns and the GETLLAR goes ahead, so the guest runs one more iteration of
+ * its loop and sees whatever woke it, a mailbox write included.
+ *
+ * Delaying a GETLLAR only moves the read later, which is always legal, so a
+ * missed wake costs at most the timeout. In that game's combat no timed-out
+ * wait found the line changed (the timeouts are the queue staying empty), and
+ * the process went from 3.5 busy host cores to 2.3 with the frame time
+ * unchanged. SPU_LLAR_BACKOFF=0 turns this off; any other value is the spin
+ * window in microseconds (default 50).
+ * ===========================================================================*/
+static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0);
+
+#define SPU_LLAR_GAP_NS   50000ull   /* a longer gap between polls is work */
+#define SPU_LLAR_WAIT_MS  1
+
+static void spu_llar_backoff(spu_context* ctx, uint32_t ea)
+{
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+        const char* e = getenv("SPU_LLAR_BACKOFF");
+        spin_ns = e ? (int64_t)atoi(e) * 1000 : 50000;
+    }
+    static SPU_THREAD_LOCAL const spu_context* t_ctx;
+    static SPU_THREAD_LOCAL uint32_t t_ea;
+    static SPU_THREAD_LOCAL uint64_t t_first, t_last;
+    const uint8_t* line = vm_base + ea;
+    if (!spin_ns || !ctx->resv_valid || ctx->resv_ea != ea ||
+        memcmp(line, ctx->resv_line, MFC_ATOMIC_LINE) != 0) {
+        t_ctx = NULL;
+        return;
+    }
+    const uint64_t now = ps3_ft_now();
+    if (t_ctx != ctx || t_ea != ea || now - t_last > SPU_LLAR_GAP_NS) {
+        t_ctx = ctx; t_ea = ea; t_first = now;
+    }
+    t_last = now;
+    if (now - t_first < (uint64_t)spin_ns) return;
+
+    const uint64_t ft_t0 = PS3_FT_ON() ? now : 0;
+    yz_lockstep_block_begin(ctx);
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    if (ctx->resv_valid && memcmp(line, ctx->resv_line, MFC_ATOMIC_LINE) == 0)
+        SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                  (SRWLOCK*)&ctx->ch_wait_lock, SPU_LLAR_WAIT_MS, 0);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    yz_lockstep_block_end(ctx);
+    if (ft_t0) spu_ft_wait_span(ctx, MFC_RdAtomicStat, ft_t0);
+    t_last = ps3_ft_now();
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -707,6 +774,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* Back off first: a GETLLAR that only re-reads an unchanged line
+         * parks here, outside the lock-line lock, until the line is written. */
+        spu_llar_backoff(ctx, ea);
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
          * tick here a polling SPU would hold the run token forever while the

@@ -5675,6 +5675,45 @@ static int off_rt_find(u32 off)
 
 /* Ensure an RT resource exists for this surface; (re)creates the RTV at
  * rt_rtv_heap[i] and the SRV at srv_heap[RT_SRV_BASE+i]. */
+/* render_frame()'s state between its stages (see "render_frame() in
+ * stages"): the frame index the batch records for, the display handles, and
+ * the VP pass's bindings, which recording ahead carries from one call to the
+ * next. */
+static struct {
+    int  open;                     /* recording ahead: the list holds part of the batch */
+    u32  fi, pre_done, done;       /* prepass and recording progress */
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle, dsv_handle, cur_dsv;
+    int  vp_on;
+    ID3D12PipelineState* vpso;
+    D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
+    int  samp_bound[4], cur_rt, ib_bound, raw_bound, cur_m[3], cur_z, cur_nc, force_rebind;
+    int  seen_small_vp, captured;
+    float vp_last_w, vp_last_h, dvp_x, dvp_y, dvp_w, dvp_h;
+} s_rf;
+
+/* A resource the open command list may still reference is released only after
+ * that list has run: off_rt_get and off_ds_get replace surfaces from the
+ * prepass, which recording ahead runs after earlier draws are recorded. */
+static IUnknown* s_rf_dead[256];
+static int s_rf_dead_n;
+static void rf_release(void* p)
+{
+    IUnknown* u = (IUnknown*)p;
+    if (!u) return;
+    if (s_rf.open) {
+        if (s_rf_dead_n < (int)(sizeof s_rf_dead / sizeof s_rf_dead[0])) { s_rf_dead[s_rf_dead_n++] = u; return; }
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 2)) fprintf(stderr, "[D3D12] deferred-release list full; leaking%c", 10);
+        return;
+    }
+    u->lpVtbl->Release(u);
+}
+static void rf_release_dead(void)
+{
+    for (int i = 0; i < s_rf_dead_n; i++) s_rf_dead[i]->lpVtbl->Release(s_rf_dead[i]);
+    s_rf_dead_n = 0;
+}
+
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
 {
     if (!off || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap) return -1;
@@ -5699,8 +5738,8 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
          * replacement reads back empty. Let the GPU finish first. Recreations are
          * rare (a surface changing size), so the stall costs nothing. */
         wait_for_gpu();
-        r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
-        if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
+        rf_release(r->res); r->res = NULL;   /* dims/format changed */
+        if (r->up) { rf_release(r->up); r->up = NULL; }
     } else {
         for (int i = 0; i < MAX_OFF_RTS; i++)
             if (!s_d3d.off_rt[i].res) { slot = i; break; }
@@ -5709,10 +5748,10 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
             if (slot < 0) return -1;
             wait_for_gpu();   /* same hazard as above: the frame may still use it */
-            s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
+            rf_release(s_d3d.off_rt[slot].res);
             s_d3d.off_rt[slot].res = NULL;
             if (s_d3d.off_rt[slot].up) {
-                s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
+                rf_release(s_d3d.off_rt[slot].up);
                 s_d3d.off_rt[slot].up = NULL;
             }
         }
@@ -5946,7 +5985,7 @@ static int off_ds_get(u32 off, u32 w, u32 h)
     if (s_d3d.off_ds[i].res) {
         /* An earlier frame may still reference it (see off_rt_get). */
         wait_for_gpu();
-        s_d3d.off_ds[i].res->lpVtbl->Release(s_d3d.off_ds[i].res);
+        rf_release(s_d3d.off_ds[i].res);
         s_d3d.off_ds[i].res = NULL;
     }
     if (!s_d3d.ds_heap) {
@@ -6356,10 +6395,28 @@ static void guest_fb_present(u32 fi)
 }
 
 
-static void render_frame(void)
+/* ---------------------------------------------------------------------------
+ * render_frame() in stages
+ *
+ * A batch is recorded into the frame's command list in one go at its end (a
+ * display clear, or a flip): open the list, the RT and texture prepass over
+ * every record, the display target, the legacy pass, then the VP pass. In God
+ * of War HD that is about 480 draws and 2 ms, on the drain thread, while the
+ * title waits for the drain to reach its flip -- and the same thread sat idle
+ * for most of the frame before.
+ *
+ * D3D12_RECORD_AHEAD=1 records the batch as it arrives instead:
+ * rsx_d3d12_backend_record_ahead(), called by the host between drain passes,
+ * opens the list and records the records captured so far; the end of the
+ * batch records the rest, executes and presents. Same thread, same order, so
+ * the guest memory a texture upload reads is read earlier, never later. Not
+ * the last record (a batch can still extend it), not a batch with legacy
+ * (non-VP) records, and not while a debug filter that edits the batch is set.
+ * -------------------------------------------------------------------------*/
+static void rf_open(void)
 {
-    double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
+    s_rf.fi = fi;
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
      * vp_cb constants, per-frame texture staging): the previous frame's draws
@@ -6368,6 +6425,7 @@ static void render_frame(void)
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
     wait_for_gpu();
+    rf_release_dead();   /* the batch that last referenced them has run */
     rdoc_frame_begin(s_d3d.draw_count);
 
     /* Compile the real vertex program once its microcode is captured, and keep
@@ -6627,13 +6685,21 @@ static void render_frame(void)
         s_d3d.draw_count = keep;
       } }
 
+    for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
+    for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
+    s_rf.pre_done = s_rf.done = 0;
+}
+
+/* The RT and texture prepass for records [from, to). */
+static void rf_prepass(u32 from, u32 to)
+{
+    u32 fi = s_rf.fi; (void)fi;
     /* Render-to-texture pre-pass: make sure an offscreen RT resource exists for
      * every non-display surface targeted this frame (so draws binding it as a
      * texture can resolve to it below, whatever the op order). Depth surfaces
      * too, and the colour copy of each one a draw samples: both settle their
      * size here, before any draw's SRV window points at them. */
-    for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
-    for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+    for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (dr->is_vp && dr->rt_off)
             off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt);
@@ -6644,7 +6710,7 @@ static void render_frame(void)
             off_ds_get(dr->zeta_off, dr->rt_w, dr->rt_h);
         for (int _u = 0; _u < 4; _u++) dr->tex_ds[_u] = -1;   /* set below for draws */
     }
-    for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+    for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
         for (int _u = 0; _u < 4 && dr->is_vp && !dr->is_clear; _u++) {
             const int ds = dr->tex[_u].set ? off_ds_find(dr->tex[_u].raw) : -1;
@@ -6660,8 +6726,7 @@ static void render_frame(void)
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
     double _pre0 = perf_on() ? perf_now() : 0.0;
-    for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
-    for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+    for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
         /* Debug: RTT_VIEWRT=<hex raw offset> makes display draws sample that
@@ -6864,6 +6929,14 @@ static void render_frame(void)
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
+    if (perf_on()) s_perf_pre += perf_now() - _pre0;
+    s_rf.pre_done = to;
+}
+
+/* The display target: to RENDER_TARGET, bound, cleared. */
+static void rf_target(void)
+{
+    u32 fi = s_rf.fi;
     /* Transition render target to RENDER_TARGET state */
     D3D12_RESOURCE_BARRIER barrier = {0};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -6882,7 +6955,6 @@ static void render_frame(void)
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
 
-    if (perf_on()) s_perf_pre += perf_now() - _pre0;
     /* Set render target + depth */
     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
 
@@ -6900,6 +6972,17 @@ static void render_frame(void)
     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &viewport);
     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &scissor);
 
+    s_rf.rtv_handle = rtv_handle;
+    s_rf.dsv_handle = dsv_handle;
+    (void)barrier;
+}
+
+/* The legacy pass: every record that is not a VP draw. */
+static void rf_legacy(void)
+{
+    u32 fi = s_rf.fi; (void)fi;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rf.rtv_handle, dsv_handle = s_rf.dsv_handle;
+    (void)rtv_handle; (void)dsv_handle;
     /* Bind pipeline state and push MVP if anything to draw */
     if (s_d3d.pipeline_ready && s_d3d.draw_count > 0) {
         s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.root_signature);
@@ -7008,6 +7091,15 @@ static void render_frame(void)
         }
     }
 
+}
+
+/* The VP pass's bindings, and its recording state. */
+static void rf_vp_begin(void)
+{
+    u32 fi = s_rf.fi; (void)fi;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rf.rtv_handle, dsv_handle = s_rf.dsv_handle;
+    (void)rtv_handle; (void)dsv_handle;
+    s_rf.vp_on = 0;
     /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
      * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
     if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
@@ -7059,9 +7151,43 @@ static void render_frame(void)
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
             int cur_z = -1, cur_nc = 0, force_rebind = 0;   /* OffDS bound (-1 = shared buffer) */
             D3D12_CPU_DESCRIPTOR_HANDLE cur_dsv = dsv_handle;
-            double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
-            for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
+            s_rf.vp_on = 1;
+            s_rf.vpso = vpso;
+            s_rf.gh_base = gh_base;
+            memcpy(s_rf.samp_bound, samp_bound, sizeof samp_bound);
+            s_rf.cur_rt = cur_rt; s_rf.ib_bound = ib_bound; s_rf.raw_bound = raw_bound;
+            s_rf.vp_last_w = vp_last_w; s_rf.vp_last_h = vp_last_h;
+            s_rf.dvp_x = dvp_x; s_rf.dvp_y = dvp_y; s_rf.dvp_w = dvp_w; s_rf.dvp_h = dvp_h;
+            memcpy(s_rf.cur_m, cur_m, sizeof cur_m);
+            s_rf.cur_z = cur_z; s_rf.cur_nc = cur_nc; s_rf.force_rebind = force_rebind;
+            s_rf.cur_dsv = cur_dsv;
+            s_rf.seen_small_vp = seen_small_vp; s_rf.captured = captured;
+        }
+    }
+}
+
+/* Record VP draws [from, to); returns where it stopped (ahead: at a draw whose
+ * pipeline is still building). */
+static u32 rf_vp_draws(u32 from, u32 to, int ahead)
+{
+    if (!s_rf.vp_on) return to;
+    u32 fi = s_rf.fi; (void)fi;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rf.rtv_handle, dsv_handle = s_rf.dsv_handle;
+    (void)rtv_handle; (void)dsv_handle;
+    ID3D12PipelineState* vpso = s_rf.vpso;
+    D3D12_GPU_DESCRIPTOR_HANDLE gh_base = s_rf.gh_base;
+    int samp_bound[4]; memcpy(samp_bound, s_rf.samp_bound, sizeof samp_bound);
+    int cur_rt = s_rf.cur_rt, ib_bound = s_rf.ib_bound, raw_bound = s_rf.raw_bound;
+    float vp_last_w = s_rf.vp_last_w, vp_last_h = s_rf.vp_last_h;
+    float dvp_x = s_rf.dvp_x, dvp_y = s_rf.dvp_y, dvp_w = s_rf.dvp_w, dvp_h = s_rf.dvp_h;
+    int cur_m[3]; memcpy(cur_m, s_rf.cur_m, sizeof cur_m);
+    int cur_z = s_rf.cur_z, cur_nc = s_rf.cur_nc, force_rebind = s_rf.force_rebind;
+    D3D12_CPU_DESCRIPTOR_HANDLE cur_dsv = s_rf.cur_dsv;
+    int seen_small_vp = s_rf.seen_small_vp, captured = s_rf.captured;
+    double _rec0 = perf_on() ? perf_now() : 0.0;
+    u32 d;
+            for (d = from; d < to && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
                 for (int _u = 0; _u < 4; _u++) {
@@ -7238,6 +7364,7 @@ static void render_frame(void)
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
                  * back to the hardcoded atlas/colour PS pair. */
+                if (ahead) s_sj_nowait = 1;
                 ID3D12PipelineState* dpso =
                     dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                                 dr_num_rts(dr),
@@ -7247,7 +7374,11 @@ static void render_frame(void)
                                                 dr_cube_mask(dr), dr->raw, dr->zs_key) : NULL;
                 /* Its program is still being built: skip the draw this frame
                  * rather than draw it with another one. */
-                if (dr->fp_addr && !dpso && s_pso_pending) { s_sj_stat_skipped++; continue; }
+                s_sj_nowait = 0;
+                if (dr->fp_addr && !dpso && s_pso_pending) {
+                    if (ahead) break;   /* the final pass waits for it, as it always did */
+                    s_sj_stat_skipped++; continue;
+                }
                 if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
@@ -7377,7 +7508,28 @@ static void render_frame(void)
                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
                             dr->cull, dr->blend, 10); } }
             }
-            if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
+    s_sj_nowait = 0;
+    if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
+    memcpy(s_rf.samp_bound, samp_bound, sizeof samp_bound);
+    s_rf.cur_rt = cur_rt; s_rf.ib_bound = ib_bound; s_rf.raw_bound = raw_bound;
+    s_rf.vp_last_w = vp_last_w; s_rf.vp_last_h = vp_last_h;
+    s_rf.dvp_x = dvp_x; s_rf.dvp_y = dvp_y; s_rf.dvp_w = dvp_w; s_rf.dvp_h = dvp_h;
+    memcpy(s_rf.cur_m, cur_m, sizeof cur_m);
+    s_rf.cur_z = cur_z; s_rf.cur_nc = cur_nc; s_rf.force_rebind = force_rebind;
+    s_rf.cur_dsv = cur_dsv;
+    s_rf.seen_small_vp = seen_small_vp; s_rf.captured = captured;
+    (void)vpso; (void)gh_base; (void)vp_last_w; (void)vp_last_h;
+    return d < to ? d : to;
+}
+
+/* The end of the VP pass: the display target bound again. */
+static void rf_vp_end(void)
+{
+    if (!s_rf.vp_on) return;
+    u32 fi = s_rf.fi; (void)fi;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rf.rtv_handle, dsv_handle = s_rf.dsv_handle;
+    (void)rtv_handle; (void)dsv_handle;
+    int cur_rt = s_rf.cur_rt;
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
                 s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
@@ -7386,8 +7538,43 @@ static void render_frame(void)
                 s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
                 s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
             }
+    s_rf.vp_on = 0;
+}
+
+static void render_frame(void)
+{
+    double _rf0 = perf_on() ? perf_now() : 0.0;
+    if (!s_rf.open) {
+        rf_open();
+        rf_prepass(0, s_d3d.draw_count);
+        rf_target();
+        rf_legacy();
+        rf_vp_begin();
+    } else {
+        /* Recorded ahead: the rest of the batch. */
+        rf_prepass(s_rf.pre_done, s_d3d.draw_count);
+        int legacy = 0;
+        for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
+            if (!s_d3d.draws[i].is_vp) { legacy = 1; break; }
+        if (legacy) {
+            /* Legacy records turned up after recording began: they are drawn
+             * after the VP draws already recorded, not before them. */
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 4))
+                fprintf(stderr, "[D3D12] record-ahead batch with legacy records: drawn out of order%c", 10);
+            rf_vp_end();
+            rf_legacy();
+            rf_vp_begin();
         }
     }
+    rf_vp_draws(s_rf.done, s_d3d.draw_count, 0);
+    rf_vp_end();
+    s_rf.open = 0;
+    u32 fi = s_rf.fi;
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = s_d3d.render_targets[fi];
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
     if (perf_on()) s_perf_rf += perf_now() - _rf0;
     /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
@@ -10102,6 +10289,53 @@ int rsx_d3d12_backend_pump_messages(void)
     return s_d3d.window_closed ? -1 : 0;
 }
 
+/* D3D12_RECORD_AHEAD=1: see "render_frame() in stages". Off while a debug
+ * filter that edits the batch at render time is set. */
+static int rf_ahead_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("D3D12_RECORD_AHEAD");
+        v = (e && atoi(e) > 0) ? 1 : 0;
+        static const char* const filters[] = { "RTT_PASS", "DRAW_LIMIT", "DRAW_SKIP_TEX",
+            "DRAW_KEEP_TEX", "DRAW_LAST_TEX", "RENDERDOC_DLL", "RSX_ACCUM_FRAME" };
+        for (unsigned i = 0; v && i < sizeof filters / sizeof filters[0]; i++)
+            if (getenv(filters[i])) v = 0;
+    }
+    return v;
+}
+
+/* Record what the batch holds so far, between drain passes. A pass that
+ * catches only a few new records is left for the next one. */
+#define RF_AHEAD_MIN 16
+void rsx_d3d12_backend_record_ahead(void)
+{
+    if (!s_d3d.initialized || !rf_ahead_on()) return;
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    if (n < 2) return;
+    const u32 upto = n - 1;            /* the last record may still be extended */
+    if (!s_rf.open) {
+        if (upto < RF_AHEAD_MIN || !s_d3d.vp_ready) return;
+        for (u32 i = 0; i < upto; i++)
+            if (!s_d3d.draws[i].is_vp) return;    /* legacy records: in one go */
+        /* rf_open waits for the GPU; leave it to the next pass until the
+         * previous batch has finished, rather than stall the drain here. */
+        if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) + 1 <
+            s_d3d.fence_values[s_d3d.frame_index])
+            return;
+        rf_open();
+        rf_target();
+        rf_vp_begin();
+        s_rf.open = 1;
+    } else if (upto < s_rf.done + RF_AHEAD_MIN) {
+        return;
+    }
+    for (u32 i = s_rf.pre_done; i < upto; i++)
+        if (!s_d3d.draws[i].is_vp) return;        /* the end of the batch takes them */
+    rf_prepass(s_rf.pre_done, upto);
+    s_rf.done = rf_vp_draws(s_rf.done, upto, 1);
+}
+
 void rsx_d3d12_backend_present(void)
 {
     if (blink_dbg())
@@ -10207,5 +10441,6 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+void rsx_d3d12_backend_record_ahead(void) {}
 
 #endif /* _WIN32 */

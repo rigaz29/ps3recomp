@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_settings.h"
+#include "rsx_fsr1.h"
 #include "ps3emu/thread_name.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
@@ -325,8 +326,13 @@ typedef struct {
     ID3D12DescriptorHeap*      bb_rtv_heap;        /* RTVs of backbuffers[] */
     /* The pass that scales a display target into the swap chain's buffer */
     ID3D12RootSignature*       pp_root;
-    ID3D12PipelineState*       pp_pso;
-    ID3D12DescriptorHeap*      pp_srv_heap;        /* SRVs of render_targets[], shader-visible */
+    ID3D12PipelineState*       pp_pso;             /* bilinear and sharp bilinear */
+    ID3D12PipelineState*       pp_pso_easu;        /* FSR 1 upscale */
+    ID3D12PipelineState*       pp_pso_rcas;        /* FSR 1 sharpening */
+    ID3D12Resource*            pp_tmp;             /* EASU's output when RCAS follows, the back buffers' size */
+    ID3D12DescriptorHeap*      pp_srv_heap;        /* SRVs: render_targets[], then pp_tmp; shader-visible */
+    int                        pp_mode;            /* graphics.scaling: 0 bilinear, 1 sharp, 2 fsr1 */
+    float                      pp_stops;           /* graphics.sharpening for RCAS, in AMD's stops; < 0 off */
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
 
@@ -2062,14 +2068,49 @@ static void bb_views(void)
     }
 }
 
+/* EASU's output, at the back buffers' size, for RCAS to read: its RTV and SRV
+ * take the slot after the back buffers' and the display targets'. Made with
+ * the GPU idle (at init, or in bb_resize). */
+static void pp_tmp_create(void)
+{
+    if (s_d3d.pp_tmp) { s_d3d.pp_tmp->lpVtbl->Release(s_d3d.pp_tmp); s_d3d.pp_tmp = NULL; }
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = s_d3d.bb_w;
+    rd.Height = s_d3d.bb_h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.pp_tmp))) {
+        printf("[D3D12] FSR 1: no %ux%u target; bilinear\n", s_d3d.bb_w, s_d3d.bb_h);
+        s_d3d.pp_tmp = NULL;
+        s_d3d.pp_mode = 0;
+        return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &h);
+    h.ptr += FRAME_COUNT * s_d3d.rtv_descriptor_size;
+    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.pp_tmp, NULL, h);
+    s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &h);
+    h.ptr += FRAME_COUNT * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.pp_tmp, NULL, h);
+}
+
 /* One triangle over the whole target; the pixel shader samples the display
- * target. The root constants are for the filters that follow bilinear. */
+ * target, or for FSR 1, EASU into pp_tmp and RCAS from it (rsx_fsr1.c). */
 static int pp_init(void)
 {
     HRESULT hr;
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = FRAME_COUNT;
+    hd.NumDescriptors = FRAME_COUNT + 1;   /* the back buffers, then pp_tmp */
     hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
                                                    (void**)&s_d3d.bb_rtv_heap);
     if (FAILED(hr)) { printf("[D3D12] ERROR: back buffer RTV heap (0x%08lX)\n", hr); return -1; }
@@ -2077,6 +2118,7 @@ static int pp_init(void)
 
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.NumDescriptors = FRAME_COUNT + 1;   /* the display targets, then pp_tmp */
     hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
                                                    (void**)&s_d3d.pp_srv_heap);
     if (FAILED(hr)) { printf("[D3D12] ERROR: presentation SRV heap (0x%08lX)\n", hr); return -1; }
@@ -2138,7 +2180,16 @@ static int pp_init(void)
         "V vs(uint id : SV_VertexID) {\n"
         "  V o; float2 t = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = t; o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-        "float4 ps(V i) : SV_TARGET { return float4(src.SampleLevel(lin, i.uv, 0).rgb, 1); }\n";
+        /* p0 = display size, back buffer size; p1.x = 1 for sharp bilinear:
+         * flat across most of each display pixel, blended only near its edge,
+         * over the width a scaled pixel covers. */
+        "float4 ps(V i) : SV_TARGET {\n"
+        "  float2 uv = i.uv;\n"
+        "  if (p1.x > 0.5) {\n"
+        "    float2 t = uv * p0.xy, s = max(p0.zw / p0.xy, 1.0), f = frac(t) - 0.5, r = 0.5 - 0.5 / s;\n"
+        "    uv = (floor(t) + (f - clamp(f, -r, r)) * s + 0.5) / p0.xy;\n"
+        "  }\n"
+        "  return float4(src.SampleLevel(lin, uv, 0).rgb, 1); }\n";
     ID3DBlob *vsb = NULL, *psb = NULL;
     hr = D3DCompile(hlsl, sizeof hlsl - 1, "present_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
     if (SUCCEEDED(hr)) {
@@ -2168,10 +2219,54 @@ static int pp_init(void)
     pd.SampleDesc.Count = 1;
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
                                                            (void**)&s_d3d.pp_pso);
-    vsb->lpVtbl->Release(vsb);
     psb->lpVtbl->Release(psb);
-    if (FAILED(hr)) { printf("[D3D12] ERROR: presentation pipeline (0x%08lX)\n", hr); return -1; }
-    printf("[D3D12] presentation pass: %ux%u -> %ux%u\n", s_d3d.width, s_d3d.height, s_d3d.bb_w, s_d3d.bb_h);
+    if (FAILED(hr)) {
+        vsb->lpVtbl->Release(vsb);
+        printf("[D3D12] ERROR: presentation pipeline (0x%08lX)\n", hr);
+        return -1;
+    }
+
+    /* graphics.scaling = bilinear | sharp | fsr1, graphics.sharpening =
+     * off | low | medium | high | max (FSR 1's RCAS; high is AMD's 0.2). */
+    {
+        const char* sc = ps3_settings_str("graphics", "scaling", NULL, "bilinear");
+        s_d3d.pp_mode = ps3_settings_ieq(sc, "fsr1") ? 2 : ps3_settings_ieq(sc, "sharp") ? 1 : 0;
+        if (!s_d3d.pp_mode && !ps3_settings_ieq(sc, "bilinear"))
+            printf("[D3D12] graphics.scaling = %s is not bilinear, sharp or fsr1; bilinear\n", sc);
+        static const struct { const char* name; float stops; } k[] = {
+            { "off", -1.0f }, { "low", 1.0f }, { "medium", 0.5f }, { "high", 0.2f }, { "max", 0.0f } };
+        const char* sh = ps3_settings_str("graphics", "sharpening", NULL, "high");
+        s_d3d.pp_stops = 0.2f;
+        unsigned i = 0;
+        for (; i < sizeof k / sizeof k[0]; i++)
+            if (ps3_settings_ieq(sh, k[i].name)) { s_d3d.pp_stops = k[i].stops; break; }
+        if (i == sizeof k / sizeof k[0])
+            printf("[D3D12] graphics.sharpening = %s is not off, low, medium, high or max; high\n", sh);
+    }
+    if (s_d3d.pp_mode == 2) {
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1 && s_d3d.pp_stops < 0.0f) break;
+            ID3DBlob* fb = (ID3DBlob*)rsx_fsr1_compile(pass);
+            if (!fb) break;
+            pd.PS.pShaderBytecode = fb->lpVtbl->GetBufferPointer(fb);
+            pd.PS.BytecodeLength  = fb->lpVtbl->GetBufferSize(fb);
+            hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+                s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                (void**)(pass ? &s_d3d.pp_pso_rcas : &s_d3d.pp_pso_easu));
+            fb->lpVtbl->Release(fb);
+            if (FAILED(hr)) { printf("[D3D12] FSR 1 pipeline %d (0x%08lX)\n", pass, hr); break; }
+        }
+        if (!s_d3d.pp_pso_easu || (s_d3d.pp_stops >= 0.0f && !s_d3d.pp_pso_rcas)) {
+            printf("[D3D12] FSR 1 unavailable; bilinear\n");
+            s_d3d.pp_mode = 0;
+        } else if (s_d3d.pp_stops >= 0.0f) {
+            pp_tmp_create();
+        }
+    }
+    vsb->lpVtbl->Release(vsb);
+    static const char* const mode_name[] = { "bilinear", "sharp bilinear", "FSR 1" };
+    printf("[D3D12] presentation pass: %ux%u -> %ux%u, %s\n", s_d3d.width, s_d3d.height,
+           s_d3d.bb_w, s_d3d.bb_h, mode_name[s_d3d.pp_mode]);
     return 0;
 }
 
@@ -2189,6 +2284,7 @@ static void bb_resize(void)
                                                          s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (SUCCEEDED(hr)) { s_d3d.bb_w = w; s_d3d.bb_h = h; }
     else printf("[D3D12] swap chain resize to %ux%u failed (0x%08lX)\n", w, h, hr);
+    if (s_d3d.pp_tmp) pp_tmp_create();
     for (u32 i = 0; i < FRAME_COUNT; i++)
         s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
     bb_views();
@@ -2201,53 +2297,85 @@ static void bb_resize(void)
     if (SUCCEEDED(hr)) printf("[D3D12] swap chain %ux%u\n", w, h);
 }
 
-/* The display target into the swap chain's buffer, for a frame that is
- * presented, through the presentation pass. Both end where the next frame
- * expects them: the display target in COMMON, the swap chain's buffer in
- * PRESENT. */
-static void present_to_backbuffer(u32 fi)
+/* One pass of the presentation: src (an SRV slot of pp_srv_heap) drawn with
+ * pso into rtv, full size, with the given root constants. */
+static void pp_draw(ID3D12PipelineState* pso, u32 src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const u32 c[16])
 {
-    D3D12_RESOURCE_BARRIER bar[2];
-    memset(bar, 0, sizeof bar);
-    for (int i = 0; i < 2; i++) {
-        bar[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        bar[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    }
-    bar[0].Transition.pResource = s_d3d.render_targets[fi];
-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    bar[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    bar[1].Transition.pResource = s_d3d.backbuffers[fi];
-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    bar[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    cl->lpVtbl->ResourceBarrier(cl, 2, bar);
-
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-    s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &rtv);
-    rtv.ptr += fi * s_d3d.rtv_descriptor_size;
     D3D12_GPU_DESCRIPTOR_HANDLE srv;
     s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &srv);
-    srv.ptr += fi * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+    srv.ptr += src * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const float c[16] = { (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h };
     D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)s_d3d.bb_w, (float)s_d3d.bb_h, 0.0f, 1.0f };
     D3D12_RECT sc = { 0, 0, (LONG)s_d3d.bb_w, (LONG)s_d3d.bb_h };
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.pp_root);
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.pp_srv_heap);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, srv);
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
-    cl->lpVtbl->SetPipelineState(cl, s_d3d.pp_pso);
+    cl->lpVtbl->SetPipelineState(cl, pso);
     cl->lpVtbl->RSSetViewports(cl, 1, &vp);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+}
 
-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    bar[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    bar[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    cl->lpVtbl->ResourceBarrier(cl, 2, bar);
+static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER bar;
+    memset(&bar, 0, sizeof bar);
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = r;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar.Transition.StateBefore = from;
+    bar.Transition.StateAfter = to;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
+}
+
+/* The display target into the swap chain's buffer, for a frame that is
+ * presented, through the presentation pass: bilinear or sharp bilinear in one
+ * draw, or FSR 1, EASU then RCAS through pp_tmp (EASU alone with sharpening
+ * off). FSR 1 only scales up; a back buffer no larger than the display takes
+ * bilinear. Everything ends where the next frame expects it: the display
+ * target and pp_tmp in COMMON, the swap chain's buffer in PRESENT. */
+static void present_to_backbuffer(u32 fi)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, tmp_rtv;
+    s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &bb_rtv);
+    tmp_rtv = bb_rtv;
+    bb_rtv.ptr += fi * s_d3d.rtv_descriptor_size;
+    tmp_rtv.ptr += FRAME_COUNT * s_d3d.rtv_descriptor_size;
+    ID3D12Resource* disp = s_d3d.render_targets[fi];
+    ID3D12Resource* bb = s_d3d.backbuffers[fi];
+    const int up = s_d3d.bb_w > s_d3d.width && s_d3d.bb_h > s_d3d.height;
+    u32 c[16];
+    memset(c, 0, sizeof c);
+
+    pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (s_d3d.pp_mode == 2 && up) {
+        rsx_fsr1_easu_con(c, (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h);
+        if (s_d3d.pp_tmp) {
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            pp_draw(s_d3d.pp_pso_easu, fi, tmp_rtv, c);
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            memset(c, 0, sizeof c);
+            rsx_fsr1_rcas_con(c, s_d3d.pp_stops);
+            pp_draw(s_d3d.pp_pso_rcas, FRAME_COUNT, bb_rtv, c);
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        } else {
+            pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            pp_draw(s_d3d.pp_pso_easu, fi, bb_rtv, c);
+        }
+    } else {
+        const float f[5] = { (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h,
+                             s_d3d.pp_mode == 1 ? 1.0f : 0.0f };
+        memcpy(c, f, sizeof f);
+        pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        pp_draw(s_d3d.pp_pso, fi, bb_rtv, c);
+    }
+    pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    pp_barrier(disp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 static void move_to_next_frame(void)
@@ -9367,6 +9495,9 @@ void rsx_d3d12_backend_shutdown(void)
     }
     {
         if (s_d3d.pp_pso) s_d3d.pp_pso->lpVtbl->Release(s_d3d.pp_pso);
+        if (s_d3d.pp_pso_easu) s_d3d.pp_pso_easu->lpVtbl->Release(s_d3d.pp_pso_easu);
+        if (s_d3d.pp_pso_rcas) s_d3d.pp_pso_rcas->lpVtbl->Release(s_d3d.pp_pso_rcas);
+        if (s_d3d.pp_tmp) s_d3d.pp_tmp->lpVtbl->Release(s_d3d.pp_tmp);
         if (s_d3d.pp_root) s_d3d.pp_root->lpVtbl->Release(s_d3d.pp_root);
         if (s_d3d.pp_srv_heap) s_d3d.pp_srv_heap->lpVtbl->Release(s_d3d.pp_srv_heap);
         if (s_d3d.bb_rtv_heap) s_d3d.bb_rtv_heap->lpVtbl->Release(s_d3d.bb_rtv_heap);

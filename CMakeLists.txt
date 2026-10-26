@@ -107,6 +107,22 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+# AMD FidelityFX FSR 1 (MIT, third_party/fidelityfx_fsr1). The D3D12 backend's
+# presentation pass compiles its shaders at run time, so the two headers are
+# embedded in the library and libs/video/rsx_fsr1.c serves them to D3DCompile.
+set(FSR1_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx_fsr1")
+set(FSR1_EMBED "${CMAKE_CURRENT_BINARY_DIR}/generated/rsx_fsr1_headers.c")
+add_custom_command(
+    OUTPUT "${FSR1_EMBED}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUT=${FSR1_EMBED}"
+            "-DINPUTS=${FSR1_DIR}/ffx_a.h|${FSR1_DIR}/ffx_fsr1.h"
+            "-DNAMES=rsx_fsr1_ffx_a_h|rsx_fsr1_ffx_fsr1_h"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFiles.cmake"
+    DEPENDS "${FSR1_DIR}/ffx_a.h" "${FSR1_DIR}/ffx_fsr1.h" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFiles.cmake"
+    COMMENT "Embedding the FSR 1 shader headers"
+    VERBATIM)
+target_sources(ps3recomp_runtime PRIVATE "${FSR1_EMBED}")
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

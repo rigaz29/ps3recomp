@@ -313,7 +313,14 @@ typedef struct {
     int                        tearing;     /* D3D12_VSYNC=0 and the swap chain allows tearing */
     ID3D12DescriptorHeap*      rtv_heap;
     u32                        rtv_descriptor_size;
+    /* The title's display targets: what a frame drawn to the display buffer
+     * lands in. The swap chain's own buffers only receive them, at present
+     * (present_to_backbuffer), so the picture can be scaled or filtered on
+     * the way, and every read of the display (screen copies, dumps, CPU
+     * readbacks) reads the title's picture, not the window's. A display
+     * target rests in COMMON, which is the same state as PRESENT. */
     ID3D12Resource*            render_targets[FRAME_COUNT];
+    ID3D12Resource*            backbuffers[FRAME_COUNT];
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
 
@@ -1386,8 +1393,30 @@ static int init_d3d12(u32 width, u32 height)
 
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
-            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
+            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
         if (FAILED(hr)) return -1;
+
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = width;
+        rd.Height = height;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;   /* the swap chain's: copied 1:1 */
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv = {0};
+        cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        cv.Color[3] = 1.0f;   /* opaque black, what titles clear the display to */
+        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, &cv,
+            &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
+        if (FAILED(hr)) {
+            printf("[D3D12] ERROR: display target %u (0x%08lX)\n", i, hr);
+            return -1;
+        }
 
         s_d3d.device->lpVtbl->CreateRenderTargetView(
             s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
@@ -2107,6 +2136,32 @@ static void png_chunk(FILE* f, const char* type, const unsigned char* data, u32 
     c = png_crc(c, data, n);
     png_u32(h, c);
     fwrite(h, 1, 4, f);
+}
+
+/* The display target into the swap chain's buffer, for a frame that is
+ * presented. Both end where the next frame expects them: the display target
+ * in COMMON, the swap chain's buffer in PRESENT. */
+static void present_to_backbuffer(u32 fi)
+{
+    D3D12_RESOURCE_BARRIER bar[2];
+    memset(bar, 0, sizeof bar);
+    for (int i = 0; i < 2; i++) {
+        bar[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    bar[0].Transition.pResource = s_d3d.render_targets[fi];
+    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bar[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar[1].Transition.pResource = s_d3d.backbuffers[fi];
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bar);
+    s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, s_d3d.backbuffers[fi], s_d3d.render_targets[fi]);
+    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    bar[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bar);
 }
 
 /* The back buffer into the readback buffer, for a screenshot on a frame that
@@ -6719,6 +6774,8 @@ skip_dump_consider: ;
         }
     }
 
+    if (s_present_this_frame) present_to_backbuffer(fi);
+
     /* Close and execute */
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
@@ -9105,6 +9162,7 @@ void rsx_d3d12_backend_shutdown(void)
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
+        if (s_d3d.backbuffers[i]) s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]);
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);

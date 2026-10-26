@@ -200,6 +200,10 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* For a port's settings window (Windows): the name [keyboard] uses for a
+ * virtual-key code, or NULL when it has none. */
+const char* ps3_pad_key_name(int vk);
+
 #ifdef __cplusplus
 }
 #endif

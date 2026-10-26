@@ -422,7 +422,9 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
         v = sysutil_language();
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        /* input.enter_button = cross (the default) or circle */
+        v = ps3_settings_ieq(ps3_settings_str("input", "enter_button", NULL, "cross"), "circle")
+            ? CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CIRCLE : CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */

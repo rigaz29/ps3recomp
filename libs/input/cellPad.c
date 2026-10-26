@@ -206,10 +206,108 @@ static int pad_device(void)
     return d;
 }
 
+/* The keyboard as pad 0. [keyboard] has one line per PS3 button or stick
+ * direction, naming up to four keys or mouse buttons, comma-separated:
+ * `cross = Space, MouseLeft`. A line the file leaves out keeps the runtime's
+ * map: the arrows for the D-pad and the left stick, Z X A S for Cross Circle
+ * Square Triangle, Q W 1 2 for L1 R1 L2 R2, Enter and Tab for Start and
+ * Select, no right stick. Nothing is read while Alt is down, so Alt+Enter and
+ * Alt+Tab press nothing in the game. */
+enum { KB_BTN = 16, KB_AXIS = 8, KB_KEYS = 4 };
+static const struct { const char* name; u16 btn; const char* def; } s_kb_btn[KB_BTN] = {
+    { "up",       CELL_PAD_CTRL_UP,       "Up"    }, { "down",     CELL_PAD_CTRL_DOWN,     "Down"  },
+    { "left",     CELL_PAD_CTRL_LEFT,     "Left"  }, { "right",    CELL_PAD_CTRL_RIGHT,    "Right" },
+    { "cross",    CELL_PAD_CTRL_CROSS,    "Z"     }, { "circle",   CELL_PAD_CTRL_CIRCLE,   "X"     },
+    { "square",   CELL_PAD_CTRL_SQUARE,   "A"     }, { "triangle", CELL_PAD_CTRL_TRIANGLE, "S"     },
+    { "l1",       CELL_PAD_CTRL_L1,       "Q"     }, { "r1",       CELL_PAD_CTRL_R1,       "W"     },
+    { "l2",       CELL_PAD_CTRL_L2,       "1"     }, { "r2",       CELL_PAD_CTRL_R2,       "2"     },
+    { "l3",       CELL_PAD_CTRL_L3,       ""      }, { "r3",       CELL_PAD_CTRL_R3,       ""      },
+    { "start",    CELL_PAD_CTRL_START,    "Enter" }, { "select",   CELL_PAD_CTRL_SELECT,   "Tab"   },
+};
+/* Stick directions, in this order: up, down, left, right of the left stick,
+ * then of the right one. */
+static const struct { const char* name; const char* def; } s_kb_axis[KB_AXIS] = {
+    { "lstick_up", "Up" }, { "lstick_down", "Down" }, { "lstick_left", "Left" }, { "lstick_right", "Right" },
+    { "rstick_up", "" },   { "rstick_down", "" },     { "rstick_left", "" },     { "rstick_right", "" },
+};
+static u8 s_kb_vk[KB_BTN + KB_AXIS][KB_KEYS];   /* 0 = none */
+
+/* A key's name as [keyboard] writes it: a letter or digit, or one of these. */
+static const struct { const char* name; u8 vk; } s_kb_names[] = {
+    { "Up", VK_UP }, { "Down", VK_DOWN }, { "Left", VK_LEFT }, { "Right", VK_RIGHT },
+    { "Enter", VK_RETURN }, { "Tab", VK_TAB }, { "Space", VK_SPACE }, { "Backspace", VK_BACK },
+    { "Escape", VK_ESCAPE }, { "Shift", VK_SHIFT }, { "LShift", VK_LSHIFT }, { "RShift", VK_RSHIFT },
+    { "Ctrl", VK_CONTROL }, { "LCtrl", VK_LCONTROL }, { "RCtrl", VK_RCONTROL },
+    { "Insert", VK_INSERT }, { "Delete", VK_DELETE }, { "Home", VK_HOME }, { "End", VK_END },
+    { "PageUp", VK_PRIOR }, { "PageDown", VK_NEXT },
+    { "F1", VK_F1 }, { "F2", VK_F2 }, { "F3", VK_F3 }, { "F4", VK_F4 }, { "F5", VK_F5 },
+    { "F6", VK_F6 }, { "F7", VK_F7 }, { "F8", VK_F8 }, { "F9", VK_F9 }, { "F10", VK_F10 },
+    { "F12", VK_F12 },
+    { "Num0", VK_NUMPAD0 }, { "Num1", VK_NUMPAD1 }, { "Num2", VK_NUMPAD2 }, { "Num3", VK_NUMPAD3 },
+    { "Num4", VK_NUMPAD4 }, { "Num5", VK_NUMPAD5 }, { "Num6", VK_NUMPAD6 }, { "Num7", VK_NUMPAD7 },
+    { "Num8", VK_NUMPAD8 }, { "Num9", VK_NUMPAD9 }, { "NumPlus", VK_ADD }, { "NumMinus", VK_SUBTRACT },
+    { "NumMultiply", VK_MULTIPLY }, { "NumDivide", VK_DIVIDE }, { "NumDot", VK_DECIMAL },
+    { "Comma", VK_OEM_COMMA }, { "Period", VK_OEM_PERIOD }, { "Minus", VK_OEM_MINUS },
+    { "Equals", VK_OEM_PLUS }, { "Semicolon", VK_OEM_1 }, { "Slash", VK_OEM_2 }, { "Grave", VK_OEM_3 },
+    { "LBracket", VK_OEM_4 }, { "Backslash", VK_OEM_5 }, { "RBracket", VK_OEM_6 }, { "Quote", VK_OEM_7 },
+    { "MouseLeft", VK_LBUTTON }, { "MouseRight", VK_RBUTTON }, { "MouseMiddle", VK_MBUTTON },
+    { "Mouse4", VK_XBUTTON1 }, { "Mouse5", VK_XBUTTON2 },
+};
+
+static int kb_vk(const char* s, size_t n)
+{
+    if (n == 1 && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= '0' && s[0] <= '9'))) return s[0];
+    if (n == 1 && s[0] >= 'a' && s[0] <= 'z') return s[0] - 'a' + 'A';
+    for (unsigned i = 0; i < sizeof s_kb_names / sizeof s_kb_names[0]; i++)
+        if (strlen(s_kb_names[i].name) == n && !_strnicmp(s_kb_names[i].name, s, n)) return s_kb_names[i].vk;
+    return 0;
+}
+
+/* The name [keyboard] uses for a virtual-key code, or NULL when it has none;
+ * for a port's settings window, so it writes what this file reads. */
+const char* ps3_pad_key_name(int vk)
+{
+    static char one[128][2];
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        one[vk][0] = (char)vk;
+        return one[vk];
+    }
+    for (unsigned i = 0; i < sizeof s_kb_names / sizeof s_kb_names[0]; i++)
+        if (s_kb_names[i].vk == vk) return s_kb_names[i].name;
+    return NULL;
+}
+
+/* The map, read once on the first poll. F11 switches the window mode and Alt
+ * is held back, so neither has a name. */
+static void kb_load_map(void)
+{
+    for (int a = 0; a < KB_BTN + KB_AXIS; a++) {
+        const char* name = a < KB_BTN ? s_kb_btn[a].name : s_kb_axis[a - KB_BTN].name;
+        const char* def  = a < KB_BTN ? s_kb_btn[a].def  : s_kb_axis[a - KB_BTN].def;
+        const char* v = ps3_settings_str("keyboard", name, NULL, def);
+        int k = 0;
+        while (v && *v) {
+            while (*v == ' ' || *v == ',') v++;
+            const char* e = v;
+            while (*e && *e != ',') e++;
+            const char* t = e;
+            while (t > v && t[-1] == ' ') t--;
+            if (t > v) {
+                const int vk = kb_vk(v, (size_t)(t - v));
+                if (!vk) printf("[cellPad] keyboard.%s: no key called '%.*s'\n", name, (int)(t - v), v);
+                else if (k < KB_KEYS) s_kb_vk[a][k++] = (u8)vk;
+            }
+            v = e;
+        }
+    }
+}
+
 static void pad_poll_keyboard(void)
 {
+    static int loaded;
+    if (!loaded) { loaded = 1; kb_load_map(); }
     PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
+    if (!pad_host_window_focused() || (GetAsyncKeyState(VK_MENU) & 0x8000)) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
         hs->buttons = 0;
@@ -219,27 +317,25 @@ static void pad_poll_keyboard(void)
         return;
     }
 
-    static const struct { int vk; u16 btn; } map[] = {
-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
-    };
-
     u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+    unsigned ax = 0;
+    for (int a = 0; a < KB_BTN + KB_AXIS; a++)
+        for (int k = 0; k < KB_KEYS && s_kb_vk[a][k]; k++)
+            if (GetAsyncKeyState(s_kb_vk[a][k]) & 0x8000) {
+                if (a < KB_BTN) btns |= s_kb_btn[a].btn;
+                else ax |= 1u << (a - KB_BTN);
+                break;
+            }
 
+    /* A direction held both ways is centred. */
+#define KB_STICK(neg, pos) (u8)(((ax >> (neg)) & 1) == ((ax >> (pos)) & 1) ? 128 : ((ax >> (neg)) & 1) ? 0 : 255)
     hs->buttons   = btns;
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
+    hs->analog_lx = KB_STICK(2, 3);
+    hs->analog_ly = KB_STICK(0, 1);
+    hs->analog_rx = KB_STICK(6, 7);
+    hs->analog_ry = KB_STICK(4, 5);
+#undef KB_STICK
     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
 
@@ -257,6 +353,20 @@ static void pad_poll_keyboard(void)
  * soon a pad plugged in there is seen; the slots are staggered so one poll
  * never pays for all of them. */
 #define PAD_EMPTY_RECHECK_MS 1000
+
+/* input.deadzone: the share of a stick's travel read as centred, 0 to 0.9;
+ * XInput's recommended 7849 of 32767 (0.24) by default. Read once. */
+static short pad_deadzone(void)
+{
+    static int dz = -1;
+    if (dz < 0) {
+        double f = ps3_settings_num("input", "deadzone", NULL, PAD_STICK_DEADZONE / 32767.0);
+        if (f < 0.0) f = 0.0;
+        if (f > 0.9) f = 0.9;
+        dz = (int)(f * 32767.0 + 0.5);
+    }
+    return (short)dz;
+}
 static unsigned long long s_pad_empty_until[PAD_MAX_HOST_PORTS];
 
 static void pad_poll_xinput(void)
@@ -307,10 +417,11 @@ static void pad_poll_xinput(void)
          * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
          * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
          * (via sagemono, PR #42) */
-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        const short dz = pad_deadzone();
+        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, dz);
+        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, dz));
+        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, dz);
+        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, dz));
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -1182,8 +1293,11 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     s_rumble[port_no].hi = hi;
 
 #if PAD_BACKEND_XINPUT
+    /* input.vibration off: the motors stay still. Read once. */
+    static int vib_on = -1;
+    if (vib_on < 0) vib_on = ps3_settings_bool("input", "vibration", NULL, 1);
     /* XInput keeps the motors at what they were last set to: no renewal. */
-    if (s_host_state[port_no].connected) {
+    if (s_host_state[port_no].connected && vib_on) {
         XINPUT_VIBRATION vib;
         vib.wLeftMotorSpeed  = (WORD)lo;
         vib.wRightMotorSpeed = (WORD)hi;

@@ -21,6 +21,7 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_settings.h"
 #include "rsx_fsr1.h"
+#include "rsx_smaa.h"
 #include "ps3emu/thread_name.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
@@ -333,6 +334,27 @@ typedef struct {
     ID3D12DescriptorHeap*      pp_srv_heap;        /* SRVs: render_targets[], then pp_tmp; shader-visible */
     int                        pp_mode;            /* graphics.scaling: 0 bilinear, 1 sharp, 2 fsr1 */
     float                      pp_stops;           /* graphics.sharpening for RCAS, in AMD's stops; < 0 off */
+    /* The overlay: text over the scaled picture (ov_draw) */
+    ID3D12PipelineState*       ov_pso;
+    ID3D12Resource*            ov_tex;             /* OV_W x OV_H, premultiplied RGBA */
+    ID3D12Resource*            ov_up[FRAME_COUNT]; /* its uploads, one per frame in flight, mapped */
+    unsigned char*             ov_up_ptr[FRAME_COUNT];
+    int                        ov_tex_ready;       /* ov_tex has left COMMON for PIXEL_SHADER_RESOURCE */
+    /* SMAA 1x on the display target before it is scaled (graphics.antialiasing) */
+    int                        aa_on;
+    ID3D12RootSignature*       aa_root;            /* an SRV table of three, 16 constants */
+    ID3D12PipelineState*       aa_pso[3];          /* edges, blending weights, neighbourhood blending */
+    ID3D12Resource*            aa_edges;           /* R8G8, the display's size */
+    ID3D12Resource*            aa_blend;           /* RGBA8 */
+    ID3D12Resource*            aa_out;             /* RGBA8: what the scaling pass reads */
+    ID3D12Resource*            aa_area;            /* the lookup textures, uploaded on first use */
+    ID3D12Resource*            aa_search;
+    ID3D12Resource*            aa_up;
+    ID3D12DescriptorHeap*      aa_rtv_heap;        /* edges, blend, out */
+    int                        aa_luts_ready;
+    /* F12 with display.screenshot = output: the swap chain's buffer read back */
+    ID3D12Resource*            shot_buf;
+    u32                        shot_w, shot_h, shot_pitch;
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
 
@@ -1078,6 +1100,7 @@ static u32    s_lock_n  = 0;
 static int  s_borderless;
 static RECT s_windowed_rect;   /* the frame's rectangle before going borderless */
 static volatile LONG s_shot_pending;   /* F12: write the next presented frame (shot_png) */
+static void ov_toast(const char* msg);
 /* The view's client size, set by the window's thread; the presenting thread
  * resizes the swap chain to it after its next Present (bb_resize). */
 static volatile LONG s_view_w, s_view_h;
@@ -1149,13 +1172,19 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && (lp & (1 << 29))) {   /* Alt+Enter */
-            if (!(lp & (1 << 30))) d3d12_set_borderless(hwnd, !s_borderless);
+            if (!(lp & (1 << 30))) {
+                d3d12_set_borderless(hwnd, !s_borderless);
+                ov_toast(s_borderless ? "Borderless fullscreen" : "Windowed");
+            }
             return 0;
         }
         break;   /* Alt+F4 and the rest: the default */
     case WM_KEYDOWN:
         if (wp == VK_F11) {
-            if (!(lp & (1 << 30))) d3d12_set_borderless(hwnd, !s_borderless);
+            if (!(lp & (1 << 30))) {
+                d3d12_set_borderless(hwnd, !s_borderless);
+                ov_toast(s_borderless ? "Borderless fullscreen" : "Windowed");
+            }
         } else if (wp == VK_F12) {
             if (!(lp & (1 << 30))) InterlockedExchange(&s_shot_pending, 1);
         } else if (wp == VK_ESCAPE && d3d12_esc_quits()) {
@@ -1252,6 +1281,8 @@ static int d3d12_vsync_off(void)
 }
 
 static int pp_init(void);
+static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
+static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 
 static int init_d3d12(u32 width, u32 height)
 {
@@ -2057,6 +2088,15 @@ static void wait_for_gpu(void)
 /* ---------------------------------------------------------------------------
  * The presentation pass: a display target scaled into the swap chain's buffer
  * -----------------------------------------------------------------------*/
+/* pp_srv_heap: the display targets at 0..FRAME_COUNT-1, then pp_tmp, ov_tex
+ * and aa_out; then SMAA's tables of three, one per pass (and per display
+ * target for the passes that read it). */
+#define PP_SLOT_AA_OUT   (FRAME_COUNT + 2)
+#define PP_SLOT_AA_E(fi) (8u + 3u * (fi))
+#define PP_SLOT_AA_W     16u
+#define PP_SLOT_AA_N(fi) (20u + 3u * (fi))
+#define PP_SRV_SLOTS     32u
+
 /* RTVs for the swap chain's buffers, made again after each resize. */
 static void bb_views(void)
 {
@@ -2066,6 +2106,52 @@ static void bb_views(void)
         s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.backbuffers[i], NULL, h);
         h.ptr += s_d3d.rtv_descriptor_size;
     }
+}
+
+/* A root signature of the presentation's passes: a table of nsrv SRVs
+ * (t0..), sixteen root constants at b0, and two static samplers, s0 linear and
+ * s1 point, both clamped. */
+static int pp_root_create(UINT nsrv, ID3D12RootSignature** out)
+{
+    HRESULT hr;
+    D3D12_DESCRIPTOR_RANGE range = {0};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = nsrv;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_ROOT_PARAMETER rp[2];
+    memset(rp, 0, sizeof rp);
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &range;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 16;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC ss[2];
+    memset(ss, 0, sizeof ss);
+    for (int i = 0; i < 2; i++) {
+        ss[i].Filter = i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss[i].AddressU = ss[i].AddressV = ss[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss[i].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        ss[i].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[i].ShaderRegister = (UINT)i;
+        ss[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 2;
+    rd.pParameters = rp;
+    rd.NumStaticSamplers = 2;
+    rd.pStaticSamplers = ss;
+    ID3DBlob *sig = NULL, *err = NULL;
+    hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (SUCCEEDED(hr))
+        hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
+                                                       sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature,
+                                                       (void**)out);
+    if (sig) sig->lpVtbl->Release(sig);
+    if (err) err->lpVtbl->Release(err);
+    if (FAILED(hr)) { printf("[D3D12] ERROR: presentation root signature (0x%08lX)\n", hr); return -1; }
+    return 0;
 }
 
 /* EASU's output, at the back buffers' size, for RCAS to read: its RTV and SRV
@@ -2118,7 +2204,7 @@ static int pp_init(void)
 
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    hd.NumDescriptors = FRAME_COUNT + 1;   /* the display targets, then pp_tmp */
+    hd.NumDescriptors = PP_SRV_SLOTS;
     hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
                                                    (void**)&s_d3d.pp_srv_heap);
     if (FAILED(hr)) { printf("[D3D12] ERROR: presentation SRV heap (0x%08lX)\n", hr); return -1; }
@@ -2133,43 +2219,8 @@ static int pp_init(void)
         }
     }
 
-    D3D12_DESCRIPTOR_RANGE range = {0};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    D3D12_ROOT_PARAMETER rp[2];
-    memset(rp, 0, sizeof rp);
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[0].DescriptorTable.NumDescriptorRanges = 1;
-    rp[0].DescriptorTable.pDescriptorRanges = &range;
-    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[1].Constants.Num32BitValues = 16;
-    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC ss[2];
-    memset(ss, 0, sizeof ss);
-    for (int i = 0; i < 2; i++) {
-        ss[i].Filter = i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        ss[i].AddressU = ss[i].AddressV = ss[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        ss[i].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        ss[i].MaxLOD = D3D12_FLOAT32_MAX;
-        ss[i].ShaderRegister = (UINT)i;
-        ss[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    D3D12_ROOT_SIGNATURE_DESC rd = {0};
-    rd.NumParameters = 2;
-    rd.pParameters = rp;
-    rd.NumStaticSamplers = 2;
-    rd.pStaticSamplers = ss;
-    ID3DBlob *sig = NULL, *err = NULL;
-    hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
-    if (SUCCEEDED(hr))
-        hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
-                                                       sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature,
-                                                       (void**)&s_d3d.pp_root);
-    if (sig) sig->lpVtbl->Release(sig);
-    if (err) err->lpVtbl->Release(err);
-    if (FAILED(hr)) { printf("[D3D12] ERROR: presentation root signature (0x%08lX)\n", hr); return -1; }
+    if (pp_root_create(1, &s_d3d.pp_root) != 0) return -1;
+    ID3DBlob* err = NULL;
 
     static const char hlsl[] =
         "Texture2D src : register(t0);\n"
@@ -2264,9 +2315,20 @@ static int pp_init(void)
         }
     }
     vsb->lpVtbl->Release(vsb);
+    ov_init(pd);
+    /* graphics.antialiasing = off (the default) | smaa */
+    {
+        const char* aa = ps3_settings_str("graphics", "antialiasing", NULL, "off");
+        if (ps3_settings_ieq(aa, "smaa")) {
+            s_d3d.aa_on = aa_init(pd) == 0;
+            if (!s_d3d.aa_on) printf("[D3D12] SMAA unavailable; off\n");
+        } else if (!ps3_settings_ieq(aa, "off")) {
+            printf("[D3D12] graphics.antialiasing = %s is not off or smaa; off\n", aa);
+        }
+    }
     static const char* const mode_name[] = { "bilinear", "sharp bilinear", "FSR 1" };
-    printf("[D3D12] presentation pass: %ux%u -> %ux%u, %s\n", s_d3d.width, s_d3d.height,
-           s_d3d.bb_w, s_d3d.bb_h, mode_name[s_d3d.pp_mode]);
+    printf("[D3D12] presentation pass: %ux%u -> %ux%u, %s%s\n", s_d3d.width, s_d3d.height,
+           s_d3d.bb_w, s_d3d.bb_h, mode_name[s_d3d.pp_mode], s_d3d.aa_on ? ", SMAA 1x" : "");
     return 0;
 }
 
@@ -2332,6 +2394,434 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
 }
 
+/* ---------------------------------------------------------------------------
+ * The overlay: the frame rate (display.show_fps = overlay) and short messages
+ * ("Borderless fullscreen", "Screenshot saved"), drawn over the scaled picture
+ * at the window's own resolution. The text is drawn by GDI into a small
+ * bitmap, uploaded only when it changes (once a second for the frame rate),
+ * and each item is one quad of it, white on a dark box.
+ * -----------------------------------------------------------------------*/
+#define OV_W   640
+#define OV_H   96
+#define OV_ROW 48   /* one item a row: the frame rate, then the message */
+
+static const char* volatile s_toast_msg;   /* a string literal, or NULL */
+static volatile ULONGLONG   s_toast_until;
+static char s_ov_fps[32];                  /* the presenting thread's */
+
+/* A message for two seconds; any thread. */
+static void ov_toast(const char* msg)
+{
+    s_toast_until = GetTickCount64() + 2000;
+    InterlockedExchangePointer((void* volatile*)&s_toast_msg, (void*)msg);
+}
+
+/* display.show_fps: 0 off, 1 the title bar (the default), 2 overlay. Read once. */
+static int d3d12_show_fps(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* s = ps3_settings_str("display", "show_fps", NULL, "title");
+        v = ps3_settings_ieq(s, "off") ? 0 : ps3_settings_ieq(s, "overlay") ? 2 : 1;
+    }
+    return v;
+}
+
+/* The two items into a premultiplied RGBA image, OV_W wide, OV_H tall, at
+ * dst: white text with the font's antialiasing over a box of 55% black. The
+ * widths drawn come back in w[]. */
+static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px, u32 w[2])
+{
+    static HDC dc;
+    static u32* bits;
+    static HFONT font;
+    static u32 font_size;
+    if (!dc) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = OV_W;
+        bi.bmiHeader.biHeight = -OV_H;   /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        dc = CreateCompatibleDC(NULL);
+        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
+        if (!dc || !bmp || !bits) { w[0] = w[1] = 0; return; }
+        SelectObject(dc, bmp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+    if (font_size != font_px) {
+        if (font) DeleteObject(font);
+        font = CreateFontA(-(int)font_px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                           DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        SelectObject(dc, font);
+        font_size = font_px;
+    }
+    memset(bits, 0, (size_t)OV_W * OV_H * 4);
+    const int pad = (int)font_px / 2;
+    for (int r = 0; r < 2; r++) {
+        w[r] = 0;
+        if (!item[r] || !item[r][0]) continue;
+        SIZE sz;
+        const int len = (int)strlen(item[r]);
+        GetTextExtentPoint32A(dc, item[r], len, &sz);
+        w[r] = (u32)(sz.cx + 2 * pad) < OV_W ? (u32)(sz.cx + 2 * pad) : OV_W;
+        TextOutA(dc, pad, r * OV_ROW + (OV_ROW - sz.cy) / 2, item[r], len);
+    }
+    GdiFlush();
+    for (u32 y = 0; y < OV_H; y++) {
+        const u32 r = y / OV_ROW;
+        for (u32 x = 0; x < OV_W; x++) {
+            unsigned char* o = dst + ((size_t)y * OV_W + x) * 4;
+            if (x >= w[r]) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
+            const u32 p = bits[(size_t)y * OV_W + x];
+            u32 cov = p & 0xFF;
+            if (((p >> 8) & 0xFF) > cov) cov = (p >> 8) & 0xFF;
+            if (((p >> 16) & 0xFF) > cov) cov = (p >> 16) & 0xFF;
+            o[0] = o[1] = o[2] = (unsigned char)cov;
+            o[3] = (unsigned char)(cov + (255 - cov) * 140 / 255);
+        }
+    }
+}
+
+/* The overlay's items over the back buffer at rtv, after the scaling pass. */
+static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    if (!s_d3d.ov_pso) return;
+    const char* msg = (const char*)s_toast_msg;
+    if (msg && GetTickCount64() > s_toast_until) msg = NULL;
+    const char* item[2] = { d3d12_show_fps() == 2 && s_ov_fps[0] ? s_ov_fps : NULL, msg };
+    if (!item[0] && !item[1]) return;
+
+    /* Text the window's height can read: 1/40 of it, 14 to 40 pixels. */
+    u32 font_px = s_d3d.bb_h / 40;
+    if (font_px < 14) font_px = 14;
+    if (font_px > 40) font_px = 40;
+    static char shown[2][64];
+    static u32 shown_px, w[2];
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    if (font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") || strcmp(shown[1], item[1] ? item[1] : "")) {
+        ov_render(s_d3d.ov_up_ptr[fi], item, font_px, w);
+        snprintf(shown[0], sizeof shown[0], "%s", item[0] ? item[0] : "");
+        snprintf(shown[1], sizeof shown[1], "%s", item[1] ? item[1] : "");
+        shown_px = font_px;
+        pp_barrier(s_d3d.ov_tex, s_d3d.ov_tex_ready ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                                    : D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+        dl.pResource = s_d3d.ov_tex;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        sl.pResource = s_d3d.ov_up[fi];
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sl.PlacedFootprint.Footprint.Width = OV_W;
+        sl.PlacedFootprint.Footprint.Height = OV_H;
+        sl.PlacedFootprint.Footprint.Depth = 1;
+        sl.PlacedFootprint.Footprint.RowPitch = OV_W * 4;
+        cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, 0, 0, &sl, NULL);
+        pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        s_d3d.ov_tex_ready = 1;
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE srv;
+    s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &srv);
+    srv.ptr += (FRAME_COUNT + 1) * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.pp_root);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.pp_srv_heap);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, srv);
+    cl->lpVtbl->SetPipelineState(cl, s_d3d.ov_pso);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    const float bw = (float)s_d3d.bb_w, bh = (float)s_d3d.bb_h, m = (float)font_px * 0.5f;
+    for (int r = 0; r < 2; r++) {
+        if (!item[r] || !w[r]) continue;
+        /* the frame rate in the top left corner, a message centred near the top */
+        const float x = r ? (bw - (float)w[r]) * 0.5f : m, y = r ? bh * 0.08f : m;
+        const float c[16] = {
+            x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
+            (x + (float)w[r]) / bw * 2.0f - 1.0f, 1.0f - (y + (float)OV_ROW) / bh * 2.0f,
+            0.0f, (float)(r * OV_ROW) / (float)OV_H, (float)w[r] / (float)OV_W, (float)((r + 1) * OV_ROW) / (float)OV_H };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+    }
+}
+
+/* The overlay's texture, uploads and pipeline; part of pp_init. Without them
+ * the game runs as before, with no overlay. */
+static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
+{
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = OV_W;
+    rd.Height = OV_H;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&s_d3d.ov_tex)))
+        return;
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC ub = {0};
+    ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    ub.Width = (u64)OV_W * 4 * OV_H;
+    ub.Height = 1; ub.DepthOrArraySize = 1; ub.MipLevels = 1; ub.SampleDesc.Count = 1;
+    ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        D3D12_RANGE none = {0, 0};
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &ub,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&s_d3d.ov_up[i])) ||
+            FAILED(s_d3d.ov_up[i]->lpVtbl->Map(s_d3d.ov_up[i], 0, &none, (void**)&s_d3d.ov_up_ptr[i])))
+            return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &h);
+    h.ptr += (FRAME_COUNT + 1) * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.ov_tex, NULL, h);
+
+    static const char hlsl[] =
+        "cbuffer pc : register(b0) { float4 dst; float4 src_uv; float4 p2; float4 p3; };\n"
+        "Texture2D tex : register(t0);\n"
+        "SamplerState pnt : register(s1);\n"
+        "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+        "V vs(uint id : SV_VertexID) {\n"
+        "  float2 t = float2(id & 1, id >> 1); V o;\n"
+        "  o.pos = float4(lerp(dst.xy, dst.zw, t), 0, 1); o.uv = lerp(src_uv.xy, src_uv.zw, t); return o; }\n"
+        "float4 ps(V i) : SV_TARGET { return tex.SampleLevel(pnt, i.uv, 0); }\n";
+    ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
+    HRESULT hr = D3DCompile(hlsl, sizeof hlsl - 1, "overlay_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    if (SUCCEEDED(hr)) hr = D3DCompile(hlsl, sizeof hlsl - 1, "overlay_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
+    if (err) err->lpVtbl->Release(err);
+    if (SUCCEEDED(hr)) {
+        pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
+        pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
+        pd.PS.pShaderBytecode = psb->lpVtbl->GetBufferPointer(psb);
+        pd.PS.BytecodeLength  = psb->lpVtbl->GetBufferSize(psb);
+        D3D12_RENDER_TARGET_BLEND_DESC* bl = &pd.BlendState.RenderTarget[0];
+        bl->BlendEnable = TRUE;   /* premultiplied */
+        bl->SrcBlend = D3D12_BLEND_ONE;       bl->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;      bl->BlendOp = D3D12_BLEND_OP_ADD;
+        bl->SrcBlendAlpha = D3D12_BLEND_ONE;  bl->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA; bl->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                               (void**)&s_d3d.ov_pso);
+    }
+    if (vsb) vsb->lpVtbl->Release(vsb);
+    if (psb) psb->lpVtbl->Release(psb);
+    if (FAILED(hr)) { printf("[D3D12] overlay unavailable (0x%08lX)\n", hr); s_d3d.ov_pso = NULL; }
+}
+
+/* SMAA 1x (graphics.antialiasing = smaa; rsx_smaa.c): its targets, the
+ * display's size, its lookup textures, its tables in pp_srv_heap and its
+ * three pipelines. Anything missing turns it off and the game runs as before. */
+static ID3D12Resource* aa_texture(DXGI_FORMAT fmt, u32 w, u32 h, int rt)
+{
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = rt ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* r = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&r)))
+        return NULL;
+    return r;
+}
+
+static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
+{
+    const u32 w = s_d3d.width, h = s_d3d.height;
+    if (pp_root_create(3, &s_d3d.aa_root) != 0) return -1;
+    s_d3d.aa_edges  = aa_texture(DXGI_FORMAT_R8G8_UNORM, w, h, 1);
+    s_d3d.aa_blend  = aa_texture(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1);
+    s_d3d.aa_out    = aa_texture(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1);
+    unsigned aw, ah, ab, sw, sh, sb;
+    const unsigned char* area = rsx_smaa_area(&aw, &ah, &ab);
+    const unsigned char* search = rsx_smaa_search(&sw, &sh, &sb);
+    s_d3d.aa_area   = aa_texture(DXGI_FORMAT_R8G8_UNORM, aw, ah, 0);
+    s_d3d.aa_search = aa_texture(DXGI_FORMAT_R8_UNORM, sw, sh, 0);
+    if (!s_d3d.aa_edges || !s_d3d.aa_blend || !s_d3d.aa_out || !s_d3d.aa_area || !s_d3d.aa_search) return -1;
+
+    /* The lookup textures' upload, rows at the 256-byte pitch copies need:
+     * AreaTex, then SearchTex at the next 512-byte boundary. */
+    const u32 ap = (aw * ab + 255u) & ~255u, sp = (sw * sb + 255u) & ~255u;
+    const u32 soff = (ap * ah + 511u) & ~511u;
+    D3D12_HEAP_PROPERTIES up = {0};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC ub = {0};
+    ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    ub.Width = soff + (u64)sp * sh;
+    ub.Height = 1; ub.DepthOrArraySize = 1; ub.MipLevels = 1; ub.SampleDesc.Count = 1;
+    ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    unsigned char* m = NULL;
+    D3D12_RANGE none = {0, 0};
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &up, D3D12_HEAP_FLAG_NONE, &ub,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&s_d3d.aa_up)) ||
+        FAILED(s_d3d.aa_up->lpVtbl->Map(s_d3d.aa_up, 0, &none, (void**)&m)) || !m)
+        return -1;
+    for (u32 y = 0; y < ah; y++) memcpy(m + (size_t)y * ap, area + (size_t)y * aw * ab, aw * ab);
+    for (u32 y = 0; y < sh; y++) memcpy(m + soff + (size_t)y * sp, search + (size_t)y * sw * sb, sw * sb);
+    s_d3d.aa_up->lpVtbl->Unmap(s_d3d.aa_up, 0, NULL);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 3;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
+                                                          (void**)&s_d3d.aa_rtv_heap)))
+        return -1;
+    D3D12_CPU_DESCRIPTOR_HANDLE r;
+    s_d3d.aa_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.aa_rtv_heap, &r);
+    ID3D12Resource* const rts[3] = { s_d3d.aa_edges, s_d3d.aa_blend, s_d3d.aa_out };
+    for (int i = 0; i < 3; i++) {
+        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, rts[i], NULL, r);
+        r.ptr += s_d3d.rtv_descriptor_size;
+    }
+
+    /* The tables: an unused place holds a null view. */
+    const UINT inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE base;
+    s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &base);
+    D3D12_SHADER_RESOURCE_VIEW_DESC nd;
+    memset(&nd, 0, sizeof nd);
+    nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nd.Texture2D.MipLevels = 1;
+    struct { u32 slot; ID3D12Resource* res; } views[] = {
+        { PP_SLOT_AA_OUT, s_d3d.aa_out },
+        { PP_SLOT_AA_W, s_d3d.aa_edges }, { PP_SLOT_AA_W + 1, s_d3d.aa_area }, { PP_SLOT_AA_W + 2, s_d3d.aa_search },
+    };
+    for (unsigned i = 0; i < sizeof views / sizeof views[0]; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE hh = base;
+        hh.ptr += views[i].slot * inc;
+        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, views[i].res, NULL, hh);
+    }
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++) {
+        ID3D12Resource* const e[3] = { s_d3d.render_targets[fi], NULL, NULL };
+        ID3D12Resource* const n[3] = { s_d3d.render_targets[fi], s_d3d.aa_blend, NULL };
+        for (u32 k = 0; k < 3; k++) {
+            D3D12_CPU_DESCRIPTOR_HANDLE he = base, hn = base;
+            he.ptr += (PP_SLOT_AA_E(fi) + k) * inc;
+            hn.ptr += (PP_SLOT_AA_N(fi) + k) * inc;
+            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, e[k], e[k] ? NULL : &nd, he);
+            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, n[k], n[k] ? NULL : &nd, hn);
+        }
+    }
+
+    static const DXGI_FORMAT fmt[3] = { DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM };
+    pd.pRootSignature = s_d3d.aa_root;
+    for (int p = 0; p < 3; p++) {
+        ID3DBlob* vs = (ID3DBlob*)rsx_smaa_compile(p, 1);
+        ID3DBlob* ps = vs ? (ID3DBlob*)rsx_smaa_compile(p, 0) : NULL;
+        HRESULT hr = E_FAIL;
+        if (vs && ps) {
+            pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
+            pd.VS.BytecodeLength  = vs->lpVtbl->GetBufferSize(vs);
+            pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+            pd.PS.BytecodeLength  = ps->lpVtbl->GetBufferSize(ps);
+            pd.RTVFormats[0] = fmt[p];
+            hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                                   (void**)&s_d3d.aa_pso[p]);
+        }
+        if (vs) vs->lpVtbl->Release(vs);
+        if (ps) ps->lpVtbl->Release(ps);
+        if (FAILED(hr)) { s_d3d.aa_pso[p] = NULL; return -1; }
+    }
+    return 0;
+}
+
+/* One SMAA pass at the display's size: the table at slot src into rtv. */
+static void aa_draw(ID3D12PipelineState* pso, u32 src, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    D3D12_GPU_DESCRIPTOR_HANDLE srv;
+    s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &srv);
+    srv.ptr += src * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const float w = (float)s_d3d.width, h = (float)s_d3d.height;
+    const float c[16] = { 1.0f / w, 1.0f / h, w, h };
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, w, h, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height };
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.aa_root);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.pp_srv_heap);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, srv);
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+    cl->lpVtbl->SetPipelineState(cl, pso);
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+}
+
+/* SMAA 1x from display target fi into aa_out (left in PIXEL_SHADER_RESOURCE
+ * for the scaling pass; aa_finish puts the targets back in COMMON). The
+ * display target is already in PIXEL_SHADER_RESOURCE. */
+static void aa_run(u32 fi)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    if (!s_d3d.aa_luts_ready) {
+        unsigned aw, ah, ab, sw, sh, sb;
+        rsx_smaa_area(&aw, &ah, &ab);
+        rsx_smaa_search(&sw, &sh, &sb);
+        const u32 ap = (aw * ab + 255u) & ~255u, sp = (sw * sb + 255u) & ~255u, soff = (ap * ah + 511u) & ~511u;
+        ID3D12Resource* const dst[2] = { s_d3d.aa_area, s_d3d.aa_search };
+        const DXGI_FORMAT fmt[2] = { DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM };
+        const u32 dims[2][4] = { { aw, ah, ap, 0 }, { sw, sh, sp, soff } };
+        for (int i = 0; i < 2; i++) {
+            pp_barrier(dst[i], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+            dl.pResource = dst[i];
+            dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sl.pResource = s_d3d.aa_up;
+            sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            sl.PlacedFootprint.Offset = dims[i][3];
+            sl.PlacedFootprint.Footprint.Format = fmt[i];
+            sl.PlacedFootprint.Footprint.Width = dims[i][0];
+            sl.PlacedFootprint.Footprint.Height = dims[i][1];
+            sl.PlacedFootprint.Footprint.Depth = 1;
+            sl.PlacedFootprint.Footprint.RowPitch = dims[i][2];
+            cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, 0, 0, &sl, NULL);
+            pp_barrier(dst[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        s_d3d.aa_luts_ready = 1;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[3];
+    s_d3d.aa_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.aa_rtv_heap, &rtv[0]);
+    rtv[1] = rtv[0]; rtv[1].ptr += s_d3d.rtv_descriptor_size;
+    rtv[2] = rtv[1]; rtv[2].ptr += s_d3d.rtv_descriptor_size;
+    static const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    /* Edges; the pass discards where there are none, so it starts cleared. */
+    pp_barrier(s_d3d.aa_edges, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->lpVtbl->ClearRenderTargetView(cl, rtv[0], zero, 0, NULL);
+    aa_draw(s_d3d.aa_pso[0], PP_SLOT_AA_E(fi), rtv[0]);
+    pp_barrier(s_d3d.aa_edges, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    /* Blending weights */
+    pp_barrier(s_d3d.aa_blend, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    aa_draw(s_d3d.aa_pso[1], PP_SLOT_AA_W, rtv[1]);
+    pp_barrier(s_d3d.aa_blend, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    /* Neighbourhood blending */
+    pp_barrier(s_d3d.aa_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    aa_draw(s_d3d.aa_pso[2], PP_SLOT_AA_N(fi), rtv[2]);
+    pp_barrier(s_d3d.aa_out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+static void aa_finish(void)
+{
+    pp_barrier(s_d3d.aa_edges, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    pp_barrier(s_d3d.aa_blend, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    pp_barrier(s_d3d.aa_out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
 /* The display target into the swap chain's buffer, for a frame that is
  * presented, through the presentation pass: bilinear or sharp bilinear in one
  * draw, or FSR 1, EASU then RCAS through pp_tmp (EASU alone with sharpening
@@ -2352,11 +2842,16 @@ static void present_to_backbuffer(u32 fi)
     memset(c, 0, sizeof c);
 
     pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    u32 src = fi;   /* the display target, or SMAA's output */
+    if (s_d3d.aa_on) {
+        aa_run(fi);
+        src = PP_SLOT_AA_OUT;
+    }
     if (s_d3d.pp_mode == 2 && up) {
         rsx_fsr1_easu_con(c, (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h);
         if (s_d3d.pp_tmp) {
             pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            pp_draw(s_d3d.pp_pso_easu, fi, tmp_rtv, c);
+            pp_draw(s_d3d.pp_pso_easu, src, tmp_rtv, c);
             pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
             memset(c, 0, sizeof c);
@@ -2365,15 +2860,17 @@ static void present_to_backbuffer(u32 fi)
             pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         } else {
             pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            pp_draw(s_d3d.pp_pso_easu, fi, bb_rtv, c);
+            pp_draw(s_d3d.pp_pso_easu, src, bb_rtv, c);
         }
     } else {
         const float f[5] = { (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h,
                              s_d3d.pp_mode == 1 ? 1.0f : 0.0f };
         memcpy(c, f, sizeof f);
         pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        pp_draw(s_d3d.pp_pso, fi, bb_rtv, c);
+        pp_draw(s_d3d.pp_pso, src, bb_rtv, c);
     }
+    ov_draw(fi, bb_rtv);
+    if (s_d3d.aa_on) aa_finish();
     pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     pp_barrier(disp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
@@ -2519,26 +3016,83 @@ static void shot_copy(u32 fi)
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
 }
 
-static void shot_png(void)
+/* display.screenshot = output (the default: what the window shows, at its
+ * size, after the scaling and the overlay) or game (the title's own frame).
+ * Read once. */
+static int d3d12_shot_game(void)
 {
-    if (!s_d3d.readback_buf) return;
-    const u32 w = s_d3d.width, h = s_d3d.height, row = 1 + w * 3;
+    static int v = -1;
+    if (v < 0) v = ps3_settings_ieq(ps3_settings_str("display", "screenshot", NULL, "output"), "game");
+    return v;
+}
+
+/* The swap chain's buffer into shot_buf, after the presentation pass: made
+ * again when the window's size has changed (the last shot has been written,
+ * so nothing still uses the old one). */
+static void shot_copy_bb(u32 fi)
+{
+    const u32 pitch = (s_d3d.bb_w * 4 + 255) & ~255u;
+    if (!s_d3d.shot_buf || s_d3d.shot_w != s_d3d.bb_w || s_d3d.shot_h != s_d3d.bb_h) {
+        if (s_d3d.shot_buf) { s_d3d.shot_buf->lpVtbl->Release(s_d3d.shot_buf); s_d3d.shot_buf = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = (u64)pitch * s_d3d.bb_h;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_d3d.shot_buf))) {
+            s_d3d.shot_buf = NULL;
+            return;
+        }
+        s_d3d.shot_w = s_d3d.bb_w; s_d3d.shot_h = s_d3d.bb_h; s_d3d.shot_pitch = pitch;
+    }
+    D3D12_RESOURCE_BARRIER bar;
+    memset(&bar, 0, sizeof bar);
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = s_d3d.backbuffers[fi];
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = s_d3d.shot_buf;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width    = s_d3d.bb_w;
+    dst.PlacedFootprint.Footprint.Height   = s_d3d.bb_h;
+    dst.PlacedFootprint.Footprint.Depth    = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    src.pResource = s_d3d.backbuffers[fi];
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
+}
+
+/* A w x h RGBA image read back into buf, rows pitch bytes apart, as a PNG. */
+static int shot_png(ID3D12Resource* buf, u32 w, u32 h, u32 pitch)
+{
+    if (!buf) return 0;
+    const u32 row = 1 + w * 3;
     const size_t raw = (size_t)row * h, blocks = (raw + 65534) / 65535;
     const size_t idat = 2 + raw + blocks * 5 + 4;
     unsigned char* z = (unsigned char*)malloc(idat);
     unsigned char* line = (unsigned char*)malloc(row);
     void* mapped = NULL;
-    D3D12_RANGE rr = {0, (SIZE_T)s_d3d.readback_pitch * h};
-    if (!z || !line || FAILED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mapped)) || !mapped) {
+    D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
+    if (!z || !line || FAILED(buf->lpVtbl->Map(buf, 0, &rr, &mapped)) || !mapped) {
         free(z); free(line);
-        return;
+        return 0;
     }
     /* zlib: header, stored blocks of the filtered rows, Adler-32 */
     size_t o = 0, left = raw, blk = 0;
     u32 a = 1, s = 0;
     z[o++] = 0x78; z[o++] = 0x01;
     for (u32 y = 0; y < h; y++) {
-        const unsigned char* src = (const unsigned char*)mapped + (size_t)y * s_d3d.readback_pitch;
+        const unsigned char* src = (const unsigned char*)mapped + (size_t)y * pitch;
         line[0] = 0;   /* filter: none */
         for (u32 x = 0; x < w; x++) memcpy(line + 1 + x * 3, src + x * 4, 3);
         for (u32 i = 0; i < row; i++) {
@@ -2557,7 +3111,7 @@ static void shot_png(void)
     png_u32(z + o, (s << 16) | a);
     o += 4;
     D3D12_RANGE wr = {0, 0};
-    s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+    buf->lpVtbl->Unmap(buf, 0, &wr);
 
     char dir[MAX_PATH], path[MAX_PATH + 96];
     DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
@@ -2587,6 +3141,7 @@ static void shot_png(void)
         printf("[D3D12] screenshot: could not write %s\n", path);
     }
     free(z); free(line);
+    return f != NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5831,7 +6386,7 @@ static void render_frame(void)
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
     /* Lazily create the readback buffer the first time a dump is requested. */
-    if ((s_d3d.dump_frames_left > 0 || s_shot_pending) && !s_d3d.readback_buf) {
+    if ((s_d3d.dump_frames_left > 0 || (s_shot_pending && d3d12_shot_game())) && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -7050,7 +7605,11 @@ skip_dump_consider: ;
     composite_present(fi);
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
-    const int shot = s_d3d.readback_buf && InterlockedExchange(&s_shot_pending, 0);
+    /* A shot of the title's frame needs the readback buffer; one of the
+     * window, a frame that is presented. */
+    int shot = 0;
+    if (s_shot_pending && (d3d12_shot_game() ? s_d3d.readback_buf != NULL : s_present_this_frame))
+        shot = InterlockedExchange(&s_shot_pending, 0) != 0;
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
                        mind2 = e ? atoi(e) : 0; }
@@ -7092,7 +7651,7 @@ skip_dump_consider: ;
         /* End-of-frame fallback snapshot: used when the frame never contained a
          * reduced-viewport pass to capture mid-frame. */
         screen_copy_capture(fi);
-        if (shot) {
+        if (shot && d3d12_shot_game()) {
             shot_copy(fi);   /* ends in PRESENT */
         } else {
             /* Transition render target to PRESENT state */
@@ -7103,6 +7662,7 @@ skip_dump_consider: ;
     }
 
     if (s_present_this_frame) present_to_backbuffer(fi);
+    if (shot && !d3d12_shot_game()) shot_copy_bb(fi);
 
     /* Close and execute */
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
@@ -7149,7 +7709,10 @@ skip_dump_consider: ;
     }
     if (shot) {
         wait_for_gpu();
-        shot_png();
+        const int ok = d3d12_shot_game()
+            ? shot_png(s_d3d.readback_buf, s_d3d.width, s_d3d.height, s_d3d.readback_pitch)
+            : shot_png(s_d3d.shot_buf, s_d3d.shot_w, s_d3d.shot_h, s_d3d.shot_pitch);
+        ov_toast(ok ? "Screenshot saved" : "Screenshot failed");
     }
     if (dumping) {
         wait_for_gpu();            /* ensure the copy finished before mapping */
@@ -7287,17 +7850,17 @@ skip_dump_consider: ;
         s_tframes++;
         ULONGLONG tnow = GetTickCount64();
         if (s_tt0 == 0) s_tt0 = tnow;
-        /* display.show_fps = title (the default) or off */
-        static int show = -1;
-        if (show < 0) show = !ps3_settings_ieq(ps3_settings_str("display", "show_fps", NULL, "title"), "off");
-        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd && show) {
-            extern char g_rsx_title_base[128];
-            char tb[256];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
-                     g_rsx_title_base,
-                     s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
-            SetWindowTextA(s_d3d.hwnd, tb);
+        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
+            const double fps = s_tframes * 1000.0 / (double)(tnow - s_tt0);
+            if (d3d12_show_fps() == 1) {
+                extern char g_rsx_title_base[128];
+                char tb[256];
+                snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+                         g_rsx_title_base, fps, s_dbg_last_draws, s_d3d.width, s_d3d.height);
+                SetWindowTextA(s_d3d.hwnd, tb);
+            } else if (d3d12_show_fps() == 2) {
+                snprintf(s_ov_fps, sizeof s_ov_fps, "%.0f FPS", fps);
+            }
             s_tframes = 0;
             s_tt0 = tnow;
         }
@@ -9498,6 +10061,19 @@ void rsx_d3d12_backend_shutdown(void)
         if (s_d3d.pp_pso_easu) s_d3d.pp_pso_easu->lpVtbl->Release(s_d3d.pp_pso_easu);
         if (s_d3d.pp_pso_rcas) s_d3d.pp_pso_rcas->lpVtbl->Release(s_d3d.pp_pso_rcas);
         if (s_d3d.pp_tmp) s_d3d.pp_tmp->lpVtbl->Release(s_d3d.pp_tmp);
+        if (s_d3d.ov_pso) s_d3d.ov_pso->lpVtbl->Release(s_d3d.ov_pso);
+        if (s_d3d.ov_tex) s_d3d.ov_tex->lpVtbl->Release(s_d3d.ov_tex);
+        for (u32 i = 0; i < FRAME_COUNT; i++)
+            if (s_d3d.ov_up[i]) s_d3d.ov_up[i]->lpVtbl->Release(s_d3d.ov_up[i]);
+        if (s_d3d.shot_buf) s_d3d.shot_buf->lpVtbl->Release(s_d3d.shot_buf);
+        for (int i = 0; i < 3; i++)
+            if (s_d3d.aa_pso[i]) s_d3d.aa_pso[i]->lpVtbl->Release(s_d3d.aa_pso[i]);
+        ID3D12Resource* const aa_res[6] = { s_d3d.aa_edges, s_d3d.aa_blend, s_d3d.aa_out,
+                                            s_d3d.aa_area, s_d3d.aa_search, s_d3d.aa_up };
+        for (int i = 0; i < 6; i++)
+            if (aa_res[i]) aa_res[i]->lpVtbl->Release(aa_res[i]);
+        if (s_d3d.aa_rtv_heap) s_d3d.aa_rtv_heap->lpVtbl->Release(s_d3d.aa_rtv_heap);
+        if (s_d3d.aa_root) s_d3d.aa_root->lpVtbl->Release(s_d3d.aa_root);
         if (s_d3d.pp_root) s_d3d.pp_root->lpVtbl->Release(s_d3d.pp_root);
         if (s_d3d.pp_srv_heap) s_d3d.pp_srv_heap->lpVtbl->Release(s_d3d.pp_srv_heap);
         if (s_d3d.bb_rtv_heap) s_d3d.bb_rtv_heap->lpVtbl->Release(s_d3d.bb_rtv_heap);

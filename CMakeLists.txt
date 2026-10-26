@@ -123,6 +123,19 @@ add_custom_command(
     VERBATIM)
 target_sources(ps3recomp_runtime PRIVATE "${FSR1_EMBED}")
 
+# SMAA (MIT, third_party/smaa): SMAA.hlsl for libs/video/rsx_smaa.c, the same way.
+set(SMAA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/smaa")
+set(SMAA_EMBED "${CMAKE_CURRENT_BINARY_DIR}/generated/rsx_smaa_hlsl.c")
+add_custom_command(
+    OUTPUT "${SMAA_EMBED}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUT=${SMAA_EMBED}"
+            "-DINPUTS=${SMAA_DIR}/SMAA.hlsl" "-DNAMES=rsx_smaa_hlsl"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFiles.cmake"
+    DEPENDS "${SMAA_DIR}/SMAA.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFiles.cmake"
+    COMMENT "Embedding SMAA.hlsl"
+    VERBATIM)
+target_sources(ps3recomp_runtime PRIVATE "${SMAA_EMBED}")
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

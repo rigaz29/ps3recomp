@@ -301,6 +301,7 @@ typedef struct {
 typedef struct {
     /* Window */
     HWND hwnd;
+    HWND view;   /* the child the swap chain presents to (see create_window) */
     u32  width;
     u32  height;
     int  window_closed;
@@ -1045,6 +1046,62 @@ static u32    s_lock_n  = 0;
  * Win32 window
  * -----------------------------------------------------------------------*/
 
+/* A top-level window holds a child, the view, which the swap chain presents
+ * to. The swap chain's buffers stay at the title's display size and DXGI
+ * stretches them to the view; the view is kept at the largest rectangle of
+ * the display's shape centred in the window, so a window or a monitor of
+ * another shape gets black bars instead of a stretched picture.
+ *
+ * display.mode = windowed | borderless (the whole monitor, no frame); Alt+Enter
+ * and F11 switch between them. display.window_size = WxH is the windowed client
+ * size, the display size by default. Esc closes the game only while
+ * system.esc_quits is on, as it always did before the setting. */
+static int  s_borderless;
+static RECT s_windowed_rect;   /* the frame's rectangle before going borderless */
+static volatile LONG s_shot_pending;   /* F12: write the next presented frame (shot_png) */
+
+static void d3d12_place_view(HWND hwnd)
+{
+    RECT rc;
+    if (!s_d3d.view || !s_d3d.width || !s_d3d.height || !GetClientRect(hwnd, &rc)) return;
+    const LONG cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    if (cw <= 0 || ch <= 0) return;
+    LONG w = cw, h = (LONG)((long long)cw * s_d3d.height / s_d3d.width);
+    if (h > ch) { h = ch; w = (LONG)((long long)ch * s_d3d.width / s_d3d.height); }
+    MoveWindow(s_d3d.view, (cw - w) / 2, (ch - h) / 2, w, h, TRUE);
+}
+
+static void d3d12_set_borderless(HWND hwnd, int on)
+{
+    if (on == s_borderless) return;
+    if (on) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        GetWindowRect(hwnd, &s_windowed_rect);
+        SetWindowLongA(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongA(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN);
+        SetWindowPos(hwnd, HWND_NOTOPMOST, s_windowed_rect.left, s_windowed_rect.top,
+                     s_windowed_rect.right - s_windowed_rect.left,
+                     s_windowed_rect.bottom - s_windowed_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    }
+    s_borderless = on;
+    d3d12_place_view(hwnd);
+    printf("[D3D12] window: %s\n", on ? "borderless" : "windowed");
+}
+
+static int d3d12_esc_quits(void)
+{
+    static int v = -1;
+    if (v < 0) v = ps3_settings_bool("system", "esc_quits", NULL, 1);
+    return v;
+}
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1055,13 +1112,40 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_SIZE:
+        d3d12_place_view(hwnd);
+        return 0;
+    case WM_SETCURSOR:   /* no pointer over the picture when borderless */
+        if (s_borderless && LOWORD(lp) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        break;
+    case WM_SYSCOMMAND:
+        /* Alt alone opens the window menu in a modal loop on this thread,
+         * which is the one that presents; the game would stand still. */
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+        break;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29))) {   /* Alt+Enter */
+            if (!(lp & (1 << 30))) d3d12_set_borderless(hwnd, !s_borderless);
+            return 0;
+        }
+        break;   /* Alt+F4 and the rest: the default */
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
+        if (wp == VK_F11) {
+            if (!(lp & (1 << 30))) d3d12_set_borderless(hwnd, !s_borderless);
+        } else if (wp == VK_F12) {
+            if (!(lp & (1 << 30))) InterlockedExchange(&s_shot_pending, 1);
+        } else if (wp == VK_ESCAPE && d3d12_esc_quits()) {
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
         return 0;
     }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK d3d12_view_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_ERASEBKGND) return 1;   /* the swap chain covers it */
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
@@ -1073,21 +1157,61 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = d3d12_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);   /* the bars */
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = d3d12_view_wndproc;
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = "ps3recomp_d3d12_view";
+    RegisterClassExA(&wc);
 
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
+    /* Physical pixels. Without this, Windows scales the whole window by the
+     * display's scale factor (125% on many laptops) after DXGI has already
+     * stretched the picture once, and both blur it. A window of the default
+     * size keeps the size it had: the display size times that factor. */
+    UINT dpi = 96;
+    {
+        typedef BOOL (WINAPI *set_ctx_fn)(HANDLE);
+        typedef UINT (WINAPI *get_dpi_fn)(void);
+        HMODULE user = GetModuleHandleA("user32.dll");
+        set_ctx_fn set_ctx = user ? (set_ctx_fn)(void*)GetProcAddress(user, "SetProcessDpiAwarenessContext") : NULL;
+        get_dpi_fn get_dpi = user ? (get_dpi_fn)(void*)GetProcAddress(user, "GetDpiForSystem") : NULL;
+        if (set_ctx) set_ctx((HANDLE)(intptr_t)-4);   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+        if (get_dpi) dpi = get_dpi();
+        if (dpi < 96) dpi = 96;
+    }
+    u32 cw = width * dpi / 96, ch = height * dpi / 96;
+    const char* ws = ps3_settings_str("display", "window_size", NULL, NULL);
+    if (ws && *ws) {
+        unsigned a = 0, c = 0;
+        char x = 0;
+        if (sscanf(ws, "%u%c%u", &a, &x, &c) == 3 && (x == 'x' || x == 'X') &&
+            a >= 320 && c >= 180 && a <= 16384 && c <= 16384) { cw = a; ch = c; }
+        else printf("[D3D12] display.window_size = %s is not WxH; using %ux%u\n", ws, cw, ch);
+    }
+    RECT wr = {0, 0, (LONG)cw, (LONG)ch};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-    return CreateWindowExA(
+    HWND hwnd = CreateWindowExA(
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (!hwnd) return NULL;
+    s_d3d.view = CreateWindowExA(0, "ps3recomp_d3d12_view", NULL, WS_CHILD | WS_VISIBLE,
+                                 0, 0, (int)cw, (int)ch, hwnd, NULL, GetModuleHandle(NULL), NULL);
+    if (!s_d3d.view) { DestroyWindow(hwnd); return NULL; }
+    d3d12_place_view(hwnd);
+
+    const char* mode = ps3_settings_str("display", "mode", NULL, "windowed");
+    if (ps3_settings_ieq(mode, "borderless")) d3d12_set_borderless(hwnd, 1);
+    else if (!ps3_settings_ieq(mode, "windowed"))
+        printf("[D3D12] display.mode = %s is not windowed or borderless; windowed\n", mode);
+    return hwnd;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1223,7 +1347,7 @@ static int init_d3d12(u32 width, u32 height)
     IDXGISwapChain1* swap_chain1 = NULL;
     hr = factory->lpVtbl->CreateSwapChainForHwnd(
         factory, (IUnknown*)s_d3d.cmd_queue,
-        s_d3d.hwnd, &sc_desc, NULL, NULL, &swap_chain1);
+        s_d3d.view, &sc_desc, NULL, NULL, &swap_chain1);
     if (FAILED(hr)) {
         printf("[D3D12] ERROR: CreateSwapChainForHwnd failed (0x%08lX)\n", hr);
         factory->lpVtbl->Release(factory);
@@ -1231,7 +1355,7 @@ static int init_d3d12(u32 width, u32 height)
     }
 
     /* Disable Alt+Enter fullscreen toggle */
-    factory->lpVtbl->MakeWindowAssociation(factory, s_d3d.hwnd, DXGI_MWA_NO_ALT_ENTER);
+    factory->lpVtbl->MakeWindowAssociation(factory, s_d3d.view, DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
 
     /* Query SwapChain3 interface */
@@ -1950,6 +2074,136 @@ static void dump_backbuffer_bmp(void)
     }
     D3D12_RANGE wr = {0, 0};
     s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+}
+
+/* F12: the frame in the readback buffer as a PNG in screenshots/ next to the
+ * executable, named by the title and the time. The pixels go in uncompressed
+ * (deflate's stored blocks): a 1280x720 shot is 2.7 MB, written in a few
+ * milliseconds on the presenting thread, with no image library. */
+static u32 png_crc(u32 c, const unsigned char* p, size_t n)
+{
+    static u32 t[256];
+    if (!t[1])
+        for (u32 i = 0; i < 256; i++) {
+            u32 v = i;
+            for (int k = 0; k < 8; k++) v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            t[i] = v;
+        }
+    c = ~c;
+    while (n--) c = t[(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+static void png_u32(unsigned char* p, u32 v) { p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16); p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v; }
+
+static void png_chunk(FILE* f, const char* type, const unsigned char* data, u32 n)
+{
+    unsigned char h[8];
+    png_u32(h, n);
+    memcpy(h + 4, type, 4);
+    fwrite(h, 1, 8, f);
+    if (n) fwrite(data, 1, n, f);
+    u32 c = png_crc(0, h + 4, 4);
+    c = png_crc(c, data, n);
+    png_u32(h, c);
+    fwrite(h, 1, 4, f);
+}
+
+/* The back buffer into the readback buffer, for a screenshot on a frame that
+ * is not being dumped (a dump makes the same copy itself). */
+static void shot_copy(u32 fi)
+{
+    D3D12_RESOURCE_BARRIER bar = {0};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = s_d3d.render_targets[fi];
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = s_d3d.readback_buf;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width    = s_d3d.width;
+    dst.PlacedFootprint.Footprint.Height   = s_d3d.height;
+    dst.PlacedFootprint.Footprint.Depth    = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
+    src.pResource = s_d3d.render_targets[fi];
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &bar);
+}
+
+static void shot_png(void)
+{
+    if (!s_d3d.readback_buf) return;
+    const u32 w = s_d3d.width, h = s_d3d.height, row = 1 + w * 3;
+    const size_t raw = (size_t)row * h, blocks = (raw + 65534) / 65535;
+    const size_t idat = 2 + raw + blocks * 5 + 4;
+    unsigned char* z = (unsigned char*)malloc(idat);
+    unsigned char* line = (unsigned char*)malloc(row);
+    void* mapped = NULL;
+    D3D12_RANGE rr = {0, (SIZE_T)s_d3d.readback_pitch * h};
+    if (!z || !line || FAILED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mapped)) || !mapped) {
+        free(z); free(line);
+        return;
+    }
+    /* zlib: header, stored blocks of the filtered rows, Adler-32 */
+    size_t o = 0, left = raw, blk = 0;
+    u32 a = 1, s = 0;
+    z[o++] = 0x78; z[o++] = 0x01;
+    for (u32 y = 0; y < h; y++) {
+        const unsigned char* src = (const unsigned char*)mapped + (size_t)y * s_d3d.readback_pitch;
+        line[0] = 0;   /* filter: none */
+        for (u32 x = 0; x < w; x++) memcpy(line + 1 + x * 3, src + x * 4, 3);
+        for (u32 i = 0; i < row; i++) {
+            if (!blk) {
+                blk = left < 65535 ? left : 65535;
+                z[o++] = left == blk;   /* BFINAL on the last block, BTYPE 00 */
+                z[o++] = (unsigned char)blk; z[o++] = (unsigned char)(blk >> 8);
+                z[o++] = (unsigned char)~blk; z[o++] = (unsigned char)(~blk >> 8);
+            }
+            z[o++] = line[i];
+            a = (a + line[i]) % 65521u;
+            s = (s + a) % 65521u;
+            blk--; left--;
+        }
+    }
+    png_u32(z + o, (s << 16) | a);
+    o += 4;
+    D3D12_RANGE wr = {0, 0};
+    s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+
+    char dir[MAX_PATH], path[MAX_PATH + 96];
+    DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+    char* slash = n && n < sizeof dir ? strrchr(dir, '\\') : NULL;
+    if (slash) slash[1] = 0; else dir[0] = 0;
+    strncat(dir, "screenshots", sizeof dir - strlen(dir) - 1);
+    CreateDirectoryA(dir, NULL);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    extern char g_rsx_title_base[128];
+    snprintf(path, sizeof path, "%s\\%s_%04u%02u%02u_%02u%02u%02u_%03u.png", dir,
+             g_rsx_title_base[0] ? g_rsx_title_base : "ps3recomp", t.wYear, t.wMonth, t.wDay,
+             t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        static const unsigned char sig[8] = { 0x89, 'P', 'N', 'G', 13, 10, 26, 10 };
+        unsigned char ihdr[13];
+        png_u32(ihdr, w); png_u32(ihdr + 4, h);
+        ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = ihdr[11] = ihdr[12] = 0;   /* 8-bit RGB */
+        fwrite(sig, 1, 8, f);
+        png_chunk(f, "IHDR", ihdr, 13);
+        png_chunk(f, "IDAT", z, (u32)o);
+        png_chunk(f, "IEND", NULL, 0);
+        fclose(f);
+        printf("[D3D12] screenshot %s\n", path);
+    } else {
+        printf("[D3D12] screenshot: could not write %s\n", path);
+    }
+    free(z); free(line);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2751,6 +3005,22 @@ static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap(u32 w)
 /* Sampler from the guest's TEXTURE_ADDRESS (wrap S [3:0], T [11:8], R [19:16]),
  * TEXTURE_FILTER (LOD bias [12:0] signed x/256, min [18:16], mag [26:24]) and
  * TEXTURE_CONTROL0 (max anisotropy [6:4]) and BORDER_COLOR (ARGB). */
+/* graphics.anisotropy = game (the title's own, the default) or 2, 4, 8, 16:
+ * a sampler that filters linearly both ways becomes anisotropic at that level,
+ * or at the title's when it asks for more. Point-sampled lookups stay as they
+ * are; they are often data, not pictures. Read once. */
+static int rsx_aniso_setting(void)
+{
+    static int v = -1;
+    if (v >= 0) return v;
+    const char* s = ps3_settings_str("graphics", "anisotropy", NULL, "game");
+    const long n = ps3_settings_ieq(s, "game") ? 0 : strtol(s, NULL, 10);
+    v = (n == 2 || n == 4 || n == 8 || n == 16) ? (int)n : 0;
+    if (!v && !ps3_settings_ieq(s, "game"))
+        printf("[D3D12] graphics.anisotropy = %s is not game, 2, 4, 8 or 16; the title's\n", s);
+    return v;
+}
+
 static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
 {
     const u32 addr = k[0], filter = k[1], ctrl0 = k[2], border = k[3];
@@ -2759,10 +3029,12 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
     const int mip_lin = minf == 5 || minf == 6 || minf == 7;
     const int mag_lin = magf == 2 || magf == 4;
     static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+    u32 level = aniso[(ctrl0 >> 4) & 7u];
+    if (min_lin && mag_lin && level < (u32)rsx_aniso_setting()) level = (u32)rsx_aniso_setting();
     memset(s, 0, sizeof *s);
-    if (aniso[(ctrl0 >> 4) & 7u] > 1 && min_lin && mag_lin) {
+    if (level > 1 && min_lin && mag_lin) {
         s->Filter = D3D12_FILTER_ANISOTROPIC;
-        s->MaxAnisotropy = aniso[(ctrl0 >> 4) & 7u];
+        s->MaxAnisotropy = level;
     } else {
         s->Filter = (D3D12_FILTER)((min_lin << 4) | (mag_lin << 2) | mip_lin);
         s->MaxAnisotropy = 1;
@@ -5176,7 +5448,7 @@ static void render_frame(void)
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
     /* Lazily create the readback buffer the first time a dump is requested. */
-    if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
+    if ((s_d3d.dump_frames_left > 0 || s_shot_pending) && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -6395,6 +6667,7 @@ skip_dump_consider: ;
     composite_present(fi);
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
+    const int shot = s_d3d.readback_buf && InterlockedExchange(&s_shot_pending, 0);
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
                        mind2 = e ? atoi(e) : 0; }
@@ -6436,10 +6709,14 @@ skip_dump_consider: ;
         /* End-of-frame fallback snapshot: used when the frame never contained a
          * reduced-viewport pass to capture mid-frame. */
         screen_copy_capture(fi);
-        /* Transition render target to PRESENT state */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        if (shot) {
+            shot_copy(fi);   /* ends in PRESENT */
+        } else {
+            /* Transition render target to PRESENT state */
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        }
     }
 
     /* Close and execute */
@@ -6484,6 +6761,10 @@ skip_dump_consider: ;
         s_dump_name = "screencopy";
         dump_backbuffer_bmp();
         s_dump_name = NULL;
+    }
+    if (shot) {
+        wait_for_gpu();
+        shot_png();
     }
     if (dumping) {
         wait_for_gpu();            /* ensure the copy finished before mapping */
@@ -6620,7 +6901,10 @@ skip_dump_consider: ;
         s_tframes++;
         ULONGLONG tnow = GetTickCount64();
         if (s_tt0 == 0) s_tt0 = tnow;
-        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
+        /* display.show_fps = title (the default) or off */
+        static int show = -1;
+        if (show < 0) show = !ps3_settings_ieq(ps3_settings_str("display", "show_fps", NULL, "title"), "off");
+        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd && show) {
             extern char g_rsx_title_base[128];
             char tb[256];
             snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",

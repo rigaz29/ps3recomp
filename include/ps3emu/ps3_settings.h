@@ -10,7 +10,8 @@
  *   1. a command-line override (ps3_settings_override),
  *   2. the environment variable the caller names, if it is set,
  *   3. the file,
- *   4. the caller's default.
+ *   4. the port's default (ps3_settings_default),
+ *   5. the caller's default.
  * So a test can still force anything with an environment variable, and a run
  * with no file behaves as before. Each setting is logged once, with where its
  * value came from, the first time it is read.
@@ -39,6 +40,10 @@ const char* ps3_settings_path(void);
 
 /* A command-line value; it wins over the environment and the file. */
 void ps3_settings_override(const char* section, const char* key, const char* value);
+
+/* A port's own default, for a title whose players want something other than
+ * the runtime's default; the file still wins over it. */
+void ps3_settings_default(const char* section, const char* key, const char* value);
 
 /* Change the file's value (the launcher's edits). The line is changed in
  * place, or added at the end of its section; the section is added when the

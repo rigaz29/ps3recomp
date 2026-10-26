@@ -35,6 +35,8 @@ static resolved_t* s_res;
 static int         s_nres, s_res_cap;
 static override_t* s_ovr;
 static int         s_novr;
+static override_t* s_def;    /* the port's defaults, below the file */
+static int         s_ndef;
 static int         s_lock;   /* the reads: several threads may resolve their first settings at once */
 
 static void lk(void)  { while (__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) { } }
@@ -181,16 +183,26 @@ int ps3_settings_load(const char* path)
 
 const char* ps3_settings_path(void) { return s_path; }
 
+static void push_value(override_t** list, int* n, const char* section, const char* key, const char* value)
+{
+    override_t* l = (override_t*)realloc(*list, (size_t)(*n + 1) * sizeof *l);
+    if (!l) return;
+    *list = l;
+    l[*n].section = dup_s(section);
+    l[*n].key = dup_s(key);
+    l[*n].value = dup_s(value);
+    (*n)++;
+    forget_resolved();
+}
+
 void ps3_settings_override(const char* section, const char* key, const char* value)
 {
-    override_t* n = (override_t*)realloc(s_ovr, (size_t)(s_novr + 1) * sizeof *n);
-    if (!n) return;
-    s_ovr = n;
-    s_ovr[s_novr].section = dup_s(section);
-    s_ovr[s_novr].key = dup_s(key);
-    s_ovr[s_novr].value = dup_s(value);
-    s_novr++;
-    forget_resolved();
+    push_value(&s_ovr, &s_novr, section, key, value);
+}
+
+void ps3_settings_default(const char* section, const char* key, const char* value)
+{
+    push_value(&s_def, &s_ndef, section, key, value);
 }
 
 static int needs_quotes(const char* v)
@@ -271,6 +283,11 @@ static resolved_t* resolve(const char* section, const char* key, const char* env
             r->from = "file";
         }
     }
+    for (int i = s_ndef - 1; i >= 0 && !r->from; i--)
+        if (ps3_settings_ieq(s_def[i].section, section) && ps3_settings_ieq(s_def[i].key, key)) {
+            r->value = dup_s(s_def[i].value);
+            r->from = "port default";
+        }
     r->section = dup_s(section);
     r->key = dup_s(key);
     if (!r->section || !r->key) { free(r->section); free(r->key); free(r->value); return NULL; }

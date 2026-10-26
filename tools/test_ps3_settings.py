@@ -7,7 +7,8 @@ checks that:
 
 - values come from the file, with comments and quotes handled;
 - an environment variable wins over the file, a command-line override over
-  both, and the caller's default applies when none has a value;
+  both, a port's default is under the file, and the caller's default applies
+  when none has a value;
 - on/off, hex and decimal numbers parse, and a bad value gives the default;
 - a changed value is written in place with its comment, a new key lands at
   the end of its section, a new section at the end, and every other line
@@ -86,6 +87,12 @@ int main(int argc, char** argv)
     ps3_settings_override("display", "mode", "windowed");
     CHECK(!strcmp(ps3_settings_str("display", "mode", "TEST_MODE", "x"), "windowed"));
 
+    /* a port's default: under the file, over the caller's */
+    ps3_settings_default("input", "deadzone", "0.5");
+    ps3_settings_default("system", "esc_quits", "off");
+    CHECK(ps3_settings_num("input", "deadzone", NULL, 0.24) == 0.3);
+    CHECK(ps3_settings_bool("system", "esc_quits", NULL, 1) == 0);
+
     /* the launcher's edits, then the file written back */
     CHECK(ps3_settings_set("display", "mode", "borderless") == 0);
     CHECK(ps3_settings_set("display", "vsync", "on") == 0);
@@ -162,7 +169,8 @@ with tempfile.TemporaryDirectory() as tmp:
     for line in ('[settings] display.mode = borderless (file)',
                  '[settings] graphics.async_shaders = 5 (TEST_ASYNC)',
                  '[settings] graphics.nothing = 7 (default)',
-                 '[settings] display.mode = windowed (command line)'):
+                 '[settings] display.mode = windowed (command line)',
+                 '[settings] system.esc_quits = off (port default)'):
         if line not in log:
             raise SystemExit('FAIL: the log has no line "%s"' % line)
     if log.count("is not on or off") != 1:

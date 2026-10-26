@@ -2484,6 +2484,12 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
+    lv2_syscall_register(tbl, SYS_PROCESS_EXIT3,  sys_process_exit_handler);
+    /* SYS_PROCESS_EXIT (22 on real lv2 / RPCS3) was never registered: a guest
+     * issuing it fell through to the catch-all stub, which told the guest its
+     * exit succeeded -- and the guest carried on executing. Registered as the
+     * same handler as SYS_PROCESS_EXIT3 (3, the number bare-metal/newlib
+     * images issue; both spell the same call). */
     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_GET_SDK_VERSION, sys_process_get_sdk_version_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,

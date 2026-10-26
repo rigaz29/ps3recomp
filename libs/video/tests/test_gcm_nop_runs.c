@@ -37,6 +37,8 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 static u32 seen_m[16], seen_d[16], seen_n;
 int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
+/* cellGcmSys asks whether a vtable backend is registered (#466). */
+rsx_backend* rsx_get_backend(void) { return NULL; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     (void)state;

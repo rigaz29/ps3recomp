@@ -43,6 +43,7 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (
 int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
 int  rsx_draw_engine_enabled(void) { return 1; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 /* guest_read is defined below: it plays the engine's part. */

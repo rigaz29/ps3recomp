@@ -50,6 +50,7 @@ static struct LwmSlot* lwm_slot(uint32_t lwmutex) { s_asked = lwmutex; return nu
 static void lwm_release(struct LwmSlot*) {}
 static int lwm_acquire(struct LwmSlot*, uint64_t) { return 1; }
 static void Sleep(unsigned) {}
+static void ppu_thread_note_block(uint64_t) {}
 %s
 %s
 int main() {

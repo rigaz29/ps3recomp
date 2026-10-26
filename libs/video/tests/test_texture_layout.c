@@ -479,6 +479,32 @@ static void test_decode_argb_linear(void)
     CHECK_EQ(dst[2], 0x33); CHECK_EQ(dst[3], 0x44);
 }
 
+/* Linear 32-bit colour has its own fast path on little-endian hosts; it must
+ * produce the same bytes as the per-texel decode. A one-row swizzled image is
+ * stored in raster order and still takes the per-texel path, so it is the
+ * reference. */
+static void test_decode_linear_argb_matches_texel_path(void)
+{
+    const u32 fmts[2] = { FMT_A8R8G8B8, FMT_D8R8G8B8 };
+    u8 src[64 * 4];
+    for (u32 i = 0; i < sizeof src; i++) src[i] = (u8)(i * 37u + 11u);
+
+    for (int f = 0; f < 2; f++)
+        for (int as_rgba = 0; as_rgba < 2; as_rgba++) {
+            rsx_tex_layout lin, swz;
+            rsx_texture_layout(fmts[f] | FMT_LN, 64, 1, &lin);
+            rsx_texture_layout(fmts[f], 64, 1, &swz);
+            CHECK(!lin.swizzled);
+            CHECK(swz.swizzled);
+            u8 a[64 * 4 + 8], b[64 * 4 + 8];
+            memset(a, 0xA5, sizeof a);
+            memset(b, 0xA5, sizeof b);
+            rsx_texture_decode(a, sizeof a, src, 64, 1, &lin, as_rgba);
+            rsx_texture_decode(b, sizeof b, src, 64, 1, &swz, as_rgba);
+            CHECK(memcmp(a, b, sizeof a) == 0);
+        }
+}
+
 /* A swizzled image must come out in raster order. Build the source so that
  * texel (x,y) holds a known value AT ITS MORTON OFFSET, then check the decode
  * lays it back out row by row. */
@@ -735,6 +761,28 @@ static void test_remap_x16_lanes(void)
     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
 }
 
+/* The depth formats decode to one channel and present it on every source,
+ * as RPCS3 maps them (R,R,R,R): a shadow map read through crossbar 0xA900
+ * (R, G and B from A, A forced to one) gets the depth in R, not the
+ * resource's opaque alpha, which made every shadow compare see 1.0. */
+static void test_remap_depth_lanes(void)
+{
+    static const u32 fmts[4] = { 0x90u, 0x91u, 0x92u, 0x93u };
+    for (int f = 0; f < 4; f++) {
+        u8 m[4];
+        rsx_texture_component_remap(0xA900u, fmts[f] | FMT_LN | 0x40u, m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE); CHECK_EQ(m[R_], 0);
+        CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+        u8 n[4];
+        rsx_texture_component_remap(0xAAE4u, fmts[f], n);
+        for (int i = 0; i < 4; i++) CHECK_EQ(n[i], 0);
+    }
+    /* A8R8G8B8 keeps its own lanes: 0xA900 reads its alpha. */
+    u8 c[4];
+    rsx_texture_component_remap(0xA900u, FMT_A8R8G8B8, c);
+    CHECK_EQ(c[R_], 3); CHECK_EQ(c[A_], RSX_REMAP_ONE);
+}
+
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
@@ -810,6 +858,7 @@ int main(void)
     test_swizzle_offset();
     test_log2_ceil();
     test_decode_argb_linear();
+    test_decode_linear_argb_matches_texel_path();
     test_decode_swizzled();
     test_decode_g8b8_swizzled();
     test_decode_swizzled_sizes();
@@ -824,6 +873,7 @@ int main(void)
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
     test_remap_dxt_matches_argb();
+    test_remap_depth_lanes();
     test_expand_mask();
     test_remap_rejects_null();
 

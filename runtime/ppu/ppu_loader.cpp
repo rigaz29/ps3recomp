@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <atomic>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -40,6 +41,7 @@
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
@@ -1581,9 +1583,18 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+/* -2 until PPU_RWATCH is read, -1 when unset. File scope so the gate below is
+ * one load inlined into every vm_read*, not a call. */
+static int64_t s_rwatch_lo = -2;
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra);
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
-    static int64_t s_lo = -2; static uint32_t s_len = 0x10;
+    if (__builtin_expect(s_rwatch_lo == -1, 1)) return;
+    ppu_rwatch_hit_slow(a, width, ra);
+}
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra)
+{
+    int64_t& s_lo = s_rwatch_lo; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
         const char* e = getenv("PPU_RWATCH");
         s_lo = e ? (int64_t)strtoul(e, 0, 16) : -1;
@@ -1894,8 +1905,18 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* -1 until read; 0 when neither PPU_WVAL nor PPU_WWATCH is set, which with no
+ * sync-line probe armed leaves every guest store one load and one compare. */
+static int s_store_watch = -1;
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(s_store_watch == 0, 1) && !g_barrier_sync_watch) return;
+    barrier_watch_hit_slow(a, v, width, ra);
+}
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -2015,23 +2036,12 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
     }
 }
 
-/* barrier_watch_hit is a call and a handful of static loads per guest store
- * even with every watch off: ~8% of God of War HD's main thread. Only make it
- * when PPU_WVAL or PPU_WWATCH is set, or the barrier probe has armed a line. */
-static int s_store_watch = -1;
-static inline int store_watch_on(void)
-{
-    if (__builtin_expect(s_store_watch < 0, 0))
-        s_store_watch = (getenv("PPU_WVAL") || getenv("PPU_WWATCH")) ? 1 : 0;
-    return s_store_watch | (g_barrier_sync_watch != 0);
-}
-
 /* See the note on the forward declaration above ppu_stwcx32. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
 {
     barrier_watch_hit(ea, val, width, ra);
 }
-void vm_write8 (uint64_t a, uint8_t  v) { if (store_watch_on()) barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
@@ -2041,9 +2051,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { if (store_watch_on()) barrier_watch_hi
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
     VM_WRITE_COH(a, &v, 1); }
-void vm_write16(uint64_t a, uint16_t v) { if (store_watch_on()) barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
+void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { if (store_watch_on()) barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
+void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
@@ -2061,10 +2071,8 @@ void vm_write64(uint64_t a, uint64_t v) {
      * every 64-bit struct field is written with std, so a watch on one would
      * report nothing and read as "nobody writes this". Two halves so an
      * 8-byte store still shows up when only its low or high word is watched. */
-    if (store_watch_on()) {
-        barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
-        barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
-    }
+    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
+    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 }
@@ -3848,6 +3856,75 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack an HLE -> guest callback runs on.
+ *
+ * This used to be the fixed EA 0xCFFE0000 in every host thread (the variable
+ * was thread-local, its value was not). The movie player's cellAdec and cellVdec
+ * callbacks run synchronously on two different MoviePlayerStream threads, so
+ * they built their frames over each other: the adec callback's scoped mutex
+ * guard (func_005F0CA8, guard at 0xCFFDFE50) read back a NULL mutex pointer,
+ * unlocked NULL (the [null-write] at 0x005EF018 / [null-read] of 0x8 in the
+ * hung runs) and left the player mutex locked for good -- the next lock of it
+ * (func_005EEFE4) never returned. 0xCFFE0000 is also inside RSX local memory
+ * (0xC0000000 + 256 MB), so VRAM writes could land on it as well.
+ *
+ * lv2 runs these callbacks on a real PPU thread with a stack of its own (the
+ * decoder's thread, or the thread that asked for the callback). Give every
+ * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
+ * callback below the live frame of the one it is nested in. */
+/* Slots in use, one bit each. A host thread takes the lowest free one on its
+ * first callback and gives it back when it exits (cb_slot_owner below), so a
+ * title that starts and ends threads all session -- a movie player starts
+ * several per movie -- never runs out: only more than 64 host threads making
+ * callbacks AT ONCE share a slot. */
+static std::atomic<uint64_t> s_cb_slots_used{0};
+struct cb_slot_owner {
+    int slot = -1;
+    ~cb_slot_owner()
+    {
+        if (slot >= 0) s_cb_slots_used.fetch_and(~(1ull << slot), std::memory_order_acq_rel);
+    }
+};
+static thread_local cb_slot_owner t_cb_slot;
+
+static uint32_t ppu_cb_stack_sp(const ppu_context* active)
+{
+    static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
+    if (!s_hi) {
+        const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
+        static_assert(VM_CB_STACK_REGION / VM_CB_STACK_SIZE <= 64, "one bit per slot");
+        uint32_t i = slots;
+        uint64_t used = s_cb_slots_used.load(std::memory_order_acquire);
+        while (~used & (slots >= 64 ? ~0ull : (1ull << slots) - 1u)) {
+            uint32_t k = 0;
+            while (used >> k & 1u) k++;
+            if (s_cb_slots_used.compare_exchange_weak(used, used | (1ull << k),
+                                                      std::memory_order_acq_rel)) {
+                i = k;
+                t_cb_slot.slot = (int)k;
+                break;
+            }
+        }
+        if (i < slots) {
+            s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+        } else {
+            /* Out of slots: share the last one, and say so. */
+            s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+            fprintf(stderr, "[ppu] guest_call: more than %u live host threads make guest "
+                            "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
+        }
+    }
+    if (active) {
+        uint32_t sp = (uint32_t)active->gpr[1];
+        /* Nested: below the outer callback's frame and its 288-byte protected zone. */
+        if (sp > s_lo + 0x1000 && sp <= s_hi) return (sp - 0x400) & ~0xFu;
+    }
+    /* Room above the first frame for the callee's LR/CR save words (sp+8, sp+16). */
+    return (s_hi - 0x100) & ~0xFu;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3872,14 +3949,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3919,12 +3991,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3951,11 +4020,16 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+     * redirected block-buffered stdout and nothing flushing it, printf lines
+     * sat in the buffer for minutes and were LOST when the run was killed --
+     * which made "the log line is absent" unusable as evidence. This used to
+     * set stdout unbuffered, which with mingw-w64 costs one write() per
+     * character. ps3_stdio_init() buffers stdout and stderr and flushes them
+     * every PS3_STDIO_FLUSH_MS (50 ms), at exit, on abort and on a crash, so a
+     * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+     * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+    ps3_stdio_init();
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;

@@ -21,6 +21,10 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#ifndef _WIN32
+/* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
+extern "C" uint64_t host_monotonic_ns(void);
+#endif
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -72,8 +76,9 @@ static void sys_time_get_system_time(ppu_context* ctx)
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    /* The same host clock as the timebase (sys_timer.h), so guest code that
+     * mixes mftb and this stays consistent. */
+    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
 #endif
 }
 
@@ -278,6 +283,8 @@ static void lwm_release(struct LwmSlot* sl)
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
  * logging during that window only (park hunts: gate on state, not counts). */
 volatile int g_nd_inpump = 0;
+/* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
+extern "C" void ppu_thread_note_block(uint64_t tid);
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -309,6 +316,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
+            ppu_thread_note_block(ctx->thread_id);
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             if (!lwm_acquire(sl0, timeout_us)) {   /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
@@ -451,6 +459,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
+        ppu_thread_note_block(ctx->thread_id);
         lwm_release(sl);
         Sleep(1);
         lwm_acquire(sl, 0);

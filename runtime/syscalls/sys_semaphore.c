@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -337,6 +338,7 @@ void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL;
 #endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))

@@ -131,6 +131,14 @@ def main():
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks from one "
                          "call target to the next becomes one C function, so branches "
                          "inside it are gotos instead of trampoline round trips")
+    ap.add_argument("--handled", metavar="JSON",
+                    help="With --input: {sha256: reason} for discovered programs another path "
+                         "already provides (an existing registration, an interpreter route). They "
+                         "are not lifted here, count as covered, and the reason is recorded")
+    ap.add_argument("--image-ids", metavar="JSON",
+                    help="With --input: {sha256: image_id} pinning every registered program's "
+                         "image id. A registered program missing from the map is an error, so "
+                         "ids are reviewed and stable instead of content-derived")
     args = ap.parse_args()
     if args.input:
         from spu_program_pipeline import build_programs

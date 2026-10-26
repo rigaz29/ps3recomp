@@ -852,8 +852,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
  * build without it still links (no HLE registered -> imports log + return 0). */
+#if defined(_MSC_VER)
+/* MSVC has no weak functions: /alternatename redirects references to the
+ * default only while the strong definition from the generated unit is absent
+ * -- weak semantics, and ignored when ppu_hle_nids.cpp is linked. */
+extern "C" void ppu_hle_register_all_default(void) {}
+extern "C" void ppu_hle_register_all(void);   /* generated unit; /alternatename falls back */
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/alternatename:_ppu_hle_register_all=_ppu_hle_register_all_default")
+#  else
+#    pragma comment(linker, "/alternatename:ppu_hle_register_all=ppu_hle_register_all_default")
+#  endif
+#else
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
+#endif
 
 extern "C" void ppu_hle_init(void)
 {

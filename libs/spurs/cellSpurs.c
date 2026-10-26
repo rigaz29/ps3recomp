@@ -1076,6 +1076,13 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 att
          * for the tasksets registered here. */
         extern void spu_taskset2_register(uint32_t ea);
         spu_taskset2_register(ts_ea);
+        /* A Taskset2 also carries two lv2 event flags (ids at +0x1898 and
+         * +0x189C), and the SPU task library refuses to create a task in a
+         * taskset whose flags are 0 (CELL_SPURS_TASK_ERROR_PERM). God of War:
+         * Ascension's tasks start their next phase that way, from the SPU. */
+        extern int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern);
+        sys_event_flag_create_host(ts_ea + CSTS_EVENT_FLAG_ID1, 0);
+        sys_event_flag_create_host(ts_ea + CSTS_EVENT_FLAG_ID2, 0);
     }
     return rc;
 }
@@ -1456,9 +1463,10 @@ s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision)
  *  const CellSpursTaskArgument* argument, const CellSpursTaskAttribute2* attr)
  *
  * Creates and starts the task like cellSpursCreateTask, with the context and
- * LS pattern taken from the attribute, then signals it, as the firmware does:
- * a Task2 task that waits for a signal before its first piece of work gets
- * that one from its creation. */
+ * LS pattern taken from the attribute. No signal goes with it: God of War:
+ * Ascension's post-process tasks wait for one from the job that hands them a
+ * frame, and a signal at creation made each run a batch from an empty control
+ * block and write its label to EA 0. */
 s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
                          u64 argument_ea, u64 attr_ea)
 {
@@ -1474,8 +1482,7 @@ s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
                                  (void*)(uintptr_t)(u32)elf_ea,
                                  (void*)(uintptr_t)context_ea, size_context,
                                  ls_pattern_ea, (u32)argument_ea);
-    if (rc != CELL_OK) return rc;
-    return _cellSpursSendSignal(taskset, vm_read32((u32)id_ea));
+    return rc;
 }
 
 /* The SDK's versioned taskset-attribute initializer. We forward taskset creation

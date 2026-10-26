@@ -409,6 +409,25 @@ static int s_gcm_syscall_mode = 0;
  * Internal helpers
  * -----------------------------------------------------------------------*/
 
+/* The guest's copy of the tables is the real thing once cellGcmGetOffsetTable
+ * has handed it out: titles keep the pointers and convert addresses inline
+ * (ioAddress[ea >> 20], 0xFFFF and up meaning unmapped) instead of calling
+ * cellGcmAddressToOffset. Publishing only inside cellGcmGetOffsetTable left
+ * every later map and unmap out of it. God of War: Ascension maps more main
+ * memory after taking the table, converts a command buffer pointer in it to
+ * `put`, gets -1, and the FIFO walker then runs off the end of its commands
+ * into shader microcode. From the first hand-out on, each changed entry is
+ * written through. */
+static int s_offset_tables_published;
+static void gcm_mirror_offset_entry(u32 ea_page, u32 io_page)
+{
+    if (!s_offset_tables_published) return;
+    if (ea_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + ea_page * 2, s_io_address_table[ea_page]);
+    if (io_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + io_page * 2, s_ea_address_table[io_page]);
+}
+
 /* Populate the offset table entries for an IO mapping */
 static void populate_offset_table(u32 ea, u32 io, u32 size)
 {
@@ -429,6 +448,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -442,6 +462,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -3390,6 +3411,7 @@ static void gcm_publish_offset_tables(void)
         vm_write16(GCM_OFFSET_TABLE_IO_ADDR + i * 2, s_io_address_table[i]);
         vm_write16(GCM_OFFSET_TABLE_EA_ADDR + i * 2, s_ea_address_table[i]);
     }
+    s_offset_tables_published = 1;   /* from here on, gcm_mirror_offset_entry */
 }
 
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)

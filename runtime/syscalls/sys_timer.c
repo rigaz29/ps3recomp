@@ -244,8 +244,34 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
-    if (usec >= 1000) {
+    /* SYS_USLEEP_SPIN_MAX_US (default 200): waits that long or longer sleep on
+     * this thread's high-resolution waitable timer; shorter ones spin below.
+     * Spinning every wait under 1 ms held a core per polling thread: God of
+     * War: Ascension's EdgeWatchdog polls with 800 us sleeps (12k a 10 s)
+     * and sat at 97-99% of a core on a 6-core host where the SPU workers
+     * needed it. */
+    static long s_spin_max = -1;
+    if (s_spin_max < 0) {
+        const char* e = getenv("SYS_USLEEP_SPIN_MAX_US");
+        s_spin_max = e ? atol(e) : 200;
+    }
+    static _Thread_local HANDLE s_hrt;
+    static _Thread_local int s_hrt_tried;
+    if (!s_hrt_tried) {
+        s_hrt_tried = 1;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        /* Windows 10 1803 and later; NULL before, and the paths below stand. */
+        s_hrt = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+    }
+    if (s_hrt && usec > 0 && (long)usec >= s_spin_max) {
+        LARGE_INTEGER due;
+        due.QuadPart = -((LONGLONG)usec * 10);   /* 100 ns units, relative */
+        if (SetWaitableTimer(s_hrt, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(s_hrt, INFINITE);
+    } else if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {
             LARGE_INTEGER due;

@@ -450,7 +450,37 @@ static void interp_stats_step(const spu_context* ctx)
     s_is_tot = 0; s_is_t0 = now;
 }
 
+/* SPU_INTERP_ENTRIES=<lo>-<hi> (hex LS): every distinct pc in [lo,hi) the
+ * interpreter is entered at, once, with the image that owns it. The stats
+ * above keep the eight busiest; a lift that misbehaves because one indirect
+ * target or return point is missing needs all of them, even the rare ones. */
+static void interp_entry_note(const spu_context* ctx, uint32_t pc)
+{
+    static uint32_t lo = 1, hi;
+    if (lo == 1) {
+        const char* e = getenv("SPU_INTERP_ENTRIES");
+        char* d;
+        lo = 0;
+        if (e) { lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') hi = (uint32_t)strtoul(d + 1, 0, 16); }
+    }
+    if (!hi || pc < lo || pc >= hi) return;
+    enum { SEEN = 1024 };
+    static uint32_t seen[SEEN]; static volatile long n;
+    for (long i = 0; i < n && i < SEEN; i++) if (seen[i] == pc) return;
+    const long k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+    if (k >= SEEN) return;
+    seen[k] = pc;
+    int owner = ctx->image_id;
+    for (unsigned s = 0; s < 4; ++s)
+        if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+            pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+            owner = ctx->resident_code[s].image_id;
+    fprintf(stderr, "[interp-entry] pc=0x%05X owner=%d lr=0x%05X\n", pc, owner,
+            ctx->gpr[0]._u32[0] & 0x3FFFC);
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    interp_entry_note(ctx, start_lsa & 0x3FFFC);
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */

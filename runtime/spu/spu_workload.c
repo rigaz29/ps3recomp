@@ -1310,9 +1310,36 @@ static void spu_taskset_wake_written(void* opaque)
 }
 
 /* Deliver a signal to a task (callable from any PPU/host thread). */
+/* SPU_SIG_TRACE=<ea>[,<ea>...] (hex, up to 8): 128-byte lines to follow --
+ * a taskset (its signalled bitset is at +0x40), a barrier, a control block.
+ * Every atomic commit to them, every WAIT_SIGNAL of a task of a listed
+ * taskset and every runtime-delivered signal is printed with a time stamp. */
+static int spu_sig_trace_hit(uint32_t ea)
+{
+    static uint32_t lines[8];
+    static int n = -1;
+    if (n < 0) {
+        int k = 0;
+        const char* e = getenv("SPU_SIG_TRACE");
+        while (e && *e && k < 8) {
+            lines[k++] = (uint32_t)strtoul(e, NULL, 16) & ~127u;
+            while (*e && *e != ',') e++;
+            if (*e == ',') e++;
+        }
+        n = k;
+    }
+    for (int i = 0; i < n; i++) if (lines[i] == (ea & ~127u)) return 1;
+    return 0;
+}
+
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
+    if (spu_sig_trace_hit(taskset_ea)) {   /* SPU_SIG_TRACE */
+        extern unsigned long long ps3_ms_now(void);
+        fprintf(stderr, "[sig] %llu SIGNAL task=%08X/%u from the runtime (caller %p)\n",
+                ps3_ms_now(), taskset_ea, taskId, __builtin_return_address(0));
+    }
     /* Update before taking s_sig_lock: watched-line notifications run under
      * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
     spu_signalled_update(taskset_ea, taskId, 1);

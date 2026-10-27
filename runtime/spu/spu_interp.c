@@ -475,8 +475,14 @@ static void interp_entry_note(const spu_context* ctx, uint32_t pc)
         if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
             pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
             owner = ctx->resident_code[s].image_id;
-    fprintf(stderr, "[interp-entry] pc=0x%05X owner=%d lr=0x%05X\n", pc, owner,
-            ctx->gpr[0]._u32[0] & 0x3FFFC);
+    const uint8_t* q = ctx->ls + pc;
+    fprintf(stderr, "[interp-entry] pc=0x%05X owner=%d lr=0x%05X code=%02X%02X%02X%02X %02X%02X%02X%02X res:",
+            pc, owner, ctx->gpr[0]._u32[0] & 0x3FFFC, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+    for (unsigned s2 = 0; s2 < 4; ++s2)
+        if (ctx->resident_code[s2].image_id)
+            fprintf(stderr, " %d@%05X-%05X/%d", ctx->resident_code[s2].image_id, ctx->resident_code[s2].lsa,
+                    ctx->resident_code[s2].lsa + ctx->resident_code[s2].size, ctx->resident_code[s2].verify_state);
+    fprintf(stderr, "\n");
 }
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {

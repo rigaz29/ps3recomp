@@ -1952,6 +1952,53 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* SPURS_WID_PROF=<seconds>: policy-module time per workload, every so many
+ * seconds -- runs/s, busy (percent of one core), mean run length, and the
+ * share of runs that returned without polling (found nothing to do). The
+ * workers' total says how busy the SPU side is; this says which workload. */
+#define WID_PROF_MAX 32
+static volatile LONG64 s_wp_ns[WID_PROF_MAX], s_wp_runs[WID_PROF_MAX], s_wp_empty[WID_PROF_MAX];
+static int wid_prof_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_WID_PROF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static u64 wid_prof_now_ns(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (u64)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+}
+static void wid_prof_note(u32 wid, u64 ns, unsigned polls)
+{
+    if (wid >= WID_PROF_MAX) return;
+    InterlockedAdd64(&s_wp_ns[wid], (LONG64)ns);
+    InterlockedIncrement64(&s_wp_runs[wid]);
+    if (!polls) InterlockedIncrement64(&s_wp_empty[wid]);
+    static volatile LONG64 last;
+    const u64 now = wid_prof_now_ns();
+    LONG64 l = last;
+    if (!l) { InterlockedCompareExchange64(&last, (LONG64)now, 0); return; }
+    const double win = (double)(now - (u64)l);
+    if (win < wid_prof_secs() * 1e9 || InterlockedCompareExchange64(&last, (LONG64)now, l) != l) return;
+    double total = 0;
+    for (u32 w = 0; w < WID_PROF_MAX; w++) total += (double)s_wp_ns[w];
+    fprintf(stderr, "[wid-prof] %.1fs: policy modules %.0f%% of one core\n", win / 1e9, total * 100.0 / win);
+    for (u32 w = 0; w < WID_PROF_MAX; w++) {
+        const LONG64 ns_w = InterlockedExchange64(&s_wp_ns[w], 0);
+        const LONG64 runs = InterlockedExchange64(&s_wp_runs[w], 0);
+        const LONG64 empty = InterlockedExchange64(&s_wp_empty[w], 0);
+        if (!runs) continue;
+        fprintf(stderr, "[wid-prof]   w%-2u %6.1f%%  %8.0f runs/s  %7.1f us/run  %3.0f%% empty\n",
+                w, ns_w * 100.0 / win, runs * 1e9 / win, ns_w / 1e3 / (double)runs,
+                empty * 100.0 / (double)runs);
+    }
+    fflush(stderr);
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -1971,10 +2018,21 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
+        const u64 wp_t0 = wid_prof_secs() ? wid_prof_now_ns() : 0;
+        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
+        if (wp_t0) wid_prof_note(slot->wid, wid_prof_now_ns() - wp_t0, polls);
+        /* PS3_FTRACE: a policy-module run is SPU busy time for its workload;
+         * the workers never wait on a channel, so nothing else records it. */
+        if (ft_t0) {
+            const uint64_t ft_t1 = ps3_ft_now();
+            if (ft_t1 - ft_t0 >= ps3_ft_min_ns())
+                ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid,
+                            ft_t0, ft_t1);
+        }
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;

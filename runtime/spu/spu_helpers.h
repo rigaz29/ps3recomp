@@ -464,21 +464,21 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ * as the byte loop; 8-12% of God of War: Ascension's lifted job code). SPU
+ * byte P lives at host byte SPU_W(P) = P ^ 3. The result's SPU byte t and the
+ * control's SPU byte t are both at host byte SPU_W(t), so each host position
+ * takes the control byte at the same host position, and only the source index
+ * needs the swap: SPU byte i of a or b is host byte i ^ 3. Swapping a, b, the
+ * control and the result into SPU order instead cost four more pshufb. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(0x03));
+    /* bit 4 (b, not a) moved to bit 7, the only bit blendv reads */
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
+    /* Special selectors, bit 7 set, by the top three bits: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+    const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, (char)0xFF, (char)0x80, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i special = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 5), _mm_set1_epi8(0x07)));
+    r = _mm_blendv_epi8(r, special, C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__ARM_NEON)
@@ -787,6 +787,12 @@ SPU__SF_V2(spu__fm_s, spu__fm_any(x, y))
 SPU__SF_V3(spu__fma_s,  spu__fma_any(x, y, z, 0, 0))
 SPU__SF_V3(spu__fms_s,  spu__fma_any(x, y, z, 0, 0x80000000u))
 SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
+/* SPU_FLOAT_RZ on x86 (spu_float_mode_enter, runtime/spu/spu_channels.c): MXCSR at round toward
+ * zero with flush-to-zero and denormals-are-zero while SPU code runs. g_spu_float_rz is set
+ * before the first run that switches the mode, and with it every run does, so lifted code reads
+ * the flag instead of MXCSR (see the AVX2 forms of spu_fa below). */
+#define SPU_MXCSR_RZFZ 0xE040u   /* FTZ (bit 15), RC = 11 toward zero (bits 13-14), DAZ (bit 6) */
+SPU_GATE int g_spu_float_rz = 0;
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* Four lanes at a time, every lane exact, with no FPCR change. The host rounds to nearest (the
  * thread's default FPCR: RN, no flush-to-zero -- writing FPCR per op serializes, ~17 ns on an
@@ -1105,9 +1111,7 @@ SPU__X8_INLINE u128 spu__x8_fa(u128 a, u128 b, uint32_t negb) {
     ok = _mm_and_si128(ok, pre);
     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb);
 }
-SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
-SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
-SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) {
+SPU__X8_INLINE u128 spu__x8_fm(u128 a, u128 b) {
     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
     __m128i ok, zm;
     const __m128i r = spu__x8_trunc0(_mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
@@ -1126,9 +1130,89 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)), spu__x8_plain0(z)));
     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc);
 }
-SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
-SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
-SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x8_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+/* SPU_FLOAT_RZ: in MXCSR's round toward zero with FTZ and DAZ, as the NEON RZ forms above, the
+ * host's own single-precision op truncates like the SPU and reads and writes a denormal as zero;
+ * what is left is the range check and the +0 rule. Overflow gives FLT_MAX in this mode, which the
+ * range check leaves to the per-lane path with Inf and NaN (an extended-range operand). The form
+ * is chosen by g_spu_float_rz: MXCSR can only be read through memory, and clang neither shares
+ * that read between ops nor keeps it off the exact path (it computed both forms and selected). */
+SPU__X8_INLINE __m128i spu__x8_z(__m128i x) {            /* biased exponent 0: an SPU zero */
+    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+}
+SPU__X8_INLINE __m128i spu__x8_inrange(__m128i s) {      /* |s| < FLT_MAX (Inf and NaN fail) */
+    return _mm_cmpgt_epi32(_mm_set1_epi32(0x7F7FFFFF), _mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)));
+}
+SPU__X8_INLINE __m128i spu__x8_flush(__m128i r) { return _mm_andnot_si128(spu__x8_z(r), r); }   /* zero: +0 */
+SPU__X8_INLINE __m128 spu__x8_f(__m128i v) { return _mm_castsi128_ps(v); }
+#if defined(SPU_FLOAT_RZ_CHECK)
+/* Check build (-DSPU_FLOAT_RZ_CHECK): every native result against the integer reference,
+ * which does not depend on MXCSR; mismatches are counted and the first ones printed with the
+ * operands and MXCSR. Slow; for checking a title's own data, not for play. */
+SPU_GATE volatile long long g_spu_rz_ops = 0, g_spu_rz_bad = 0;
+static __attribute__((noinline, cold, unused)) u128 spu__x8_rz_check(u128 got, int op, u128 a, u128 b, u128 c,
+                                                                    uint32_t negp, uint32_t negc) {
+    static const char* const name[3] = { "fa/fs", "fm", "fma" };
+    const long long n = __atomic_add_fetch(&g_spu_rz_ops, 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++) {
+        const uint32_t x = a._u32[i], y = b._u32[i], z = c._u32[i];
+        const uint32_t ref = op == 0 ? spu__fa_lane(x, y ^ negc) : op == 1 ? spu__fm_lane(x, y)
+                                     : spu__fma_lane(x, y, z, negp, negc);
+        if (got._u32[i] == ref) continue;
+        if (__atomic_add_fetch(&g_spu_rz_bad, 1, __ATOMIC_RELAXED) <= 32)
+            fprintf(stderr, "[spu-rz-check] %s MISMATCH a=%08X b=%08X c=%08X neg=%X/%X got=%08X ref=%08X mxcsr=%04X\n",
+                    name[op], x, y, z, negp, negc, got._u32[i], ref, _mm_getcsr());
+    }
+    if ((n & 0x3FFFFFF) == 0)
+        fprintf(stderr, "[spu-rz-check] %lld vector ops checked, %lld lanes differ\n", n, g_spu_rz_bad);
+    return got;
+}
+#define SPU__X8_RZ_CHECK(r, op, a, b, c, np, nc) spu__x8_rz_check(r, op, a, b, c, np, nc)
+#else
+#define SPU__X8_RZ_CHECK(r, op, a, b, c, np, nc) (r)
+#endif
+SPU__X8_INLINE u128 spu__x8_rz_fa(u128 a, u128 b, uint32_t negb) {
+    const __m128i x = spu__x8_ld(a), y = _mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb));
+    const __m128i s = _mm_castps_si128(_mm_add_ps(spu__x8_f(x), spu__x8_f(y)));
+    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
+    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb),
+                            0, a, b, b, 0, negb);
+}
+SPU__X8_INLINE u128 spu__x8_rz_fm(u128 a, u128 b) {
+    const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
+    const __m128i zp = _mm_or_si128(spu__x8_z(x), spu__x8_z(y));                 /* zero product */
+    const __m128i s = _mm_castps_si128(_mm_mul_ps(spu__x8_f(x), spu__x8_f(y)));
+    const __m128i ok = _mm_or_si128(spu__x8_inrange(s), zp);
+    const __m128i r = _mm_andnot_si128(zp, spu__x8_flush(s));
+    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b),
+                            1, a, b, b, 0, 0);
+}
+/* A zero product gives the addend as it is (extended range too), selected off the op's path. */
+SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    const __m128i xa = spu__x8_ld(a), y = spu__x8_ld(b), zc = spu__x8_ld(c);
+    const __m128i zp = _mm_or_si128(spu__x8_z(xa), spu__x8_z(y));                /* zero product */
+    const __m128i zi = _mm_andnot_si128(spu__x8_z(zc), _mm_xor_si128(zc, _mm_set1_epi32((int)negc)));
+    const __m128i x = _mm_xor_si128(xa, _mm_set1_epi32((int)negp));
+#if defined(__FMA__)
+    const __m128i s = _mm_castps_si128(_mm_fmadd_ps(spu__x8_f(x), spu__x8_f(y), spu__x8_f(zi)));
+#else
+    /* x*y is exact in double; the add truncates at 53 bits and the narrowing at 24, which is the
+     * truncation at 24: the 53-bit one lies between it and the exact sum */
+    const __m128i s = _mm_castps_si128(_mm256_cvtpd_ps(_mm256_add_pd(
+        _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), spu__x8_wide(zi))));
+#endif
+    const __m128i ok = _mm_or_si128(spu__x8_inrange(s), zp);
+    const __m128i r = _mm_blendv_epi8(spu__x8_flush(s), zi, zp);
+    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc),
+                            2, a, b, c, negp, negc);
+}
+#define SPU__X8_FA(a, b, nb) (g_spu_float_rz ? spu__x8_rz_fa(a, b, nb) : spu__x8_fa(a, b, nb))
+#define SPU__X8_FMA(a, b, c, np, nc) (g_spu_float_rz ? spu__x8_rz_fma(a, b, c, np, nc) : spu__x8_fma(a, b, c, np, nc))
+SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return SPU__X8_FA(a, b, 0); }
+SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return SPU__X8_FA(a, b, 0x80000000u); }
+SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return g_spu_float_rz ? spu__x8_rz_fm(a, b) : spu__x8_fm(a, b); }
+SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0); }            /* a*b + c */
+SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__X8_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #else
 static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
 static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
@@ -1350,10 +1434,10 @@ static inline u128 spu_dfcmgt_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){
 
 /* Double precision is IEEE round to nearest with denormals, and the double -> single of frds
  * rounds to nearest too. A thread running with SPU_FLOAT_RZ's FPCR (round toward zero,
- * flush-to-zero) computes them with the default FPCR: the operands and the result pass through
- * empty asm statements placed between the two FPCR writes, so the compiler cannot move a double
- * op outside them. Double precision is rare in SPU code; the two writes (~20 ns) only happen on
- * such a thread. */
+ * flush-to-zero; on x86 MXCSR's, with DAZ) computes them with the default: the operands and the
+ * result pass through empty asm statements placed between the two FPCR writes, so the compiler
+ * cannot move a double op outside them. Double precision is rare in SPU code; the two writes
+ * (~20 ns) only happen on such a thread. */
 #if defined(__aarch64__)
 static inline uint64_t spu__fpcr_now(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
 static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
@@ -1369,6 +1453,22 @@ static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :
     if (__builtin_expect(m == 0, 1)) return f##_h_(a, b, c); \
     spu__fpcr_put(0); __asm__ volatile("" : "+m"(a), "+m"(b), "+m"(c)); u128 r = f##_h_(a, b, c); \
     __asm__ volatile("" : "+m"(r)); spu__fpcr_put(m); return r; }
+#elif defined(__x86_64__) || defined(_M_X64)
+/* x86: SPU_MXCSR_RZFZ (rounding control, FTZ, DAZ) cleared for the op, the exception masks and
+ * flags kept; the same empty asm statements hold the op between the two writes. */
+#include <xmmintrin.h>
+#define SPU__DP_RN1(f) static inline u128 f(u128 a) { const unsigned m = _mm_getcsr(); \
+    if (__builtin_expect(!(m & SPU_MXCSR_RZFZ), 1)) return f##_h_(a); \
+    _mm_setcsr(m & ~SPU_MXCSR_RZFZ); __asm__ volatile("" : "+m"(a)); u128 r = f##_h_(a); \
+    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
+#define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { const unsigned m = _mm_getcsr(); \
+    if (__builtin_expect(!(m & SPU_MXCSR_RZFZ), 1)) return f##_h_(a, b); \
+    _mm_setcsr(m & ~SPU_MXCSR_RZFZ); __asm__ volatile("" : "+m"(a), "+m"(b)); u128 r = f##_h_(a, b); \
+    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
+#define SPU__DP_RN3(f) static inline u128 f(u128 a, u128 b, u128 c) { const unsigned m = _mm_getcsr(); \
+    if (__builtin_expect(!(m & SPU_MXCSR_RZFZ), 1)) return f##_h_(a, b, c); \
+    _mm_setcsr(m & ~SPU_MXCSR_RZFZ); __asm__ volatile("" : "+m"(a), "+m"(b), "+m"(c)); u128 r = f##_h_(a, b, c); \
+    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
 #else
 #define SPU__DP_RN1(f) static inline u128 f(u128 a) { return f##_h_(a); }
 #define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { return f##_h_(a, b); }

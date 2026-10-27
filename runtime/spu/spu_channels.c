@@ -242,8 +242,9 @@ void spu_stop(spu_context* ctx)
  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
+ * the default around itself inside a run. arm64, and x86-64 with MXCSR (the AVX2 forms; the
+ * scalar ones the interpreter uses are exact in either mode); elsewhere the exact forms always
+ * run. Returns the FPCR (MXCSR) to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -260,6 +261,23 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    /* x86: MXCSR at round toward zero with FTZ and DAZ (SPU_MXCSR_RZFZ). Lifted code picks its
+     * forms by g_spu_float_rz rather than by reading MXCSR, so the flag is set before any run
+     * switches the mode, and from then on every run does. */
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_ACQUIRE);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
+    }
+    if (!on) return ~0ull;
+    const unsigned v = _mm_getcsr();
+    if ((v & SPU_MXCSR_RZFZ) == SPU_MXCSR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
+    _mm_setcsr(v | SPU_MXCSR_RZFZ);
+    return v;
 #else
     return ~0ull;
 #endif
@@ -268,6 +286,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
 #else
     (void)outer;
 #endif

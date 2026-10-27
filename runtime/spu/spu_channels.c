@@ -659,6 +659,16 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    if ((void*)ctx == g_spurs_pm_trace_ctx) {   /* SPURS_PM_TRACE_WID */
+        const uint8_t* d = cmd == MFC_GETLLAR_CMD ? mem : ls;
+        fprintf(stderr, "[pm-wid]   %s ea=0x%08X lsa=0x%05X pc=0x%05X:",
+                cmd == MFC_GETLLAR_CMD ? "GETLLAR" : cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC",
+                ea, lsa, (uint32_t)ctx->pc & SPU_LS_MASK);
+        for (uint32_t o = 0; o < 0x50; o += 4)
+            fprintf(stderr, "%s%02X%02X%02X%02X", (o && !(o & 15)) ? " | " : " ",
+                    d[o], d[o + 1], d[o + 2], d[o + 3]);
+        fprintf(stderr, "\n");
+    }
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;

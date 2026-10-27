@@ -1166,7 +1166,13 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
             int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
             while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
                                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-            s_parked_obj[i] = wait_obj; s_parked[i] = key;
+            /* Claim the slot: two tasks parking at once found the same free
+             * one, and the second store left the first task unlisted -- "not
+             * parked" for as long as it waited. */
+            uint64_t expect = 0;
+            if (!__atomic_compare_exchange_n(&s_parked[i], &expect, key, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+            s_parked_obj[i] = wait_obj;
             __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1177,7 +1183,8 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
         if (s_parked[i] == key) {
-            s_parked[i] = 0;
+            s_parked_obj[i] = 0;   /* "unknown" until the next owner sets its own */
+            __atomic_store_n(&s_parked[i], 0, __ATOMIC_RELEASE);
             __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }

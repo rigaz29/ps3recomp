@@ -123,6 +123,12 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 
+/* rsx_fp_decompile_ex with per-unit texture gamma masks (RGBA lanes to decode
+ * from sRGB on fetch, rsx_texture_gamma_mask); NULL means none. */
+int rsx_fp_decompile_color_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                              u32 tex_cube_mask, const u8 gamma_masks[16],
+                              char* out, u32 out_size);
+
 /* Buffered-constant variant of rsx_fp_decompile_ex. Inline CONST payloads are
  * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
  * printed as HLSL literals. `out_constant_count` receives the exact slot

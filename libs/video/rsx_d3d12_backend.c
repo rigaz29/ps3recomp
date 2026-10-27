@@ -264,6 +264,11 @@ typedef struct {
                          * edge slivers instead of fullscreen). A fight in
                          * SoulCalibur II HD uses more than 16. */
 
+/* Not a SHADER_CONTROL bit: the draw's colour outputs are encoded to sRGB
+ * (SET_SHADER_PACKER on an integer colour target). It rides in the recorded
+ * control word so the pipeline key separates the two compiles. */
+#define FP_CTRL_SRGB_OUT 0x00800000u
+
 /* Compiled guest-FP pipeline cache: decompiled VS (by cache slot) + decompiled
  * PS (fragment ucode at fp_addr). */
 typedef struct {
@@ -287,6 +292,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     int raw;                /* raw-fetch VS, no input layout (PSO key) */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
+    u32 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     ID3D12PipelineState* pso;
     struct ShaderJob* job;  /* pso still building (D3D12_ASYNC_SHADERS) */
 } VPFPEntry;
@@ -4138,6 +4144,24 @@ static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char
 }
 
 /* Which of a draw's texture units are cube textures, as a 4-bit mask. */
+/* The RGBA lanes each unit's fetch decodes from sRGB (TEXTURE_ADDRESS gamma
+ * bits, after the remap), 4 bits per unit. A title that encodes its output to
+ * sRGB keeps its colour textures sRGB-encoded too and has the fetch decode
+ * them; without the decode they come out too light once the output encodes.
+ * RSX_NO_SRGB=1 turns this off with the output side. */
+static u32 dr_gamma_key(const D3D12DrawRecord* dr)
+{
+    static int no_srgb = -1;
+    if (no_srgb < 0) no_srgb = getenv("RSX_NO_SRGB") ? 1 : 0;
+    if (no_srgb) return 0;
+    u32 k = 0;
+    for (int u = 0; u < 4; u++)
+        if (dr->tex[u].set)
+            k |= (u32)(rsx_texture_gamma_mask(dr->tex[u].fmt, dr->tex[u].ctrl1, dr->tex[u].filter,
+                                              dr->tex[u].addr) & 15u) << (4 * u);
+    return k;
+}
+
 static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 {
     /* ON by default (RSX_CUBE_TEX=0 to disable). This was off while the cube path
@@ -4183,7 +4207,7 @@ static ID3D12PipelineState* vp_fp_ready(VPFPEntry* q)
  * skipped rather than drawn with another program. */
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
-                                          u32 cube_mask, int raw, u64 zs)
+                                          u32 cube_mask, int raw, u64 zs, u32 gamma)
 {
     s_pso_pending = 0;
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
@@ -4251,6 +4275,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
+            s_d3d.vp_fp[i].gamma == gamma &&
             s_d3d.vp_fp[i].zs == zs)
             return vp_fp_ready(&s_d3d.vp_fp[i]);
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -4314,8 +4339,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * RSX_FP_CTRL_AUTO=1 restores the guess. */
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
-    u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+    u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : (ctrl & ~FP_CTRL_SRGB_OUT);
+    u8 gamma_masks[16] = {0};
+    for (int u = 0; u < 4; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
+    int n = rsx_fp_decompile_color_ex(vm_base + off, 4096, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
+                                      hlsl, sizeof(hlsl));
+    /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
+     * before they reach an integer target. */
+    if (n > 0 && !ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
+        rsx_fp_apply_srgb_output(hlsl, sizeof(hlsl)) < 0) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: sRGB output not applied (shape)%c", fp_addr, 10);
+    }
     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
@@ -4666,6 +4702,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].gamma     = gamma;
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
@@ -5590,7 +5627,15 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 static u32 rec_fp_ctrl(void)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
-    return st ? (st->shader_control & FP_CTRL_BITS) : CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+    if (!st) return CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+    u32 c = st->shader_control & FP_CTRL_BITS;
+    /* RSX_NO_SRGB=1: ignore the packer (outputs stay linear, as before). */
+    static int no_srgb = -1;
+    if (no_srgb < 0) no_srgb = getenv("RSX_NO_SRGB") ? 1 : 0;
+    if (!no_srgb && rsx_fp_srgb_output_enabled(st->shader_packer, st->shader_control,
+                                               st->surface_format & 0x1Fu))
+        c |= FP_CTRL_SRGB_OUT;
+    return c;
 }
 
 /* The draw's depth surface (none when the surface format has no depth), and
@@ -6937,7 +6982,7 @@ static void rf_prepass(u32 from, u32 to)
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
-                                       dr->zs_key);
+                                       dr->zs_key, dr_gamma_key(dr));
         s_sj_nowait = 0;
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
@@ -7384,7 +7429,8 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->raw, dr->zs_key) : NULL;
+                                                dr_cube_mask(dr), dr->raw, dr->zs_key,
+                                                dr_gamma_key(dr)) : NULL;
                 /* Its program is still being built: skip the draw this frame
                  * rather than draw it with another one. */
                 s_sj_nowait = 0;

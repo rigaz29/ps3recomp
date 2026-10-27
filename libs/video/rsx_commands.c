@@ -918,6 +918,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_SHADER_PACKER) {
+        state->shader_packer = data;
+        return 0;
+    }
     if (method == NV4097_SET_SHADER_CONTROL) {
         { static int _sc=0; if (PS3_LOG_FIRST(_sc, 12) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }

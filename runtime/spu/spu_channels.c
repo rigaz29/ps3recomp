@@ -2069,6 +2069,22 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         for (unsigned i = 0; match && i < o->code_count; ++i)
             match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        /* SPU_OVL_VERIFYLOG=1: a resident span whose bytes do not match its
+         * lift, with the first differing address (the span runs interpreted). */
+        { static int on = -1; static long n;
+          if (on < 0) on = getenv("SPU_OVL_VERIFYLOG") ? 1 : 0;
+          if (on && !match && (++n <= 64 || (n & 1023) == 0)) {
+              uint32_t at = 0, len = 0;
+              for (unsigned i = 0; i < o->code_count && !len; ++i)
+                  for (uint32_t k = 0; k < o->code[i].size; ++k)
+                      if (ctx->ls[o->code[i].lsa + k] != o->code[i].bytes[k]) {
+                          at = o->code[i].lsa + k;
+                          while (k < o->code[i].size && ctx->ls[o->code[i].lsa + k] != o->code[i].bytes[k]) { k++; len++; }
+                          break;
+                      }
+              fprintf(stderr, "[ovl-verify] #%ld image=%d rejected: first difference at LS 0x%05X (%u bytes) pc=0x%05X\n",
+                      n, ctx->resident_code[slot].image_id, at, len, (uint32_t)ctx->pc & SPU_LS_MASK);
+          } }
     }
     return *state == SPU_OVERLAY_VERIFIED;
 }
@@ -2257,6 +2273,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+                /* SPU_OVL_CLEARLOG=1: the GET that ends a resident code span's
+                 * residency (its lifted code goes to the interpreter after). */
+                { static int on = -1; static long n;
+                  if (on < 0) on = getenv("SPU_OVL_CLEARLOG") ? 1 : 0;
+                  if (on && (++n <= 64 || (n & 1023) == 0))
+                      fprintf(stderr, "[ovl-clear] #%ld image=%d span=0x%05X-0x%05X src=0x%08X by GET ea=0x%08X lsa=0x%05X size=0x%X pc=0x%05X\n",
+                              n, ctx->resident_code[slot].image_id, base, end,
+                              ctx->resident_code[slot].source_ea, ea, lsa, size,
+                              (uint32_t)ctx->pc & SPU_LS_MASK); }
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
             } else if (ctx->resident_code[slot].verify_state) {

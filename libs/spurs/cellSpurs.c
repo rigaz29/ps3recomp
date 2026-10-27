@@ -1239,10 +1239,12 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
-                   " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
-                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
-                   context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
+            { static int _n = 0;   /* the first few, then only with PS3_VERBOSE */
+              if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+                printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                       " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                       s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+                       context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]); }
 
             /* One-shot: dump the memory the task argument points at, to find the
              * pointer that reads back 0 (the task GETs from EA 0 -> some field of

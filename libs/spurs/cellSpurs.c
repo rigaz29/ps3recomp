@@ -1999,6 +1999,20 @@ static void wid_prof_note(u32 wid, u64 ns, unsigned polls)
     fflush(stderr);
 }
 
+/* The workload each policy-module worker is running, by host thread id (-1
+ * between runs), for the PS3_SAMPLE_THREAD profiler: it records it with each
+ * sample of a worker, so a profile splits by workload as SPURS_WID_PROF does. */
+#define PM_NOW_MAX 32
+static volatile LONG s_pm_now_n;
+static volatile LONG s_pm_now_tid[PM_NOW_MAX], s_pm_now_wid[PM_NOW_MAX];
+int spurs_pm_current_wid(unsigned long tid)
+{
+    const LONG n = s_pm_now_n < PM_NOW_MAX ? s_pm_now_n : PM_NOW_MAX;
+    for (LONG i = 0; i < n; i++)
+        if ((unsigned long)s_pm_now_tid[i] == tid) return (int)s_pm_now_wid[i];
+    return -1;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2012,6 +2026,13 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
+    LONG now_i = PM_NOW_MAX;
+#ifdef _WIN32
+    if (s_pm_now_n < PM_NOW_MAX) {
+        now_i = InterlockedIncrement(&s_pm_now_n) - 1;
+        if (now_i < PM_NOW_MAX) { s_pm_now_wid[now_i] = -1; s_pm_now_tid[now_i] = (LONG)GetCurrentThreadId(); }
+    }
+#endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
@@ -2020,8 +2041,10 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ReleaseSRWLockExclusive(&si->lock);
         const u64 wp_t0 = wid_prof_secs() ? wid_prof_now_ns() : 0;
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        if (now_i < PM_NOW_MAX) s_pm_now_wid[now_i] = (LONG)slot->wid;
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        if (now_i < PM_NOW_MAX) s_pm_now_wid[now_i] = -1;
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         if (wp_t0) wid_prof_note(slot->wid, wid_prof_now_ns() - wp_t0, polls);

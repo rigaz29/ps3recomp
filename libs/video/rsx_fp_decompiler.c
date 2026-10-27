@@ -905,6 +905,11 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+        /* Screen-space derivatives. God of War: Ascension's font is a distance
+         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+         * an unhandled op the destination kept 0 and every glyph bloated. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */

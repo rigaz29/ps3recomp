@@ -1006,6 +1006,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     g_ydkj_real_taskset_ea = taskset_ea;
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
+    /* Known to the runtime from now on, so tasks an SPU creates in it start
+     * (spu_taskset_line_committed). */
+    extern void spu_taskset_register(uint32_t ea);
+    spu_taskset_register(taskset_ea);
     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
     return CELL_OK;
 }

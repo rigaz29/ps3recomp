@@ -68,6 +68,17 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
+/* NV4097_INLINE_ARRAY: vertices pushed through the FIFO rather than read from
+ * arrays. While g_rsx_inline is set (rsx_commands.c, for the one draw it
+ * issues), every enabled attribute is read from it: attribute a of vertex i at
+ * base + i * stride + off[a], in the PS3's byte order. */
+typedef struct rsx_inline_src {
+    const u8* base;
+    u32 stride, count;
+    u32 off[16];
+} rsx_inline_src;
+extern const rsx_inline_src* g_rsx_inline;
+
 #ifdef __cplusplus
 }
 #endif

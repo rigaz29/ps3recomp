@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "rsx_vertex_fetch.h"   /* rsx_inline_src, g_rsx_inline */
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -27,6 +28,50 @@
  * -----------------------------------------------------------------------*/
 
 static rsx_backend* s_backend = NULL;
+/* NV4097_INLINE_ARRAY: the words of the current BEGIN/END, in the PS3's byte
+ * order. A full-screen pass sends a handful of vertices this way. */
+#define RSX_INLINE_MAX (256u * 1024u)
+static u8  s_inline_buf[RSX_INLINE_MAX];
+static u32 s_inline_words;   /* INLINE_ARRAY words since the last BEGIN_END */
+
+/* Bytes one component of a vertex array type takes (SET_VERTEX_DATA_ARRAY_FORMAT
+ * [3:0]); CMP packs a whole vector in one word. */
+static u32 rsx_inline_attr_bytes(const rsx_vertex_attrib* a)
+{
+    switch (a->type) {
+    case 1: case 3: case 5: return 2u * a->size;   /* S1, SF, S32K */
+    case 2:                 return 4u * a->size;   /* F */
+    case 6:                 return 4u;             /* CMP */
+    default:                return a->size;        /* UB, UB256 */
+    }
+}
+
+/* Draw the batch: the enabled attributes are interleaved in index order, and
+ * the arrays' common stride (when the title sets one) is the vertex size. */
+static void rsx_inline_draw(rsx_state* state)
+{
+    rsx_inline_src src;
+    memset(&src, 0, sizeof src);
+    u32 size = 0, stride = 0;
+    for (u32 a = 0; a < RSX_MAX_VERTEX_ATTRIBS && a < 16; a++) {
+        const rsx_vertex_attrib* at = &state->vertex_attribs[a];
+        if (!at->enabled) continue;
+        src.off[a] = size;
+        size += rsx_inline_attr_bytes(at);
+        if (at->stride > stride) stride = at->stride;
+    }
+    if (stride < size) stride = size;
+    const u32 bytes = s_inline_words * 4u;
+    if (!stride || bytes < stride) return;
+    src.base = s_inline_buf;
+    src.stride = stride;
+    src.count = bytes / stride;
+    if (s_backend && s_backend->draw_arrays) {
+        g_rsx_inline = &src;
+        s_backend->draw_arrays(s_backend->userdata, state->primitive_type, 0, src.count);
+        g_rsx_inline = NULL;
+    }
+}
 
 /* Last NV406E_SET_REFERENCE value seen in the FIFO. The title writes a
  * reference then spins on the GCM control register's `ref` field until the RSX
@@ -885,6 +930,33 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             }
         } else {
             state->in_begin_end = 0;
+            /* INLINE_DBG=1: the INLINE_ARRAY batches (first 32): primitive,
+             * words, program, target and the enabled array formats. */
+            if (s_inline_words) {
+                static int on = -1, n = 0;
+                if (on < 0) on = getenv("INLINE_DBG") ? 1 : 0;
+                if (on && n < 32) {
+                    n++;
+                    fprintf(stderr, "[INLINE] prim=%u words=%u fp=0x%08X rt=0x%X fmts:",
+                            state->primitive_type, s_inline_words, state->shader_program,
+                            state->surface_color_offset[0]);
+                    for (u32 a = 0; a < RSX_MAX_VERTEX_ATTRIBS; a++)
+                        if (state->vertex_attribs[a].enabled)
+                            fprintf(stderr, " %u:0x%X", a, state->vertex_attribs[a].format);
+                    fprintf(stderr, "%c", 10);
+                }
+                rsx_inline_draw(state);
+                s_inline_words = 0;
+            }
+        }
+        return 0;
+    }
+    if (method == 0x1818u) {   /* NV4097_INLINE_ARRAY: one word of vertex data */
+        if (s_inline_words < RSX_INLINE_MAX / 4u) {
+            u8* q = s_inline_buf + s_inline_words * 4u;
+            q[0] = (u8)(data >> 24); q[1] = (u8)(data >> 16);
+            q[2] = (u8)(data >> 8);  q[3] = (u8)data;
+            s_inline_words++;
         }
         return 0;
     }
@@ -920,6 +992,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 
     if (method == NV4097_SET_SHADER_PACKER) {
         state->shader_packer = data;
+        return 0;
+    }
+    if (method == NV4097_SET_SHADER_WINDOW) {
+        state->shader_window = data;
         return 0;
     }
     if (method == NV4097_SET_SHADER_CONTROL) {

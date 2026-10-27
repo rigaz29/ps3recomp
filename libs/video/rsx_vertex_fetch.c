@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+const rsx_inline_src* g_rsx_inline = NULL;
+
 float rsx_rd_bef(const u8* p)
 {
     u32 w; memcpy(&w, p, 4);
@@ -39,6 +41,12 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     out[3] = st->vertex_data4f[idx][3];
 
     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+    const u8* p;
+    if (g_rsx_inline) {
+        if (!a->enabled || vi >= g_rsx_inline->count) return;
+        p = g_rsx_inline->base + (size_t)vi * g_rsx_inline->stride + g_rsx_inline->off[idx];
+        goto convert;
+    }
     if (!a->enabled || a->stride == 0 || !vm_base) return;
 
     /* Vertex frequency divisor (instancing). An ordinary array
@@ -72,10 +80,11 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
      * collapsed to the origin, while non-indexed geometry whose arrays lie
      * outside the shadowed pages drew fine. */
     u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
-    const u8* p = vm_base + ((a->offset & 0x80000000u)
+    p = vm_base + ((a->offset & 0x80000000u)
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
 
+convert:;
     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
     switch (a->type) {
     case 2: /* CELL_GCM_VERTEX_F: float32 BE */

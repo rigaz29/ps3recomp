@@ -1173,6 +1173,19 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     spu_lockline_unlock();
 }
 
+/* Set by a renderer that keeps what it draws on the GPU (the D3D12 backend):
+ * told of each unscaled 32-bit copy out of a display buffer, in FIFO order,
+ * before the guest-memory copy, which moves only what the CPU side holds. The
+ * source is given as the display buffer's offset and the pixel the copy starts
+ * at; the destination as an effective address. */
+void (*cellGcm_blit_observer)(int src_display, u32 src_off, u32 sx, u32 sy, u32 src_pitch,
+                              u32 dst_ea, u32 dst_pitch, u32 w, u32 h) = NULL;
+/* The same renderer, told of each unscaled 32-bit copy from local memory to
+ * local memory: the byte offsets of the first source and destination pixels
+ * and the pitches. */
+void (*cellGcm_blit_local_observer)(u32 src_off, u32 src_pitch, u32 dst_off, u32 dst_pitch,
+                                    u32 w, u32 h) = NULL;
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -1184,8 +1197,20 @@ static void nv3089_blit(void)
      * capture covers the scene of interest instead of the first N since boot. */
     { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;
       if (gate == (const char*)-1) gate = getenv("NV3089_GATE");
-      if (gate) {
+      /* NV3089_LOG_AFTER=<flips>: the same lines for the first 64 blits after
+       * that many flip requests -- a scene reached late, where blits are too
+       * few for the gate's every-64th poll to open in time. */
+      { static long after = -2; static int logged;
+        if (after == -2) { const char* e = getenv("NV3089_LOG_AFTER"); after = e ? atol(e) : -1; }
+        if (after >= 0 && logged < 64 && cellGcm_flip_request_count() >= (unsigned)after) {
+            logged++;
+            if (!gate) gate = "";   /* print below */
+            open_gate = 1;
+        } else if (after >= 0 && !getenv("NV3089_GATE")) open_gate = 0; }
+      if (gate && *gate) {
           if ((poll++ & 63u) == 0) { FILE* g = fopen(gate, "rb"); open_gate = g != NULL; if (g) fclose(g); }
+      }
+      if (gate) {
           if (open_gate) {
               int _sl = (s_nv3089.src_dma != 0xFEED0001u), _dl = (s_gcm2d.dst_dma != 0xFEED0001u);
               printf("[NV3089G] fmt=0x%X out=%ux%u at %u,%u in=%ux%u uv=0x%08X ds=0x%X dt=0x%X src=0x%08X/%u dst=0x%08X/%u swz=%d%c",
@@ -1219,6 +1244,35 @@ static void nv3089_blit(void)
                                         dst_pitch, out_x, out_y, out_w, out_h);
         if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
             rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
+    }
+    if (cellGcm_blit_observer && !rsx_live_draw_enabled() && !s_nv309e.active &&
+        s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        ((s_nv3089.fmt & 0xFF) == 3u || (s_nv3089.fmt & 0xFF) == 4u) &&
+        s_nv3089.src_dma != 0xFEED0001u) {
+        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+        const u32 so = s_nv3089.in_off + v0 * in_pitch + u0 * 4u;
+        for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++) {
+            const CellGcmDisplayInfo* db = &s_display_buffers[i];
+            if (!s_display_buffer_set[i] || db->pitch != in_pitch || so < db->offset ||
+                so - db->offset >= db->pitch * db->height)
+                continue;
+            const u32 rel = so - db->offset;
+            const int dl = (s_gcm2d.dst_dma != 0xFEED0001u);
+            cellGcm_blit_observer(1, db->offset, (rel % db->pitch) / 4u, rel / db->pitch, in_pitch,
+                                  cellGcmResolveLocated(dl, s_gcm2d.dst_offset)
+                                      + out_y * dst_pitch + out_x * 4u,
+                                  dst_pitch, out_w, out_h);
+            break;
+        }
+    }
+    if (cellGcm_blit_local_observer && !rsx_live_draw_enabled() && !s_nv309e.active &&
+        s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        ((s_nv3089.fmt & 0xFF) == 3u || (s_nv3089.fmt & 0xFF) == 4u) &&
+        s_nv3089.src_dma != 0xFEED0001u && s_gcm2d.dst_dma != 0xFEED0001u) {
+        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+        cellGcm_blit_local_observer(s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch,
+                                    s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u, dst_pitch,
+                                    out_w, out_h);
     }
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
@@ -3183,6 +3237,14 @@ int cellGcmOffsetIsDisplay(u32 offset)
         if (s_display_buffer_set[i] && s_display_buffers[i].offset == offset)
             return 1;
     return 0;
+}
+
+/* Backend query: the offset of display buffer `id`, or 0xFFFFFFFF when it is
+ * not registered. */
+u32 cellGcm_display_buffer_offset(u32 id)
+{
+    if (id >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[id]) return 0xFFFFFFFFu;
+    return s_display_buffers[id].offset;
 }
 
 /* NID: 0xEAA52F23 */

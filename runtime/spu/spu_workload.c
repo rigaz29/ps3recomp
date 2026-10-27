@@ -624,8 +624,13 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+        /* Per-task lines: the first few, then only with PS3_VERBOSE. A title
+         * that starts ten tasks a frame (God of War: Ascension's particle work)
+         * otherwise writes them all through the one stderr lock. */
+        { static int _n = 0;
+          if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+            fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                            "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task); }
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
     }
@@ -839,9 +844,11 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    { static int _n = 0;
+                      if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+                        fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                                "taskset=0x%08X task=%u\n", j->image_id,
+                                j->taskset_ea, j->taskid); }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -979,8 +986,10 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            { static int _n = 0;
+              if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+                fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                        "(job ran to completion, did not loop)\n", j->image_id, rc); }
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
         }
@@ -1611,9 +1620,11 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    { static int _n = 0;
+      if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+            (unsigned long long)fp, args_ea, image_id); }
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word

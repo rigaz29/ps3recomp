@@ -172,7 +172,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
+    enum { SPURS_PM_MAX_WKL = 32 };   /* a CellSpurs2 has 32 workloads (slots[32][6]) */
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     struct PmSlot* resident = policy_slot(spurs_ea, wid, spu_num);
     if (!resident) return -1;

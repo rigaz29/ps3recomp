@@ -183,6 +183,9 @@ typedef struct {
      * offset blit_src (pitch blit_sp) to blit_dst (pitch blit_dp), replayed
      * between the targets that hold them (blit_rt_copy). */
     int   is_blit;
+    /* Flip op (also is_clear): RSX_DISPLAY_RT's key of the display buffer a
+     * flip named at this point of the batch (d3d12_flip_observed). */
+    u32   flip_key;
     u16   tex_zok;      /* prepass: units whose offset a depth surface wrote
                          * last (or nothing seen yet), so may be read as depth */
     u32   blit_src, blit_sp, blit_dst, blit_dp, blit_w, blit_h;
@@ -3556,6 +3559,8 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
             const D3D12DrawRecord* r = &s_d3d.draws[d];
             if (r->snap_ea)
                 fprintf(mf, "op%03u SNAP  ea=0x%08X slot=%d src=0x%X\n", d, r->snap_ea, r->snap_slot, r->snap_src);
+            else if (r->flip_key)
+                fprintf(mf, "op%03u FLIP  0x%08X\n", d, r->flip_key);
             else if (r->is_blit)
                 fprintf(mf, "op%03u BLIT  0x%X/%u -> 0x%X/%u %ux%u\n", d, r->blit_src, r->blit_sp,
                         r->blit_dst, r->blit_dp, r->blit_w, r->blit_h);
@@ -6045,7 +6050,7 @@ static u32 rec_surface_a(void)
 static void rec_not_copy(D3D12DrawRecord* dr)
 {
     dr->snap_ea = 0; dr->snap_slot = -1; dr->snap_src = 0;
-    dr->is_blit = 0;
+    dr->is_blit = 0; dr->flip_key = 0;
 }
 
 static u32 rec_wpos_win(void)
@@ -6930,6 +6935,35 @@ static void d3d12_blit_observed(int src_display, u32 src_off, u32 sx, u32 sy, u3
                   src_off, sx, sy, w, h, dst_ea, base, 10); }
 }
 
+/* cellGcm_flip_observer: a flip named a display buffer at this point of the
+ * stream. Presenting the flipped buffer's target at the end of the batch shows
+ * whatever the batch drew into it after the flip too: once God of War:
+ * Ascension's SPU work stopped holding it back, the drain passed several
+ * flips per present and the screen showed a buffer whose next frame was half
+ * drawn -- its scene without the post chain or the menu. Recorded as an op,
+ * the replay copies the buffer to the backbuffer right there (the last flip of
+ * the batch wins). FLIP_AT_OP=0: present the buffer at the batch's end. */
+static void d3d12_flip_observed(u32 buffer_id)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
+    extern u32 cellGcm_display_buffer_offset(u32 id);
+    if (!on || !display_rt_on() || !s_d3d.initialized || s_d3d.draw_count >= MAX_DRAWS) return;
+    const u32 o = cellGcm_display_buffer_offset(buffer_id);
+    if (o == 0xFFFFFFFFu) return;
+    D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
+    memset(dr, 0, sizeof(*dr));
+    dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1; dr->snap_slot = -1;
+    dr->flip_key = DISP_RT_TAG | o;
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("FLIP_PATH_DBG"); cap = e ? atoi(e) : 0; }
+      if (n < cap) { n++; fprintf(stderr, "[flip-op] buffer %u at op %u%c", buffer_id,
+                                  s_d3d.draw_count - 1, 10); } }
+    s_d3d.merge_prev_draw = 0;
+    s_ix_run_valid = 0;
+    s_raw_run_valid = 0;
+}
+
 /* cellGcm_blit_local_observer: a copy between two places in local memory. God
  * of War: Ascension's menu copies a rectangle of the previous frame's display
  * buffer into its scene target, shifted, every frame (its drifting ink); with
@@ -7230,16 +7264,27 @@ static u32 s_last_drawn_off  = 0;
 
 void rsx_d3d12_composite_from_offscreen(u32 raw_off) { s_composite_src = raw_off; }
 
+static int s_flip_shown;   /* a flip op already put this batch's frame on the backbuffer */
+static void composite_copy(u32 fi, int i, u32 want);
+
 static void composite_present(u32 fi)
 {
     u32 want = s_composite_src;
     s_composite_src = 0;
+    if (s_flip_shown) { s_flip_shown = 0; return; }
     if (!want) return;
     /* want == 2 means "whatever this frame's draws targeted" -- the one thing
      * guaranteed to hold geometry, and immune to the offset collision above. */
     int i;
     if (want == 2u) { i = s_last_drawn_slot; want = s_last_drawn_off; }
     else            { i = off_rt_find(want); }
+    composite_copy(fi, i, want);
+}
+
+/* Copy offscreen target i (key want, for the log) to frame fi's backbuffer,
+ * which is a render target in the frame's list. */
+static void composite_copy(u32 fi, int i, u32 want)
+{
     if (i < 0 || !s_d3d.off_rt[i].res) return;
     OffRT* r = &s_d3d.off_rt[i];
     /* Same-format copy only; a half-float source would need a converting draw. */
@@ -8215,6 +8260,12 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 if (!dr->is_vp) continue;
                 if (dr->snap_ea) { blit_snap_take(dr, fi); continue; }
                 if (dr->is_blit) { blit_rt_copy(dr); force_rebind = 1; continue; }
+                if (dr->flip_key) {
+                    composite_copy(fi, off_rt_find(dr->flip_key), dr->flip_key);
+                    s_flip_shown = 1;
+                    force_rebind = 1;
+                    continue;
+                }
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     if (dr->is_clear || dr->tex_cv[_u] < 0 || dr->tex_rt[_u] < 0 ||
                         dr->tex_rt[_u] == cur_rt)
@@ -11326,7 +11377,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     { extern void (*cellGcm_blit_observer)(int, u32, u32, u32, u32, u32, u32, u32, u32);
       extern void (*cellGcm_blit_local_observer)(u32, u32, u32, u32, u32, u32);
       cellGcm_blit_observer = d3d12_blit_observed;
-      cellGcm_blit_local_observer = d3d12_blit_local_observed; }
+      cellGcm_blit_local_observer = d3d12_blit_local_observed;
+      extern void (*cellGcm_flip_observer)(u32);
+      cellGcm_flip_observer = d3d12_flip_observed; }
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();

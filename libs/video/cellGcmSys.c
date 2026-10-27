@@ -156,9 +156,14 @@ int cellGcm_take_flip_pending(void)
 /* The flip now names this buffer. The shared draw engine presents on the
  * host's call and only learns a buffer from 0xE944 by itself, so it would
  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
+/* The renderer, told of each flip at its place in the command stream, so it
+ * can show the buffer as it was then rather than at the end of the batch. */
+void (*cellGcm_flip_observer)(u32 buffer_id) = NULL;
+
 static void gcm_set_current_display_buffer(u32 bufferId)
 {
     s_current_display_buffer_id = bufferId;
+    if (cellGcm_flip_observer) cellGcm_flip_observer(bufferId);
     if (rsx_draw_engine_enabled())
         rsx_draw_engine_note_flip(bufferId);
 }
@@ -3261,6 +3266,12 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    /* FLIP_PATH_DBG=<n>: the first n flip requests, queued in the FIFO or
+     * taken at once (a full command buffer falls back to the latter). */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("FLIP_PATH_DBG"); cap = e ? atoi(e) : 0; }
+      if (n < cap) { n++; fprintf(stderr, "[flip-path] buffer %u %s%c", bufferId,
+                                  in_fifo ? "queued in the FIFO" : "at once", 10); } }
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on
@@ -3361,10 +3372,19 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
-    /* Never near the end: those bytes are the title's reserve before its
-     * ring wraps, and the recycle above keys on them. On a segmented ring a
-     * full segment is closed first instead. */
-    if (!gcm_ctx_room(ctx, 8)) return 0;
+    /* Never near the end of a ring the runtime owns: those bytes are its
+     * reserve before the ring wraps, and the recycle above keys on them. On a
+     * segmented ring a full segment is closed first instead. A title that
+     * manages its own command buffers (its own buffer-full callback) only
+     * needs room for the marker: it reads ctx->current back before it writes
+     * again. God of War: Ascension flips on such a context with ~3.7 KB left
+     * of a 64 KB buffer; held to the 4 KB reserve, every menu flip fell back
+     * to the immediate form and showed a buffer the drain had not finished. */
+    { const u32 cb = vm_read32(ctx + 0xC);
+      const int runtime_owned = (cb && vm_read32(cb) == GCM_FIFO_CALLBACK_SENTINEL_EA) ||
+                                (s_seg_size && ctx == s_gcm_context_ea);
+      if (runtime_owned ? !gcm_ctx_room(ctx, 8) : vm_read32(ctx + 8) + 4 > vm_read32(ctx + 4))
+          return 0; }
     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
@@ -3403,6 +3423,10 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
     (void)context;   /* command context — flip is immediate in HLE */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("FLIP_PATH_DBG"); cap = e ? atoi(e) : 0; }
+      if (n < cap) { n++; fprintf(stderr, "[flip-path] cellGcmSetFlip ctx=0x%X%c",
+                                  (u32)(uintptr_t)context, 10); } }
     return cellGcmSetFlipCommand(bufferId);
 }
 
@@ -4204,6 +4228,12 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("FLIP_PATH_DBG"); cap = e ? atoi(e) : 0; }
+      if (n < cap) { n++; const u32 c = (u32)(uintptr_t)ctx;
+          fprintf(stderr, "[flip-path] _cellGcmSetFlipCommand ctx=0x%X not queued: begin=0x%X end=0x%X cur=0x%X io=0x%X%c",
+                  c, c ? vm_read32(c) : 0, c ? vm_read32(c + 4) : 0, c ? vm_read32(c + 8) : 0,
+                  c ? gcm_ea2io(vm_read32(c + 8)) : 0, 10); } }
     return cellGcmSetFlipCommand(bufferId);
 }
 

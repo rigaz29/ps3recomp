@@ -307,6 +307,25 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     static SPU_THREAD_LOCAL unsigned long s_runs = 0;
     unsigned long runno = ++s_runs;
     int log_this = s_trace && (runno <= 64 || (runno & 0xFFF) == 0);
+    /* SPURS_PM_TRACE_WID=<wid>[,<runs>]: the first <runs> (default 6) runs of
+     * one workload whole -- every DMA and atomic with its data, and at the end
+     * the last hops and the job manager's list state in local store. The
+     * sampled trace above cannot follow one workload among thousands of runs. */
+    static int s_tw = -2; static long s_tw_runs = 6; static volatile long s_tw_n;
+    if (s_tw == -2) {
+        const char* e = getenv("SPURS_PM_TRACE_WID");
+        s_tw = e ? atoi(e) : -1;
+        const char* c = e ? strchr(e, ',') : NULL;
+        if (c) s_tw_runs = atol(c + 1);
+    }
+    const int trace_wid = s_tw >= 0 && (uint32_t)s_tw == wid &&
+                          __atomic_fetch_add(&s_tw_n, 1, __ATOMIC_RELAXED) < s_tw_runs;
+    if (trace_wid) {
+        fprintf(stderr, "[pm-wid] RUN wid=%u lane=%u data=0x%llX first=%d readyCount(tempArea)=%u flags1=0x%02X\n",
+                wid, spu_num, (unsigned long long)wkl_data, first,
+                ctx->ls[0x100 + (wid < 16 ? wid : 0x10 + (wid - 16))], ctx->ls[0x174]);
+        g_spurs_pm_trace_ctx = ctx;
+    }
     if (log_this) {
         fprintf(stderr, "[spurs-pm] RUN#%lu wid=%u data=0x%llX spurs=0x%08X image=%d entry=0xA00 size=%u\n",
                 runno, wid, (unsigned long long)wkl_data, spurs_ea, image_id, pm_size);
@@ -536,6 +555,26 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (log_this) {
         fprintf(stderr, "[spurs-pm] END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u\n",
                 wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
+        fflush(stderr);
+    }
+    if (trace_wid) {
+        g_spurs_pm_trace_ctx = 0;
+        uint32_t hops[32];
+        extern unsigned spu_recent_pcs(uint32_t* out, unsigned max);
+        unsigned nh = spu_recent_pcs(hops, 32);
+        fprintf(stderr, "[pm-wid] END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u hops:",
+                wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
+        for (unsigned k = 0; k < nh; k++) fprintf(stderr, " %05X", hops[k]);
+        /* The job manager's cached list line (LS 0xD00) and its state block. */
+        static const struct { uint32_t a, n; } R[] = { { 0xD00, 0x80 }, { 0x1280, 0x80 }, { 0x1500, 0x20 } };
+        for (unsigned r = 0; r < sizeof R / sizeof R[0]; r++) {
+            fprintf(stderr, "\n[pm-wid]   LS %05X:", R[r].a);
+            for (uint32_t o = 0; o < R[r].n; o += 4)
+                fprintf(stderr, "%s%02X%02X%02X%02X", (o && !(o & 15)) ? " | " : " ",
+                        ctx->ls[R[r].a + o], ctx->ls[R[r].a + o + 1],
+                        ctx->ls[R[r].a + o + 2], ctx->ls[R[r].a + o + 3]);
+        }
+        fprintf(stderr, "\n");
         fflush(stderr);
     }
 

@@ -1991,6 +1991,29 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* SPURS_MAXCONT=<wid>=<n>[,<wid>=<n>...]: let a workload run on up to n SPUs
+ * at once whatever maximum contention the title set. A diagnostic: God of
+ * War: Ascension sets 1 for every workload, and its three EDGE job lists then
+ * run one after another on one SPU while four others wait. */
+static u32 spurs_maxcont_override(u32 wid, u32 maxcont)
+{
+    static int parsed;
+    static u8 over[SPURS_MAX_WID];
+    if (!parsed) {
+        const char* e = getenv("SPURS_MAXCONT");
+        while (e && *e) {
+            char* end;
+            const unsigned long w = strtoul(e, &end, 10);
+            if (*end != '=') break;
+            const unsigned long n = strtoul(end + 1, &end, 10);
+            if (w < SPURS_MAX_WID && n > 0 && n < 16) over[w] = (u8)n;
+            e = *end ? end + 1 : end;
+        }
+        parsed = 1;
+    }
+    return (wid < SPURS_MAX_WID && over[wid]) ? over[wid] : maxcont;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -2033,7 +2056,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     continue;
                 if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn))
                     continue; /* priority zero makes this physical lane ineligible */
-                u32 maxcont = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
+                u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
                 if (!maxcont || si->active[wid] >= maxcont) continue;
                 WklPm* pm = spurs_resolve_pm(wid);
                 if (!pm) continue;

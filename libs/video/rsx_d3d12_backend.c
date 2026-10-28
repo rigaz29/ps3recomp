@@ -691,6 +691,11 @@ static double perf_now(void)
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
+/* RSX_CENSUS's hitch log: what the backend spent between two presents --
+ * textures uploaded new or again and their time, waits for shader builds,
+ * draws skipped for one, builds queued, waits for the GPU. */
+static double s_hl_tex_s, s_hl_sjwait_s, s_hl_gpuwait_s;
+static unsigned s_hl_tex_n, s_hl_skipped, s_hl_jobs;
 static int perf_on(void)
 {
     static int v = -1;
@@ -1172,6 +1177,7 @@ static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const
     WakeConditionVariable(&s_sj_work);
     ReleaseSRWLockExclusive(&s_sj_lock);
     s_sj_stat_jobs++;
+    s_hl_jobs++;
     return j;
 }
 
@@ -1203,6 +1209,7 @@ static int sj_wait(ShaderJob* j)
     }
     ReleaseSRWLockExclusive(&s_sj_lock);
     used += perf_now() - t0;
+    s_hl_sjwait_s += perf_now() - t0;
     return sj_is_done(j);
 }
 
@@ -5497,7 +5504,7 @@ static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
  * evicted, resources created, and what the cache holds. */
 enum { TS_HIT = 1, TS_SAME, TS_CHANGED, TS_NEW, TS_FAIL, TS_N };
 static int s_ts_out;
-static u64 s_ts_n[TS_N], s_ts_evict, s_ts_create;
+static u64 s_ts_n[TS_N], s_ts_evict, s_ts_create, s_ts_reuse;
 static double s_ts_t[TS_N];
 
 /* The texture cache: a hash table over the slots' keys, and what their
@@ -5604,8 +5611,31 @@ static int vp_tex_lru(void)
  * the least recently used textures go first. Then a slot not handed out yet,
  * an empty one, or the least recently used, whose resource vp_upload_tex_slot
  * reuses when the size and format match. -1 when this batch binds them all. */
-static int vp_tex_alloc(u64 need)
+/* Frames a texture has gone unbound before a new one of the same size, format
+ * and level count may take over its resource. */
+#define VP_TEX_REUSE_AGE 60u
+
+static int vp_tex_alloc(u64 need, u32 w, u32 h, u32 fmt, int cube, u32 levels)
 {
+    /* When the cache is full, a texture of the same size, format and levels
+     * not bound for VP_TEX_REUSE_AGE frames hands its slot and resource over
+     * as they are: creating a texture resource costs ~1-1.5 ms on the frame
+     * clock thread and releasing one ~0.5 ms, and on entering a new area God
+     * of War: Ascension uploads 90-150 new textures in a frame (113-236 ms).
+     * RSX_TEX_TAKEOVER=0 always releases and creates. */
+    static int takeover = -1;
+    if (takeover < 0) { const char* e = getenv("RSX_TEX_TAKEOVER"); takeover = e ? (atoi(e) != 0) : 1; }
+    if (takeover && (s_tex_bytes + need > vp_tex_budget() || s_tex_hw == VP_TEX_SLOTS)) {
+        const u32 now = (u32)s_d3d.frame_count;
+        int best = -1;
+        for (int i = 0; i < s_tex_hw; i++) {
+            const VPTexSlot* c = &s_d3d.vp_tex[i];
+            if (c->res && !c->used && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube &&
+                c->levels == levels && now - c->last_frame >= VP_TEX_REUSE_AGE &&
+                (best < 0 || c->last_frame < s_d3d.vp_tex[best].last_frame)) best = i;
+        }
+        if (best >= 0) { vp_tex_unlink(best); s_ts_evict++; s_ts_reuse++; return best; }
+    }
     while (s_tex_bytes + need > vp_tex_budget()) {
         const int v = vp_tex_lru();
         if (v < 0) break;
@@ -5640,12 +5670,12 @@ static void tex_stats_note(double dt)
         fprintf(stderr, "[tex-stats] per frame:");
         for (int k = 1; k < TS_N; k++)
             fprintf(stderr, " %s %.0f (%.2f ms)", name[k], s_ts_n[k] / nf, s_ts_t[k] * 1000.0 / nf);
-        fprintf(stderr, "; evicted %.1f, created %.1f; %d textures held, %.0f of %.0f MB\n",
-                s_ts_evict / nf, s_ts_create / nf, live,
+        fprintf(stderr, "; evicted %.1f, created %.1f, taken over %.1f; %d textures held, %.0f of %.0f MB\n",
+                s_ts_evict / nf, s_ts_create / nf, s_ts_reuse / nf, live,
                 s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0);
         fflush(stderr);
         for (int k = 0; k < TS_N; k++) { s_ts_n[k] = 0; s_ts_t[k] = 0; }
-        s_ts_evict = s_ts_create = 0; f0 = fc;
+        s_ts_evict = s_ts_create = s_ts_reuse = 0; f0 = fc;
     }
 }
 
@@ -5899,7 +5929,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * staged chain's, in the 64 KB units a committed resource takes. */
     const int ts_new = slot < 0;
     const u64 need = ((u64)lay_total + 0xFFFFu) & ~(u64)0xFFFFu;
-    if (slot < 0) slot = vp_tex_alloc(need);
+    if (slot < 0) slot = vp_tex_alloc(need, w, h, fmt, cube, nlev);
     if (slot < 0) return -1;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     t->last_frame = s_d3d.frame_count;
@@ -6980,6 +7010,18 @@ static void rsx_census_present(void)
         s_cen_hist[b]++;
         if (ms > s_cen_max_ms) s_cen_max_ms = ms;
     }
+    { static double pre_prev, rf_prev;
+      double dpre = s_perf_pre - pre_prev, drf = s_perf_rf - rf_prev;
+      if (dpre < 0.0) dpre = s_perf_pre;   /* PERF reset its sums in between */
+      if (drf < 0.0) drf = s_perf_rf;
+      pre_prev = s_perf_pre; rf_prev = s_perf_rf;
+      if (s_cen_last_present > 0.0 && (now - s_cen_last_present) * 1000.0 >= 150.0)
+          fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms), shader waits %.1f ms, draws skipped %u, "
+                          "builds queued %u, GPU wait %.1f ms, prepass %.1f ms, render_frame %.1f ms\n",
+                  (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0, s_hl_sjwait_s * 1000.0,
+                  s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0); }
+    s_hl_tex_n = s_hl_skipped = s_hl_jobs = 0;
+    s_hl_tex_s = s_hl_sjwait_s = s_hl_gpuwait_s = 0.0;
     s_cen_last_present = now;
     if (s_cen_t0 <= 0.0) s_cen_t0 = now;
     if (now - s_cen_t0 < (double)rsx_census_secs()) return;
@@ -8045,7 +8087,9 @@ static void rf_open(void)
      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
-    wait_for_gpu();
+    { const double t0 = perf_now();
+      wait_for_gpu();
+      s_hl_gpuwait_s += perf_now() - t0; }
     rf_release_dead();   /* the batch that last referenced them has run */
     vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
@@ -8564,10 +8608,14 @@ static void rf_prepass(u32 from, u32 to)
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     const double _ts0 = tex_stats_frames() ? perf_now() : 0.0;
+                    const double _hl0 = rsx_census_secs() ? perf_now() : 0.0;
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
                                                 _cube, dr->tex[_u].mips);
                     if (_ts0 > 0.0) tex_stats_note(perf_now() - _ts0);
+                    if (_hl0 > 0.0 && (s_ts_out == TS_NEW || s_ts_out == TS_CHANGED)) {
+                        s_hl_tex_n++; s_hl_tex_s += perf_now() - _hl0;
+                    }
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -9084,7 +9132,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 s_sj_nowait = 0;
                 if (dr->fp_addr && !dpso && s_pso_pending) {
                     if (ahead) break;   /* the final pass waits for it, as it always did */
-                    s_sj_stat_skipped++; continue;
+                    s_sj_stat_skipped++; s_hl_skipped++; continue;
                 }
                 if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,

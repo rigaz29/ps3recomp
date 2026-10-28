@@ -695,6 +695,10 @@ static double perf_now(void)
  * textures uploaded new or again and their time, waits for shader builds,
  * draws skipped for one, builds queued, waits for the GPU. */
 static double s_hl_tex_s, s_hl_sjwait_s, s_hl_gpuwait_s;
+/* What texture uploads spent creating resources, releasing evicted ones and
+ * decoding into the upload buffer, summed since start: TEX_STATS and the hitch
+ * log report what each grew by. */
+static double s_tex_create_s, s_tex_evict_s, s_tex_decode_s;
 static unsigned s_hl_tex_n, s_hl_skipped, s_hl_jobs;
 static int perf_on(void)
 {
@@ -5636,6 +5640,7 @@ static int vp_tex_alloc(u64 need, u32 w, u32 h, u32 fmt, int cube, u32 levels)
         }
         if (best >= 0) { vp_tex_unlink(best); s_ts_evict++; s_ts_reuse++; return best; }
     }
+    const double ev0 = perf_now();
     while (s_tex_bytes + need > vp_tex_budget()) {
         const int v = vp_tex_lru();
         if (v < 0) break;
@@ -5643,6 +5648,7 @@ static int vp_tex_alloc(u64 need, u32 w, u32 h, u32 fmt, int cube, u32 levels)
         vp_tex_drop(&s_d3d.vp_tex[v]);
         s_ts_evict++;
     }
+    s_tex_evict_s += perf_now() - ev0;
     if (s_tex_hw < VP_TEX_SLOTS) return s_tex_hw++;
     for (int i = 0; i < VP_TEX_SLOTS; i++)
         if (!s_d3d.vp_tex[i].res && !s_d3d.vp_tex[i].linked) return i;
@@ -5670,9 +5676,14 @@ static void tex_stats_note(double dt)
         fprintf(stderr, "[tex-stats] per frame:");
         for (int k = 1; k < TS_N; k++)
             fprintf(stderr, " %s %.0f (%.2f ms)", name[k], s_ts_n[k] / nf, s_ts_t[k] * 1000.0 / nf);
-        fprintf(stderr, "; evicted %.1f, created %.1f, taken over %.1f; %d textures held, %.0f of %.0f MB\n",
-                s_ts_evict / nf, s_ts_create / nf, s_ts_reuse / nf, live,
+        static double cr_prev, ev_prev, dc_prev;
+        fprintf(stderr, "; evicted %.1f (%.2f ms), created %.1f (%.2f ms), taken over %.1f; decode %.2f ms; "
+                        "%d textures held, %.0f of %.0f MB\n",
+                s_ts_evict / nf, (s_tex_evict_s - ev_prev) * 1000.0 / nf,
+                s_ts_create / nf, (s_tex_create_s - cr_prev) * 1000.0 / nf, s_ts_reuse / nf,
+                (s_tex_decode_s - dc_prev) * 1000.0 / nf, live,
                 s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0);
+        cr_prev = s_tex_create_s; ev_prev = s_tex_evict_s; dc_prev = s_tex_decode_s;
         fflush(stderr);
         for (int k = 0; k < TS_N; k++) { s_ts_n[k] = 0; s_ts_t[k] = 0; }
         s_ts_evict = s_ts_create = s_ts_reuse = 0; f0 = fc;
@@ -5947,6 +5958,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         vp_tex_drop(t);
     if (!t->res) {
         s_ts_create++;
+        const double cr0 = perf_now();
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td = {0};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -5960,6 +5972,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
             return -1;
+        s_tex_create_s += perf_now() - cr0;
         t->bytes = (u32)need; s_tex_bytes += need;
         fresh = 1;
     }
@@ -6060,8 +6073,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
      * semantics and lives in rsx_texture_layout.c, so a second backend gets
      * it by calling this rather than porting the loops again. */
-    rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
-                       rsx_texture_argb_is_rgba());
+    { const double dc0 = perf_now();
+      rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
+                         rsx_texture_argb_is_rgba());
+      s_tex_decode_s += perf_now() - dc0; }
 
     /* The diagnostics below only apply to the linear 8-bit case (Bink video
      * planes); they used to sit inside that branch of the conversion. */
@@ -6324,6 +6339,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
     /* The levels below 0, each face's at its footprint. */
+    const double dcl0 = perf_now();
     for (u32 _f = 0; _f < _nfaces && nlev > 1; _f++)
         for (u32 _l = 1; _l < nlev; _l++) {
             const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* fp = &s_lay[_f * nlev + _l];
@@ -6331,6 +6347,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                                vm_base + _off0 + _f * _face_bytes + s_lv[_l].offset,
                                s_lv[_l].w, s_lv[_l].h, &s_lv[_l].tl, rsx_texture_argb_is_rgba());
         }
+    s_tex_decode_s += perf_now() - dcl0;
     if (up_res != s_d3d.tex_ring) t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
@@ -7010,15 +7027,19 @@ static void rsx_census_present(void)
         s_cen_hist[b]++;
         if (ms > s_cen_max_ms) s_cen_max_ms = ms;
     }
-    { static double pre_prev, rf_prev;
+    { static double pre_prev, rf_prev, cr_prev, ev_prev, dc_prev;
+      const double dcr = s_tex_create_s - cr_prev, dev = s_tex_evict_s - ev_prev, ddc = s_tex_decode_s - dc_prev;
+      cr_prev = s_tex_create_s; ev_prev = s_tex_evict_s; dc_prev = s_tex_decode_s;
       double dpre = s_perf_pre - pre_prev, drf = s_perf_rf - rf_prev;
       if (dpre < 0.0) dpre = s_perf_pre;   /* PERF reset its sums in between */
       if (drf < 0.0) drf = s_perf_rf;
       pre_prev = s_perf_pre; rf_prev = s_perf_rf;
       if (s_cen_last_present > 0.0 && (now - s_cen_last_present) * 1000.0 >= 150.0)
-          fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms), shader waits %.1f ms, draws skipped %u, "
-                          "builds queued %u, GPU wait %.1f ms, prepass %.1f ms, render_frame %.1f ms\n",
-                  (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0, s_hl_sjwait_s * 1000.0,
+          fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms: create %.1f, evict %.1f, decode %.1f), "
+                          "shader waits %.1f ms, draws skipped %u, builds queued %u, GPU wait %.1f ms, prepass %.1f ms, "
+                          "render_frame %.1f ms\n",
+                  (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0,
+                  dcr * 1000.0, dev * 1000.0, ddc * 1000.0, s_hl_sjwait_s * 1000.0,
                   s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0); }
     s_hl_tex_n = s_hl_skipped = s_hl_jobs = 0;
     s_hl_tex_s = s_hl_sjwait_s = s_hl_gpuwait_s = 0.0;

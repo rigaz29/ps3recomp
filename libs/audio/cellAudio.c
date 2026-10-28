@@ -434,6 +434,46 @@ static inline float ld_be_f32(const float* p)
 }
 
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+/* AUDIO_RATE's ring counters, over the running ports: blocks read all zero
+ * inside sound (a run of at most AUDIO_GAP_MAX between blocks with data -- the
+ * producer was late, not quiet), blocks written after they were read (seen
+ * non-zero again one block later), and how many blocks past the one read
+ * already held data (0-3, 3 = 3 or more). */
+#define AUDIO_GAP_MAX 4
+static unsigned s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[4];
+
+static int audio_block_has_data(const float* b, u32 nch)
+{
+    const u32* w = (const u32*)b;
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * nch; i++)
+        if (w[i]) return 1;
+    return 0;
+}
+
+static void audio_ring_note(int p, const AudioPortSlot* port, const float* src, u32 nch, u32 nblock)
+{
+    static u32 zrun[CELL_AUDIO_PORT_MAX];
+    static u8 sound[CELL_AUDIO_PORT_MAX];
+    const u32 bsz = CELL_AUDIO_BLOCK_SAMPLES * nch;
+    const u32 r = (u32)(port->read_index % nblock);
+    const u32 prev = (r + nblock - 1) % nblock;
+    if (port->read_index > 0 && audio_block_has_data(port->buffer + prev * bsz, nch)) s_ar_late++;
+    u32 lead = 0;
+    while (lead < 3 && lead + 1 < nblock &&
+           audio_block_has_data(port->buffer + ((r + lead + 1) % nblock) * bsz, nch)) lead++;
+    s_ar_lead[lead]++;
+    if (!audio_block_has_data(src, nch)) { zrun[p]++; return; }
+    if (sound[p] && zrun[p] > 0 && zrun[p] <= AUDIO_GAP_MAX) { s_ar_gaps++; s_ar_gap_blocks += zrun[p]; }
+    zrun[p] = 0; sound[p] = 1;
+}
+
+static int audio_rate_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+    return on;
+}
+
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
@@ -472,6 +512,7 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        if (audio_rate_on()) audio_ring_note(p, port, src, nch, nblock);
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -639,6 +680,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #else
                         0u, 10);
 #endif
+                fprintf(stderr, "[audio-ring] gaps %u (%u blocks), written after read %u, blocks ahead 0:%u 1:%u 2:%u 3+:%u%c",
+                        s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[0], s_ar_lead[1], s_ar_lead[2], s_ar_lead[3], 10);
+                s_ar_gaps = s_ar_gap_blocks = s_ar_late = 0;
+                memset(s_ar_lead, 0, sizeof s_ar_lead);
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
         /* Notify event queues */

@@ -1157,6 +1157,16 @@ static void sj_build(ShaderJob* j)
     const double t0 = perf_now();
     j->hr = guest_pso_create(&j->pd, j->dbt, &j->pso);
     const double dt = perf_now() - t0;
+    if (FAILED(j->hr)) {
+        /* The driver refused it: what it was given. */
+        const char* cb = strstr(j->src, "fp_constants[");
+        char k[40];
+        if (cb) snprintf(k, sizeof k, "fp_constants[%lu]", strtoul(cb + 13, NULL, 10));
+        else snprintf(k, sizeof k, "constants compiled in");
+        fprintf(stderr, "[FP] pipeline refused (0x%08lX): %u bytes of HLSL, %u of DXBC, %s, dbt %d, %u targets%c",
+                (unsigned long)j->hr, (unsigned)j->len, (unsigned)j->pd.PS.BytecodeLength,
+                k, j->dbt, j->pd.NumRenderTargets, 10);
+    }
     AcquireSRWLockExclusive(&s_shc_lock);
     s_shc_stat_pso++;
     s_shc_stat_pso_s += dt;

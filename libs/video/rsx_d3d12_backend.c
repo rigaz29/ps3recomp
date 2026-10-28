@@ -6555,6 +6555,65 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
     return rh;
 }
 
+
+/* RSX_CENSUS=<secs> (see cellGcmSys.c): texture binds by format base and how
+ * many end up a null SRV (0 no offset, 1 format the texture path does not
+ * take, 2 taken but no slot), binds with a mip chain (uploaded as level 0
+ * only), and present-to-present intervals. */
+static int rsx_census_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_CENSUS"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static unsigned long long s_cen_bind[256], s_cen_null[256][3], s_cen_mips, s_cen_binds;
+static unsigned long long s_cen_hist[10];
+static double s_cen_last_present, s_cen_t0, s_cen_max_ms;
+static void rsx_census_bind(u32 fmt, u32 mips)
+{
+    s_cen_bind[fmt & 0xFFu]++; s_cen_binds++;
+    if (mips > 1u) s_cen_mips++;
+}
+static void rsx_census_null(u32 fmt, u32 off)
+{
+    const u32 bf = fmt & 0x9Fu;
+    const int taken = bf == 0x81 || bf == 0x85 || bf == 0x8B || (bf >= 0x86 && bf <= 0x88) ||
+                      bf == 0x9A || bf == 0x94 || bf == 0x95 || bf == 0x9C || bf == 0x9F;
+    s_cen_null[fmt & 0xFFu][!off ? 0 : (!taken ? 1 : 2)]++;
+}
+extern void rsx_fp_census_print(void);
+static void rsx_census_present(void)
+{
+    const double now = perf_now();
+    if (s_cen_last_present > 0.0) {
+        const double ms = (now - s_cen_last_present) * 1000.0;
+        static const double edge[9] = { 20, 40, 60, 80, 100, 150, 250, 500, 1000 };
+        int b = 0; while (b < 9 && ms >= edge[b]) b++;
+        s_cen_hist[b]++;
+        if (ms > s_cen_max_ms) s_cen_max_ms = ms;
+    }
+    s_cen_last_present = now;
+    if (s_cen_t0 <= 0.0) s_cen_t0 = now;
+    if (now - s_cen_t0 < (double)rsx_census_secs()) return;
+    s_cen_t0 = now;
+    fprintf(stderr, "[census] presents by interval (ms) <20:%llu 20-40:%llu 40-60:%llu 60-80:%llu "
+                    "80-100:%llu 100-150:%llu 150-250:%llu 250-500:%llu 500-1000:%llu >1000:%llu, max %.0f\n",
+            s_cen_hist[0], s_cen_hist[1], s_cen_hist[2], s_cen_hist[3], s_cen_hist[4], s_cen_hist[5],
+            s_cen_hist[6], s_cen_hist[7], s_cen_hist[8], s_cen_hist[9], s_cen_max_ms);
+    fprintf(stderr, "[census] texture binds %llu, with a mip chain %llu; by format (binds / null: "
+                    "no offset, format not taken, no slot):", s_cen_binds, s_cen_mips);
+    for (int f = 0; f < 256; f++)
+        if (s_cen_bind[f] || s_cen_null[f][0] || s_cen_null[f][1] || s_cen_null[f][2])
+            fprintf(stderr, " %02X:%llu/%llu,%llu,%llu", f, s_cen_bind[f],
+                    s_cen_null[f][0], s_cen_null[f][1], s_cen_null[f][2]);
+    fprintf(stderr, "\n");
+    rsx_fp_census_print();
+    fflush(stderr);
+    memset(s_cen_hist, 0, sizeof s_cen_hist); s_cen_max_ms = 0.0;
+    memset(s_cen_bind, 0, sizeof s_cen_bind); memset(s_cen_null, 0, sizeof s_cen_null);
+    s_cen_mips = s_cen_binds = 0;
+}
+
 /* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
  * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
 static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
@@ -8006,6 +8065,7 @@ static void rf_prepass(u32 from, u32 to)
                           D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 continue;
             }
+            if (rsx_census_secs() && dr->tex[_u].set) rsx_census_bind(dr->tex[_u].fmt, dr->tex[_u].mips);
             /* A depth surface read as a texture: its colour copy (made in the
              * RT pre-pass), refreshed from the depth buffer just before this
              * draw (ds_convert). */
@@ -8146,6 +8206,7 @@ static void rf_prepass(u32 from, u32 to)
                 fprintf(stderr, "[TEXBIND] null SRV unit=%d raw=0x%X off=0x%X %ux%u fmt=0x%02X%c",
                         _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
                         dr->tex[_u].h, dr->tex[_u].fmt, 10); } }
+            if (rsx_census_secs() && dr->tex[_u].set) rsx_census_null(dr->tex[_u].fmt, dr->tex[_u].off);
             srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         }
@@ -9299,6 +9360,7 @@ skip_dump_consider: ;
      * title past the display's rate. Skipped for an offscreen-only batch. */
     if (s_present_this_frame) {
         HRESULT phr;
+        if (rsx_census_secs()) rsx_census_present();
         if (!d3d12_vsync_off())
             phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
         else

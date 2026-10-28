@@ -15,6 +15,35 @@
 #include <string.h>
 #include "ps3emu/log_first.h"
 
+/* RSX_CENSUS: what the decompiled programs use. Per instruction: the RSX
+ * precision field (DWORD0 [23:22]: 0 fp32, 1 fp16, 2 fx12) and an fp16 (H)
+ * destination; per program: unhandled opcodes and skipped CAL/RET. A program's
+ * flags are counted when the next one starts and at each report. */
+static unsigned long long s_fpc_instr, s_fpc_prec[4], s_fpc_hdest, s_fpc_progs,
+                          s_fpc_progs_fp16, s_fpc_progs_fx12, s_fpc_progs_unh, s_fpc_progs_cal,
+                          s_fpc_unh_mask;
+static unsigned s_fpc_flags;   /* 1 fp16, 2 fx12, 4 unhandled, 8 CAL/RET, 16 started */
+static void rsx_fp_census_flush(void)
+{
+    if (!(s_fpc_flags & 16)) return;
+    s_fpc_progs++;
+    if (s_fpc_flags & 1) s_fpc_progs_fp16++;
+    if (s_fpc_flags & 2) s_fpc_progs_fx12++;
+    if (s_fpc_flags & 4) s_fpc_progs_unh++;
+    if (s_fpc_flags & 8) s_fpc_progs_cal++;
+    s_fpc_flags = 0;
+}
+void rsx_fp_census_print(void)
+{
+    rsx_fp_census_flush();
+    fprintf(stderr, "[census] fp: %llu programs decompiled; with fp16-precision ops %llu, fx12 %llu, "
+                    "unhandled opcodes %llu (mask 0x%016llX), CAL/RET skipped %llu; instructions %llu: "
+                    "fp32 %llu fp16 %llu fx12 %llu prec3 %llu, H destination %llu\n",
+            s_fpc_progs, s_fpc_progs_fp16, s_fpc_progs_fx12, s_fpc_progs_unh, s_fpc_unh_mask,
+            s_fpc_progs_cal, s_fpc_instr, s_fpc_prec[0], s_fpc_prec[1], s_fpc_prec[2], s_fpc_prec[3],
+            s_fpc_hdest);
+}
+
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
 #define FP_OUT_REG_SHIFT    1
@@ -624,6 +653,7 @@ static int rsx_fp_decompile_internal(
     const u8* expand_masks,
     char* out, u32 out_size, u32* out_constant_count)
 {
+    rsx_fp_census_flush(); s_fpc_flags = 16;
     if (!ucode || !out || out_size == 0) return -1;
     /* Cube and volume units are declared on their own t-register; with none
      * the 2D array keeps every 2D-only program byte-identical. */
@@ -736,6 +766,12 @@ static int rsx_fp_decompile_internal(
         count++;
 
         u32 opcode    = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        if (!(w2 & FP_BRANCH)) {
+            const u32 prec = (w0 >> 22) & 3u;
+            s_fpc_instr++; s_fpc_prec[prec]++;
+            if (prec == 1u) s_fpc_flags |= 1u; else if (prec == 2u) s_fpc_flags |= 2u;
+            if (w0 & FP_OUT_HALF) s_fpc_hdest++;
+        }
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         if (!(w2 & FP_BRANCH) && shadow && shadow[tex_unit].enabled &&
@@ -865,6 +901,7 @@ static int rsx_fp_decompile_internal(
                 if (loops_open) out_puts(&o, line);
                 break;
             default:   /* CAL / RET: no subroutine support yet */
+                s_fpc_flags |= 8u;
                 out_puts(&o, "    /* TODO: CAL/RET flow-control op skipped */\n");
                 break;
             }
@@ -1048,6 +1085,7 @@ static int rsx_fp_decompile_internal(
                      "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
                      opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
             out_puts(&o, todo);
+            s_fpc_flags |= 4u; s_fpc_unh_mask |= 1ull << (opcode & 63u);
             handled = 0;
             break; }
             break;

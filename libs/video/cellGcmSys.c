@@ -2202,6 +2202,37 @@ static int gcm_word_diag(void)
     return on;
 }
 
+
+/* RSX_CENSUS=<secs>: the 3D methods rsx_process_method returns -1 for (it knows
+ * nothing of them, so the vtable backend never sees their state), with how
+ * often and the last value, every <secs>. Some are handled by the walker
+ * itself right after (reports, semaphores); the rest is state the backend
+ * draws without. */
+static void gcm_census_unknown(u32 m, u32 v)
+{
+    static int secs = -1;
+    static unsigned long long n[0x800], t0;
+    static u32 last[0x800];
+    if (secs < 0) { const char* e = getenv("RSX_CENSUS"); secs = e ? atoi(e) : 0; }
+    if (secs <= 0) return;
+    n[(m & 0x1FFCu) >> 2]++; last[(m & 0x1FFCu) >> 2] = v;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (!t0) t0 = now;
+    if (now - t0 < (unsigned long long)secs * 1000u) return;
+    t0 = now;
+    fprintf(stderr, "[census] methods rsx_process_method does not know (method=count last):");
+    for (;;) {
+        u32 best = 0; unsigned long long bc = 0;
+        for (u32 i = 0; i < 0x800; i++) if (n[i] > bc) { bc = n[i]; best = i; }
+        if (!bc) break;
+        fprintf(stderr, " %04X=%llu %08X", best << 2, bc, last[best]);
+        n[best] = 0;
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
  * plus the methods whose answer the walker writes itself. */
 static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
@@ -2213,8 +2244,9 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * The gate lives here rather than at the call sites because #554 funnelled
      * every 3D method through this function -- there are two callers, and a
      * gate at one of them only would be a silent half-measure. */
-    if (legacy_state_live || gcm_legacy_method_has_effect(m))
-        rsx_process_method(st, m, v);
+    if (legacy_state_live || gcm_legacy_method_has_effect(m)) {
+        if (rsx_process_method(st, m, v) < 0) gcm_census_unknown(m, v);
+    }
     /* NV406E_SET_REFERENCE: queue the fence value for PACED
      * publication (gcm_ref_publish below) instead of letting a
      * later fence in the same batch overwrite it. */

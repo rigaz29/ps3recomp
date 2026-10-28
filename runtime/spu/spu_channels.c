@@ -1303,7 +1303,11 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
     const uint64_t t1 = ps3_ft_now();
     if (t1 - t0 < ps3_ft_min_ns()) return;
-    if (t_ft_busy0 && t0 > t_ft_busy0) {
+    /* Not for a policy module's context: its worker records each run as a
+     * busy span (cellSpurs.c), and t_ft_busy0 outlives the run, so the span
+     * from here would cover the time the worker sat idle between runs too --
+     * the trace showed more EDGE runs open than there are workers. */
+    if (t_ft_busy0 && t0 > t_ft_busy0 && !ctx->policy_mode) {
         const uint8_t* w = ctx->ls + 0x1DC;
         ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
                     ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3],

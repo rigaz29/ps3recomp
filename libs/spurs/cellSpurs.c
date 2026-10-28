@@ -466,6 +466,11 @@ struct SpursPmSlot {
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
+    /* SPURS_DISPATCH_PROF: when the coordinator handed this slot its run, and
+     * when the slot's last run ended, with whether it found work, and whose. */
+    u64 t_set, t_end;
+    unsigned last_polls;
+    u32 last_wid;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -2013,6 +2018,42 @@ int spurs_pm_current_wid(unsigned long tid)
     return -1;
 }
 
+/* SPURS_DISPATCH_PROF=<seconds>: what the hand-offs around a policy-module run
+ * cost, every so many seconds. A run ends on its worker, which wakes the
+ * coordinator; the coordinator's pass picks the next workload and wakes the
+ * worker. On the SPU that is one kernel on one core; here it is two thread
+ * wake-ups through one condition variable that every worker sleeps on.
+ *   wake: from the coordinator setting a slot busy to its worker running
+ *   again: from a run that found work (it polled) ending to the coordinator
+ *          handing the same slot the same workload again
+ *   passes: coordinator passes, and how many began on the 1 ms timeout. */
+static int dispatch_prof_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_DISPATCH_PROF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static volatile LONG64 s_dp_wake_ns, s_dp_wake_n, s_dp_wake_max, s_dp_again_ns, s_dp_again_n,
+                       s_dp_passes, s_dp_timeouts;
+static void dispatch_prof_report(void)
+{
+    static u64 last;
+    const u64 now = wid_prof_now_ns();
+    if (!last) { last = now; return; }
+    const double win = (double)(now - last);
+    if (win < dispatch_prof_secs() * 1e9) return;
+    last = now;
+    const LONG64 wn = InterlockedExchange64(&s_dp_wake_n, 0), wns = InterlockedExchange64(&s_dp_wake_ns, 0);
+    const LONG64 wmax = InterlockedExchange64(&s_dp_wake_max, 0);
+    const LONG64 an = InterlockedExchange64(&s_dp_again_n, 0), ans = InterlockedExchange64(&s_dp_again_ns, 0);
+    const LONG64 ps = InterlockedExchange64(&s_dp_passes, 0), to = InterlockedExchange64(&s_dp_timeouts, 0);
+    fprintf(stderr, "[spurs-dispatch] %.0f runs/s: wake %.1f us mean, %.0f us max; same workload again "
+            "after a working run %.1f us mean (%.0f/s); %.0f passes/s, %.0f on the 1 ms timeout\n",
+            wn * 1e9 / win, wn ? wns / 1e3 / (double)wn : 0.0, wmax / 1e3,
+            an ? ans / 1e3 / (double)an : 0.0, an * 1e9 / win, ps * 1e9 / win, to * 1e9 / win);
+    fflush(stderr);
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2038,6 +2079,11 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         while (!slot->busy && !si->stopping)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
+        if (dispatch_prof_secs() && slot->t_set) {
+            const LONG64 d = (LONG64)(wid_prof_now_ns() - slot->t_set);
+            InterlockedAdd64(&s_dp_wake_ns, d); InterlockedIncrement64(&s_dp_wake_n);
+            if (d > s_dp_wake_max) s_dp_wake_max = d;
+        }
         ReleaseSRWLockExclusive(&si->lock);
         const u64 wp_t0 = wid_prof_secs() ? wid_prof_now_ns() : 0;
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -2064,6 +2110,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < 4) si->idle[wid]++;
+        if (dispatch_prof_secs()) { slot->t_end = wid_prof_now_ns(); slot->last_polls = polls; slot->last_wid = wid; }
         slot->busy = 0;
         WakeAllConditionVariable(&si->wake);
     }
@@ -2113,12 +2160,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
             kick_pass = ++kick_run < 16;
         } else {
-            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+            if (!SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0) && dispatch_prof_secs())
+                InterlockedIncrement64(&s_dp_timeouts);
             /* This full pass reads the line after any commit that woke it. */
             (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
         }
         if (!kick_pass) kick_run = 0;
         if (si->stopping) break;
+        if (dispatch_prof_secs()) { InterlockedIncrement64(&s_dp_passes); dispatch_prof_report(); }
         if (disabled) continue;
         u32 ea = si->ea;
         AcquireSRWLockExclusive(&s_workload_registry_lock);
@@ -2169,6 +2218,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 spu_lockline_lock();
                 wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
                 ef_line_end(ea);
+                if (dispatch_prof_secs()) {
+                    const u64 t = wid_prof_now_ns();
+                    if (slot->t_end && slot->last_polls && slot->last_wid == wid) {
+                        InterlockedAdd64(&s_dp_again_ns, (LONG64)(t - slot->t_end));
+                        InterlockedIncrement64(&s_dp_again_n);
+                    }
+                    slot->t_set = t;
+                }
                 slot->busy = 1;
                 WakeAllConditionVariable(&si->wake);
                 break;

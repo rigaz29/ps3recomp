@@ -63,9 +63,14 @@
 #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
 #define VP_MAX_INDICES  (1u << 21)  /* per-frame index buffer of indexed VP draws, x2 parity */
-#define MAX_DRAWS         2048  /* per-frame draw records. Sized from the
-                                 * measured worst case (~1841, FRAME_BUDGET);
-                                 * the per-draw constant buffer is
+#define MAX_DRAWS         8192  /* per-frame draw records. 2048 was sized
+                                 * from God of War HD's worst case (~1841):
+                                 * God of War: Ascension's first level needs
+                                 * up to 3226, and two thirds of its frames
+                                 * lost the draws past 2048 -- the HUD and
+                                 * effects drawn last among them. A full batch
+                                 * still drops, and says so once (rsx_draw_room).
+                                 * The per-draw constant buffer is
                                  * VP_CB_STRIDE * MAX_DRAWS * 2 bytes, so 16384
                                  * asked for a 264 MB upload allocation. */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
@@ -4395,6 +4400,20 @@ static u64 rsx_poly_key(const rsx_state* st)
     }
     if (!(st->poly_offset_factor & 0x7FFFFFFFu) && !(bias & 0x7FFFFFFFu)) return 0;
     return ((u64)st->poly_offset_factor << 32) | bias;
+}
+
+/* Room for one more draw record. A full batch drops the draw: said once, so
+ * a scene that outgrows MAX_DRAWS shows in the log, not as missing objects. */
+static int rsx_draw_room(void)
+{
+    if (s_d3d.draw_count < MAX_DRAWS) return 1;
+    static int said = 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[D3D12] a frame has more than %d draws; the rest of it is dropped (MAX_DRAWS)\n",
+                MAX_DRAWS);
+    }
+    return 0;
 }
 
 static u32 rsx_blend_key(const rsx_state* st, int enable)
@@ -11026,7 +11045,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
-            if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+            if (emitted && rsx_draw_room()) {
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec;
                 dr->vertex_count   = emitted;
@@ -11147,7 +11166,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 return;
             }
         }
-        if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+        if (emitted && rsx_draw_room()) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
             dr->vertex_count   = emitted;
@@ -11330,7 +11349,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             return;
         }
     }
-    if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+    if (emitted && rsx_draw_room()) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->vertex_count   = emitted;

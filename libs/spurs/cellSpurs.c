@@ -471,6 +471,9 @@ struct SpursPmSlot {
     u64 t_set, t_end;
     unsigned last_polls;
     u32 last_wid;
+    /* The worker sleeps on its own condition variable, so handing it a run
+     * wakes it alone; the coordinator sleeps on the instance's. */
+    CONDITION_VARIABLE cv;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -2054,6 +2057,17 @@ static void dispatch_prof_report(void)
     fflush(stderr);
 }
 
+enum { SPURS_PICK_FULL, SPURS_PICK_KICK, SPURS_PICK_SELF };
+static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode);
+/* SPURS_SELF_PICK=0: a worker whose run ended leaves the next pick to the
+ * coordinator, as before. */
+static int spurs_self_pick_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_SELF_PICK"); v = !(e && e[0] == '0'); }
+    return v;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2077,7 +2091,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
-            SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+            SleepConditionVariableSRW(&slot->cv, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         if (dispatch_prof_secs() && slot->t_set) {
             const LONG64 d = (LONG64)(wid_prof_now_ns() - slot->t_set);
@@ -2112,7 +2126,16 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         else if (si->idle[wid] < 4) si->idle[wid]++;
         if (dispatch_prof_secs()) { slot->t_end = wid_prof_now_ns(); slot->last_polls = polls; slot->last_wid = wid; }
         slot->busy = 0;
-        WakeAllConditionVariable(&si->wake);
+        /* The next workload for this SPU, picked here as the SPU's own kernel
+         * would, rather than by waking the coordinator to pick it and wake this
+         * thread again (two wake-ups, ~36 us, against a ~140 us EDGE run). */
+        if (!si->stopping && spurs_self_pick_on()) {
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            const int got = spurs_pick(si, slot, SPURS_PICK_SELF);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            if (got) continue;
+        }
+        WakeConditionVariable(&si->wake);   /* the coordinator: this slot is free */
     }
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
@@ -2142,6 +2165,81 @@ static u32 spurs_maxcont_override(u32 wid, u32 maxcont)
     return (wid < SPURS_MAX_WID && over[wid]) ? over[wid] : maxcont;
 }
 
+/* The next workload for an idle slot: round robin from the instance's cursor
+ * over the enabled, running workloads this lane may take (nonzero priority),
+ * under their maximum contention, that are kicked -- ready count, signal or
+ * workload flag -- or, by mode:
+ *   SPURS_PICK_FULL  a coordinator pass: also the unkicked ones whose idle
+ *                    back-off probe is due this pass
+ *   SPURS_PICK_KICK  a pass after a request line commit: the kicked ones only
+ *   SPURS_PICK_SELF  a worker whose run just ended: also the unkicked ones that
+ *                    found work last time (idle 0), which every full pass takes;
+ *                    the back-off probes stay with the coordinator, whose passes
+ *                    count them.
+ * Takes one from the ready count and the signal bit, counts the contention and
+ * sets the slot busy; returns 1 if it got one. The instance lock and the
+ * workload registry lock are held. */
+static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
+{
+    const u32 ea = si->ea, sn = slot->spu_num;
+    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+    const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    for (u32 checked = 0; checked < nwid; checked++) {
+        u32 wid = si->cursor % nwid;
+        si->cursor = (wid + 1) % nwid;
+        if (!(enabled & (0x80000000u >> wid)) ||
+            vm_read8(ea + wkl_state_off(wid)) != 2 ||
+            !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
+            continue;
+        if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn))
+            continue; /* priority zero makes this physical lane ineligible */
+        u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
+        if (!maxcont || si->active[wid] >= maxcont) continue;
+        WklPm* pm = spurs_resolve_pm(wid);
+        if (!pm) continue;
+        u32 signal = vm_read16(ea + wkl_signal_off(wid));
+        u32 ready = vm_read8(ea + wkl_ready_off(wid));
+        /* The workload flag: the PPU stores 0 into it to make the
+         * receiver workload ready (cellSpursGetWorkloadFlag). */
+        int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid &&
+                      vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
+        int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
+        if (kicked) si->idle[wid] = 0;
+        if (!kicked && (mode == SPURS_PICK_KICK || (mode == SPURS_PICK_SELF && si->idle[wid]) ||
+                        (mode == SPURS_PICK_FULL && (si->pass_no & ((1u << si->idle[wid]) - 1)))))
+            continue;
+        spu_lockline_lock();
+        ready = vm_read8(ea + wkl_ready_off(wid));
+        signal = vm_read16(ea + wkl_signal_off(wid));
+        if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+        if (signal & wkl_signal_bit(wid))
+            ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
+        if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
+            ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
+        ef_line_end(ea);
+        slot->fn = pm->fn; slot->image_id = pm->image_id;
+        slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+        slot->pm_size = s_workloads[wid].sizePm;
+        slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
+        slot->wid = wid; slot->ea = ea;
+        si->active[wid]++;
+        spu_lockline_lock();
+        wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
+        ef_line_end(ea);
+        if (dispatch_prof_secs()) {
+            const u64 t = wid_prof_now_ns();
+            if (slot->t_end && slot->last_polls && slot->last_wid == wid) {
+                InterlockedAdd64(&s_dp_again_ns, (LONG64)(t - slot->t_end));
+                InterlockedIncrement64(&s_dp_again_n);
+            }
+            slot->t_set = t;
+        }
+        slot->busy = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -2169,67 +2267,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (si->stopping) break;
         if (dispatch_prof_secs()) { InterlockedIncrement64(&s_dp_passes); dispatch_prof_report(); }
         if (disabled) continue;
-        u32 ea = si->ea;
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         if (!kick_pass) si->pass_no++;
-        u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
-            const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
-            for (u32 checked = 0; checked < nwid; checked++) {
-                u32 wid = si->cursor % nwid;
-                si->cursor = (wid + 1) % nwid;
-                if (!(enabled & (0x80000000u >> wid)) ||
-                    vm_read8(ea + wkl_state_off(wid)) != 2 ||
-                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
-                    continue;
-                if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn))
-                    continue; /* priority zero makes this physical lane ineligible */
-                u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
-                if (!maxcont || si->active[wid] >= maxcont) continue;
-                WklPm* pm = spurs_resolve_pm(wid);
-                if (!pm) continue;
-                u32 signal = vm_read16(ea + wkl_signal_off(wid));
-                u32 ready = vm_read8(ea + wkl_ready_off(wid));
-                /* The workload flag: the PPU stores 0 into it to make the
-                 * receiver workload ready (cellSpursGetWorkloadFlag). */
-                int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid &&
-                              vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
-                int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
-                if (kicked) si->idle[wid] = 0;
-                if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
-                    continue;
-                spu_lockline_lock();
-                ready = vm_read8(ea + wkl_ready_off(wid));
-                signal = vm_read16(ea + wkl_signal_off(wid));
-                if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
-                if (signal & wkl_signal_bit(wid))
-                    ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
-                if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
-                    ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
-                ef_line_end(ea);
-                slot->fn = pm->fn; slot->image_id = pm->image_id;
-                slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-                slot->pm_size = s_workloads[wid].sizePm;
-                slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
-                slot->wid = wid; slot->ea = ea;
-                si->active[wid]++;
-                spu_lockline_lock();
-                wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
-                ef_line_end(ea);
-                if (dispatch_prof_secs()) {
-                    const u64 t = wid_prof_now_ns();
-                    if (slot->t_end && slot->last_polls && slot->last_wid == wid) {
-                        InterlockedAdd64(&s_dp_again_ns, (LONG64)(t - slot->t_end));
-                        InterlockedIncrement64(&s_dp_again_n);
-                    }
-                    slot->t_set = t;
-                }
-                slot->busy = 1;
-                WakeAllConditionVariable(&si->wake);
-                break;
-            }
+            if (spurs_pick(si, slot, kick_pass ? SPURS_PICK_KICK : SPURS_PICK_FULL))
+                WakeConditionVariable(&slot->cv);
         }
         ReleaseSRWLockExclusive(&s_workload_registry_lock);
     }
@@ -2258,6 +2302,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
 failed:
     AcquireSRWLockExclusive(&si->lock);
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < si->nspus; sn++) WakeConditionVariable(&si->slots[sn].cv);
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
@@ -2277,6 +2322,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     for (u32 wid = 0; wid < SPURS_MAX_WID; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < si->nspus; sn++) WakeConditionVariable(&si->slots[sn].cv);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < si->nspus; sn++) {

@@ -33,6 +33,9 @@ static void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited
  * with PS3_VERBOSE (ps3_log.h, log_first.h). */
 static int ps3_log_verbose(void) { return 0; }
 #define PS3_LOG_FIRST(ctr, limit) ((ctr) < (limit) && ++(ctr))
+/* A task that exits leaves the set of tasks that work in signal rounds. */
+void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t task)
+{ (void)taskset_ea; (void)task; }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;
 #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)

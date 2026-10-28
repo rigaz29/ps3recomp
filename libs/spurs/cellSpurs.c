@@ -2358,6 +2358,53 @@ static u32 spurs_maxcont_override(u32 wid, u32 maxcont)
  * Takes one from the ready count and the signal bit, counts the contention and
  * sets the slot busy; returns 1 if it got one. The instance lock and the
  * workload registry lock are held. */
+
+/* The scheduler's state as spurs_pick reads it, for a stall: per instance,
+ * what each worker slot is doing, and per workload the fields that decide
+ * whether it can be picked -- enabled bit, state (2 = runnable), contention
+ * (active against maximum: a run that never gave its count back stops the
+ * workload for good), the kick sources (ready count, signal bit, the flag),
+ * the idle back-off, and its priority on each SPU. Read without locks: a
+ * diagnostic, called when something has already stood still for seconds. */
+void spurs_debug_dump(const char* why)
+{
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        const u32 ea = si->ea;
+        if (!ea) continue;
+        fprintf(stderr, "[spurs-dump] %s: instance 0x%08X spus %u spurs2 %d kernel %d stopping %d kick %d pass %u cursor %u\n",
+                why, ea, si->nspus, si->is2, si->kernel_live, si->stopping, si->kick, si->pass_no, si->cursor);
+        for (u32 k = 0; k < si->nspus && k < 6; k++) {
+            const struct SpursPmSlot* sl = &si->slots[k];
+            fprintf(stderr, "[spurs-dump]   slot %u spu %u busy %d wid %u last %u polls %u\n",
+                    k, sl->spu_num, sl->busy, sl->wid, sl->last_wid, sl->last_polls);
+        }
+        const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+        for (u32 wid = 0; wid < nwid; wid++) {
+            if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+            char prio[32]; int o = 0;
+            for (u32 sn = 0; sn < si->nspus && sn < 8; sn++)
+                o += snprintf(prio + o, sizeof prio - (size_t)o, "%02X", vm_read8(ea + wkl_info_off(wid) + 0x18 + sn));
+            prio[o] = 0;
+            const u32 maxc = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
+            fprintf(stderr, "[spurs-dump]   w%-2u en %d state %u max %u (used %u) active %u cur %u ready %u signal %d "
+                            "flag %d idle %u prio %s\n",
+                    wid, !!(enabled & (0x80000000u >> wid)), vm_read8(ea + wkl_state_off(wid)), maxc,
+                    spurs_maxcont_override(wid, maxc), si->active[wid],
+                    wkl_count_get(ea, SPURS_WKL_CURCONT, wid, si->is2), vm_read8(ea + wkl_ready_off(wid)),
+                    !!(vm_read16(ea + wkl_signal_off(wid)) & wkl_signal_bit(wid)),
+                    vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid && vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0,
+                    si->idle[wid], prio);
+        }
+    }
+    const LONG n = s_pm_now_n < PM_NOW_MAX ? s_pm_now_n : PM_NOW_MAX;
+    fprintf(stderr, "[spurs-dump] workers now:");
+    for (LONG i = 0; i < n; i++) fprintf(stderr, " %ld:w%ld", (long)s_pm_now_tid[i], (long)s_pm_now_wid[i]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
 {
     const u32 ea = si->ea, sn = slot->spu_num;

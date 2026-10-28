@@ -1752,6 +1752,31 @@ void gcm_note_spu_put(u32 ea, u32 size)
     gcm_pp_patched(io, size);
 }
 
+
+/* GCM_PARK_DUMP_MS=<ms>: a park standing <ms> with put elsewhere is dumped --
+ * the FIFO around it, the last blocks SPUs wrote into RSX-visible memory, and
+ * the SPURS scheduler (spurs_debug_dump) -- and again at four times that, to
+ * see what moved. For the freeze where an EDGE hole is never filled. */
+static void gcm_fifo_dump_around(u32 getoff);
+static unsigned long long gcm_park_dump_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_DUMP_MS"); ms = e ? atoll(e) : 0; }
+    return (unsigned long long)ms;
+}
+static void gcm_park_dump(u32 off, u32 put, unsigned long long ms)
+{
+    fprintf(stderr, "[park-dump] parked at 0x%08X, put 0x%08X, %llu ms; last SPU blocks (newest first):", off, put, ms);
+    for (int k = 1; k <= GCM_SPU_BLK_N; k++) {
+        const int i = (s_spu_blk_w + GCM_SPU_BLK_N - k) % GCM_SPU_BLK_N;
+        if (s_spu_blk[i].io_end) fprintf(stderr, " %08X-%08X", s_spu_blk[i].io_start, s_spu_blk[i].io_end);
+    }
+    fprintf(stderr, "\n");
+    gcm_fifo_dump_around(off);
+    extern void spurs_debug_dump(const char* why);
+    spurs_debug_dump("park");
+}
+
 /* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.
  *
  * `put` sits at or just past the end of the block the title wants executed --
@@ -2644,6 +2669,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (put != s_fifo_getoff) {
                       extern unsigned long long ps3_ms_now(void);
                       const unsigned long long now = ps3_ms_now();
+                      { static u32 dump_off, dump_put; static int dump_n;
+                        const unsigned long long dms = gcm_park_dump_ms();
+                        if (dms && park_off == s_fifo_getoff && park_put == put) {
+                            if (dump_off != park_off || dump_put != put) { dump_off = park_off; dump_put = put; dump_n = 0; }
+                            if (dump_n < 2 && now - park_since >= dms * (dump_n ? 4u : 1u)) {
+                                dump_n++;
+                                gcm_park_dump(s_fifo_getoff, put, now - park_since);
+                            }
+                        } }
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
                       } else if (now - park_since >= gcm_park_grace_ms() &&

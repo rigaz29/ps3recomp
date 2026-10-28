@@ -260,7 +260,7 @@ static u64 fp_hash_bytes(const void* data, u32 size, u64 hash)
     return hash;
 }
 
-u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
+u64 rsx_fp_structural_hash_n(const u8* ucode, u32 max_bytes, u64 seed, u32* out_constants)
 {
     if (!ucode)
         return 0;
@@ -289,10 +289,17 @@ u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
                 &instruction_count, sizeof(instruction_count), hash);
             hash = fp_hash_bytes(
                 &constant_count, sizeof(constant_count), hash);
+            if (out_constants)
+                *out_constants = constant_count;
             return hash;
         }
     }
     return 0;
+}
+
+u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
+{
+    return rsx_fp_structural_hash_n(ucode, max_bytes, seed, NULL);
 }
 
 u64 rsx_fp_literal_source_hash(

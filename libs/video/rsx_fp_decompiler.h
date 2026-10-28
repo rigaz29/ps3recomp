@@ -169,6 +169,9 @@ int rsx_fp_collect_constants(
  * order are hashed; inline CONST payload bytes are skipped. Returns zero for
  * malformed input. */
 u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
+/* The same, also giving the number of inline constants (the fp_constants[]
+ * slots a buffered decompile reads) from the one walk. */
+u64 rsx_fp_structural_hash_n(const u8* ucode, u32 max_bytes, u64 seed, u32* out_constants);
 
 /* Hash the exact legacy HLSL literal spellings (%g) for a program while also
  * retaining structural identity. This is intended for aggregate diagnostics;

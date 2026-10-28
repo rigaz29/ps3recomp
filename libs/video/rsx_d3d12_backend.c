@@ -90,12 +90,33 @@
 /* b1, a draw's fragment program constants: the PSConstants of
  * rsx_fp_decompile_buffered_*, rearranged by vp_get_fp_pso so the fixed members
  * come first -- fp_tcscale[16] (c0-c15), fp_alpha (c16), fp_constants[] (c17
- * on). 128 float4: up to FP_CB_MAX_K inline constants; a program with more is
- * compiled with them as literals. */
-#define VP_FPCB_STRIDE    2048
+ * on). Each draw's slot is as long as its program needs (vp_record_cb), taken
+ * in turn from its frame's half of vp_fpcb; up to FP_CB_MAX_K constants, a
+ * program with more is compiled with them as literals. The guard after the
+ * second half keeps a slot read past its end inside the buffer. */
+#define FPCB_HALF         ((u32)MAX_DRAWS * 2048u)
+#define FPCB_GUARD        (64u * 1024u)
 #define FPCB_ALPHA        16
 #define FPCB_CONSTS       17
-#define FP_CB_MAX_K       ((VP_FPCB_STRIDE / 16) - FPCB_CONSTS)
+#define FP_CB_MAX_K       fp_cb_max_k()
+/* RSX_FP_CB_MAXK=<n>: fewer constants read from b1 (1-1024, default 1024). */
+static u32 fp_cb_max_k(void)
+{
+    static u32 k;
+    if (!k) {
+        const char* e = getenv("RSX_FP_CB_MAXK");
+        const int v = e ? atoi(e) : 1024;
+        k = (u32)(v < 1 ? 1 : v > 1024 ? 1024 : v);
+    }
+    return k;
+}
+/* How far a fragment program is read looking for its end: instructions and
+ * their inline constants, 16 bytes each. It was 4 KB, and God of War:
+ * Ascension's depth of field pass (249 inline constants among its
+ * instructions) runs past that: decompiled without its last instructions it
+ * exported zero, and with no end found its pipeline was keyed on its first 64
+ * bytes, whose animated focus constant made a new program every frame. */
+#define FP_MAX_BYTES      (16u * 1024u)
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -162,6 +183,7 @@ typedef struct {
      * DRAW_LIMIT) would otherwise make every surviving draw read some other
      * object's MVP -- silently transforming it somewhere else entirely. */
     u32 cb_slot;
+    u32 fpcb_off;       /* its b1 slot in this frame's half of vp_fpcb */
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
@@ -2271,7 +2293,7 @@ static int init_d3d12(u32 width, u32 height)
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
             s_d3d.vp_cb->lpVtbl->Map(s_d3d.vp_cb, 0, &nr, &s_d3d.vp_cb_mapped);
 
-        bd.Width = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;  /* per-draw FP slots (b1), x2 parity */
+        bd.Width = (u64)FPCB_HALF * 2 + FPCB_GUARD;  /* per-draw FP slots (b1), x2 parity */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_fpcb)))
@@ -3757,7 +3779,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                   extern u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
                   if (r->fp_addr && vm_base) {
                       const u32 fo = cellGcmResolveLocated((r->fp_addr & 3u) == 1, r->fp_addr & ~3u);
-                      if (fo != 0xFFFFFFFFu) fpm = rsx_fp_texture_units(vm_base + fo, 4096);
+                      if (fo != 0xFFFFFFFFu) fpm = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
                   } }
                 for (int u = 0; u < VP_TEX_UNITS; u++)
                     if (r->tex[u].set && ((fpm >> u) & 1u))
@@ -4974,13 +4996,20 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         static int cb_on = -1;
         if (cb_on < 0) { const char* e = getenv("FP_CONSTBUF"); cb_on = !(e && e[0] == '0'); }
         u32 nk = 0;
-        const u64 sh = cb_on ? rsx_fp_structural_hash_n(vm_base + off, 4096, 1469598103934665603ull, &nk) : 0;
+        const u64 sh = cb_on ? rsx_fp_structural_hash_n(vm_base + off, FP_MAX_BYTES, 1469598103934665603ull, &nk) : 0;
         if (sh && nk <= FP_CB_MAX_K) {
             buffered = 1;
             uhash = (u32)(sh ^ (sh >> 32));
         } else {
-            u32 usz = rsx_fp_program_size(vm_base + off, 4096);
-            if (usz == 0) usz = 64;
+            u32 usz = rsx_fp_program_size(vm_base + off, FP_MAX_BYTES);
+            if (cb_on) {
+                static int _w = 0;
+                if (PS3_LOG_FIRST(_w, 8))
+                    fprintf(stderr, sh ? "[FP] fp=0x%08X: %u inline constants, more than b1 holds; compiled in%c"
+                                       : "[FP] fp=0x%08X: no end within %u bytes; constants compiled in%c",
+                            fp_addr, sh ? nk : FP_MAX_BYTES, 10);
+            }
+            if (usz == 0) usz = FP_MAX_BYTES;
             s_perf_pso_hashbytes += (int)usz;
             uhash = 2166136261u;
             const u8* up = vm_base + off;
@@ -5090,9 +5119,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int u = 0; u < VP_TEX_UNITS; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
     u32 nk = 0;
     int n = buffered
-        ? rsx_fp_decompile_buffered_color_ex(vm_base + off, 4096, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
+        ? rsx_fp_decompile_buffered_color_ex(vm_base + off, FP_MAX_BYTES, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
                                              hlsl, sizeof(hlsl), &nk)
-        : rsx_fp_decompile_color_ex(vm_base + off, 4096, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
+        : rsx_fp_decompile_color_ex(vm_base + off, FP_MAX_BYTES, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
                                     hlsl, sizeof(hlsl));
     /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
      * before they reach an integer target. */
@@ -5106,8 +5135,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (buffered) {
         /* The decompiler declares fp_constants[] before fp_alpha, which then
          * moves with the program's constant count. Put the fixed members
-         * first, with the coordinate scales, so that one slot layout serves
-         * every program (VP_FPCB_STRIDE). */
+         * first, with the coordinate scales, so that every program's slot
+         * starts the same way (vp_record_cb). */
         char from[192], to[224];
         const u32 nd = nk ? nk : 1u;
         snprintf(from, sizeof from, "cbuffer PSConstants : register(b1) {\n    float4 fp_constants[%u];\n"
@@ -6627,16 +6656,41 @@ static void vp_record_raw_cb(u32 slot, const rsx_state* st)
     memcpy(dst + sizeof fa, fk, sizeof fk);
 }
 
-static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+/* b1 slots taken from the half of vp_fpcb this frame's records use. */
+static u32 s_fpcb_used;
+
+static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
     /* b1 as of this draw: fp_alpha, and the program's inline constants as
-     * the guest has patched them for it. fp_tcscale[] waits for the replay,
-     * which knows the target each unit reads (dr_coord_scales). */
-    if (s_d3d.vp_fpcb_mapped) {
-        float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
-            + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
+     * the guest has patched them for it, in a slot as long as they need.
+     * fp_tcscale[] waits for the replay, which knows the target each unit
+     * reads (dr_coord_scales). */
+    if (s_d3d.vp_fpcb_mapped && dr) {
+        extern uint8_t* vm_base;
+        extern u32 cellGcmResolveLocated(int, u32);
+        static rsx_fp_constant_block kb;   /* only the recording thread */
+        int nk = 0;
+        if (dr->fp_addr && vm_base) {
+            const u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1, dr->fp_addr & ~0x3u);
+            if (foff != 0xFFFFFFFFu) nk = rsx_fp_collect_constants(vm_base + foff, FP_MAX_BYTES, &kb);
+            if (nk < 0) nk = 0;
+            if (nk > (int)FP_CB_MAX_K) nk = (int)FP_CB_MAX_K;
+        }
+        const u32 bytes = ((FPCB_CONSTS + (nk ? (u32)nk : 1u)) * 16u + 255u) & ~255u;
+        if (s_fpcb_used + bytes > FPCB_HALF) {
+            static int _f = 0;
+            if (PS3_LOG_FIRST(_f, 4))
+                fprintf(stderr, "[D3D12] b1 half full (%u bytes this frame); the draw shares slot 0%c",
+                        s_fpcb_used, 10);
+            dr->fpcb_off = 0;
+        } else {
+            dr->fpcb_off = s_fpcb_used;
+            s_fpcb_used += bytes;
+        }
+        float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped + (u64)s_d3d.vp_parity * FPCB_HALF + dr->fpcb_off);
+        if (nk > 0) memcpy(ts + FPCB_CONSTS * 4, kb.values, (size_t)nk * 16u);
         /* fp_alpha: x the alpha test's reference, y the WPOS window height
          * when its origin is the bottom edge (0 otherwise), z the pixel-centre
          * bias (-0.5 for integer centres): what the buffered decompile
@@ -6647,18 +6701,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
           fa[1] = ((wv >> 12) & 0xFu) ? (float)(wv & 0xFFFu) : 0.0f;
           fa[2] = ((wv >> 16) & 0xFu) ? -0.5f : 0.0f;
           fa[3] = 0.0f; }
-        if (dr && dr->fp_addr) {
-            extern uint8_t* vm_base;
-            extern u32 cellGcmResolveLocated(int, u32);
-            u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
-                                             dr->fp_addr & ~0x3u);
-            if (vm_base && foff != 0xFFFFFFFFu) {
-                static rsx_fp_constant_block kb;   /* only the recording thread */
-                const int nk = rsx_fp_collect_constants(vm_base + foff, 4096, &kb);
-                if (nk > 0)
-                    memcpy(ts + FPCB_CONSTS * 4, kb.values,
-                           (size_t)(nk < (int)FP_CB_MAX_K ? nk : (int)FP_CB_MAX_K) * 16u);
-            }
+        if (dr->fp_addr) {
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
@@ -8664,7 +8707,7 @@ static void rf_prepass(u32 from, u32 to)
           extern u32 cellGcmResolveLocated(int local, u32 offset);
           if (hi && dr->fp_addr && vm_base) {
               const u32 fo = cellGcmResolveLocated((dr->fp_addr & 3u) == 1, dr->fp_addr & ~3u);
-              if (fo != 0xFFFFFFFFu) fp_units = rsx_fp_texture_units(vm_base + fo, 4096);
+              if (fo != 0xFFFFFFFFu) fp_units = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
           } }
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
@@ -9404,7 +9447,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     float sc[VP_TEX_UNITS][2];
                     dr_coord_scales(dr, sc);
                     float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
-                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+                        + (u64)s_d3d.vp_parity * FPCB_HALF + dr->fpcb_off);
                     for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                         ts[_u * 4 + 0] = sc[_u][0]; ts[_u * 4 + 1] = sc[_u][1];
                         ts[_u * 4 + 2] = 0.0f;      ts[_u * 4 + 3] = 0.0f;
@@ -9416,7 +9459,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 if (s_d3d.vp_fpcb)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
-                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+                        + (u64)s_d3d.vp_parity * FPCB_HALF + dr->fpcb_off);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
                  * the target they are aimed at. A zero vertex count, or a start
                  * vertex past the buffer, rasterises nothing while every other
@@ -9676,6 +9719,7 @@ static void render_frame(void)
     s_seg_n = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    s_fpcb_used = 0;
 
     /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
      * into a readback buffer this frame and writes rt_save.bmp (half-float

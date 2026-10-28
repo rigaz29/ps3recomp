@@ -1009,6 +1009,60 @@ static int s_report_hold_pass = 0;    /* this drain stopped on a held GET_REPORT
  * since when it has stood with that put: the jump-park grace in the walker. */
 static u32 park_off, park_put;
 static unsigned long long park_since;
+
+/* GCM_PARK_PROF=<seconds>: the walker's self-JUMP parks, every so many seconds:
+ * how many, how long it stood at them in all (ms per second), how many were
+ * patched by an SPU PUT and how long after the patch the walker moved on, and
+ * how many it stood at with `put` already past (waiting on a patch) rather
+ * than at `put` (waiting on the title). Edge geometry jobs fill command-buffer
+ * holes the title leaves as parks; a frame whose fence the title waits on
+ * cannot be reached before they are filled. */
+static volatile u32 s_pp_off;                 /* the park the walker stands at, 0 none */
+static u64 s_pp_t0;                           /* since when (us) */
+static volatile u64 s_pp_patch;               /* when an SPU PUT covered it (us), 0 none */
+static int s_pp_put_past;                     /* `put` was past it when it began */
+static u64 s_pp_n, s_pp_us, s_pp_patched, s_pp_patch_us, s_pp_past;
+static int gcm_park_prof_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_PARK_PROF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static u64 gcm_pp_now_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (u64)((double)c.QuadPart * 1e6 / (double)f.QuadPart);
+}
+/* The walker stopped at a park at io `off` (put: the title's put). */
+static void gcm_pp_park(u32 off, u32 put)
+{
+    if (s_pp_off == off) return;
+    s_pp_off = off; s_pp_t0 = gcm_pp_now_us(); s_pp_patch = 0; s_pp_put_past = put != off;
+}
+/* The walker is reading io `off`, word `w`: if it has left the park, count it. */
+static void gcm_pp_left(u32 off, u32 w)
+{
+    if (!s_pp_off || (off == s_pp_off && (w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == off)) return;
+    const u64 now = gcm_pp_now_us(), patch = s_pp_patch;
+    s_pp_n++; s_pp_us += now - s_pp_t0; s_pp_past += s_pp_put_past;
+    if (patch && patch >= s_pp_t0) { s_pp_patched++; s_pp_patch_us += now - patch; }
+    s_pp_off = 0;
+    static u64 last;
+    if (!last) last = now;
+    if (gcm_park_prof_secs() && now - last >= (u64)gcm_park_prof_secs() * 1000000u) {
+        const double win = (double)(now - last) / 1e6;
+        fprintf(stderr, "[gcm-park] %.0f parks/s, %.1f ms a second parked (%.0f us each); %.0f%% with put past them; "
+                "%.0f/s patched by an SPU PUT, moved on %.0f us after the patch\n",
+                s_pp_n / win, s_pp_us / 1000.0 / win, s_pp_n ? (double)s_pp_us / (double)s_pp_n : 0.0,
+                s_pp_n ? 100.0 * (double)s_pp_past / (double)s_pp_n : 0.0, s_pp_patched / win,
+                s_pp_patched ? (double)s_pp_patch_us / (double)s_pp_patched : 0.0);
+        fflush(stderr);
+        s_pp_n = s_pp_us = s_pp_patched = s_pp_patch_us = s_pp_past = 0; last = now;
+    }
+}
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -1581,6 +1635,17 @@ int cellGcm_take_flip_pending_synced(void)
 #define GCM_REF_QLEN 4096
 static u32 s_ref_q[GCM_REF_QLEN];
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
+/* GCM_REF_STATS=<seconds>: fences queued per second, and how long each sat in
+ * the queue before the ref register showed it (mean, max) with the backlog it
+ * found -- the time a title waiting on ref spends on the pacing rather than on
+ * the RSX. */
+static u64 s_ref_qt[GCM_REF_QLEN];
+static int gcm_ref_stats_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_REF_STATS"); v = e ? atoi(e) : 0; }
+    return v;
+}
 
 /* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
  * teleports the walker into unmapped space, where it can never reach `put`
@@ -1659,6 +1724,15 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* An SPU PUT of [io, io + size): if it covers the park the walker stands at,
+ * note when. */
+static void gcm_pp_patched(u32 io, u32 size)
+{
+    const u32 off = s_pp_off;
+    if (!off || off < io || off - io >= size) return;
+    if (gcm_park_prof_secs()) s_pp_patch = gcm_pp_now_us();
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
@@ -1670,11 +1744,12 @@ void gcm_note_spu_put(u32 ea, u32 size)
      * transfers -- otherwise only the last fragment is remembered and the
      * walker still starts in the middle of the stream. */
     int prev = (s_spu_blk_w + GCM_SPU_BLK_N - 1) % GCM_SPU_BLK_N;
-    if (s_spu_blk[prev].io_end == io) { s_spu_blk[prev].io_end = io + size; return; }
+    if (s_spu_blk[prev].io_end == io) { s_spu_blk[prev].io_end = io + size; gcm_pp_patched(io, size); return; }
 
     s_spu_blk[s_spu_blk_w].io_start = io;
     s_spu_blk[s_spu_blk_w].io_end   = io + size;
     s_spu_blk_w = (s_spu_blk_w + 1) % GCM_SPU_BLK_N;
+    gcm_pp_patched(io, size);
 }
 
 /* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.
@@ -1828,6 +1903,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
+    if (gcm_ref_stats_secs()) s_ref_qt[t % GCM_REF_QLEN] = gcm_pp_now_us();
     s_ref_qtail = t + 1;
 }
 
@@ -1860,6 +1936,20 @@ static void gcm_ref_publish_one(void)
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
+    if (gcm_ref_stats_secs()) {
+        static u64 n, sum, mx, back, t0;
+        const u64 now = gcm_pp_now_us(), lat = now - s_ref_qt[h % GCM_REF_QLEN];
+        n++; sum += lat; if (lat > mx) mx = lat; back += s_ref_qtail - (h + 1);
+        if (!t0) t0 = now;
+        if (now - t0 >= (u64)gcm_ref_stats_secs() * 1000000u) {
+            const double win = (double)(now - t0) / 1e6;
+            fprintf(stderr, "[gcm-ref] %.0f fences/s published; queued %.0f us mean, %.1f ms max; "
+                    "%.1f still queued behind each\n", n / win, n ? (double)sum / (double)n : 0.0,
+                    mx / 1000.0, n ? (double)back / (double)n : 0.0);
+            fflush(stderr);
+            n = sum = mx = back = 0; t0 = now;
+        }
+    }
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
@@ -2421,6 +2511,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
         u32 type = w >> 29;
+        if (s_pp_off) gcm_pp_left(s_fifo_getoff, w);
         /* The walker is reading something other than the park it waited on:
          * it has left it, by the patched word (a JUMP elsewhere, or commands
          * written over the park) or by a resync. Forget the park here. Kept,
@@ -2538,6 +2629,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  if (gcm_park_prof_secs()) gcm_pp_park(s_fifo_getoff, put);
                   break;
               }
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;

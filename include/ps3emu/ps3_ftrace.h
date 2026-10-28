@@ -58,6 +58,10 @@ enum ps3_ft_kind {
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
     PS3_FT_HLE         = 15, /* who = PPU tid, a = NID, b = guest lr: an HLE import call */
+    PS3_FT_LINE        = 16, /* instant: an atomic commit to the line of a watched word
+                              * (ps3_ft_watch_word); a = the word's EA, b = its value after;
+                              * who = PPU tid, 0x10000 | SPURS workload for a policy-module
+                              * context, 0x20000 | SPU id for any other SPU context */
 };
 
 #if defined(_MSC_VER)

@@ -18,6 +18,7 @@
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/commit_hooks.h"
 #include "spu_overlay_residency.h"
 #include <stdint.h>
 #include <stdatomic.h>
@@ -91,6 +92,38 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* PS3_FT_LINE: words whose line's atomic commits go into the trace, set at
+ * run time by whoever knows the addresses (ps3_ft_watch_word). */
+#define PS3_FT_WORDS_MAX 32
+static volatile uint32_t s_ft_words[PS3_FT_WORDS_MAX];
+static volatile int s_ft_nwords;
+void ps3_ft_line_note(uint32_t line, uint32_t who);
+void ps3_ft_watch_word(uint32_t ea)
+{
+    g_ps3_ft_line_hook = ps3_ft_line_note;   /* the PPU's commits come through it */
+    const int n = __atomic_load_n(&s_ft_nwords, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (s_ft_words[i] == ea) return;
+    if (n < PS3_FT_WORDS_MAX) { s_ft_words[n] = ea; __atomic_store_n(&s_ft_nwords, n + 1, __ATOMIC_RELEASE); }
+}
+/* A committed atomic write to `line`; who as PS3_FT_LINE describes. */
+void ps3_ft_line_note(uint32_t line, uint32_t who)
+{
+    const int n = __atomic_load_n(&s_ft_nwords, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const uint32_t ea = s_ft_words[i];
+        if ((ea & ~127u) != line) continue;
+        uint32_t v; memcpy(&v, vm_base + ea, 4);
+        const uint64_t t = ps3_ft_now();
+        ps3_ft_span(PS3_FT_LINE, who, ea, __builtin_bswap32(v), t, t);
+    }
+}
+static uint32_t spu_ft_who(const spu_context* ctx)
+{
+    if (ctx->policy_mode)   /* the kernel context keeps the workload at LS 0x1DC */
+        return 0x10000u | ((uint32_t)ctx->ls[0x1DC] << 24 | (uint32_t)ctx->ls[0x1DD] << 16 |
+                           (uint32_t)ctx->ls[0x1DE] << 8 | ctx->ls[0x1DF]);
+    return 0x20000u | ctx->spu_id;
+}
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -1069,6 +1102,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+            if (PS3_FT_ON()) ps3_ft_line_note(ea & ~127u, spu_ft_who(ctx));
         }
         return 1;
 
@@ -1088,6 +1122,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        if (PS3_FT_ON()) ps3_ft_line_note(ea & ~127u, spu_ft_who(ctx));
         return 1;
 
     default:

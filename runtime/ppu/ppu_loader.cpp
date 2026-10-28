@@ -1207,6 +1207,11 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
+/* Diagnostic hooks on every successful stwcx./stdcx.: SPURS_KICK_PROF sees the
+ * PPU's workload requests (which, unlike an SPU's PUTLLC, wake nothing), and
+ * PS3_FT_LINE the commits to its watched words. */
+#include "ps3emu/commit_hooks.h"
+
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
@@ -1296,6 +1301,8 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * no call at all. */
     if (ok && g_ww_lo && (uint32_t)ea >= g_ww_lo && (uint32_t)ea < g_ww_hi)
         ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
+    if (ok && g_ppu_line_commit_hook) g_ppu_line_commit_hook((uint32_t)ea & ~127u);
+    if (ok && g_ps3_ft_line_hook) g_ps3_ft_line_hook((uint32_t)ea & ~127u, self ? (uint32_t)self->thread_id : 0u);
     return ok;
 }
 extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
@@ -1330,6 +1337,8 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
         ppu_ww_note_atomic((uint32_t)ea + 4, (uint32_t)val, 4,
                            __builtin_return_address(0));
     }
+    if (ok && g_ppu_line_commit_hook) g_ppu_line_commit_hook((uint32_t)ea & ~127u);
+    if (ok && g_ps3_ft_line_hook) g_ps3_ft_line_hook((uint32_t)ea & ~127u, self ? (uint32_t)self->thread_id : 0u);
     return ok;
 }
 

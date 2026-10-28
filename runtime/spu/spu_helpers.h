@@ -1244,11 +1244,24 @@ SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32
     return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc),
                             2, a, b, c, negp, negc);
 }
+#if defined(SPU_FLOAT_RZ_ONLY)
+/* SPU_FLOAT_RZ_ONLY: code built to run only in the RZ mode -- a port that always runs with
+ * SPU_FLOAT_RZ=1 -- takes those forms directly. Chosen at run time, every operation carries
+ * both forms, the exact one widened to double beside the native one, and a test of
+ * g_spu_float_rz: two and a half times the code in a float-heavy lifted function (19,525 x86
+ * instructions against 7,709 for one of God of War: Ascension's), for the same results. Only
+ * right in the RZ mode; the scalar forms below are exact in either. */
+#define SPU__X8_FA(a, b, nb) spu__x8_rz_fa(a, b, nb)
+#define SPU__X8_FMA(a, b, c, np, nc) spu__x8_rz_fma(a, b, c, np, nc)
+#define SPU__X8_FM(a, b) spu__x8_rz_fm(a, b)
+#else
 #define SPU__X8_FA(a, b, nb) (g_spu_float_rz ? spu__x8_rz_fa(a, b, nb) : spu__x8_fa(a, b, nb))
 #define SPU__X8_FMA(a, b, c, np, nc) (g_spu_float_rz ? spu__x8_rz_fma(a, b, c, np, nc) : spu__x8_fma(a, b, c, np, nc))
+#define SPU__X8_FM(a, b) (g_spu_float_rz ? spu__x8_rz_fm(a, b) : spu__x8_fm(a, b))
+#endif
 SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return SPU__X8_FA(a, b, 0); }
 SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return SPU__X8_FA(a, b, 0x80000000u); }
-SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return g_spu_float_rz ? spu__x8_rz_fm(a, b) : spu__x8_fm(a, b); }
+SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return SPU__X8_FM(a, b); }
 SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0); }            /* a*b + c */
 SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__X8_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */

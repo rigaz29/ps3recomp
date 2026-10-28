@@ -221,7 +221,13 @@ static long dp_under_rz(long n)
 int main(int argc, char** argv)
 {
     const long scale = argc > 1 ? atol(argv[1]) : 1;
+#if defined(SPU_FLOAT_RZ_ONLY) && (defined(__x86_64__) || defined(_M_X64))
+    /* Built with only the RZ forms: they are right only in that mode, so only those passes. */
+    int rc = 0;
+    printf("test_spu_float_exact: SPU_FLOAT_RZ_ONLY, the round-toward-zero passes only\n");
+#else
     int rc = all_passes(scale, "default (round to nearest)");
+#endif
 #if TEST_RZ
     /* SPU_FLOAT_RZ: the same passes on a thread running round toward zero with flush-to-zero,
      * where spu_fa.. take their native form. */

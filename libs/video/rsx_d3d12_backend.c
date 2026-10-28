@@ -283,6 +283,7 @@ typedef struct {
     u32 bytes;          /* res's size, counted against vp_tex_budget() */
     int next;           /* the next slot + 1 in this one's lookup chain, 0 = end */
     int linked;         /* in the lookup table */
+    u32 levels;         /* mip levels of res */
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -4273,8 +4274,21 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
     s->BorderColor[1] = (float)((border >> 8) & 0xFFu) / 255.0f;
     s->BorderColor[2] = (float)(border & 0xFFu) / 255.0f;
     s->BorderColor[3] = (float)(border >> 24) / 255.0f;
-    s->MinLOD = 0.0f;
-    s->MaxLOD = D3D12_FLOAT32_MAX;
+    /* Which levels may be sampled. A min filter without mipmapping (1 NEAREST,
+     * 2 LINEAR; 7 the convolution filter) reads level 0 only -- D3D12 has no
+     * such filter, a MIP_POINT one with MaxLOD 0 is the same. The mipmapped
+     * ones (3-6) keep to TEXTURE_CONTROL0's minimum [30:19] and maximum
+     * [18:7] level of detail, 4.8 fixed point. While only level 0 was
+     * uploaded neither mattered; with the chains uploaded, the cut-out
+     * textures a title samples unmipmapped came out as blocky lower levels. */
+    float lo = 0.0f, hi = 0.0f;
+    if (minf >= 3 && minf <= 6) {
+        lo = (float)((ctrl0 >> 19) & 0xFFFu) / 256.0f;
+        hi = (float)((ctrl0 >> 7) & 0xFFFu) / 256.0f;
+        if (hi < lo) hi = lo;
+    }
+    s->MinLOD = lo;
+    s->MaxLOD = hi;
 }
 
 static void vp_sampler_write(u32 i, const D3D12_SAMPLER_DESC* s)
@@ -5385,6 +5399,57 @@ static void tex_stats_note(double dt)
     }
 }
 
+/* TEX_MIPCHECK=<n>: for the first n textures uploaded with a mip chain, the
+ * mean colour of each level as read from guest memory -- decoded for the
+ * uncompressed formats, from the block end-point colours for DXT. A level
+ * that is a downscale of the one above keeps its mean; one read from the
+ * wrong place does not. Checks rsx_texture_mip_chain against the title. */
+static void tex_mipcheck(u32 off, u32 w, u32 h, u32 fmt, u32 nlev, const rsx_tex_level* lv)
+{
+    static int cap = -1, n = 0;
+    if (cap < 0) { const char* e = getenv("TEX_MIPCHECK"); cap = e ? atoi(e) : 0; }
+    if (!cap || n >= cap || nlev < 2) return;
+    n++;
+    extern uint8_t* vm_base;
+    fprintf(stderr, "[mipcheck] off=0x%08X fmt=0x%02X %ux%u levels %u:", off, fmt, w, h, nlev);
+    for (u32 l = 0; l < nlev; l++) {
+        const u8* src = vm_base + off + lv[l].offset;
+        double sum[4] = { 0, 0, 0, 0 }; u64 cnt = 0;
+        if (lv[l].tl.compressed) {
+            const u32 bsz = lv[l].tl.fmt == RSX_TEXFMT_BC1 ? 8u : 16u;
+            const u32 nb = lv[l].tl.face_bytes / bsz;
+            for (u32 b = 0; b < nb; b++) {
+                const u8* blk = src + (u64)b * bsz + (bsz == 16u ? 8u : 0u);
+                for (int k = 0; k < 2; k++) {
+                    const u16 c = (u16)(blk[k * 2] | (blk[k * 2 + 1] << 8));
+                    sum[0] += ((c >> 11) & 31) * 255.0 / 31.0;
+                    sum[1] += ((c >> 5) & 63) * 255.0 / 63.0;
+                    sum[2] += (c & 31) * 255.0 / 31.0;
+                    cnt++;
+                }
+            }
+        } else {
+            const u32 rb = lv[l].tl.dst_row_bytes, rows = lv[l].tl.rows;
+            u8* buf = (u8*)malloc((size_t)rb * rows);
+            if (!buf) continue;
+            rsx_texture_decode(buf, rb, src, lv[l].w, lv[l].h, &lv[l].tl, rsx_texture_argb_is_rgba());
+            const u32 bpp = lv[l].tl.dst_row_bytes / (lv[l].w ? lv[l].w : 1u);
+            if (bpp == 4) {
+                for (u32 i = 0; i + 3 < rb * rows; i += 4) {
+                    sum[0] += buf[i]; sum[1] += buf[i + 1]; sum[2] += buf[i + 2]; sum[3] += buf[i + 3]; cnt++;
+                }
+            } else {
+                for (u32 i = 0; i < rb * rows; i++) { sum[0] += buf[i]; cnt++; }
+            }
+            free(buf);
+        }
+        if (!cnt) cnt = 1;
+        fprintf(stderr, " L%u %ux%u=(%.0f,%.0f,%.0f,%.0f)", l, lv[l].w, lv[l].h,
+                sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt);
+    }
+    fprintf(stderr, "\n");
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     s_ts_out = TS_FAIL;
@@ -5541,11 +5606,49 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
           }
           fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
                   start_delta, w * h * bpp, 10); } } }
+    /* The texture's whole mip chain is uploaded: 60% of God of War: Ascension's
+     * binds carry one, and minified without it its distant surfaces shimmered.
+     * rsx_texture_mip_chain() has the RSX layout (each level packed after the
+     * one above, swizzled levels swizzled within themselves); D3D12 says where
+     * each face's levels go in the staging buffer (GetCopyableFootprints:
+     * subresource = level + face * levels). RSX_TEX_MIPS=0 uploads level 0
+     * only, as before. */
+    static rsx_tex_level s_lv[RSX_MAX_TEXTURE_LEVELS];
+    static D3D12_PLACED_SUBRESOURCE_FOOTPRINT s_lay[6 * RSX_MAX_TEXTURE_LEVELS];
+    static int mips_on = -1;
+    if (mips_on < 0) { const char* e = getenv("RSX_TEX_MIPS"); mips_on = e ? (atoi(e) != 0) : 1; }
+    u32 nlev = mips_on ? rsx_texture_mip_chain(fmt, w, h, mips, 0, s_lv) : 1u;
+    if (!nlev) nlev = 1;
+    /* A LINEAR texture's levels keep level 0's row pitch: God of War:
+     * Ascension's linear A8R8G8B8 chains read at their own width came out half
+     * padding (each level's mean colour half of level 0's, TEX_MIPCHECK), and
+     * every level after drifted. rsx_texture_mip_chain() packs them; DXT and
+     * swizzled chains are packed, and read right. */
+    if (nlev > 1 && !s_lv[0].tl.swizzled && !s_lv[0].tl.compressed) {
+        const u32 pitch0 = s_lv[0].tl.row_bytes;
+        u32 o = 0;
+        for (u32 l = 0; l < nlev; l++) {
+            rsx_texture_layout_pitched(fmt, s_lv[l].w, s_lv[l].h, pitch0, &s_lv[l].tl);
+            s_lv[l].offset = o;
+            o += s_lv[l].tl.face_bytes;
+        }
+    }
+    const u32 nsub = (cube ? 6u : 1u) * nlev;
+    D3D12_RESOURCE_DESC fd = {0};
+    fd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    fd.Width = w; fd.Height = h;
+    fd.DepthOrArraySize = cube ? 6 : 1;   /* cube = 6 array slices */
+    fd.MipLevels = (UINT16)nlev;
+    fd.Format = dxfmt; fd.SampleDesc.Count = 1;
+    fd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    UINT64 lay_total = 0;
+    s_d3d.device->lpVtbl->GetCopyableFootprints(s_d3d.device, &fd, 0, nsub, 0, s_lay, NULL, NULL, &lay_total);
+    if (!lay_total) return -1;
+    if (nlev > 1) tex_mipcheck(off, w, h, fmt, nlev, s_lv);
     /* A texture not held gets a slot from vp_tex_alloc; its size there is the
-     * decoded image's, in the 64 KB units a committed resource takes. */
+     * staged chain's, in the 64 KB units a committed resource takes. */
     const int ts_new = slot < 0;
-    const u64 need = ((u64)tl.dst_row_bytes * (dxt ? blkrows : h) * (cube ? 6u : 1u)
-                      + 0xFFFFu) & ~(u64)0xFFFFu;
+    const u64 need = ((u64)lay_total + 0xFFFFu) & ~(u64)0xFFFFu;
     if (slot < 0) slot = vp_tex_alloc(need);
     if (slot < 0) return -1;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
@@ -5560,7 +5663,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->levels != nlev))
         vp_tex_drop(t);
     if (!t->res) {
         s_ts_create++;
@@ -5569,7 +5672,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         td.Width = w; td.Height = h;
         td.DepthOrArraySize = cube ? 6 : 1;   /* cube = 6 array slices */
-        td.MipLevels = 1;
+        td.MipLevels = (UINT16)nlev;
         td.Format = dxfmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
@@ -5582,7 +5685,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
     /* Stage the decoded image in the ring, or in the slot's own upload
      * buffer when the ring is full or could not be made. */
-    const u64 up_bytes = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
+    pitch = (u32)s_lay[0].Footprint.RowPitch;   /* level 0: the same 256-aligned row */
+    const u64 up_bytes = (u64)lay_total;
     const u32 fi = s_d3d.frame_index;
     if (!s_d3d.tex_ring) {
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -5672,7 +5776,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 _i = 0; _i < _face_bytes; _i += 97) _s = _s*131 + _p[_i];
         fprintf(stderr, "[CUBEFACE] f=%u off=0x%X bytes=%u bpp=%u swz=%d csum=%08X%c",
                 _f, off, _face_bytes, bpp, swz, _s, 10); }
-    mapped = _map0 + (u64)_f * pitch * _face_rows;
+    mapped = _map0 + s_lay[_f * nlev].Offset;
     /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
      * semantics and lives in rsx_texture_layout.c, so a second backend gets
      * it by calling this rather than porting the loops again. */
@@ -5827,7 +5931,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 hd[26]=1; hd[28]=24;
                 fwrite(hd, 1, 54, f);
                 for (int y = (int)h - 1; y >= 0; y--) {
-                    const u8* srow = _map0 + (u64)_face * pitch * _face_rows
+                    const u8* srow = _map0 + s_lay[_face * nlev].Offset
                                      + (u64)y * pitch;
                     for (u32 x = 0; x < w; x++) {
                         u8 px[3];
@@ -5939,6 +6043,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
       } }
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
+    /* The levels below 0, each face's at its footprint. */
+    for (u32 _f = 0; _f < _nfaces && nlev > 1; _f++)
+        for (u32 _l = 1; _l < nlev; _l++) {
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* fp = &s_lay[_f * nlev + _l];
+            rsx_texture_decode((u8*)mapped + fp->Offset, (u32)fp->Footprint.RowPitch,
+                               vm_base + _off0 + _f * _face_bytes + s_lv[_l].offset,
+                               s_lv[_l].w, s_lv[_l].h, &s_lv[_l].tl, rsx_texture_argb_is_rgba());
+        }
     if (up_res != s_d3d.tex_ring) t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
@@ -5953,14 +6065,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = up_res; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint.Format   = dxfmt;
-    src.PlacedFootprint.Footprint.Width    = w;
-    src.PlacedFootprint.Footprint.Height   = h;
-    src.PlacedFootprint.Footprint.Depth    = 1;
-    src.PlacedFootprint.Footprint.RowPitch = pitch;
-    for (u32 _f = 0; _f < _nfaces; _f++) {
-        dst.SubresourceIndex        = _f;      /* cube face = array slice */
-        src.PlacedFootprint.Offset  = up_base + (u64)_f * pitch * _face_rows;
+    for (u32 _s = 0; _s < nsub; _s++) {   /* level + face * levels */
+        dst.SubresourceIndex = _s;
+        src.PlacedFootprint = s_lay[_s];
+        src.PlacedFootprint.Offset += up_base;
         s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
     }
     {
@@ -5974,7 +6082,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
-    t->cube = cube; t->used = 1;
+    t->cube = cube; t->used = 1; t->levels = nlev;
     if (!t->linked) vp_tex_link(slot);
     if (t->up && s_tex_staging_n < (int)(sizeof s_tex_staging / sizeof s_tex_staging[0])) {
         s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
@@ -6653,10 +6761,10 @@ static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = mapping;
-    sv.Texture2D.MipLevels = 1;
+    sv.Texture2D.MipLevels = (UINT)-1;   /* every level the resource has */
     if (cube) {   /* must match the TextureCube declaration in the HLSL */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
+        sv.TextureCube.MipLevels = (UINT)-1;
         sv.TextureCube.MostDetailedMip = 0;
         sv.TextureCube.ResourceMinLODClamp = 0.0f;
     }

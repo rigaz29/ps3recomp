@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/commit_hooks.h"
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -515,10 +516,13 @@ static void spurs_line_committed(uint32_t line)
         WakeAllConditionVariable(&si->wake);
     }
 }
+static int kick_prof_secs(void);
+static void kick_prof_commit(u32 line, int from_ppu);
 static void spurs_commit_hook(uint32_t line)
 {
     ef_line_committed(line);
     spurs_line_committed(line);
+    if (kick_prof_secs()) kick_prof_commit(line, 0);
 }
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
@@ -549,6 +553,127 @@ static u32 wkl_info_off(u32 wid)
 }
 static u32 wkl_signal_off(u32 wid) { return wid < 16 ? SPURS_WKL_SIGNAL1 : SPURS_WKL_SIGNAL2; }
 static u16 wkl_signal_bit(u32 wid) { return (u16)(0x8000u >> (wid & 15)); }
+
+/* SPURS_KICK_PROF=<seconds>: who makes each workload ready, and how long it then
+ * waits for an SPU, every so many seconds. A kick is a committed write to an
+ * instance's first line -- a PPU stwcx. or an SPU PUTLLC -- after which a
+ * workload's ready count is higher or its signal bit newly set. Per workload:
+ * kicks a second by who made them (the PPU, an SPU running workload N, another
+ * SPU thread; "probe" is a pick with no kick seen, the coordinator's back-off),
+ * how long it had sat with nothing running before each (what it waited on), and
+ * from the kick to its next pick. */
+enum { KP_PPU = 32, KP_SPU = 33, KP_PROBE = 34, KP_SRC_N = 35 };
+static SRWLOCK s_kp_lock = SRWLOCK_INIT;
+static u8 s_kp_ready[SPURS_MAX_WID];
+static u32 s_kp_sig;                    /* signal bits, 0x80000000 >> wid */
+static u64 s_kp_t[SPURS_MAX_WID];       /* the pending kick (us), 0 none */
+static u64 s_kp_idle_t[SPURS_MAX_WID];  /* since when nothing of it ran (us), 0 running */
+static u64 s_kp_n[SPURS_MAX_WID][KP_SRC_N], s_kp_idle_us[SPURS_MAX_WID][KP_SRC_N];
+static u64 s_kp_lat_n[SPURS_MAX_WID], s_kp_lat_us[SPURS_MAX_WID], s_kp_lat_max[SPURS_MAX_WID];
+static u64 wid_prof_now_ns(void);   /* below, with SPURS_WID_PROF */
+static u64 kick_prof_now_us(void) { return wid_prof_now_ns() / 1000u; }
+int spurs_pm_current_wid(unsigned long tid);
+static int kick_prof_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_KICK_PROF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static u32 kick_prof_sig(u32 ea)
+{
+    return ((u32)vm_read16(ea + SPURS_WKL_SIGNAL1) << 16) | vm_read16(ea + SPURS_WKL_SIGNAL2);
+}
+static void kick_prof_report(u64 now)
+{
+    static u64 last;
+    if (!last) { last = now; return; }
+    if (now - last < (u64)kick_prof_secs() * 1000000u) return;
+    const double win = (double)(now - last) / 1e6;
+    last = now;
+    for (u32 w = 0; w < SPURS_MAX_WID; w++) {
+        u64 tot = 0;
+        for (int s = 0; s < KP_SRC_N; s++) tot += s_kp_n[w][s];
+        if (!tot) continue;
+        char buf[512]; int o = 0;
+        o += snprintf(buf + o, sizeof buf - o, "[kick-prof] w%-2u %6.0f/s, to a pick %5.0f us mean %5.1f ms max; by",
+                      w, tot / win, s_kp_lat_n[w] ? (double)s_kp_lat_us[w] / (double)s_kp_lat_n[w] : 0.0,
+                      s_kp_lat_max[w] / 1000.0);
+        for (int k = 0; k < 4; k++) {   /* the four biggest sources */
+            int best = -1;
+            for (int s = 0; s < KP_SRC_N; s++)
+                if (s_kp_n[w][s] && (best < 0 || s_kp_n[w][s] > s_kp_n[w][best])) best = s;
+            if (best < 0) break;
+            char who[16];
+            if (best == KP_PPU) snprintf(who, sizeof who, "ppu");
+            else if (best == KP_SPU) snprintf(who, sizeof who, "spu");
+            else if (best == KP_PROBE) snprintf(who, sizeof who, "probe");
+            else snprintf(who, sizeof who, "w%d", best);
+            o += snprintf(buf + o, sizeof buf - o, " %s %.0f/s (idle %.0f ms/s)", who, s_kp_n[w][best] / win,
+                          s_kp_idle_us[w][best] / 1000.0 / win);
+            s_kp_n[w][best] = 0;
+        }
+        fprintf(stderr, "%s\n", buf);
+        memset(s_kp_n[w], 0, sizeof s_kp_n[w]); memset(s_kp_idle_us[w], 0, sizeof s_kp_idle_us[w]);
+        s_kp_lat_n[w] = s_kp_lat_us[w] = s_kp_lat_max[w] = 0;
+    }
+    fflush(stderr);
+}
+static void kick_prof_commit(u32 line, int from_ppu)
+{
+    u32 ea = 0, nwid = 16;
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        const u32 e = __atomic_load_n(&s_inst[i].ea, __ATOMIC_ACQUIRE);
+        if (e && (e & ~127u) == line) { ea = e; nwid = s_inst[i].is2 ? SPURS_MAX_WID : 16u; break; }
+    }
+    if (!ea) return;
+    int src = KP_PPU;
+    if (!from_ppu) {
+        const int w = spurs_pm_current_wid(GetCurrentThreadId());
+        src = (w >= 0 && w < 32) ? w : KP_SPU;
+    }
+    AcquireSRWLockExclusive(&s_kp_lock);
+    const u64 now = kick_prof_now_us();
+    const u32 sig = kick_prof_sig(ea);
+    for (u32 w = 0; w < nwid; w++) {
+        const u8 r = vm_read8(ea + wkl_ready_off(w));
+        const u32 bit = 0x80000000u >> w;
+        if ((r > s_kp_ready[w] || ((sig & bit) && !(s_kp_sig & bit))) && !s_kp_t[w]) {
+            s_kp_t[w] = now;
+            s_kp_n[w][src]++;
+            if (s_kp_idle_t[w]) { s_kp_idle_us[w][src] += now - s_kp_idle_t[w]; s_kp_idle_t[w] = 0; }
+        }
+        s_kp_ready[w] = r;
+    }
+    s_kp_sig = sig;
+    kick_prof_report(now);
+    ReleaseSRWLockExclusive(&s_kp_lock);
+}
+static void kick_prof_ppu_commit(uint32_t line) { kick_prof_commit(line, 1); }
+/* A pick took workload wid: its ready count and signal now read as given. */
+static void kick_prof_pick(u32 ea, u32 wid)
+{
+    AcquireSRWLockExclusive(&s_kp_lock);
+    const u64 now = kick_prof_now_us();
+    if (s_kp_t[wid]) {
+        const u64 d = now - s_kp_t[wid];
+        s_kp_lat_n[wid]++; s_kp_lat_us[wid] += d; if (d > s_kp_lat_max[wid]) s_kp_lat_max[wid] = d;
+        s_kp_t[wid] = 0;
+    } else if (s_kp_idle_t[wid]) {
+        s_kp_n[wid][KP_PROBE]++;
+        s_kp_idle_us[wid][KP_PROBE] += now - s_kp_idle_t[wid];
+    }
+    s_kp_idle_t[wid] = 0;
+    s_kp_ready[wid] = vm_read8(ea + wkl_ready_off(wid));
+    s_kp_sig = kick_prof_sig(ea);
+    ReleaseSRWLockExclusive(&s_kp_lock);
+}
+/* A run of wid ended and none of it is running or requested. */
+static void kick_prof_idle(u32 ea, u32 wid)
+{
+    AcquireSRWLockExclusive(&s_kp_lock);
+    if (!s_kp_t[wid] && !s_kp_idle_t[wid] && !vm_read8(ea + wkl_ready_off(wid))) s_kp_idle_t[wid] = kick_prof_now_us();
+    ReleaseSRWLockExclusive(&s_kp_lock);
+}
 /* Current (SPURS_WKL_CURCONT) or maximum (SPURS_WKL_MAXCONT) contention. */
 static u8 wkl_count_get(u32 ea, u32 field, u32 wid, int is2)
 {
@@ -818,6 +943,45 @@ s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
     return CELL_OK;
 }
 
+/* SPURS_PRIO_LOG=<seconds>: cellSpursSetPriorities calls -- the first 32 with
+ * their time, then every so many seconds each distinct (workload, table) and
+ * how many times it was set. */
+static void spurs_prio_log(u32 wid, const u8* p)
+{
+    static int secs = -1;
+    if (secs < 0) { const char* e = getenv("SPURS_PRIO_LOG"); secs = e ? atoi(e) : 0; }
+    if (!secs) return;
+    extern unsigned long long ps3_ms_now(void);
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static struct { u32 wid; u8 p[8]; u32 n; } seen[64];
+    static int nseen, nfirst;
+    static unsigned long long t0;
+    const unsigned long long now = ps3_ms_now();
+    AcquireSRWLockExclusive(&lk);
+    if (!t0) t0 = now;
+    if (nfirst < 32) {
+        nfirst++;
+        fprintf(stderr, "[spurs-prio] t=%llu ms wid %u: %u %u %u %u %u %u %u %u\n", now, wid,
+                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+    int i;
+    for (i = 0; i < nseen; i++)
+        if (seen[i].wid == wid && !memcmp(seen[i].p, p, 8)) break;
+    if (i == nseen && nseen < 64) { seen[i].wid = wid; memcpy(seen[i].p, p, 8); seen[i].n = 0; nseen++; }
+    if (i < nseen) seen[i].n++;
+    if (now - t0 >= (unsigned long long)secs * 1000u) {
+        for (int j = 0; j < nseen; j++) {
+            if (!seen[j].n) continue;
+            fprintf(stderr, "[spurs-prio] %llus: wid %u {%u %u %u %u %u %u %u %u} x%u\n", (now - t0) / 1000, seen[j].wid,
+                    seen[j].p[0], seen[j].p[1], seen[j].p[2], seen[j].p[3], seen[j].p[4], seen[j].p[5], seen[j].p[6], seen[j].p[7], seen[j].n);
+            seen[j].n = 0;
+        }
+        fflush(stderr);
+        t0 = now;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
 s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
                            const u8* priorities)
 {
@@ -835,6 +999,7 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     for (u32 sn = 0; sn < CELL_SPURS_MAX_SPU; sn++)
         vm_write8(si->ea + wkl_info_off(wid) + 0x18 + sn, priorities_h[sn]);
     spurs_api_unlock(si);
+    spurs_prio_log(wid, priorities_h);
     return CELL_OK;
 }
 
@@ -1644,6 +1809,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             vm_write32(info + 0x14, i << 24);                    /* uniqueId */
             for (int b = 0; b < 8; b++)
                 *(vm_base + info + 0x18 + b) = priority_h ? priority_h[b] : 1;
+            spurs_prio_log(i, s_workloads[i].priority);
             *(vm_base + spurs_ea + wkl_state_off(i)) = 2;        /* runnable */
             if (i < 16)   /* minimum contention has no second set */
                 *(vm_base + spurs_ea + SPURS_WKL_MINCONT + i) = (u8)(minContention ? minContention : 1);
@@ -2020,6 +2186,18 @@ int spurs_pm_current_wid(unsigned long tid)
         if ((unsigned long)s_pm_now_tid[i] == tid) return (int)s_pm_now_wid[i];
     return -1;
 }
+/* The workloads the workers are running right now, as a mask (bit wid), for
+ * probes that attribute an event to whatever ran when it happened. */
+unsigned spurs_pm_running_mask(void)
+{
+    const LONG n = s_pm_now_n < PM_NOW_MAX ? s_pm_now_n : PM_NOW_MAX;
+    unsigned m = 0;
+    for (LONG i = 0; i < n; i++) {
+        const LONG w = s_pm_now_wid[i];
+        if (w >= 0 && w < 32) m |= 1u << w;
+    }
+    return m;
+}
 
 /* SPURS_DISPATCH_PROF=<seconds>: what the hand-offs around a policy-module run
  * cost, every so many seconds. A run ends on its worker, which wakes the
@@ -2124,6 +2302,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < 4) si->idle[wid]++;
+        if (kick_prof_secs() && !si->active[wid]) kick_prof_idle(slot->ea, wid);
         if (dispatch_prof_secs()) { slot->t_end = wid_prof_now_ns(); slot->last_polls = polls; slot->last_wid = wid; }
         slot->busy = 0;
         /* The next workload for this SPU, picked here as the SPU's own kernel
@@ -2217,6 +2396,7 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
         if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
             ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
         ef_line_end(ea);
+        if (kick_prof_secs()) kick_prof_pick(ea, wid);
         slot->fn = pm->fn; slot->image_id = pm->image_id;
         slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
         slot->pm_size = s_workloads[wid].sizePm;
@@ -2287,6 +2467,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     __atomic_store_n(&si->kick, 0, __ATOMIC_RELAXED);
     { extern void (*g_spu_line_commit_hook)(uint32_t);
       g_spu_line_commit_hook = spurs_commit_hook; }
+    if (kick_prof_secs()) g_ppu_line_commit_hook = kick_prof_ppu_commit;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {

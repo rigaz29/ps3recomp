@@ -475,6 +475,7 @@ struct SpursPmSlot {
     /* The worker sleeps on its own condition variable, so handing it a run
      * wakes it alone; the coordinator sleeps on the instance's. */
     CONDITION_VARIABLE cv;
+    int boosted;    /* host thread raised for a SPURS_BOOST_WID workload */
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -2405,6 +2406,30 @@ void spurs_debug_dump(const char* why)
     fflush(stderr);
 }
 
+/* SPURS_BOOST_WID=<wid>[,<wid>...]: the worker running one of these workloads
+ * does so at an above-normal host priority, and drops back for the others.
+ * For work with a deadline the guest's scheduler cannot keep on a busy host:
+ * God of War: Ascension mixes its audio in workload 7 (~0.8 of a core), and
+ * when that worker is held up the cellAudio blocks it was due to fill play
+ * as silence. */
+static int spurs_boost_wid(u32 wid)
+{
+    static int parsed = 0;
+    static u32 mask = 0;
+    if (!parsed) {
+        parsed = 1;
+        const char* e = getenv("SPURS_BOOST_WID");
+        while (e && *e) {
+            char* end = NULL;
+            const unsigned long v = strtoul(e, &end, 10);
+            if (end == e) break;
+            if (v < 32) mask |= 1u << v;
+            e = *end ? end + 1 : end;
+        }
+    }
+    return wid < 32 && ((mask >> wid) & 1u);
+}
+
 static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
 {
     const u32 ea = si->ea, sn = slot->spu_num;
@@ -2449,6 +2474,11 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
         slot->pm_size = s_workloads[wid].sizePm;
         slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
         slot->wid = wid; slot->ea = ea;
+        { const int b = spurs_boost_wid(wid);
+          if (b != slot->boosted && slot->thread) {
+              SetThreadPriority(slot->thread, b ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL);
+              slot->boosted = b;
+          } }
         si->active[wid]++;
         spu_lockline_lock();
         wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);

@@ -744,6 +744,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->depth_dirty = 1;
         return 0;
     }
+    if (method == NV4097_SET_POLY_OFFSET_FILL_ENABLE) {
+        state->poly_offset_fill = data ? 1 : 0;
+        state->depth_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR) {
+        state->poly_offset_factor = data;
+        state->depth_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_BIAS) {
+        state->poly_offset_bias = data;
+        state->depth_dirty = 1;
+        return 0;
+    }
 
     /* Stencil */
     if (method == NV4097_SET_STENCIL_TEST_ENABLE) {

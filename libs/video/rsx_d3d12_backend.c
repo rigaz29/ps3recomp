@@ -106,6 +106,7 @@ typedef struct {
                          * double-sided lets a shell's interior faces show
                          * through and shade unlit (black). */
     u64 zs_key;         /* packed guest depth/stencil state (rsx_zs_key), PSO key */
+    u64 poly;           /* polygon offset, rsx_poly_key (PSO key) */
     u32 stencil_ref;    /* guest stencil reference at draw time (dynamic state) */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
@@ -353,6 +354,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     int raw;                /* raw-fetch VS, no input layout (PSO key) */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
+    u64 poly;               /* polygon offset, rsx_poly_key (PSO key) */
     u64 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     u64 unnorm;             /* texel-coordinate units and their sizes (PSO key) */
     u32 wpos;               /* rec_wpos_win of the draw (PSO key) */
@@ -4365,6 +4367,22 @@ static u64 rsx_zs_key(const rsx_state* st)
     return k;
 }
 
+/* Polygon offset of a filled primitive as a PSO key: 0 when off, else the
+ * factor's float bits in the high word and the bias's in the low. The RSX
+ * bias counts steps of the depth format's resolution, as D3D12's DepthBias
+ * does; every depth buffer here is D24, and a Z16 surface's step is 256 of
+ * those. God of War: Ascension draws with factor 2 and biases of ~240,000. */
+static u64 rsx_poly_key(const rsx_state* st)
+{
+    if (!st || !st->poly_offset_fill) return 0;
+    u32 bias = st->poly_offset_bias;
+    if (((st->surface_format >> 5) & 7u) == 1u) {   /* Z16 */
+        float b; memcpy(&b, &bias, sizeof b); b *= 256.0f; memcpy(&bias, &b, sizeof bias);
+    }
+    if (!(st->poly_offset_factor & 0x7FFFFFFFu) && !(bias & 0x7FFFFFFFu)) return 0;
+    return ((u64)st->poly_offset_factor << 32) | bias;
+}
+
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
@@ -4653,6 +4671,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
             s_d3d.vp_fp[i].wpos == (udr ? udr->wpos_win : 0u) &&
+            s_d3d.vp_fp[i].poly == (udr ? udr->poly : 0u) &&
             s_d3d.vp_fp[i].zs == zs)
             return vp_fp_ready(&s_d3d.vp_fp[i]);
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -4992,6 +5011,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       static int _cfl = -1; if (_cfl < 0) _cfl = getenv("CULL_FLIP") ? 1 : 0;
       pd.RasterizerState.FrontCounterClockwise =
           (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
+    /* Polygon offset: offset = factor * max depth slope + bias * r, the same
+     * formula on both sides (rsx_poly_key). */
+    { const u64 po = udr ? udr->poly : 0u;
+      if (po) {
+          const u32 fb = (u32)(po >> 32), bb = (u32)po;
+          float f, b; memcpy(&f, &fb, sizeof f); memcpy(&b, &bb, sizeof b);
+          pd.RasterizerState.DepthBias = (INT)b;
+          pd.RasterizerState.SlopeScaledDepthBias = f;
+          pd.RasterizerState.DepthBiasClamp = 0.0f;
+      } }
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
      * straight alpha; demosaic's effect passes blend OFF; DeferredShading's
      * light accumulation is additive ONE,ONE. */
@@ -5103,6 +5132,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].wpos      = udr ? udr->wpos_win : 0u;
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = udr ? udr->poly : 0u;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp[s_d3d.vp_fp_n].job     = job;
     { const int n = s_d3d.vp_fp_n;
@@ -10897,7 +10927,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
@@ -11018,7 +11048,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
@@ -11219,7 +11249,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {

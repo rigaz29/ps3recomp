@@ -188,6 +188,9 @@ extern "C" {
 #define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_POLY_OFFSET_FILL_ENABLE      0x00000A68
+#define NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR  0x00000A78
+#define NV4097_SET_POLYGON_OFFSET_BIAS          0x00000A7C
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
 #define NV4097_SET_STENCIL_FUNC                 0x00000330
 #define NV4097_SET_STENCIL_FUNC_REF             0x00000334
@@ -300,6 +303,11 @@ typedef struct rsx_state {
     int two_sided_stencil;
     u32 back_stencil_func, back_stencil_ref, back_stencil_mask, back_stencil_write_mask;
     u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
+    /* Polygon offset of filled primitives: enable, and the scale factor
+     * and bias as the float bits written (the bias in units of the depth
+     * format's resolution). Decals and shadow maps. */
+    int poly_offset_fill;
+    u32 poly_offset_factor, poly_offset_bias;
 
     /* Culling */
     int cull_face_enable;

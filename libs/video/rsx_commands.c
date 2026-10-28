@@ -744,6 +744,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->depth_dirty = 1;
         return 0;
     }
+    /* Blend colour, MRT blending and masks, depth bounds, depth range, z min/max
+     * and anti-aliasing control: kept for the backend, which draws without
+     * whichever it does not use. */
+    if (method == NV4097_SET_BLEND_COLOR)      { state->blend_color = data;      state->blend_dirty = 1; return 0; }
+    if (method == NV4097_SET_BLEND_COLOR2)     { state->blend_color2 = data;     state->blend_dirty = 1; return 0; }
+    if (method == NV4097_SET_BLEND_ENABLE_MRT) { state->blend_enable_mrt = data; state->blend_dirty = 1; return 0; }
+    if (method == NV4097_SET_COLOR_MASK_MRT)   { state->color_mask_mrt = data;   state->blend_dirty = 1; return 0; }
+    if (method == NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE) { state->depth_bounds_enable = data ? 1 : 0; state->depth_dirty = 1; return 0; }
+    if (method == NV4097_SET_DEPTH_BOUNDS_MIN) { state->depth_bounds_min = data; state->depth_dirty = 1; return 0; }
+    if (method == NV4097_SET_DEPTH_BOUNDS_MAX) { state->depth_bounds_max = data; state->depth_dirty = 1; return 0; }
+    if (method == NV4097_SET_CLIP_MIN) { memcpy(&state->clip_min, &data, sizeof data); state->viewport_dirty = 1; return 0; }
+    if (method == NV4097_SET_CLIP_MAX) { memcpy(&state->clip_max, &data, sizeof data); state->viewport_dirty = 1; return 0; }
+    if (method == NV4097_SET_ZMIN_MAX_CONTROL) { state->zmin_max_control = data; state->depth_dirty = 1; return 0; }
+    if (method == NV4097_SET_ANTI_ALIASING_CONTROL) { state->aa_control = data; state->blend_dirty = 1; return 0; }
     if (method == NV4097_SET_POLY_OFFSET_FILL_ENABLE) {
         state->poly_offset_fill = data ? 1 : 0;
         state->depth_dirty = 1;

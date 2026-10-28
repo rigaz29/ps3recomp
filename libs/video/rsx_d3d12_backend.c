@@ -112,6 +112,12 @@ typedef struct {
                          * through and shade unlit (black). */
     u64 zs_key;         /* packed guest depth/stencil state (rsx_zs_key), PSO key */
     u64 poly;           /* polygon offset, rsx_poly_key (PSO key) */
+    u32 blend_color, blend_color2;   /* constant blend colour (dynamic state) */
+    u8  blend_const;    /* 1 a colour factor is CONSTANT_COLOR, 2 one is CONSTANT_ALPHA */
+    u32 blend_mrt, cmask_mrt;        /* SET_BLEND_ENABLE_MRT, SET_COLOR_MASK_MRT */
+    u32 dbt, dbt_min, dbt_max;       /* depth bounds: enable, min/max float bits */
+    u32 clip_min, clip_max;          /* depth range, float bits */
+    u32 zmm, aa;                     /* SET_ZMIN_MAX_CONTROL, SET_ANTI_ALIASING_CONTROL */
     u32 stencil_ref;    /* guest stencil reference at draw time (dynamic state) */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
@@ -4402,6 +4408,67 @@ static u64 rsx_poly_key(const rsx_state* st)
     return ((u64)st->poly_offset_factor << 32) | bias;
 }
 
+/* The state step 2 of the rendering accuracy plan records per draw, and the
+ * census of it (RSX_CENSUS): which of it the title uses with values that
+ * matter. A value table keeps the eight most frequent. */
+typedef struct { u32 v[8]; unsigned long long n[8]; unsigned long long other; } CenTop;
+static void cen_top(CenTop* t, u32 v)
+{
+    for (int i = 0; i < 8; i++) if (t->n[i] && t->v[i] == v) { t->n[i]++; return; }
+    for (int i = 0; i < 8; i++) if (!t->n[i]) { t->v[i] = v; t->n[i] = 1; return; }
+    t->other++;
+}
+static void cen_top_print(const char* name, CenTop* t)
+{
+    fprintf(stderr, " %s:", name);
+    for (int i = 0; i < 8; i++) if (t->n[i]) fprintf(stderr, " %08X=%llu", t->v[i], t->n[i]);
+    if (t->other) fprintf(stderr, " other=%llu", t->other);
+    memset(t, 0, sizeof *t);
+}
+static unsigned long long s_c2_draws, s_c2_const, s_c2_mrt, s_c2_dbt, s_c2_clip, s_c2_a2c;
+static CenTop s_c2_bcol, s_c2_bfmt, s_c2_bmrt, s_c2_cmrt, s_c2_dbtmm, s_c2_zmm;
+static void rsx_census_step2_print(void)
+{
+    fprintf(stderr, "[census] step2: draws %llu; constant blend %llu, MRT %llu, depth bounds on %llu, "
+                    "depth range not 0..1 %llu, alpha to coverage %llu;",
+            s_c2_draws, s_c2_const, s_c2_mrt, s_c2_dbt, s_c2_clip, s_c2_a2c);
+    cen_top_print("blend colour", &s_c2_bcol); cen_top_print("its target fmt", &s_c2_bfmt);
+    cen_top_print("MRT blend", &s_c2_bmrt); cen_top_print("MRT mask", &s_c2_cmrt);
+    cen_top_print("bounds min", &s_c2_dbtmm); cen_top_print("zmm", &s_c2_zmm);
+    fprintf(stderr, "\n");
+    s_c2_draws = s_c2_const = s_c2_mrt = s_c2_dbt = s_c2_clip = s_c2_a2c = 0;
+}
+static int rsx_census_secs(void);
+static void rec_step2_state(D3D12DrawRecord* dr, const rsx_state* st)
+{
+    if (!st) return;
+    dr->blend_color = st->blend_color; dr->blend_color2 = st->blend_color2;
+    dr->blend_const = 0;
+    if (st->blend_enable) {
+        const u32 f[2] = { st->blend_sfactor & 0xFFFFu, st->blend_dfactor & 0xFFFFu };
+        for (int i = 0; i < 2; i++) {
+            if (f[i] == 0x8001u || f[i] == 0x8002u) dr->blend_const |= 1u;
+            if (f[i] == 0x8003u || f[i] == 0x8004u) dr->blend_const |= 2u;
+        }
+        const u32 fa[2] = { st->blend_sfactor >> 16, st->blend_dfactor >> 16 };
+        for (int i = 0; i < 2; i++)
+            if (fa[i] >= 0x8001u && fa[i] <= 0x8004u) dr->blend_const |= 4u;
+    }
+    dr->blend_mrt = st->blend_enable_mrt; dr->cmask_mrt = st->color_mask_mrt;
+    dr->dbt = (u32)st->depth_bounds_enable; dr->dbt_min = st->depth_bounds_min; dr->dbt_max = st->depth_bounds_max;
+    memcpy(&dr->clip_min, &st->clip_min, sizeof dr->clip_min);
+    memcpy(&dr->clip_max, &st->clip_max, sizeof dr->clip_max);
+    dr->zmm = st->zmin_max_control; dr->aa = st->aa_control;
+    if (!rsx_census_secs()) return;
+    s_c2_draws++;
+    if (dr->blend_const) { s_c2_const++; cen_top(&s_c2_bcol, dr->blend_color); cen_top(&s_c2_bfmt, st->surface_format & 0x1Fu); }
+    if (st->color_target & 0x10u) { s_c2_mrt++; cen_top(&s_c2_bmrt, (st->blend_enable ? 1u : 0u) | (dr->blend_mrt & 0xEu)); cen_top(&s_c2_cmrt, dr->cmask_mrt); }
+    if (dr->dbt) { s_c2_dbt++; cen_top(&s_c2_dbtmm, dr->dbt_min); }
+    if (st->clip_min != 0.0f || (st->clip_max != 1.0f && st->clip_max != 0.0f)) s_c2_clip++;
+    if (dr->aa & 0x10u) s_c2_a2c++;
+    cen_top(&s_c2_zmm, dr->zmm);
+}
+
 /* Room for one more draw record. A full batch drops the draw: said once, so
  * a scene that outgrows MAX_DRAWS shows in the log, not as missing objects. */
 static int rsx_draw_room(void)
@@ -4414,6 +4481,38 @@ static int rsx_draw_room(void)
                 MAX_DRAWS);
     }
     return 0;
+}
+
+/* 2.1: the constant blend colour of a draw that blends with it. SET_BLEND_COLOR
+ * is A8R8G8B8 for an 8-bit target; for an fp16 or fp32 one it holds R and G as
+ * halves, and SET_BLEND_COLOR2 B and A. CONSTANT_ALPHA has no D3D12 factor of
+ * its own here, so a draw blending with it (and not with CONSTANT_COLOR) gets
+ * the alpha in all four lanes. The factor was never set before: such draws
+ * blended with D3D12's default. RSX_BLEND_COLOR=0 leaves it so. */
+static int rsx_blend_color_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_BLEND_COLOR"); v = e ? (atoi(e) != 0) : 1; }
+    return v;
+}
+static float rsx_half(u32 h)
+{
+    const u32 s = (h >> 15) & 1u, e = (h >> 10) & 31u, m = h & 1023u;
+    float v = e ? ldexpf((float)(m | 1024u), (int)e - 25) : ldexpf((float)m, -24);
+    if (e == 31u) v = m ? 0.0f : 65504.0f;
+    return s ? -v : v;
+}
+static void rsx_blend_factor(const D3D12DrawRecord* dr, float bf[4])
+{
+    const u32 c = dr->blend_color, c2 = dr->blend_color2;
+    if ((dr->rt_fmt & 0x1Fu) == 0x0Bu || (dr->rt_fmt & 0x1Fu) == 0x0Cu) {
+        bf[0] = rsx_half(c & 0xFFFFu); bf[1] = rsx_half(c >> 16);
+        bf[2] = rsx_half(c2 & 0xFFFFu); bf[3] = rsx_half(c2 >> 16);
+    } else {
+        bf[0] = (float)((c >> 16) & 0xFFu) / 255.0f; bf[1] = (float)((c >> 8) & 0xFFu) / 255.0f;
+        bf[2] = (float)(c & 0xFFu) / 255.0f;         bf[3] = (float)(c >> 24) / 255.0f;
+    }
+    if ((dr->blend_const & 3u) == 2u) bf[0] = bf[1] = bf[2] = bf[3];
 }
 
 static u32 rsx_blend_key(const rsx_state* st, int enable)
@@ -6765,6 +6864,7 @@ static void rsx_census_present(void)
                     s_cen_null[f][0], s_cen_null[f][1], s_cen_null[f][2]);
     fprintf(stderr, "\n");
     rsx_fp_census_print();
+    rsx_census_step2_print();
     fflush(stderr);
     memset(s_cen_hist, 0, sizeof s_cen_hist); s_cen_max_ms = 0.0;
     memset(s_cen_bind, 0, sizeof s_cen_bind); memset(s_cen_null, 0, sizeof s_cen_null);
@@ -8858,6 +8958,11 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                if (dr->blend_const && rsx_blend_color_on()) {
+                    float bf[4];
+                    rsx_blend_factor(dr, bf);
+                    s_d3d.cmd_list->lpVtbl->OMSetBlendFactor(s_d3d.cmd_list, bf);
+                }
                 if (cur_z >= 0 && (dr->zs_key & (2u | (1u << 5)))) s_d3d.off_ds[cur_z].gen++;
                 /* Per-draw viewport: the guest rect when sane, else the
                  * full target. Scissor tracks the same rect. */
@@ -11054,7 +11159,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
@@ -11175,7 +11280,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
@@ -11376,7 +11481,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {

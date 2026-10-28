@@ -189,6 +189,14 @@ extern "C" {
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
 #define NV4097_SET_POLY_OFFSET_FILL_ENABLE      0x00000A68
+#define NV4097_SET_BLEND_ENABLE_MRT             0x0000036C
+#define NV4097_SET_COLOR_MASK_MRT               0x00000370
+#define NV4097_SET_BLEND_COLOR2                 0x0000037C
+#define NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE     0x00000380
+#define NV4097_SET_DEPTH_BOUNDS_MIN             0x00000384
+#define NV4097_SET_DEPTH_BOUNDS_MAX             0x00000388
+#define NV4097_SET_ZMIN_MAX_CONTROL             0x00001D78
+#define NV4097_SET_ANTI_ALIASING_CONTROL        0x00001D7C
 #define NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR  0x00000A78
 #define NV4097_SET_POLYGON_OFFSET_BIAS          0x00000A7C
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
@@ -308,6 +316,15 @@ typedef struct rsx_state {
      * format's resolution). Decals and shadow maps. */
     int poly_offset_fill;
     u32 poly_offset_factor, poly_offset_bias;
+    /* Written by titles, until now dropped: the second blend colour word (B,A
+     * halves for an fp16 target), blending and colour masks of MRT 1-3, the
+     * depth bounds test (min/max as float bits), z min/max control (near/far
+     * culling and clamping) and anti-aliasing control (alpha to coverage). */
+    u32 blend_color2;
+    u32 blend_enable_mrt, color_mask_mrt;
+    int depth_bounds_enable;
+    u32 depth_bounds_min, depth_bounds_max;
+    u32 zmin_max_control, aa_control;
 
     /* Culling */
     int cull_face_enable;

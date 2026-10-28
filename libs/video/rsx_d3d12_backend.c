@@ -367,6 +367,8 @@ typedef struct {
     int raw;                /* raw-fetch VS, no input layout (PSO key) */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
     u64 poly;               /* polygon offset, rsx_poly_key (PSO key) */
+    u32 ext;                /* 1 depth bounds test, 2 depth clip (PSO key) */
+    u32 mrt;                /* MRT 1-3 masks and blend enables, rsx_pso_mrt (PSO key) */
     u64 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     u64 unnorm;             /* texel-coordinate units and their sizes (PSO key) */
     u32 wpos;               /* rec_wpos_win of the draw (PSO key) */
@@ -981,6 +983,7 @@ typedef struct ShaderJob {
     HRESULT hr;
     ID3DBlob* blob;                 /* the compiled program */
     ID3D12PipelineState* pso;       /* pipeline jobs: the pipeline */
+    int dbt;                        /* pipeline jobs: with the depth bounds test */
     char err[160];                  /* the start of a compile error */
 } ShaderJob;
 
@@ -1005,6 +1008,83 @@ static void sj_release(ShaderJob* j)
     free(j);
 }
 
+/* 2.3, the depth bounds test: God of War: Ascension enables it on ~300,000
+ * draws a minute in its first level (bounds ~0.97-1.0: effects meant for the
+ * far background only). It needs ID3D12GraphicsCommandList1::OMSetDepthBounds
+ * and a pipeline with D3D12_DEPTH_STENCIL_DESC1.DepthBoundsTestEnable, which
+ * only a pipeline state stream (ID3D12Device2) can describe; the pipelines of
+ * the draws that use it are made that way, the rest as before. Off where the
+ * adapter lacks it, or with RSX_DEPTH_BOUNDS=0. */
+static struct { int init, ok; ID3D12Device2* dev2; ID3D12GraphicsCommandList1* cl1; } s_dbt;
+static int dbt_ready(void)
+{
+    if (s_dbt.init) return s_dbt.ok;
+    s_dbt.init = 1;
+    const char* e = getenv("RSX_DEPTH_BOUNDS");
+    if (e && !atoi(e)) return 0;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2;
+    memset(&o2, 0, sizeof o2);
+    if (s_d3d.device && s_d3d.cmd_list &&
+        SUCCEEDED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)) &&
+        o2.DepthBoundsTestSupported &&
+        SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device2, (void**)&s_dbt.dev2)) &&
+        SUCCEEDED(s_d3d.cmd_list->lpVtbl->QueryInterface(s_d3d.cmd_list, &IID_ID3D12GraphicsCommandList1, (void**)&s_dbt.cl1)))
+        s_dbt.ok = 1;
+    printf("[D3D12] depth bounds test %s\n", s_dbt.ok ? "on" : "unavailable");
+    return s_dbt.ok;
+}
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature* v; } PssRootSig;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } PssShader;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_BLEND_DESC v; } PssBlend;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; UINT v; } PssUint;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RASTERIZER_DESC v; } PssRaster;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_DEPTH_STENCIL_DESC1 v; } PssDepth1;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_INPUT_LAYOUT_DESC v; } PssLayout;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_PRIMITIVE_TOPOLOGY_TYPE v; } PssTopology;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } PssRtFormats;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; DXGI_FORMAT v; } PssFormat;
+typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; DXGI_SAMPLE_DESC v; } PssSample;
+/* A guest pipeline: from its description, or as a stream with the depth
+ * bounds test on (`dbt`). */
+static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, int dbt,
+                                ID3D12PipelineState** out)
+{
+    if (!dbt || !s_dbt.dev2)
+        return s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, pd, &IID_ID3D12PipelineState,
+                                                                 (void**)out);
+    struct {
+        PssRootSig rs; PssShader vs, ps; PssBlend blend; PssUint mask; PssRaster raster; PssDepth1 depth;
+        PssLayout layout; PssTopology topo; PssRtFormats rtf; PssFormat dsf; PssSample sample;
+    } st;
+    memset(&st, 0, sizeof st);
+    st.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;      st.rs.v = pd->pRootSignature;
+    st.vs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;                  st.vs.v = pd->VS;
+    st.ps.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;                  st.ps.v = pd->PS;
+    st.blend.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;            st.blend.v = pd->BlendState;
+    st.mask.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK;       st.mask.v = pd->SampleMask;
+    st.raster.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;      st.raster.v = pd->RasterizerState;
+    st.depth.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+    st.depth.v.DepthEnable      = pd->DepthStencilState.DepthEnable;
+    st.depth.v.DepthWriteMask   = pd->DepthStencilState.DepthWriteMask;
+    st.depth.v.DepthFunc        = pd->DepthStencilState.DepthFunc;
+    st.depth.v.StencilEnable    = pd->DepthStencilState.StencilEnable;
+    st.depth.v.StencilReadMask  = pd->DepthStencilState.StencilReadMask;
+    st.depth.v.StencilWriteMask = pd->DepthStencilState.StencilWriteMask;
+    st.depth.v.FrontFace        = pd->DepthStencilState.FrontFace;
+    st.depth.v.BackFace         = pd->DepthStencilState.BackFace;
+    st.depth.v.DepthBoundsTestEnable = TRUE;
+    st.layout.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT;    st.layout.v = pd->InputLayout;
+    st.topo.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; st.topo.v = pd->PrimitiveTopologyType;
+    st.rtf.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    st.rtf.v.NumRenderTargets = pd->NumRenderTargets;
+    memcpy(st.rtf.v.RTFormats, pd->RTVFormats, sizeof st.rtf.v.RTFormats);
+    st.dsf.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; st.dsf.v = pd->DSVFormat;
+    st.sample.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;     st.sample.v = pd->SampleDesc;
+    D3D12_PIPELINE_STATE_STREAM_DESC sd;
+    sd.SizeInBytes = sizeof st; sd.pPipelineStateSubobjectStream = &st;
+    return s_dbt.dev2->lpVtbl->CreatePipelineState(s_dbt.dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
+}
+
 static void sj_build(ShaderJob* j)
 {
     ID3DBlob* err = NULL;
@@ -1017,8 +1097,7 @@ static void sj_build(ShaderJob* j)
     j->pd.PS.pShaderBytecode = j->blob->lpVtbl->GetBufferPointer(j->blob);
     j->pd.PS.BytecodeLength  = j->blob->lpVtbl->GetBufferSize(j->blob);
     const double t0 = perf_now();
-    j->hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-        s_d3d.device, &j->pd, &IID_ID3D12PipelineState, (void**)&j->pso);
+    j->hr = guest_pso_create(&j->pd, j->dbt, &j->pso);
     const double dt = perf_now() - t0;
     AcquireSRWLockExclusive(&s_shc_lock);
     s_shc_stat_pso++;
@@ -1069,7 +1148,7 @@ static int sj_workers(void)
  * shader and the compiled program as pixel shader. The caller owns one
  * reference (sj_release). */
 static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const char* target,
-                            ID3DBlob* vs, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+                            ID3DBlob* vs, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, int dbt)
 {
     ShaderJob* j = (ShaderJob*)calloc(1, sizeof *j);
     if (!j) return NULL;
@@ -1079,6 +1158,7 @@ static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const
     j->src[len] = 0;
     j->len = len; j->name = name; j->target = target;
     j->refs = 2;
+    j->dbt = dbt;
     if (vs && pd) {
         vs->lpVtbl->AddRef(vs);
         j->vs = vs;
@@ -3933,7 +4013,7 @@ static int vp_get_vs(const rsx_state* st)
     ShaderJob* vjob = NULL;
     if (sj_workers() > 0) {
         vb = shc_find(hlsl, strlen(hlsl), "vs_5_0");
-        if (!vb) vjob = sj_submit(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", NULL, NULL);
+        if (!vb) vjob = sj_submit(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", NULL, NULL, 0);
     }
     if (!vb && !vjob) {
         ID3DBlob* e = NULL;
@@ -4146,7 +4226,7 @@ static ID3DBlob* vp_vs_raw(int vs_idx)
             e->raw_failed = 0;
             return vb;
         }
-        e->raw_job = sj_submit(out, o, "guest_vp_raw", "vs_5_0", NULL, NULL);
+        e->raw_job = sj_submit(out, o, "guest_vp_raw", "vs_5_0", NULL, NULL, 0);
         if (e->raw_job) {
             free(out);
             e->raw_failed = 0;
@@ -4483,6 +4563,28 @@ static int rsx_draw_room(void)
     return 0;
 }
 
+/* The per-draw pipeline key bits of step 2: the depth bounds test (bit 0) and
+ * depth clipping (bit 1); and MRT 1-3's colour masks and blend enables. The
+ * switches RSX_DEPTH_CLIP=0 and RSX_MRT_MASK=0 keep the old behaviour. */
+static int dbt_ready(void);
+static u32 rsx_pso_ext(const D3D12DrawRecord* dr)
+{
+    static int clip = -1;
+    if (clip < 0) { const char* e = getenv("RSX_DEPTH_CLIP"); clip = e ? (atoi(e) != 0) : 1; }
+    if (!dr) return 0;
+    u32 e = 0;
+    if (dr->dbt && dbt_ready()) e |= 1u;
+    if (clip && (dr->zmm & 1u)) e |= 2u;
+    return e;
+}
+static u32 rsx_pso_mrt(const D3D12DrawRecord* dr)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_MRT_MASK"); on = e ? (atoi(e) != 0) : 1; }
+    if (!dr || !on) return 0;
+    return 1u | (dr->cmask_mrt & 0xFFF0u) | ((dr->blend_mrt & 0xEu) << 16);
+}
+
 /* 2.1: the constant blend colour of a draw that blends with it. SET_BLEND_COLOR
  * is A8R8G8B8 for an 8-bit target; for an fp16 or fp32 one it holds R and G as
  * halves, and SET_BLEND_COLOR2 B and A. CONSTANT_ALPHA has no D3D12 factor of
@@ -4737,6 +4839,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 {
     s_pso_pending = 0;
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
+    const u32 ext = rsx_pso_ext(udr);
+    const u32 mrt = nrt > 1 ? rsx_pso_mrt(udr) : 0u;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
@@ -4804,6 +4908,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
             s_d3d.vp_fp[i].wpos == (udr ? udr->wpos_win : 0u) &&
             s_d3d.vp_fp[i].poly == (udr ? udr->poly : 0u) &&
+            s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
             s_d3d.vp_fp[i].zs == zs)
             return vp_fp_ready(&s_d3d.vp_fp[i]);
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -5143,6 +5248,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       static int _cfl = -1; if (_cfl < 0) _cfl = getenv("CULL_FLIP") ? 1 : 0;
       pd.RasterizerState.FrontCounterClockwise =
           (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
+    /* 2.4: SET_ZMIN_MAX_CONTROL bit 0 culls what falls outside the depth range
+     * (D3D12's depth clip); clear (0x110 here: clamp instead) it does not. The
+     * guest pipelines had DepthClipEnable left at FALSE, a clamp for all. */
+    pd.RasterizerState.DepthClipEnable = (ext & 2u) ? TRUE : FALSE;
     /* Polygon offset: offset = factor * max depth slope + bias * r, the same
      * formula on both sides (rsx_poly_key). */
     { const u64 po = udr ? udr->poly : 0u;
@@ -5185,6 +5294,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       if (_cf) cmask = 0xF; }
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
+    /* 2.2: targets B-D (MRT 1-3) take their own nibble of SET_COLOR_MASK_MRT
+     * (A, R, G, B at bits 0-3) and bit of SET_BLEND_ENABLE_MRT, target A the
+     * main colour mask and blend enable -- the rule the Vulkan and Metal
+     * backends keep. With A's state on every target, a pass that leaves the
+     * G-buffer's alpha alone (0xEEE0, a few thousand draws a minute here)
+     * wrote over it. */
+    if (mrt) {
+        static int cf2 = -1;
+        if (cf2 < 0) cf2 = getenv("CMASK_FORCE") ? 1 : 0;
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        for (int _r = 1; _r < nrt; _r++) {
+            const u32 nib = (mrt >> (_r * 4)) & 0xFu;
+            UINT8 wm = 0;
+            if (nib & 1u) wm |= D3D12_COLOR_WRITE_ENABLE_ALPHA;
+            if (nib & 2u) wm |= D3D12_COLOR_WRITE_ENABLE_RED;
+            if (nib & 4u) wm |= D3D12_COLOR_WRITE_ENABLE_GREEN;
+            if (nib & 8u) wm |= D3D12_COLOR_WRITE_ENABLE_BLUE;
+            pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = cf2 ? (UINT8)0xF : wm;
+            pd.BlendState.RenderTarget[_r].BlendEnable =
+                pd.BlendState.RenderTarget[0].BlendEnable && ((mrt >> (16 + _r)) & 1u);
+        }
+    }
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     /* Guest depth/stencil state (rsx_zs_key). This was a fixed LESS_EQUAL
      * depth test with writes and no stencil, whatever the title set: God of
@@ -5222,12 +5353,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     ID3D12PipelineState* pso = NULL;
     ShaderJob* job = NULL;
     if (async) {
-        job = sj_submit(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", vsb, &pd);
+        job = sj_submit(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", vsb, &pd, (int)(ext & 1u));
         if (!job) return NULL;
     } else {
         { const double t0 = perf_now();
-          hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-              s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+          hr = guest_pso_create(&pd, (int)(ext & 1u), &pso);
           s_shc_stat_pso++; s_shc_stat_pso_s += perf_now() - t0; }
         pb->lpVtbl->Release(pb);
         if (FAILED(hr)) {
@@ -5265,6 +5395,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = udr ? udr->poly : 0u;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].ext     = ext;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].mrt     = mrt;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp[s_d3d.vp_fp_n].job     = job;
     { const int n = s_d3d.vp_fp_n;
@@ -8958,6 +9090,14 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                if (dr->dbt && dbt_ready()) {
+                    float lo, hi;
+                    memcpy(&lo, &dr->dbt_min, sizeof lo); memcpy(&hi, &dr->dbt_max, sizeof hi);
+                    if (!(lo >= 0.0f)) lo = 0.0f;
+                    if (!(hi <= 1.0f)) hi = 1.0f;
+                    if (hi < lo) hi = lo;
+                    s_dbt.cl1->lpVtbl->OMSetDepthBounds(s_dbt.cl1, lo, hi);
+                }
                 if (dr->blend_const && rsx_blend_color_on()) {
                     float bf[4];
                     rsx_blend_factor(dr, bf);

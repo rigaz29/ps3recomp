@@ -329,6 +329,7 @@ static u32 s_vram_mb;   /* the adapter's dedicated VRAM; 0 = not known */
 struct ShaderJob;
 typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
+    u64 last_use;           /* frame_count of the last draw recorded with it */
     ID3DBlob* vs;
     int uses_c03;
     char* hlsl;             /* the decompiled source, for vp_vs_raw */
@@ -337,12 +338,16 @@ typedef struct {
     struct ShaderJob* job;     /* vs still building (D3D12_ASYNC_SHADERS) */
     struct ShaderJob* raw_job; /* vs_raw still building */
 } VPVSEntry;
-#define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
-                         * thrashed every frame and eviction shifted slots
-                         * under recorded vs_idx values -- the display mesh
-                         * drew with the WRONG vertex program (sub-rect +
-                         * edge slivers instead of fullscreen). A fight in
-                         * SoulCalibur II HD uses more than 16. */
+#define VP_VS_CACHE 1024 /* wave uses 5+ distinct VPs; at 4 the cache
+                          * thrashed every frame and eviction shifted slots
+                          * under recorded vs_idx values -- the display mesh
+                          * drew with the WRONG vertex program (sub-rect +
+                          * edge slivers instead of fullscreen). A fight in
+                          * SoulCalibur II HD uses more than 16, the first
+                          * minute of God of War: Ascension's first level
+                          * 106. A full cache replaces the least recently
+                          * used entry where it is (vp_get_vs): no other
+                          * slot moves. */
 
 /* Not a SHADER_CONTROL bit: the draw's colour outputs are encoded to sRGB
  * (SET_SHADER_PACKER on an integer colour target). It rides in the recorded
@@ -380,6 +385,7 @@ typedef struct {
     u32 wpos;               /* rec_wpos_win of the draw, literal programs (PSO key) */
     u32 atest;              /* alpha test compiled in: CELL_GCM function, and for a
                              * literal program the reference above bit 16 (PSO key) */
+    u64 last_use;           /* frame_count of the last draw that asked for it */
     ID3D12PipelineState* pso;
     struct ShaderJob* job;  /* pso still building (D3D12_ASYNC_SHADERS) */
 } VPFPEntry;
@@ -391,8 +397,8 @@ typedef struct {
 /* Room for a level's working set once every program builds (God of War:
  * Ascension's level selects several hundred), looked up through a hash of the
  * ucode rather than a scan. */
-#define VP_FP_CACHE 4096
-#define VP_FP_HASH  1024
+#define VP_FP_CACHE 8192
+#define VP_FP_HASH  4096
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -707,6 +713,9 @@ static double s_hl_tex_s, s_hl_sjwait_s, s_hl_gpuwait_s;
  * decoding into the upload buffer, summed since start: TEX_STATS and the hitch
  * log report what each grew by. */
 static double s_tex_create_s, s_tex_evict_s, s_tex_decode_s;
+/* PERF: vertex programs replaced in the VS cache, pipelines dropped from the
+ * fragment pipeline cache, since the last report. */
+static unsigned s_perf_vs_replaced, s_perf_fp_dropped;
 static unsigned s_hl_tex_n, s_hl_skipped, s_hl_jobs;
 static int perf_on(void)
 {
@@ -960,6 +969,21 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
             printf("[d3d12] slow shader compile: %s (%s, %u bytes of HLSL) took %.0f ms%c",
                    name, target, (unsigned)len, dt * 1000.0, 10);
     }
+    /* D3D12_SHADER_MISS_DUMP=<existing dir>: the source of each of the first
+     * 400 programs compiled (not in the disk cache), as <n>_<name>.hlsl: what
+     * a warm cache still has to compile. */
+    { static const char* dir = (const char*)1;
+      static volatile LONG nd;
+      if (dir == (const char*)1) dir = getenv("D3D12_SHADER_MISS_DUMP");
+      if (dir) {
+          const LONG i = InterlockedIncrement(&nd) - 1;
+          if (i < 400) {
+              char p[600];
+              snprintf(p, sizeof p, "%s/%04ld_%s.hlsl", dir, (long)i, name);
+              FILE* f = fopen(p, "wb");
+              if (f) { fwrite(src, 1, len, f); fclose(f); }
+          }
+      } }
     AcquireSRWLockExclusive(&s_shc_lock);
     s_shc_stat_compiled++;
     s_shc_stat_compile_s += dt;
@@ -3963,8 +3987,10 @@ static int vp_get_vs(const rsx_state* st)
     static int memo_idx = -1;
     static u32 memo_hash;
     if (st == memo_st && !st->vp_dirty && memo_idx >= 0 && memo_idx < s_d3d.vp_vs_n &&
-        s_d3d.vp_vs[memo_idx].hash == memo_hash)
+        s_d3d.vp_vs[memo_idx].hash == memo_hash) {
+        s_d3d.vp_vs[memo_idx].last_use = s_d3d.frame_count;
         return memo_idx;
+    }
     /* Start at the instruction SET_TRANSFORM_PROGRAM_START selects, not at 0.
      * The microcode store holds every resident program -- this title keeps its
      * scene, fluid, caustics and droplet programs in it at once -- so
@@ -3988,7 +4014,7 @@ static int vp_get_vs(const rsx_state* st)
     ((rsx_state*)st)->vp_dirty = 0;
     memo_st = st; memo_hash = hash; memo_idx = -1;
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
-        if (s_d3d.vp_vs[i].hash == hash) { memo_idx = i; return i; }
+        if (s_d3d.vp_vs[i].hash == hash) { memo_idx = i; s_d3d.vp_vs[i].last_use = s_d3d.frame_count; return i; }
 
     static char hlsl[262144];
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
@@ -4064,16 +4090,34 @@ static int vp_get_vs(const rsx_state* st)
     }
     int slot;
     if (s_d3d.vp_vs_n < VP_VS_CACHE) slot = s_d3d.vp_vs_n++;
-    else {  /* evict slot 0 */
-        if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
-        if (s_d3d.vp_vs[0].vs_raw) s_d3d.vp_vs[0].vs_raw->lpVtbl->Release(s_d3d.vp_vs[0].vs_raw);
-        sj_release(s_d3d.vp_vs[0].job);
-        sj_release(s_d3d.vp_vs[0].raw_job);
-        free(s_d3d.vp_vs[0].hlsl);
-        memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
-        slot = VP_VS_CACHE - 1;
+    else {
+        /* Replace the least recently used program in its own slot. Not one a
+         * draw of this frame or the last was recorded with: that draw replays
+         * with whatever its vs_idx then holds. */
+        const u64 fc = s_d3d.frame_count;
+        slot = -1;
+        for (int i = 0; i < VP_VS_CACHE; i++)
+            if (fc - s_d3d.vp_vs[i].last_use >= 2 &&
+                (slot < 0 || s_d3d.vp_vs[i].last_use < s_d3d.vp_vs[slot].last_use)) slot = i;
+        if (slot < 0) {
+            static int _f = 0;
+            if (PS3_LOG_FIRST(_f, 4))
+                fprintf(stderr, "[VP] all %d cached vertex programs drawn with in two frames; not cached%c",
+                        VP_VS_CACHE, 10);
+            if (vb) vb->lpVtbl->Release(vb);
+            sj_release(vjob);
+            return -1;
+        }
+        VPVSEntry* o = &s_d3d.vp_vs[slot];
+        if (o->vs) o->vs->lpVtbl->Release(o->vs);
+        if (o->vs_raw) o->vs_raw->lpVtbl->Release(o->vs_raw);
+        sj_release(o->job);
+        sj_release(o->raw_job);
+        free(o->hlsl);
+        s_perf_vs_replaced++;
     }
     s_d3d.vp_vs[slot].hash = hash;
+    s_d3d.vp_vs[slot].last_use = s_d3d.frame_count;
     s_d3d.vp_vs[slot].vs   = vb;
     s_d3d.vp_vs[slot].job  = vjob;
     s_d3d.vp_vs[slot].raw_job = NULL;
@@ -4966,8 +5010,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
             s_d3d.vp_fp[i].poly == (udr ? udr->poly : 0u) &&
             s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
-            s_d3d.vp_fp[i].zs == zs)
+            s_d3d.vp_fp[i].zs == zs) {
+            s_d3d.vp_fp[i].last_use = s_d3d.frame_count;
             return vp_fp_ready(&s_d3d.vp_fp[i]);
+        }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -5460,13 +5506,43 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
     }
 
-    /* insert (evict oldest when full; a frame in flight may still use it) */
+    /* Full: drop the pipelines no draw has asked for for longest, an eighth of
+     * the cache or more at once behind one wait for the GPU. It used to drop
+     * the oldest one, waiting for the GPU, for every pipeline added once the
+     * cache was full -- God of War: Ascension's first level fills it. Never
+     * one asked for this frame or the last: the open command list may bind it. */
     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
+        const u64 fc = s_d3d.frame_count;
+        u64 age = 1024;
+        int k = 0;
+        for (;;) {
+            k = 0;
+            for (int i = 0; i < s_d3d.vp_fp_n; i++) k += fc - s_d3d.vp_fp[i].last_use >= age;
+            if (k >= VP_FP_CACHE / 8 || age <= 2) break;
+            age /= 2;
+        }
+        if (!k) {
+            static int _f = 0;
+            if (PS3_LOG_FIRST(_f, 4))
+                fprintf(stderr, "[FP] all %d cached pipelines asked for in two frames; not cached%c", VP_FP_CACHE, 10);
+            if (pso) rf_release(pso);
+            if (job) { s_pso_pending = 1; sj_release(job); }
+            return NULL;
+        }
         wait_for_gpu();
-        if (s_d3d.vp_fp[0].pso) rf_release(s_d3d.vp_fp[0].pso);
-        sj_release(s_d3d.vp_fp[0].job);
-        memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
-        s_d3d.vp_fp_n = VP_FP_CACHE - 1;
+        int w = 0;
+        for (int i = 0; i < s_d3d.vp_fp_n; i++) {
+            VPFPEntry* q = &s_d3d.vp_fp[i];
+            if (fc - q->last_use >= age) {
+                if (q->pso) q->pso->lpVtbl->Release(q->pso);
+                sj_release(q->job);
+                s_perf_fp_dropped++;
+                continue;
+            }
+            if (w != i) s_d3d.vp_fp[w] = *q;
+            w++;
+        }
+        s_d3d.vp_fp_n = w;
         vp_fp_index_rebuild();
     }
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
@@ -5485,6 +5561,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm    = unnorm;
     s_d3d.vp_fp[s_d3d.vp_fp_n].wpos      = wpos_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].atest     = atest;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].last_use  = s_d3d.frame_count;
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = udr ? udr->poly : 0u;
@@ -9547,6 +9624,9 @@ static void render_frame(void)
                 s_shc_stat_compiled = s_shc_stat_hits = s_shc_stat_pso = 0;
                 s_shc_stat_compile_s = s_shc_stat_pso_s = 0.0;
             }
+            fprintf(stderr, "[PERF] caches: %d vertex programs (%u replaced), %d fragment pipelines (%u dropped)%c",
+                    s_d3d.vp_vs_n, s_perf_vs_replaced, s_d3d.vp_fp_n, s_perf_fp_dropped, 10);
+            s_perf_vs_replaced = s_perf_fp_dropped = 0;
             if (s_sj_stat_jobs || s_sj_stat_skipped) {
                 fprintf(stderr, "[PERF] shader builds: %u queued to workers, %u draws skipped"
                                 " waiting for one%c", s_sj_stat_jobs, s_sj_stat_skipped, 10);

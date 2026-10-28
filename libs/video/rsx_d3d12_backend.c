@@ -875,6 +875,23 @@ static void shc_write(FILE* f, u64 key, u32 srclen, ID3DBlob* b)
     fwrite(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f);
 }
 
+/* A copy of a cached program, for the caller to own: the cache's own blobs
+ * are never handed out. d3dcompiler_47 counts a blob's references without
+ * atomics (ID3DBlob::Release is a plain load, decrement and store), and one
+ * blob shared by the shader workers and the drain thread lost counts: freed
+ * while the cache still held it, the next pipeline made from it was refused
+ * (E_FAIL, its bytecode gone) and its release freed the block a second time.
+ * God of War: Ascension's first level crashed with a corrupted heap in half
+ * the runs, a few seconds in. */
+static ID3DBlob* shc_copy(ID3DBlob* b)
+{
+    ID3DBlob* c = NULL;
+    const SIZE_T n = b->lpVtbl->GetBufferSize(b);
+    if (FAILED(D3DCreateBlob(n, &c)) || !c) return NULL;
+    memcpy(c->lpVtbl->GetBufferPointer(c), b->lpVtbl->GetBufferPointer(b), n);
+    return c;
+}
+
 /* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. */
 static void shc_open(void)
 {
@@ -924,9 +941,9 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     if (s_shc_on) {
         key = shc_key(src, len, target, flags);
         ShaderCacheEntry* e = s_shc_cap ? shc_slot(key, (u32)len) : NULL;
-        if (e && e->blob) {
-            e->blob->lpVtbl->AddRef(e->blob);
-            *out = e->blob;
+        ID3DBlob* c = e && e->blob ? shc_copy(e->blob) : NULL;
+        if (c) {
+            *out = c;
             if (err) *err = NULL;
             s_shc_stat_hits++;
             ReleaseSRWLockExclusive(&s_shc_lock);
@@ -947,9 +964,9 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     s_shc_stat_compiled++;
     s_shc_stat_compile_s += dt;
     if (s_shc_on && SUCCEEDED(hr) && *out) {
-        (*out)->lpVtbl->AddRef(*out);
-        if (shc_put(key, (u32)len, *out) && s_shc_file) {
-            shc_write(s_shc_file, key, (u32)len, *out);
+        ID3DBlob* c = shc_copy(*out);
+        if (c && shc_put(key, (u32)len, c) && s_shc_file) {
+            shc_write(s_shc_file, key, (u32)len, c);
             fflush(s_shc_file);
         }
     }
@@ -957,7 +974,7 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     return hr;
 }
 
-/* The disk cache's program for this source, referenced, or NULL: no compile. */
+/* A copy of the disk cache's program for this source, or NULL: no compile. */
 static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
 {
     ID3DBlob* b = NULL;
@@ -965,11 +982,8 @@ static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
     if (s_shc_on < 0) shc_open();
     if (s_shc_on && s_shc_cap) {
         ShaderCacheEntry* e = shc_slot(shc_key(src, len, target, shc_flags()), (u32)len);
-        if (e->blob) {
-            e->blob->lpVtbl->AddRef(e->blob);
-            b = e->blob;
+        if (e->blob && (b = shc_copy(e->blob)) != NULL)
             s_shc_stat_hits++;
-        }
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
     return b;
@@ -997,7 +1011,8 @@ typedef struct ShaderJob {
     volatile LONG done;             /* results below are final */
     char* src; size_t len;          /* HLSL, owned */
     const char* name; const char* target;
-    ID3DBlob* vs;                   /* pipeline jobs: the vertex shader, referenced */
+    void* vs;                       /* pipeline jobs: the vertex shader's bytecode, a copy
+                                     * (no blob is shared between threads: shc_copy) */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;   /* pipeline jobs: all but the pixel shader */
     HRESULT hr;
     ID3DBlob* blob;                 /* the compiled program */
@@ -1022,7 +1037,7 @@ static void sj_release(ShaderJob* j)
     if (!j || InterlockedDecrement(&j->refs)) return;
     if (j->blob) j->blob->lpVtbl->Release(j->blob);
     if (j->pso)  j->pso->lpVtbl->Release(j->pso);
-    if (j->vs)   j->vs->lpVtbl->Release(j->vs);
+    free(j->vs);
     free(j->src);
     free(j);
 }
@@ -1179,11 +1194,13 @@ static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const
     j->refs = 2;
     j->dbt = dbt;
     if (vs && pd) {
-        vs->lpVtbl->AddRef(vs);
-        j->vs = vs;
+        const SIZE_T vn = vs->lpVtbl->GetBufferSize(vs);
+        j->vs = malloc(vn);
+        if (!j->vs) { free(j->src); free(j); return NULL; }
+        memcpy(j->vs, vs->lpVtbl->GetBufferPointer(vs), vn);
         j->pd = *pd;
-        j->pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
-        j->pd.VS.BytecodeLength  = vs->lpVtbl->GetBufferSize(vs);
+        j->pd.VS.pShaderBytecode = j->vs;
+        j->pd.VS.BytecodeLength  = vn;
     }
     AcquireSRWLockExclusive(&s_sj_lock);
     if (s_sj_tail) s_sj_tail->next = j; else s_sj_head = j;

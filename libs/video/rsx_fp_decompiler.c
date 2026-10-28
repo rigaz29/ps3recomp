@@ -57,6 +57,7 @@ void rsx_fp_census_print(void)
 #define FP_TEX_UNIT_MASK    (15u << 17)
 #define FP_OPCODE_SHIFT     24
 #define FP_OPCODE_MASK      (0x3Fu << 24)
+#define FP_PREC_SHIFT       22         /* 0 fp32, 1 fp16, 2 fx12, 3 fx9 */
 #define FP_OUT_NONE         (1u << 30)
 #define FP_OUT_SAT          (1u << 31)
 
@@ -174,6 +175,35 @@ static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
 }
 
 unsigned long long g_rsx_fp_nonfinite_constants = 0;
+
+/* The precision an instruction computes at (OPDEST [23:22]) and the fp16 (H)
+ * registers. The RSX does fp16 work in half precision and fx12/fx9 work in
+ * fixed point, where an out-of-range result is clamped and an invalid one
+ * becomes zero on the spot; computed here at fp32, the NaN or Inf runs on to
+ * the colour outputs: a lane wiped out, white, black. So the result of such an
+ * instruction, and anything written to an H register, is clamped to the
+ * format's range with NaN taken as 0: fp16 +-65504, fx12 [-2, 2], fx9 [-1, 1].
+ * Applied before the saturate modifier, as the hardware orders them. God of
+ * War: Ascension: 92% of its programs have fp16 instructions, 43% of all
+ * instructions write an H register. RSX_FP_PRECISION=0 leaves results at
+ * fp32 as before. */
+static int rsx_fp_precision_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_PRECISION"); v = e ? (atoi(e) != 0) : 1; }
+    return v;
+}
+static const char* rsx_fp_precision_clamp(u32 w0)
+{
+    if (!rsx_fp_precision_on()) return "";
+    switch ((w0 >> FP_PREC_SHIFT) & 3u) {
+    case 2: return " _v = clamp(isnan(_v) ? 0.0 : _v, -2.0, 2.0);";
+    case 3: return " _v = clamp(isnan(_v) ? 0.0 : _v, -1.0, 1.0);";
+    case 1: return " _v = clamp(isnan(_v) ? 0.0 : _v, -65504.0, 65504.0);";
+    default:
+        return (w0 & FP_OUT_HALF) ? " _v = clamp(isnan(_v) ? 0.0 : _v, -65504.0, 65504.0);" : "";
+    }
+}
 
 /* An inline fragment constant is never legitimately non-finite.  A NaN one
  * poisons every pixel the program touches, which on an FP16 HDR target shows
@@ -1154,17 +1184,18 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[880];
                 snprintf(line, sizeof(line),
-                         "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
-                         rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
+                         "    { float4 _v = (float4)(%s)%s;%s%s %s[%u].%s = _v.%s; }\n",
+                         rhs, scale_txt[res_scale], rsx_fp_precision_clamp(w0), sat,
+                         reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[1280];
                 snprintf(buf, sizeof(buf),
-                         "    { float4 _v = (float4)(%s)%s;%s\n",
-                         rhs, scale_txt[res_scale], sat);
+                         "    { float4 _v = (float4)(%s)%s;%s%s\n",
+                         rhs, scale_txt[res_scale], rsx_fp_precision_clamp(w0), sat);
                 out_puts(&o, buf);
                 if (has_dest) {
                     if (is_uncond) {

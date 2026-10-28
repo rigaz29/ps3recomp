@@ -1215,31 +1215,32 @@ SPU__X8_INLINE u128 spu__x8_rz_fa(u128 a, u128 b, uint32_t negb) {
     return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb),
                             0, a, b, b, 0, negb);
 }
+/* fm and fma take the operands as they are: DAZ reads an SPU zero (biased exponent 0) as zero,
+ * so a zero product is zero and a zero addend adds nothing, and the one case the SPU defines
+ * differently -- zero times an extended-range word, which is NaN here -- fails the range check
+ * and is redone by the per-lane path, as are an extended-range addend and any result at or
+ * past FLT_MAX. Telling the zero product apart up front (as the NEON forms do) kept those
+ * lanes off the per-lane path at the cost of six more operations on every vector. */
 SPU__X8_INLINE u128 spu__x8_rz_fm(u128 a, u128 b) {
     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
-    const __m128i zp = _mm_or_si128(spu__x8_z(x), spu__x8_z(y));                 /* zero product */
     const __m128i s = _mm_castps_si128(_mm_mul_ps(spu__x8_f(x), spu__x8_f(y)));
-    const __m128i ok = _mm_or_si128(spu__x8_inrange(s), zp);
-    const __m128i r = _mm_andnot_si128(zp, spu__x8_flush(s));
+    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
     return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b),
                             1, a, b, b, 0, 0);
 }
-/* A zero product gives the addend as it is (extended range too), selected off the op's path. */
 SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
-    const __m128i xa = spu__x8_ld(a), y = spu__x8_ld(b), zc = spu__x8_ld(c);
-    const __m128i zp = _mm_or_si128(spu__x8_z(xa), spu__x8_z(y));                /* zero product */
-    const __m128i zi = _mm_andnot_si128(spu__x8_z(zc), _mm_xor_si128(zc, _mm_set1_epi32((int)negc)));
-    const __m128i x = _mm_xor_si128(xa, _mm_set1_epi32((int)negp));
+    const __m128i x = _mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp)), y = spu__x8_ld(b);
+    const __m128i z = _mm_xor_si128(spu__x8_ld(c), _mm_set1_epi32((int)negc));
 #if defined(__FMA__)
-    const __m128i s = _mm_castps_si128(_mm_fmadd_ps(spu__x8_f(x), spu__x8_f(y), spu__x8_f(zi)));
+    const __m128i s = _mm_castps_si128(_mm_fmadd_ps(spu__x8_f(x), spu__x8_f(y), spu__x8_f(z)));
 #else
     /* x*y is exact in double; the add truncates at 53 bits and the narrowing at 24, which is the
-     * truncation at 24: the 53-bit one lies between it and the exact sum */
+     * truncation at 24: the 53-bit one lies between it and the exact sum. DAZ applies to the
+     * widening too. */
     const __m128i s = _mm_castps_si128(_mm256_cvtpd_ps(_mm256_add_pd(
-        _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), spu__x8_wide(zi))));
+        _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), spu__x8_wide(z))));
 #endif
-    const __m128i ok = _mm_or_si128(spu__x8_inrange(s), zp);
-    const __m128i r = _mm_blendv_epi8(spu__x8_flush(s), zi, zp);
+    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
     return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc),
                             2, a, b, c, negp, negc);
 }

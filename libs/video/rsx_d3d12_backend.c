@@ -263,10 +263,9 @@ typedef struct {
 #define DRAW_SRV_BASE 64
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
 
-/* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
- * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
- * memory). Each draw that samples it writes its own SRV into its window at
- * DRAW_SRV_BASE. */
+/* VP texture slot: a guest texture held for the VP draws, uploaded again when
+ * its source bytes change (gcm/cube's plasma animates in guest memory). Each
+ * draw that samples it writes its own SRV into its window at DRAW_SRV_BASE. */
 typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
@@ -280,20 +279,28 @@ typedef struct {
     int used;           /* referenced this frame */
     u32 last_frame;     /* frame_count when last referenced: the slot least
                          * recently used is the one given to a new texture */
+    u32 bytes;          /* res's size, counted against vp_tex_budget() */
+    int next;           /* the next slot + 1 in this one's lookup chain, 0 = end */
+    int linked;         /* in the lookup table */
 } VPTexSlot;
-/* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
- * frame but not for a scene: this title binds ~20 distinct textures per frame,
- * so every draw past the fourth got slot -1 from vp_upload_tex_slot ("out of
- * slots") and drew UNTEXTURED. That reads as a correctly-lit but solid black
- * object, which is indistinguishable from a missing texture upload. */
-#define VP_TEX_SLOTS 192
+/* Textures held at once. Four was enough for a UI/atlas-style frame but not for
+ * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
+ * drew UNTEXTURED, which reads as a correctly-lit but solid black object. 192
+ * was not enough for God of War: Ascension, whose levels bind more distinct
+ * textures than that in one frame: each frame evicted 20-50 that the next one
+ * needed again (25-55 ms of uploads on the frame clock thread) and refused
+ * 400-2,200 binds. The cache is bounded by its size in bytes now; the slots
+ * only have to outnumber what that holds. Found through a hash table. */
+#define VP_TEX_SLOTS 4096
+#define VP_TEX_BUCKET_BITS 13
+static u32 s_vram_mb;   /* the adapter's dedicated VRAM; 0 = not known */
 /* Guest texture uploads are staged in one persistently mapped upload buffer,
  * a part per frame in flight, reset when that frame's command allocator is
  * (the GPU has finished its copies by then). A committed upload buffer per
  * texture cost about two thirds of a texture burst in God of War HD: 50 new
  * textures in one report interval spent 41 ms creating their upload buffers.
  * A texture that does not fit in what is left of the part uses its own buffer,
- * as before. */
+ * released once the batch has run (vp_tex_release_staging). */
 #define TEX_RING_PART (32u << 20)
 
 /* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
@@ -491,7 +498,7 @@ typedef struct {
     ID3DBlob*             vp_vs_blob;           /* kept for guest-FP PSO builds  */
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
-    VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
+    VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* the VP texture cache          */
     ID3D12Resource*       tex_ring;             /* texture upload ring, FRAME_COUNT parts */
     u8*                   tex_ring_ptr;         /* persistently mapped           */
     u64                   tex_ring_used[FRAME_COUNT];
@@ -1410,6 +1417,7 @@ static int init_d3d12(u32 width, u32 height)
                         (void**)&s_d3d.device))) {
                     printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
                            (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+                    s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
                     adapter->lpVtbl->Release(adapter);
                     break;
                 }
@@ -5188,8 +5196,168 @@ static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
     }
 }
 
+/* TEX_STATS=<frames>: the texture binds of the prepass by outcome, every so many
+ * frames: per frame, how many and how long (1 bound already this frame; 2 held
+ * from an earlier frame, checksum unchanged; 3 checksum changed, uploaded again;
+ * 4 not held, uploaded into a free or evicted slot; 5 refused), textures
+ * evicted, resources created, and what the cache holds. */
+enum { TS_HIT = 1, TS_SAME, TS_CHANGED, TS_NEW, TS_FAIL, TS_N };
+static int s_ts_out;
+static u64 s_ts_n[TS_N], s_ts_evict, s_ts_create;
+static double s_ts_t[TS_N];
+
+/* The texture cache: a hash table over the slots' keys, and what their
+ * resources take against vp_tex_budget(). Slots are handed out in order; once
+ * all have been, vp_tex_alloc takes an empty one or evicts. */
+static int s_tex_head[1 << VP_TEX_BUCKET_BITS];   /* slot + 1, 0 = empty chain */
+static int s_tex_hw;                              /* slots handed out so far */
+static u64 s_tex_bytes;                           /* held by the slots' resources */
+/* Upload buffers of textures that did not fit in the ring: released by the
+ * next rf_open, after its wait for the GPU; the batch's copies read them. */
+static ID3D12Resource* s_tex_staging[1024];
+static int s_tex_staging_n;
+
+static void vp_tex_release_staging(void)
+{
+    for (int i = 0; i < s_tex_staging_n; i++)
+        s_tex_staging[i]->lpVtbl->Release(s_tex_staging[i]);
+    s_tex_staging_n = 0;
+}
+
+static void vp_tex_cache_reset(void)
+{
+    memset(s_tex_head, 0, sizeof s_tex_head);
+    s_tex_hw = 0; s_tex_bytes = 0; s_tex_staging_n = 0;
+}
+
+static u32 vp_tex_hash(u32 key, u32 w, u32 h, u32 fmt, int cube)
+{
+    u32 x = (key * 0x9E3779B1u) ^ (w * 0x85EBCA77u) ^ (h * 0xC2B2AE3Du) ^ (fmt << 16) ^ (u32)cube;
+    x ^= x >> 15; x *= 0x2C1B3C6Du; x ^= x >> 12;
+    return x & ((1u << VP_TEX_BUCKET_BITS) - 1u);
+}
+
+static int vp_tex_find(u32 key, u32 w, u32 h, u32 fmt, int cube)
+{
+    for (int i = s_tex_head[vp_tex_hash(key, w, h, fmt, cube)]; i; i = s_d3d.vp_tex[i - 1].next) {
+        const VPTexSlot* c = &s_d3d.vp_tex[i - 1];
+        if (c->key == key && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube)
+            return i - 1;
+    }
+    return -1;
+}
+
+static void vp_tex_link(int slot)
+{
+    VPTexSlot* t = &s_d3d.vp_tex[slot];
+    int* head = &s_tex_head[vp_tex_hash(t->key, t->w, t->h, t->fmt, t->cube)];
+    t->next = *head; *head = slot + 1; t->linked = 1;
+}
+
+static void vp_tex_unlink(int slot)
+{
+    VPTexSlot* t = &s_d3d.vp_tex[slot];
+    if (!t->linked) return;
+    int* p = &s_tex_head[vp_tex_hash(t->key, t->w, t->h, t->fmt, t->cube)];
+    while (*p && *p != slot + 1) p = &s_d3d.vp_tex[*p - 1].next;
+    if (*p) *p = t->next;
+    t->next = 0; t->linked = 0;
+}
+
+/* Release a slot's resources. Only ever a slot this batch has not bound: the
+ * batches before it have run (rf_open waits for the GPU), so nothing in flight
+ * reads them. */
+static void vp_tex_drop(VPTexSlot* t)
+{
+    if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+    if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+    s_tex_bytes -= t->bytes; t->bytes = 0;
+}
+
+/* TEX_CACHE_MB=<n>: what the cached textures may take. Default: a third of the
+ * adapter's dedicated VRAM within 256-2048 MB, 512 MB when that is not known. */
+static u64 vp_tex_budget(void)
+{
+    static u64 b;
+    if (!b) {
+        const char* e = getenv("TEX_CACHE_MB");
+        const int v = e ? atoi(e) : 0;
+        u64 mb = v > 0 ? (u64)v : 0;
+        if (!mb) {
+            mb = s_vram_mb ? s_vram_mb / 3u : 512u;
+            if (mb < 256) mb = 256;
+            if (mb > 2048) mb = 2048;
+        }
+        b = mb << 20;
+    }
+    return b;
+}
+
+/* The least recently used slot holding a texture this batch has not bound; -1
+ * when there is none. */
+static int vp_tex_lru(void)
+{
+    int best = -1;
+    for (int i = 0; i < s_tex_hw; i++) {
+        const VPTexSlot* c = &s_d3d.vp_tex[i];
+        if (c->res && !c->used &&
+            (best < 0 || c->last_frame < s_d3d.vp_tex[best].last_frame)) best = i;
+    }
+    return best;
+}
+
+/* A slot for a texture the cache does not hold, `need` bytes: over the budget,
+ * the least recently used textures go first. Then a slot not handed out yet,
+ * an empty one, or the least recently used, whose resource vp_upload_tex_slot
+ * reuses when the size and format match. -1 when this batch binds them all. */
+static int vp_tex_alloc(u64 need)
+{
+    while (s_tex_bytes + need > vp_tex_budget()) {
+        const int v = vp_tex_lru();
+        if (v < 0) break;
+        vp_tex_unlink(v);
+        vp_tex_drop(&s_d3d.vp_tex[v]);
+        s_ts_evict++;
+    }
+    if (s_tex_hw < VP_TEX_SLOTS) return s_tex_hw++;
+    for (int i = 0; i < VP_TEX_SLOTS; i++)
+        if (!s_d3d.vp_tex[i].res && !s_d3d.vp_tex[i].linked) return i;
+    const int v = vp_tex_lru();
+    if (v >= 0) { vp_tex_unlink(v); s_ts_evict++; }
+    return v;
+}
+static int tex_stats_frames(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("TEX_STATS"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static void tex_stats_note(double dt)
+{
+    static u64 f0 = ~0ull;
+    const u64 fc = (u64)s_d3d.frame_count;
+    if (f0 == ~0ull) f0 = fc;
+    if (s_ts_out > 0 && s_ts_out < TS_N) { s_ts_n[s_ts_out]++; s_ts_t[s_ts_out] += dt; }
+    if (fc - f0 >= (u64)tex_stats_frames()) {
+        const double nf = (double)(fc - f0);
+        int live = 0;
+        for (int i = 0; i < s_tex_hw; i++) live += s_d3d.vp_tex[i].res != NULL;
+        static const char* const name[TS_N] = { "", "bound this frame", "same checksum", "changed", "new", "refused" };
+        fprintf(stderr, "[tex-stats] per frame:");
+        for (int k = 1; k < TS_N; k++)
+            fprintf(stderr, " %s %.0f (%.2f ms)", name[k], s_ts_n[k] / nf, s_ts_t[k] * 1000.0 / nf);
+        fprintf(stderr, "; evicted %.1f, created %.1f; %d textures held, %.0f of %.0f MB\n",
+                s_ts_evict / nf, s_ts_create / nf, live,
+                s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0);
+        fflush(stderr);
+        for (int k = 0; k < TS_N; k++) { s_ts_n[k] = 0; s_ts_t[k] = 0; }
+        s_ts_evict = s_ts_create = 0; f0 = fc;
+    }
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
+    s_ts_out = TS_FAIL;
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
      * tried against the TDR and does not help, because PERF shows the upload
      * path costing 0.01s for 775 calls. Kept because it is the right lever if a
@@ -5232,32 +5400,22 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* (portable helper tex_csum() -- see above; a statement-expression macro
      * here was a GCC/Clang extension MSVC rejects.) */
     #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
-    int slot = -1, freeslot = -1;
-    for (int i = 0; i < VP_TEX_SLOTS; i++) {
-        VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
-            && c->cube == cube) {
-            c->last_frame = s_d3d.frame_count;
-            if (c->used) return i;                /* already bound this frame */
-            { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
-              if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
-                                 nocache = e ? atoi(e) : 0; }
-              if (nocache) { slot = i; break; } }
+    int slot = vp_tex_find(key_off, w, h, fmt, cube);
+    if (slot >= 0) {
+        VPTexSlot* c = &s_d3d.vp_tex[slot];
+        c->last_frame = s_d3d.frame_count;
+        if (c->used) { s_ts_out = TS_HIT; return slot; }   /* already bound this frame */
+        static int nocache = -1;                 /* TEX_NOCACHE=1: always re-upload */
+        if (nocache < 0) { const char* e = getenv("TEX_NOCACHE"); nocache = e ? atoi(e) : 0; }
+        if (!nocache) {
             /* Held from an earlier frame: re-upload only if the guest bytes
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
-            if (cs == c->csum) { c->used = 1; return i; }
-            slot = i; break;                      /* stale: fall through and redo */
+            if (cs == c->csum) { c->used = 1; s_ts_out = TS_SAME; return slot; }
         }
-        /* A new texture takes an empty slot, else the one used least
-         * recently. Taking the first slot not used this frame evicted
-         * textures the next frame needed again. */
-        if (!c->used && (freeslot < 0 ||
-                         (s_d3d.vp_tex[freeslot].res &&
-                          (!c->res || c->last_frame < s_d3d.vp_tex[freeslot].last_frame))))
-            freeslot = i;
+        /* stale: uploaded again below, in its own slot */
     }
     /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
      * Measured on the Rubber Ducky demo: at the bind offset every texture reads
@@ -5309,10 +5467,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 off = alt;
             }
         } } }
-    /* A stale cache entry (slot >= 0) re-uses its own slot; otherwise take a
-     * free one. Without this the stale path fell through to freeslot and either
-     * duplicated the texture into a second slot or bailed when none was free. */
-    if (slot < 0 && freeslot < 0) return -1;      /* out of slots this frame */
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;
@@ -5357,7 +5511,12 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
           }
           fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
                   start_delta, w * h * bpp, 10); } } }
-    if (slot < 0) slot = freeslot;
+    /* A texture not held gets a slot from vp_tex_alloc; its size there is the
+     * decoded image's, in the 64 KB units a committed resource takes. */
+    const int ts_new = slot < 0;
+    const u64 need = ((u64)tl.dst_row_bytes * (dxt ? blkrows : h) * (cube ? 6u : 1u)
+                      + 0xFFFFu) & ~(u64)0xFFFFu;
+    if (slot < 0) slot = vp_tex_alloc(need);
     if (slot < 0) return -1;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     t->last_frame = s_d3d.frame_count;
@@ -5371,11 +5530,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)) {
-        t->res->lpVtbl->Release(t->res); t->res = NULL;
-        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
-    }
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
+        vp_tex_drop(t);
     if (!t->res) {
+        s_ts_create++;
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td = {0};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -5389,6 +5547,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
             return -1;
+        t->bytes = (u32)need; s_tex_bytes += need;
         fresh = 1;
     }
     /* Stage the decoded image in the ring, or in the slot's own upload
@@ -5786,9 +5945,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1;
+    if (!t->linked) vp_tex_link(slot);
+    if (t->up && s_tex_staging_n < (int)(sizeof s_tex_staging / sizeof s_tex_staging[0])) {
+        s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
+        t->up = NULL;
+    }
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
       t->csum = TEX_CSUM(vm_base + off, nb); }
     #undef TEX_CSUM
+    s_ts_out = ts_new ? TS_NEW : TS_CHANGED;
     return slot;
 }
 
@@ -7434,6 +7599,7 @@ static void rf_open(void)
      * costs little. */
     wait_for_gpu();
     rf_release_dead();   /* the batch that last referenced them has run */
+    vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
 
     /* Compile the real vertex program once its microcode is captured, and keep
@@ -7694,7 +7860,7 @@ static void rf_open(void)
       } }
 
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
-    for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
+    for (int _i = 0; _i < s_tex_hw; _i++) s_d3d.vp_tex[_i].used = 0;
     s_rf.pre_done = s_rf.done = 0;
 }
 
@@ -7948,9 +8114,11 @@ static void rf_prepass(u32 from, u32 to)
                      _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                    const double _ts0 = tex_stats_frames() ? perf_now() : 0.0;
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
                                                 _cube, dr->tex[_u].mips);
+                    if (_ts0 > 0.0) tex_stats_note(perf_now() - _ts0);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -11317,6 +11485,7 @@ static rsx_backend s_d3d12_backend = {0};
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_d3d, 0, sizeof(s_d3d));
+    vp_tex_cache_reset();
     s_d3d.width = width;
     s_d3d.height = height;
     s_d3d.clear_color[0] = 0.0f;

@@ -739,6 +739,12 @@ static double s_tex_create_s, s_tex_evict_s, s_tex_decode_s;
  * fragment pipeline cache, since the last report. */
 static unsigned s_perf_vs_replaced, s_perf_fp_dropped;
 static unsigned s_hl_tex_n, s_hl_skipped, s_hl_jobs;
+/* More of what a long frame did: fragment pipelines made on this thread on a
+ * miss (decompile, edits, queueing), upload buffers made because the texture
+ * ring was full, offscreen targets made, and every wait for the GPU. */
+static unsigned s_hl_miss_n, s_hl_upbuf_n, s_hl_rt_n, s_hl_waits_n;
+static double s_hl_miss_s, s_hl_upbuf_s, s_hl_rt_s, s_hl_waits_s;
+static IDXGIAdapter3* s_adapter3;   /* local memory use and budget, for the hitch log */
 static int perf_on(void)
 {
     static int v = -1;
@@ -1606,6 +1612,8 @@ static int init_d3d12(u32 width, u32 height)
                     printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
                            (unsigned long long)(ad.DedicatedVideoMemory >> 20));
                     s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
+                    if (FAILED(adapter->lpVtbl->QueryInterface(adapter, &IID_IDXGIAdapter3, (void**)&s_adapter3)))
+                        s_adapter3 = NULL;
                     adapter->lpVtbl->Release(adapter);
                     break;
                 }
@@ -2313,7 +2321,15 @@ static int init_d3d12(u32 width, u32 height)
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
+static void wait_for_gpu_once(void);
 static void wait_for_gpu(void)
+{
+    const double w0 = perf_now();
+    wait_for_gpu_once();
+    s_hl_waits_n++; s_hl_waits_s += perf_now() - w0;
+}
+
+static void wait_for_gpu_once(void)
 {
     u32 fi = s_d3d.frame_index;
     s_d3d.fence_values[fi]++;
@@ -6205,6 +6221,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         s_d3d.tex_ring_used[fi] = ring_at + up_bytes;
     } else {
         if (!t->up) {
+            const double ub0 = perf_now();
             D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bd = {0};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -6216,6 +6233,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                     D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                     &IID_ID3D12Resource, (void**)&t->up)))
                 return -1;
+            s_hl_upbuf_n++; s_hl_upbuf_s += perf_now() - ub0;
         }
         up_res = t->up;
     }
@@ -7056,6 +7074,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             }
         }
     }
+    const double rt0 = perf_now();
     OffRT* r = &s_d3d.off_rt[slot];
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td = {0};
@@ -7172,6 +7191,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     sh.ptr += (u64)(RT_SRV_BASE + slot) * s_d3d.srv_inc;
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, r->res, &sv, sh);
 
+    s_hl_rt_n++; s_hl_rt_s += perf_now() - rt0;
     static int _log = 0;
     if (PS3_LOG_FIRST(_log, 8))
         printf("[D3D12] offscreen RT %d: off=0x%X %ux%u (render-to-texture)\n",
@@ -7232,15 +7252,26 @@ static void rsx_census_present(void)
       if (dpre < 0.0) dpre = s_perf_pre;   /* PERF reset its sums in between */
       if (drf < 0.0) drf = s_perf_rf;
       pre_prev = s_perf_pre; rf_prev = s_perf_rf;
-      if (s_cen_last_present > 0.0 && (now - s_cen_last_present) * 1000.0 >= 150.0)
+      if (s_cen_last_present > 0.0 && (now - s_cen_last_present) * 1000.0 >= 150.0) {
+          DXGI_QUERY_VIDEO_MEMORY_INFO vm;
+          memset(&vm, 0, sizeof vm);
+          if (s_adapter3)
+              s_adapter3->lpVtbl->QueryVideoMemoryInfo(s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm);
           fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms: create %.1f, evict %.1f, decode %.1f), "
                           "shader waits %.1f ms, draws skipped %u, builds queued %u, GPU wait %.1f ms, prepass %.1f ms, "
-                          "render_frame %.1f ms\n",
+                          "render_frame %.1f ms; pipelines made here %u (%.1f ms), upload buffers %u (%.1f ms), "
+                          "targets made %u (%.1f ms), all GPU waits %u (%.1f ms), VRAM %llu of %llu MB\n",
                   (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0,
                   dcr * 1000.0, dev * 1000.0, ddc * 1000.0, s_hl_sjwait_s * 1000.0,
-                  s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0); }
+                  s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0,
+                  s_hl_miss_n, s_hl_miss_s * 1000.0, s_hl_upbuf_n, s_hl_upbuf_s * 1000.0,
+                  s_hl_rt_n, s_hl_rt_s * 1000.0, s_hl_waits_n, s_hl_waits_s * 1000.0,
+                  (unsigned long long)(vm.CurrentUsage >> 20), (unsigned long long)(vm.Budget >> 20));
+      } }
     s_hl_tex_n = s_hl_skipped = s_hl_jobs = 0;
     s_hl_tex_s = s_hl_sjwait_s = s_hl_gpuwait_s = 0.0;
+    s_hl_miss_n = s_hl_upbuf_n = s_hl_rt_n = s_hl_waits_n = 0;
+    s_hl_miss_s = s_hl_upbuf_s = s_hl_rt_s = s_hl_waits_s = 0.0;
     s_cen_last_present = now;
     if (s_cen_t0 <= 0.0) s_cen_t0 = now;
     if (now - s_cen_t0 < (double)rsx_census_secs()) return;
@@ -8871,12 +8902,15 @@ static void rf_prepass(u32 from, u32 to)
         /* Queue every build the frame needs before waiting for any: the draw
          * pass below waits, within the budget, for the ones still running. */
         s_sj_nowait = 1;
+        const int _m0 = s_perf_pso_miss;
+        const double _mt0 = rsx_census_secs() ? perf_now() : 0.0;
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
                                        dr->zs_key, dr_gamma_key(dr), dr_unnorm_key(dr), dr);
+        if (_mt0 > 0.0 && s_perf_pso_miss != _m0) { s_hl_miss_n++; s_hl_miss_s += perf_now() - _mt0; }
         s_sj_nowait = 0;
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }

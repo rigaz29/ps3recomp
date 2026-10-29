@@ -361,6 +361,39 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 static u32 s_report_dma = 0xFEED0000u;
 static u64 s_report_last_ts;
 
+/* ZPASS counts from the renderer. A query is CLEAR_REPORT_VALUE(1), its
+ * draws, GET_REPORT(1); the walker reaches the report long before the GPU has
+ * drawn them. The observer (the D3D12 backend) is told of both in stream
+ * order, counts the draws between them, and writes the count into the
+ * report's value word once the GPU has it (cellGcm_zpass_result). The walker
+ * writes the last count that report had -- 0xFFFF, "visible", until there is
+ * one -- so a title reading it a frame later gets a measured answer. */
+void (*cellGcm_zpass_observer)(int op, u32 value_ea);   /* op 0: clear, 1: report */
+#define ZP_N 16384u
+#define ZP_PROBE 64u     /* a full table costs a bounded search, then a reuse */
+static u32 s_zp_ea[ZP_N], s_zp_count[ZP_N];
+void cellGcm_zpass_result(u32 value_ea, u32 count)
+{
+    const u32 h = (value_ea >> 4) * 2654435761u;
+    u32 k = h & (ZP_N - 1u);
+    for (u32 i = 0; i < ZP_PROBE; i++) {
+        const u32 j = (h + i) & (ZP_N - 1u);
+        if (s_zp_ea[j] == value_ea || !s_zp_ea[j]) { k = j; break; }
+    }
+    s_zp_ea[k] = value_ea; s_zp_count[k] = count;
+    vm_write32(value_ea, count);
+}
+static int gcm_zpass_last(u32 value_ea, u32* count)
+{
+    const u32 h = (value_ea >> 4) * 2654435761u;
+    for (u32 i = 0; i < ZP_PROBE; i++) {
+        const u32 k = (h + i) & (ZP_N - 1u);
+        if (!s_zp_ea[k]) return 0;
+        if (s_zp_ea[k] == value_ea) { *count = s_zp_count[k]; return 1; }
+    }
+    return 0;
+}
+
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
  * walker pass must not share a time stamp or go backwards. */
 static u64 gcm_report_timestamp(void)
@@ -2281,13 +2314,15 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * later fence in the same batch overwrite it. */
     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
     /* NV4097_GET_REPORT: (type << 24) | offset into the report
-     * area. Sample counts are not measured, so a ZPASS query
-     * reports "visible" -- the conservative answer; reading 0
-     * tells the title every queried object is occluded. */
+     * area. A ZPASS count the renderer does not measure is reported
+     * "visible" -- the conservative answer; reading 0 tells the title
+     * every queried object is occluded. */
     if (m == 0x1A8) s_report_dma = v;
+    /* NV4097_CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT): a query starts. */
+    if (m == 0x17C8 && v == 1u && cellGcm_zpass_observer) cellGcm_zpass_observer(0, 0);
     if (m == 0x1800) {
         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
-        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+        u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
         const u64 ts = gcm_report_timestamp();
         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
@@ -2295,10 +2330,13 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
             const u32 rea = gcm_io2ea(off);
             if (rea) {
+                const int zp = (v >> 24) == 1u && cellGcm_zpass_observer;
+                if (zp) gcm_zpass_last(rea + 8u, &val);
                 vm_write32(rea, (u32)(ts >> 32));
                 vm_write32(rea + 4u, (u32)ts);
                 vm_write32(rea + 8u, val);
                 vm_write32(rea + 12u, 0u);
+                if (zp) cellGcm_zpass_observer(1, rea + 8u);
             } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
             s_report_data[idx].timestamp = ts;

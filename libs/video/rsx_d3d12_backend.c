@@ -230,6 +230,9 @@ typedef struct {
     /* Flip op (also is_clear): RSX_DISPLAY_RT's key of the display buffer a
      * flip named at this point of the batch (d3d12_flip_observed). */
     u32   flip_key;
+    /* ZPASS query op (also is_clear): 1 = CLEAR_REPORT_VALUE, 2 = GET_REPORT,
+     * whose count goes into the value word at zq_ea (d3d12_zpass_observed). */
+    u32   zq_op, zq_ea;
     u16   tex_zok;      /* prepass: units whose offset a depth surface wrote
                          * last (or nothing seen yet), so may be read as depth */
     u32   blit_src, blit_sp, blit_dst, blit_dp, blit_w, blit_h;
@@ -3813,6 +3816,8 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 fprintf(mf, "op%03u SNAP  ea=0x%08X slot=%d src=0x%X\n", d, r->snap_ea, r->snap_slot, r->snap_src);
             else if (r->flip_key)
                 fprintf(mf, "op%03u FLIP  0x%08X\n", d, r->flip_key);
+            else if (r->zq_op)
+                fprintf(mf, "op%03u ZPASS %s 0x%08X\n", d, r->zq_op == 1 ? "clear" : "report", r->zq_ea);
             else if (r->is_blit)
                 fprintf(mf, "op%03u BLIT  0x%X/%u -> 0x%X/%u %ux%u\n", d, r->blit_src, r->blit_sp,
                         r->blit_dst, r->blit_dp, r->blit_w, r->blit_h);
@@ -7170,7 +7175,7 @@ static u32 rec_surface_a(void)
 static void rec_not_copy(D3D12DrawRecord* dr)
 {
     dr->snap_ea = 0; dr->snap_slot = -1; dr->snap_src = 0;
-    dr->is_blit = 0; dr->flip_key = 0;
+    dr->is_blit = 0; dr->flip_key = 0; dr->zq_op = 0;
 }
 
 static u32 rec_wpos_win(void)
@@ -8821,6 +8826,151 @@ static void gts_read(void)
     fprintf(stderr, "%c", 10);
 }
 
+/* ZPASS occlusion counts. God of War: Ascension issues ~400 a frame, one
+ * bounding shape per object between CLEAR_REPORT_VALUE and GET_REPORT, and
+ * its SPU jobs read every result: answered "visible" they culled nothing, and
+ * answered 0 nearly the whole scene. The draws between a clear and its report
+ * are counted by D3D12 occlusion queries, resolved at the batch's end; the
+ * next batch, which starts by waiting for the GPU, hands each count to the
+ * walker (cellGcm_zpass_result), which writes it into the report's value word
+ * and keeps it for the next time the title reads that report.
+ * RSX_ZPASS=0: off, every count "visible". */
+#define ZQ_MAX     4096
+#define ZQ_REP_MAX 2048
+typedef struct { u32 ea, q0, q1; } ZqRep;      /* q0 = 0xFFFFFFFF: not counted */
+static ID3D12QueryHeap* s_zq_heap;
+static ID3D12Resource* s_zq_rb;
+static ZqRep s_zq_rep[FRAME_COUNT][ZQ_REP_MAX];
+static u32 s_zq_nrep[FRAME_COUNT], s_zq_n[FRAME_COUNT];
+static int s_zq_resolved[FRAME_COUNT];
+static int s_zq_open = -1, s_zq_counting, s_zq_lost;
+static unsigned long long s_zq_stat[4];      /* [1] visible [2] hidden [3] not counted */
+static u32 s_zq_acc0;
+static int zq_wanted(void)
+{
+    const char* e = getenv("RSX_ZPASS");
+    return !(e && atoi(e) == 0);
+}
+static int zq_on(void)
+{
+    static int v = -1;
+    if (v >= 0) return v;
+    v = 0;
+    if (!zq_wanted() || !s_d3d.device) return v;
+    D3D12_QUERY_HEAP_DESC qd;
+    memset(&qd, 0, sizeof qd);
+    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+    qd.Count = ZQ_MAX * FRAME_COUNT;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 8ull * ZQ_MAX * FRAME_COUNT;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SUCCEEDED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_zq_heap)) &&
+        SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_zq_rb)))
+        v = 1;
+    printf("[D3D12] ZPASS counts: %s\n", v ? "occlusion queries" : "could not create the query heap, reported visible");
+    return v;
+}
+/* cellGcm_zpass_observer: a query's clear (op 0) or report (op 1, its value
+ * word at value_ea), recorded where it falls among the draws. */
+static void d3d12_zpass_observed(int op, u32 value_ea)
+{
+    if (!s_d3d.initialized || s_d3d.draw_count >= MAX_DRAWS) return;
+    D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
+    memset(dr, 0, sizeof(*dr));
+    dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1; dr->snap_slot = -1;
+    dr->zq_op = (u32)op + 1u;
+    dr->zq_ea = value_ea;
+    s_d3d.merge_prev_draw = 0;
+    s_ix_run_valid = 0;
+    s_raw_run_valid = 0;
+}
+static void zq_close(void)
+{
+    if (s_zq_open < 0) return;
+    s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_zq_heap, D3D12_QUERY_TYPE_OCCLUSION,
+                                     (UINT)(s_rf.fi * ZQ_MAX) + (UINT)s_zq_open);
+    s_zq_open = -1;
+}
+static void zq_op_replay(const D3D12DrawRecord* dr)
+{
+    if (!zq_on()) return;
+    const u32 fi = s_rf.fi;
+    zq_close();
+    if (dr->zq_op == 1) { s_zq_counting = 1; s_zq_acc0 = s_zq_n[fi]; s_zq_lost = 0; return; }
+    if (s_zq_nrep[fi] < ZQ_REP_MAX) {
+        ZqRep* r = &s_zq_rep[fi][s_zq_nrep[fi]++];
+        r->ea = dr->zq_ea;
+        /* A report with no clear before it in this batch, or whose draws ran
+         * out of queries, keeps the count the walker gave it. */
+        r->q0 = (s_zq_counting && !s_zq_lost) ? s_zq_acc0 : 0xFFFFFFFFu;
+        r->q1 = s_zq_n[fi];
+    }
+    s_zq_counting = 0;
+}
+static void zq_before_draw(void)
+{
+    if (!s_zq_counting || s_zq_open >= 0 || !zq_on()) return;
+    const u32 fi = s_rf.fi;
+    if (s_zq_n[fi] >= ZQ_MAX) { s_zq_lost = 1; return; }
+    s_zq_open = (int)s_zq_n[fi]++;
+    s_d3d.cmd_list->lpVtbl->BeginQuery(s_d3d.cmd_list, s_zq_heap, D3D12_QUERY_TYPE_OCCLUSION,
+                                       (UINT)(fi * ZQ_MAX) + (UINT)s_zq_open);
+}
+static void zq_resolve(void)
+{
+    if (!zq_on()) return;
+    const u32 fi = s_rf.fi;
+    zq_close();
+    if (s_zq_n[fi])
+        s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_zq_heap, D3D12_QUERY_TYPE_OCCLUSION,
+                                                 (UINT)(fi * ZQ_MAX), s_zq_n[fi], s_zq_rb, 8ull * ZQ_MAX * fi);
+    s_zq_resolved[fi] = 1;
+}
+/* After the wait for the GPU: every batch submitted has run. */
+static void zq_read(void)
+{
+    if (!zq_on()) return;
+    extern void cellGcm_zpass_result(u32 value_ea, u32 count);
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++) {
+        /* A list reset without being submitted took its queries with it. */
+        if (!s_zq_resolved[fi]) { s_zq_nrep[fi] = 0; s_zq_n[fi] = 0; continue; }
+        if (s_zq_nrep[fi] && s_zq_n[fi]) {
+            void* p = NULL;
+            D3D12_RANGE rr = { (SIZE_T)8 * ZQ_MAX * fi, (SIZE_T)8 * ZQ_MAX * fi + (SIZE_T)8 * s_zq_n[fi] };
+            if (SUCCEEDED(s_zq_rb->lpVtbl->Map(s_zq_rb, 0, &rr, &p)) && p) {
+                const u64* q = (const u64*)((const u8*)p + (size_t)8 * ZQ_MAX * fi);
+                for (u32 k = 0; k < s_zq_nrep[fi]; k++) {
+                    const ZqRep* r = &s_zq_rep[fi][k];
+                    if (r->q0 == 0xFFFFFFFFu || r->q1 > s_zq_n[fi]) { s_zq_stat[3]++; continue; }
+                    u64 sum = 0;
+                    for (u32 i = r->q0; i < r->q1; i++) sum += q[i];
+                    const u32 c = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)sum;
+                    cellGcm_zpass_result(r->ea, c);
+                    s_zq_stat[c ? 1 : 2]++;
+                }
+                D3D12_RANGE wr = {0, 0};
+                s_zq_rb->lpVtbl->Unmap(s_zq_rb, 0, &wr);
+            }
+        }
+        s_zq_resolved[fi] = 0; s_zq_nrep[fi] = 0; s_zq_n[fi] = 0;
+    }
+    s_zq_open = -1;   /* a new command list: nothing open in it */
+    /* With RSX_CENSUS: how the counts came out over each census window. */
+    { static ULONGLONG t0;
+      const unsigned secs = rsx_census_secs();
+      const ULONGLONG now = GetTickCount64();
+      if (!t0) t0 = now;
+      if (secs && now - t0 >= (ULONGLONG)secs * 1000ull) {
+          t0 = now;
+          fprintf(stderr, "[zpass] reports counted: %llu visible, %llu hidden; %llu left as the walker wrote them%c",
+                  s_zq_stat[1], s_zq_stat[2], s_zq_stat[3], 10);
+          memset(s_zq_stat, 0, sizeof s_zq_stat);
+      } }
+}
+
 static void rf_open(void)
 {
     u32 fi = s_d3d.frame_index;
@@ -8836,6 +8986,7 @@ static void rf_open(void)
       wait_for_gpu();
       s_hl_gpuwait_s += perf_now() - t0; }
     gts_read();
+    zq_read();
     rf_release_dead();   /* the batch that last referenced them has run */
     vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
@@ -9688,6 +9839,8 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     force_rebind = 1;
                     continue;
                 }
+                if (dr->zq_op) { zq_op_replay(dr); continue; }
+                if (!dr->is_clear) zq_before_draw();
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     if (dr->is_clear || dr->tex_cv[_u] < 0 || dr->tex_rt[_u] < 0 ||
                         dr->tex_rt[_u] == cur_rt)
@@ -10463,6 +10616,7 @@ skip_dump_consider: ;
     if (shot && !d3d12_shot_game()) shot_copy_bb(fi);
 
     /* Close and execute */
+    zq_resolve();
     gts_resolve();
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
@@ -12923,7 +13077,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
       cellGcm_blit_observer = d3d12_blit_observed;
       cellGcm_blit_local_observer = d3d12_blit_local_observed;
       extern void (*cellGcm_flip_observer)(u32);
-      cellGcm_flip_observer = d3d12_flip_observed; }
+      cellGcm_flip_observer = d3d12_flip_observed;
+      extern void (*cellGcm_zpass_observer)(int, u32);
+      if (zq_wanted()) cellGcm_zpass_observer = d3d12_zpass_observed; }
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();

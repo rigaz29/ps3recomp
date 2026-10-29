@@ -298,7 +298,9 @@ typedef struct {
     u32                   conv_gen;    /* gen its colour copy was made from */
     u64                   last_frame;  /* frame_count of the last pass that bound it */
 } OffDS;
-#define MAX_OFF_DS   6
+/* Room to spare: God of War: Ascension's first level keeps six in use (the
+ * scene's, a 1408x1408 one, the half-size passes'). */
+#define MAX_OFF_DS   12
 #define DS_SRV_BASE  37  /* SRV heap slots 37..48 hold depth + stencil SRVs (2 per OffDS) */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..36 hold offscreen-RT SRVs */
 /* Per-draw SRV windows: each VP draw gets VP_TEX_UNITS consecutive
@@ -9118,7 +9120,12 @@ static void rf_prepass(u32 from, u32 to)
         for (int _m = 0; _m < 3; _m++)
             if (dr->is_vp && dr->rt_mrt[_m])
                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
-        if (dr->is_vp && dr->zeta_off && (dr->rt_off || dr->no_color))
+        /* Only for a pass that uses its depth surface: a depth or stencil
+         * test, the depth bounds test, or a depth clear. God of War:
+         * Ascension names a zeta in every post pass that never touches it,
+         * ~20 a frame, and those took the slots its real ones needed. */
+        if (dr->is_vp && dr->zeta_off && (dr->rt_off || dr->no_color) &&
+            (dr->is_clear ? (dr->clear_mask & 3u) != 0 : (dr->zs_key != 0 || dr->dbt)))
             off_ds_get(dr->zeta_off, dr->rt_w, dr->rt_h);
         if (dr->snap_ea)
             dr->snap_slot = (!dr->snap_src || off_rt_find(dr->snap_src) >= 0)

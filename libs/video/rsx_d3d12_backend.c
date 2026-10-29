@@ -1121,6 +1121,29 @@ static int dbt_ready(void)
     printf("[D3D12] depth bounds test %s\n", s_dbt.ok ? "on" : "unavailable");
     return s_dbt.ok;
 }
+/* Polygon offset set per draw (ID3D12GraphicsCommandList9::RSSetDepthBias)
+ * rather than built into the pipeline. The offset was the key field a new
+ * pipeline most often differed in from the closest one cached (PSO_MISS_WHY):
+ * a minute of God of War: Ascension's first level made 2,000-3,000 pipelines,
+ * and 22-57 with the offset set per draw. Off where the adapter lacks it, or
+ * with RSX_DYN_DEPTH_BIAS=0. */
+static struct { int init, ok; ID3D12GraphicsCommandList9* cl9; } s_dyb;
+static int dyb_ready(void)
+{
+    if (s_dyb.init) return s_dyb.ok;
+    s_dyb.init = 1;
+    const char* e = getenv("RSX_DYN_DEPTH_BIAS");
+    if (e && !atoi(e)) return 0;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16;
+    memset(&o16, 0, sizeof o16);
+    if (s_d3d.device && s_d3d.cmd_list &&
+        SUCCEEDED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16)) &&
+        o16.DynamicDepthBiasSupported &&
+        SUCCEEDED(s_d3d.cmd_list->lpVtbl->QueryInterface(s_d3d.cmd_list, &IID_ID3D12GraphicsCommandList9, (void**)&s_dyb.cl9)))
+        s_dyb.ok = 1;
+    printf("[D3D12] dynamic depth bias %s\n", s_dyb.ok ? "on" : "unavailable");
+    return s_dyb.ok;
+}
 typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature* v; } PssRootSig;
 typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } PssShader;
 typedef struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_BLEND_DESC v; } PssBlend;
@@ -1142,7 +1165,7 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
                                                                  (void**)out);
     struct {
         PssRootSig rs; PssShader vs, ps; PssBlend blend; PssUint mask; PssRaster raster; PssDepth1 depth;
-        PssLayout layout; PssTopology topo; PssRtFormats rtf; PssFormat dsf; PssSample sample;
+        PssLayout layout; PssTopology topo; PssRtFormats rtf; PssFormat dsf; PssSample sample; PssUint flags;
     } st;
     memset(&st, 0, sizeof st);
     st.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;      st.rs.v = pd->pRootSignature;
@@ -1168,6 +1191,7 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
     memcpy(st.rtf.v.RTFormats, pd->RTVFormats, sizeof st.rtf.v.RTFormats);
     st.dsf.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; st.dsf.v = pd->DSVFormat;
     st.sample.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;     st.sample.v = pd->SampleDesc;
+    st.flags.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS;            st.flags.v = (UINT)pd->Flags;
     D3D12_PIPELINE_STATE_STREAM_DESC sd;
     sd.SizeInBytes = sizeof st; sd.pPipelineStateSubobjectStream = &st;
     return s_dbt.dev2->lpVtbl->CreatePipelineState(s_dbt.dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
@@ -4956,6 +4980,17 @@ static void rf_release(void* p);
 static int s_fp_head[VP_FP_HASH];
 static int s_fp_next[VP_FP_CACHE];
 
+/* PSO_MISS_WHY=1 (PERF report): misses of a program no pipeline was cached
+ * for, and for the rest how often each key field differed from the cached
+ * pipeline of the same program that differs in the fewest. */
+enum { PW_VS_IDX, PW_VS_HASH, PW_GEN, PW_BLEND, PW_NRT, PW_RTFMT, PW_CTRL, PW_CMASK, PW_CULL,
+       PW_CUBE, PW_RAW, PW_GAMMA, PW_UNNORM, PW_WPOS, PW_ATEST, PW_POLY, PW_EXT, PW_MRT, PW_ZS, PW_N };
+static const char* const s_pw_name[PW_N] = { "vs_idx", "vs_hash", "gen", "blend", "nrt", "rtfmt", "ctrl",
+    "cmask", "cull", "cube_mask", "raw", "gamma", "unnorm", "wpos", "atest", "poly", "ext", "mrt", "zs" };
+static unsigned s_pw_new, s_pw_n[PW_N];
+static u32 s_pw_ctrl;           /* control bits that differed */
+static int s_env_psowhy = -1;
+
 static void vp_fp_index_rebuild(void)
 {
     memset(s_fp_head, 0, sizeof s_fp_head);
@@ -4975,6 +5010,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
     const u32 ext = rsx_pso_ext(udr);
     const u32 mrt = nrt > 1 ? rsx_pso_mrt(udr) : 0u;
+    /* The polygon offset as the key holds it: with dynamic depth bias only
+     * whether the draw has one, the values being set per draw. */
+    const u64 pkey = (udr && udr->poly) ? (dyb_ready() ? 1u : udr->poly) : 0u;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
@@ -5065,13 +5103,37 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
-            s_d3d.vp_fp[i].poly == (udr ? udr->poly : 0u) &&
+            s_d3d.vp_fp[i].poly == pkey &&
             s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
             s_d3d.vp_fp[i].zs == zs) {
             s_d3d.vp_fp[i].last_use = s_d3d.frame_count;
             return vp_fp_ready(&s_d3d.vp_fp[i]);
         }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
+    if (s_env_psowhy < 0) { const char* e = getenv("PSO_MISS_WHY"); s_env_psowhy = e ? atoi(e) : 0; }
+    if (s_env_psowhy) {
+        u32 best = 0; int bestn = PW_N + 1, bi = -1;
+        const u64 poly = pkey;
+        for (int i = s_fp_head[uhash & (VP_FP_HASH - 1)] - 1; i >= 0; i = s_fp_next[i] - 1) {
+            const VPFPEntry* q = &s_d3d.vp_fp[i];
+            if (q->ucode_hash != uhash) continue;
+            const u32 m = (u32)(q->vs_idx != vs_idx) << PW_VS_IDX | (u32)(q->vs_hash != vs_hash) << PW_VS_HASH |
+                (u32)(q->gen != s_d3d.vp_gen) << PW_GEN | (u32)(q->blend != blend) << PW_BLEND |
+                (u32)(q->nrt != nrt) << PW_NRT | (u32)(q->rtfmt != (u32)rtfmt) << PW_RTFMT |
+                (u32)(q->ctrl != ctrl) << PW_CTRL | (u32)(q->cmask != cmask) << PW_CMASK |
+                (u32)(q->cull != cull) << PW_CULL | (u32)(q->cube_mask != cube_mask) << PW_CUBE |
+                (u32)(q->raw != raw) << PW_RAW | (u32)(q->gamma != gamma) << PW_GAMMA |
+                (u32)(q->unnorm != unnorm) << PW_UNNORM | (u32)(q->wpos != wpos_key) << PW_WPOS |
+                (u32)(q->atest != atest) << PW_ATEST | (u32)(q->poly != poly) << PW_POLY |
+                (u32)(q->ext != ext) << PW_EXT | (u32)(q->mrt != mrt) << PW_MRT | (u32)(q->zs != zs) << PW_ZS;
+            int n = 0;
+            for (u32 x = m; x; x &= x - 1) n++;
+            if (n < bestn) { bestn = n; best = m; bi = i; }
+        }
+        if (bestn > PW_N) s_pw_new++;
+        else for (int b = 0; b < PW_N; b++) if ((best >> b) & 1u) s_pw_n[b]++;
+        if (bi >= 0 && ((best >> PW_CTRL) & 1u)) s_pw_ctrl |= s_d3d.vp_fp[bi].ctrl ^ ctrl;
+    }
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -5450,7 +5512,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Polygon offset: offset = factor * max depth slope + bias * r, the same
      * formula on both sides (rsx_poly_key). */
     { const u64 po = udr ? udr->poly : 0u;
-      if (po) {
+      if (po && dyb_ready()) {
+          pd.Flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;   /* RSSetDepthBias per draw */
+      } else if (po) {
           const u32 fb = (u32)(po >> 32), bb = (u32)po;
           float f, b; memcpy(&f, &fb, sizeof f); memcpy(&b, &bb, sizeof b);
           pd.RasterizerState.DepthBias = (INT)b;
@@ -5621,7 +5685,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].last_use  = s_d3d.frame_count;
     s_d3d.vp_fp[s_d3d.vp_fp_n].raw     = raw;
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = udr ? udr->poly : 0u;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = pkey;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ext     = ext;
     s_d3d.vp_fp[s_d3d.vp_fp_n].mrt     = mrt;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
@@ -9606,6 +9670,12 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
+                if (dpso && dr->poly && dyb_ready()) {
+                    const u32 fb = (u32)(dr->poly >> 32), bb = (u32)dr->poly;
+                    float f, b;
+                    memcpy(&f, &fb, sizeof f); memcpy(&b, &bb, sizeof b);
+                    s_dyb.cl9->lpVtbl->RSSetDepthBias(s_dyb.cl9, (float)(INT)b, 0.0f, f);
+                }
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
                 if (dr->dbt && dbt_ready()) {
                     float lo, hi;
@@ -9930,6 +10000,15 @@ static void render_frame(void)
             fprintf(stderr, "[PERF] caches: %d vertex programs (%u replaced), %d fragment pipelines (%u dropped)%c",
                     s_d3d.vp_vs_n, s_perf_vs_replaced, s_d3d.vp_fp_n, s_perf_fp_dropped, 10);
             s_perf_vs_replaced = s_perf_fp_dropped = 0;
+            if (s_env_psowhy > 0) {
+                fprintf(stderr, "[PERF] pipeline misses: %u of programs not cached; differing from the closest:", s_pw_new);
+                for (int b = 0; b < PW_N; b++)
+                    if (s_pw_n[b]) fprintf(stderr, " %s %u", s_pw_name[b], s_pw_n[b]);
+                if (s_pw_ctrl) fprintf(stderr, " (control bits 0x%08X)", s_pw_ctrl);
+                fprintf(stderr, "%c", 10);
+                s_pw_new = 0; s_pw_ctrl = 0;
+                memset(s_pw_n, 0, sizeof s_pw_n);
+            }
             if (s_sj_stat_jobs || s_sj_stat_skipped) {
                 fprintf(stderr, "[PERF] shader builds: %u queued to workers, %u draws skipped"
                                 " waiting for one%c", s_sj_stat_jobs, s_sj_stat_skipped, 10);

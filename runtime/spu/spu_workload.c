@@ -543,7 +543,15 @@ void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t t)
      * state (2 = exited, 4 = joined), exit code at +8. The SPURS kernel writes
      * it when a task exits; nothing here did, so a task that joins its workers
      * (Havok's master SPU task does) retried forever and the PPU waited on it.
-     * Only Taskset2s have the array -- a v1 taskset ends at 0x1900. */
+     * Only Taskset2s have the array -- a v1 taskset ends at 0x1900.
+     *
+     * The byte an exit leaves at +15 is 0x12, as libsre's taskset policy
+     * module writes it. A task created from the SPU gets 1 there, its pending
+     * bit, and only then its creator checks the entry for 1 or 0x12 and sets
+     * 0x10 (halting on anything else). Here the pending bit starts the task at
+     * once, so a short task can exit before that check; with 2 the creator
+     * halted, and in God of War: Ascension the frame it was building never
+     * finished (the FIFO park freeze). */
 static uint32_t s_ts2[16]; static int s_n_ts2;
 void spu_taskset2_register(uint32_t ea)
 {
@@ -567,7 +575,7 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
     memset(e, 0, 16);
     if (exited) {
         e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
-        e[15] = 2;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
+        e[15] = 0x12;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
     }
     spu_coh_notify_write(ea);
     spu_lockline_unlock();

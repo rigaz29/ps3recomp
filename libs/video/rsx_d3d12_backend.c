@@ -745,6 +745,9 @@ static unsigned s_hl_tex_n, s_hl_skipped, s_hl_jobs;
  * miss (decompile, edits, queueing), upload buffers made because the texture
  * ring was full, offscreen targets made, and every wait for the GPU. */
 static unsigned s_hl_miss_n, s_hl_upbuf_n, s_hl_rt_n, s_hl_waits_n;
+/* The frame before on the GPU (RSX_CENSUS timestamps): its copies (to the end
+ * of the prepass), its draws, the rest, and all of it, in ms. */
+static double s_hl_gpu_ms[4];
 static double s_hl_miss_s, s_hl_upbuf_s, s_hl_rt_s, s_hl_waits_s;
 static IDXGIAdapter3* s_adapter3;   /* local memory use and budget, for the hitch log */
 static int perf_on(void)
@@ -7538,14 +7541,16 @@ static void rsx_census_present(void)
                           "shader waits %.1f ms, draws skipped %u, builds queued %u, GPU wait %.1f ms, prepass %.1f ms, "
                           "render_frame %.1f ms; pipelines made here %u (%.1f ms), upload buffers %u (%.1f ms), "
                           "targets made %u (%.1f ms), heaps made %u (%.1f ms), all GPU waits %u (%.1f ms), "
-                          "VRAM %llu of %llu MB\n",
+                          "VRAM %llu of %llu MB; the frame before on the GPU %.1f ms (copies %.1f, draws %.1f, "
+                          "the rest %.1f)\n",
                   (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0,
                   dcr * 1000.0, dev * 1000.0, ddc * 1000.0, s_hl_sjwait_s * 1000.0,
                   s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0,
                   s_hl_miss_n, s_hl_miss_s * 1000.0, s_hl_upbuf_n, s_hl_upbuf_s * 1000.0,
                   s_hl_rt_n, s_hl_rt_s * 1000.0, s_hl_heap_n, s_hl_heap_s * 1000.0,
                   s_hl_waits_n, s_hl_waits_s * 1000.0,
-                  (unsigned long long)(vm.CurrentUsage >> 20), (unsigned long long)(vm.Budget >> 20));
+                  (unsigned long long)(vm.CurrentUsage >> 20), (unsigned long long)(vm.Budget >> 20),
+                  s_hl_gpu_ms[3], s_hl_gpu_ms[0], s_hl_gpu_ms[1], s_hl_gpu_ms[2]);
       } }
     s_hl_tex_n = s_hl_skipped = s_hl_jobs = 0;
     s_hl_tex_s = s_hl_sjwait_s = s_hl_gpuwait_s = 0.0;
@@ -8605,6 +8610,137 @@ static void guest_fb_present(u32 fi)
  * the last record (a batch can still extend it), not a batch with legacy
  * (non-VP) records, and not while a debug filter that edits the batch is set.
  * -------------------------------------------------------------------------*/
+/* RSX_CENSUS: GPU timestamps at a frame's start, after its prepass (the
+ * texture copies), after its draws and at its end, read back after the next
+ * frame's wait for the GPU: a long wait at a frame's start is the frame
+ * before it on the GPU. */
+static ID3D12QueryHeap* s_gts_heap;
+static ID3D12Resource* s_gts_rb;
+static u64 s_gts_freq;
+static int s_gts_slot = -1, s_gts_marked;
+/* And one at every render target change of the draw pass: a frame whose draws
+ * took over 50 ms on the GPU prints its longest passes. */
+#define GPS_MAX 256
+typedef struct { u32 from, off, w, h, fp; } GpsPass;
+static ID3D12QueryHeap* s_gps_heap;
+static ID3D12Resource* s_gps_rb;
+static GpsPass s_gps[FRAME_COUNT][GPS_MAX];
+static int s_gps_n[FRAME_COUNT];        /* timestamps of the frame on index fi */
+static int s_gps_rd_slot = -1, s_gps_rd_n;
+static int gts_on(void)
+{
+    static int v = -1;
+    if (v >= 0) return v;
+    v = 0;
+    if (!rsx_census_secs() || !s_d3d.device || !s_d3d.cmd_queue) return v;
+    D3D12_QUERY_HEAP_DESC qd;
+    memset(&qd, 0, sizeof qd);
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = 4 * FRAME_COUNT;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 32 * FRAME_COUNT;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SUCCEEDED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_gts_heap)) &&
+        SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_gts_rb)) &&
+        SUCCEEDED(s_d3d.cmd_queue->lpVtbl->GetTimestampFrequency(s_d3d.cmd_queue, &s_gts_freq)) && s_gts_freq)
+        v = 1;
+    if (v) {
+        qd.Count = GPS_MAX * FRAME_COUNT;
+        bd.Width = 8ull * GPS_MAX * FRAME_COUNT;
+        if (FAILED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_gps_heap)) ||
+            FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_gps_rb)))
+            s_gps_heap = NULL;
+    }
+    return v;
+}
+
+/* A pass begins at draw `from`, into the target at `off` (0: the display),
+ * w x h, its first draw's fragment program fp. */
+static void gps_pass(u32 from, u32 off, u32 w, u32 h, u32 fp)
+{
+    if (!gts_on() || !s_gps_heap) return;
+    const u32 fi = s_rf.fi;
+    if (s_gps_n[fi] >= GPS_MAX - 1) return;     /* the last one ends the passes */
+    GpsPass* p = &s_gps[fi][s_gps_n[fi]];
+    p->from = from; p->off = off; p->w = w; p->h = h; p->fp = fp;
+    s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_gps_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                     (UINT)(fi * GPS_MAX + s_gps_n[fi]));
+    s_gps_n[fi]++;
+}
+static void gps_end(u32 draws)
+{
+    if (!gts_on() || !s_gps_heap || !s_gps_n[s_rf.fi]) return;
+    gps_pass(draws, 0, 0, 0, 0);
+}
+static void gts_mark(int k)
+{
+    if (!gts_on()) return;
+    s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_gts_heap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(s_rf.fi * 4 + k));
+    if (k == 0) { s_gts_marked = 1; s_gps_n[s_rf.fi] = 0; }
+}
+static void gts_resolve(void)
+{
+    if (!gts_on() || !s_gts_marked) return;
+    gts_mark(3);
+    const UINT base = (UINT)s_rf.fi * 4;
+    s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_gts_heap, D3D12_QUERY_TYPE_TIMESTAMP, base, 4,
+                                             s_gts_rb, (UINT64)base * 8);
+    s_gts_slot = (int)s_rf.fi;
+    s_gts_marked = 0;
+    s_gps_rd_slot = -1;
+    if (s_gps_heap && s_gps_n[s_rf.fi] >= 2) {
+        s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_gps_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                                 (UINT)s_rf.fi * GPS_MAX, (UINT)s_gps_n[s_rf.fi], s_gps_rb,
+                                                 8ull * GPS_MAX * s_rf.fi);
+        s_gps_rd_slot = (int)s_rf.fi;
+        s_gps_rd_n = s_gps_n[s_rf.fi];
+    }
+}
+static void gts_read(void)
+{
+    if (!gts_on() || s_gts_slot < 0) return;
+    void* p = NULL;
+    D3D12_RANGE rr = { (SIZE_T)s_gts_slot * 32, (SIZE_T)s_gts_slot * 32 + 32 };
+    if (FAILED(s_gts_rb->lpVtbl->Map(s_gts_rb, 0, &rr, &p)) || !p) return;
+    u64 t[4];
+    memcpy(t, (const u8*)p + s_gts_slot * 32, sizeof t);
+    D3D12_RANGE wr = {0, 0};
+    s_gts_rb->lpVtbl->Unmap(s_gts_rb, 0, &wr);
+    s_gts_slot = -1;
+    if (t[1] < t[0] || t[2] < t[1] || t[3] < t[2]) return;
+    const double k = 1000.0 / (double)s_gts_freq;
+    s_hl_gpu_ms[0] = (double)(t[1] - t[0]) * k;
+    s_hl_gpu_ms[1] = (double)(t[2] - t[1]) * k;
+    s_hl_gpu_ms[2] = (double)(t[3] - t[2]) * k;
+    s_hl_gpu_ms[3] = (double)(t[3] - t[0]) * k;
+    if (s_hl_gpu_ms[1] < 50.0 || s_gps_rd_slot < 0) return;
+    const int fi = s_gps_rd_slot, n = s_gps_rd_n;
+    D3D12_RANGE pr = { (SIZE_T)8 * GPS_MAX * fi, (SIZE_T)8 * GPS_MAX * fi + (SIZE_T)8 * n };
+    if (FAILED(s_gps_rb->lpVtbl->Map(s_gps_rb, 0, &pr, &p)) || !p) return;
+    static u64 ts[GPS_MAX];
+    memcpy(ts, (const u8*)p + (size_t)8 * GPS_MAX * fi, (size_t)8 * n);
+    s_gps_rb->lpVtbl->Unmap(s_gps_rb, 0, &wr);
+    fprintf(stderr, "[gpu-passes] the frame's draws took %.1f ms on the GPU, %d passes; longest:", s_hl_gpu_ms[1], n - 1);
+    static unsigned char done[GPS_MAX];
+    memset(done, 0, sizeof done);
+    for (int r = 0; r < 6; r++) {
+        int best = -1;
+        for (int i = 0; i + 1 < n; i++)
+            if (!done[i] && ts[i + 1] >= ts[i] && (best < 0 || ts[i + 1] - ts[i] > ts[best + 1] - ts[best])) best = i;
+        if (best < 0) break;
+        done[best] = 1;
+        const GpsPass* g = &s_gps[fi][best];
+        fprintf(stderr, " | %.1f ms: target 0x%08X %ux%u, draws %u-%u, fp 0x%08X",
+                (double)(ts[best + 1] - ts[best]) * k, g->off, g->w, g->h, g->from,
+                s_gps[fi][best + 1].from, g->fp);
+    }
+    fprintf(stderr, "%c", 10);
+}
+
 static void rf_open(void)
 {
     u32 fi = s_d3d.frame_index;
@@ -8619,6 +8755,7 @@ static void rf_open(void)
     { const double t0 = perf_now();
       wait_for_gpu();
       s_hl_gpuwait_s += perf_now() - t0; }
+    gts_read();
     rf_release_dead();   /* the batch that last referenced them has run */
     vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
@@ -8660,6 +8797,7 @@ static void rf_open(void)
     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
     s_d3d.tex_ring_used[fi] = 0;   /* this frame index's copies are done */
     tex_spill_reset(fi);
+    gts_mark(0);
 
     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
      * The atlas is a linear 8-bit coverage map, so a straight row copy (no
@@ -9549,6 +9687,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     }
                     D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
                     vp_last_w = vp.Width; vp_last_h = vp.Height;
+                    gps_pass(d, want >= 0 ? s_d3d.off_rt[want].off : 0, (u32)vp.Width, (u32)vp.Height, dr->fp_addr);
                     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, dr->no_color ? 0 : nrt,
                                                                dr->no_color ? NULL : rh, FALSE, &cur_dsv);
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
@@ -9905,8 +10044,11 @@ static void render_frame(void)
             rf_vp_begin();
         }
     }
+    gts_mark(1);
     rf_vp_draws(s_rf.done, cap_stop(s_d3d.draw_count), 0);
+    gps_end(s_d3d.draw_count);
     rf_vp_end();
+    gts_mark(2);
     s_rf.open = 0;
     u32 fi = s_rf.fi;
     D3D12_RESOURCE_BARRIER barrier = {0};
@@ -10203,6 +10345,7 @@ skip_dump_consider: ;
     if (shot && !d3d12_shot_game()) shot_copy_bb(fi);
 
     /* Close and execute */
+    gts_resolve();
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);

@@ -1764,6 +1764,9 @@ static unsigned long long gcm_park_dump_ms(void)
     if (ms < 0) { const char* e = getenv("GCM_PARK_DUMP_MS"); ms = e ? atoll(e) : 0; }
     return (unsigned long long)ms;
 }
+/* The title's own state for a park dump, set by the port (main.cpp): the
+ * runtime does not know its job lists. */
+void (*gcm_park_dump_hook)(void);
 static void gcm_park_dump(u32 off, u32 put, unsigned long long ms)
 {
     fprintf(stderr, "[park-dump] parked at 0x%08X, put 0x%08X, %llu ms; last SPU blocks (newest first):", off, put, ms);
@@ -1775,6 +1778,7 @@ static void gcm_park_dump(u32 off, u32 put, unsigned long long ms)
     gcm_fifo_dump_around(off);
     extern void spurs_debug_dump(const char* why);
     spurs_debug_dump("park");
+    if (gcm_park_dump_hook) gcm_park_dump_hook();
 }
 
 /* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.

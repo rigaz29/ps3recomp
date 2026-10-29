@@ -1401,6 +1401,7 @@ static u32    s_lock_n  = 0;
 static int  s_borderless;
 static RECT s_windowed_rect;   /* the frame's rectangle before going borderless */
 static volatile LONG s_shot_pending;   /* F12: write the next presented frame (shot_png) */
+static int s_shot_cap;                 /* RSX_CAP_SHOT: this frame's shot also captures it */
 static void ov_toast(const char* msg);
 /* The view's client size, set by the window's thread; the presenting thread
  * resizes the swap chain to it after its next Present (bb_resize). */
@@ -3799,6 +3800,10 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
             if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].used)
                 fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
                         s_d3d.off_rt[i].w, s_d3d.off_rt[i].h, s_d3d.off_rt[i].dxgi);
+        for (int i = 0; i < MAX_OFF_DS; i++)
+            if (s_d3d.off_ds[i].res)
+                fprintf(mf, "offds[%d] off=0x%08X %ux%u last=%llu\n", i, s_d3d.off_ds[i].off,
+                        s_d3d.off_ds[i].w, s_d3d.off_ds[i].h, (unsigned long long)s_d3d.off_ds[i].last_frame);
         fprintf(mf, "--- ops ---\n");
         for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* r = &s_d3d.draws[d];
@@ -3816,12 +3821,17 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                         r->sc_x, r->sc_y, r->sc_w, r->sc_h);
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
-                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X sc=%u,%u,%ux%u\n",
+                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X sc=%u,%u,%ux%u z=0x%X zs=0x%llX\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw, r->surf_a,
-                        r->sc_x, r->sc_y, r->sc_w, r->sc_h);
+                        r->sc_x, r->sc_y, r->sc_w, r->sc_h, r->zeta_off, (unsigned long long)r->zs_key);
+                if (r->dbt) {
+                    float lo, hi;
+                    memcpy(&lo, &r->dbt_min, sizeof lo); memcpy(&hi, &r->dbt_max, sizeof hi);
+                    fprintf(mf, "      dbt %.6f..%.6f z=0x%X\n", lo, hi, r->zeta_off);
+                }
                 /* Only the units the program samples: the others carry
                  * whatever earlier draws left bound. */
                 u32 fpm = 0xFFFFFFFFu;
@@ -3834,11 +3844,12 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                   } }
                 for (int u = 0; u < VP_TEX_UNITS; u++)
                     if (r->tex[u].set && ((fpm >> u) & 1u))
-                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
+                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X addr=0x%X filter=0x%X border=0x%08X\n", u,
                                 r->tex[u].off, r->tex[u].fmt,
                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
-                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
+                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF,
+                                r->tex[u].addr, r->tex[u].filter, r->tex[u].border);
             }
         }
         /* Per-draw VP constant banks for the first few offscreen-RT geometry
@@ -10389,6 +10400,7 @@ skip_dump_consider: ;
     int shot = 0;
     if (s_shot_pending && (d3d12_shot_game() ? s_d3d.readback_buf != NULL : s_present_this_frame))
         shot = InterlockedExchange(&s_shot_pending, 0) != 0;
+    s_shot_cap = shot;
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
                        mind2 = e ? atoi(e) : 0; }
@@ -10600,6 +10612,20 @@ skip_dump_consider: ;
         rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
         s_cap_done++;
     }
+    /* RSX_CAP_SHOT=1: a screenshot (F12) captures its frame too (captures
+     * 400+), and the frame after it (500+): a script's picture of a moment
+     * comes with that frame's targets. God of War: Ascension lights a frame
+     * with the shadow mask the batch before made, so the pair is needed. */
+    { static int on = -1, k = 0, next = -1;
+      if (on < 0) { const char* e = getenv("RSX_CAP_SHOT"); on = e ? atoi(e) : 0; }
+      if (on && next >= 0 && s_dbg_last_draws > 0) {
+          rsx_capture_frame(fi, s_dbg_last_draws, 500 + (u32)next);
+          next = -1;
+      }
+      if (s_shot_cap) {
+          if (on && s_dbg_last_draws > 0) { rsx_capture_frame(fi, s_dbg_last_draws, 400 + (u32)k); next = k++; }
+          s_shot_cap = 0;
+      } }
     { static int yn = -1, yi = 0;
       if (yn < 0) { const char* e = getenv("RSX_CAP_YELLOW"); yn = e ? atoi(e) : 0; }
       int yk = 0;
@@ -10608,6 +10634,27 @@ skip_dump_consider: ;
                   yk == 1 ? "a display this batch drew" : "the backbuffer only", 10);
           rsx_capture_frame(fi, s_dbg_last_draws, 100 + yi);
           yi++;
+      } }
+    /* RSX_CAP_DIP=<n>: up to n frames that draw less than half of what the
+     * frame before drew, each with the frame after it (captures 200+ and
+     * 300+). In the menus 70 presents carried less than half the draws of
+     * both neighbours, the suspects for the flicker reported there. */
+    { static int dn = -1, di = 0, after = -1;
+      static u32 prev;
+      if (dn < 0) { const char* e = getenv("RSX_CAP_DIP"); dn = e ? atoi(e) : 0; }
+      if (dn && s_dbg_last_draws > 0) {
+          if (after >= 0) {
+              rsx_capture_frame(fi, s_dbg_last_draws, 300 + (u32)after);
+              fprintf(stderr, "[RSXCAP] after dip %d: frame %llu, %u draws%c", after,
+                      (unsigned long long)s_d3d.frame_count, s_dbg_last_draws, 10);
+              after = -1;
+          } else if (di < dn && prev >= 60 && s_dbg_last_draws * 2 < prev) {
+              fprintf(stderr, "[RSXCAP] dip %d: frame %llu, %u draws after %u%c", di,
+                      (unsigned long long)s_d3d.frame_count, s_dbg_last_draws, prev, 10);
+              rsx_capture_frame(fi, s_dbg_last_draws, 200 + (u32)di);
+              after = di++;
+          }
+          prev = s_dbg_last_draws;
       } }
     if (cap_env()) cap_arm();
 

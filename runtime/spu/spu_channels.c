@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_jobcap.h"     /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY */
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -189,6 +190,8 @@ void spu_jmp_no_unwind(void* env)
 void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
+    if (SPU_JOBCAP_ON(2))
+        spu_jobcap_restart(ctx);   /* SPU_JOB_REPLAY: the replay is the driver; does not return */
     if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
@@ -212,6 +215,8 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    if (SPU_JOBCAP_ON(1))
+        spu_jobcap_abandon("stop");   /* the record cannot hold what follows */
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
@@ -256,6 +261,8 @@ void spu_dbg_e60(spu_context* ctx)
  * service. Env YDKJ_STOP_NOHALT restores the old (looping) behavior for A/B. */
 void spu_stop(spu_context* ctx)
 {
+    if (SPU_JOBCAP_ON(1))
+        spu_jobcap_abandon("stop");   /* the record cannot hold what follows */
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
      * policy this is stop-and-signal: it returns up into the kernel/policy
      * service loop, which continues (i.e. the SPU "resumes" past the stop). That
@@ -719,7 +726,11 @@ static int spu_sig_trace_hit(uint32_t ea)
     return 0;
 }
 
+#ifdef PS3_SPU_JOBCAP
+static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
+#else
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+#endif
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
      * the bottom used to filter -- so the uncommitted-EA guard below reported
@@ -1130,6 +1141,25 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     }
 }
 
+#ifdef PS3_SPU_JOBCAP
+/* SPU_JOB_CAPTURE / SPU_JOB_REPLAY (spu_jobcap.c): a replay serves an atomic
+ * from its record; a capture records it, line and status, after it ran. */
+static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+{
+    if (SPU_JOBCAP_ANY() &&
+        (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
+         cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
+        if (spu_jobcap_atomic(ctx, cmd))
+            return 1;
+        const int r = spu_mfc_atomic_body(ctx, cmd);
+        if (r)
+            spu_jobcap_atomic_done(ctx, cmd);
+        return r;
+    }
+    return spu_mfc_atomic_body(ctx, cmd);
+}
+#endif
+
 static int channel_is_mfc(uint32_t ch)
 {
     switch (ch) {
@@ -1149,6 +1179,12 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: an outbound mailbox word is a job's
+     * output; a replay compares it with the record and drops it. */
+    if (SPU_JOBCAP_ANY() &&
+        (channel == SPU_WrOutMbox || channel == SPU_WrOutIntrMbox) &&
+        spu_jobcap_wrch_out(ctx, channel, value._u32[0]))
+        return;
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
@@ -1397,7 +1433,11 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+#ifdef PS3_SPU_JOBCAP
+static u128 spu_rdch_body(spu_context* ctx, uint32_t channel)
+#else
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+#endif
 {
     spu_honour_stop_request(ctx);
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
@@ -1487,10 +1527,30 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     return spu_make_preferred_u32(v);
 }
 
+#ifdef PS3_SPU_JOBCAP
+/* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: channel reads are a job's other input. */
+u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (SPU_JOBCAP_ANY()) {
+        u128 v;
+        if (spu_jobcap_rdch(ctx, channel, &v))
+            return v;
+        v = spu_rdch_body(ctx, channel);
+        spu_jobcap_rdch_done(ctx, channel, v);
+        return v;
+    }
+    return spu_rdch_body(ctx, channel);
+}
+#endif
+
 /* ===========================================================================
  * Channel count (rchcnt) -- how many entries can be read/written right now
  * ===========================================================================*/
+#ifdef PS3_SPU_JOBCAP
+static uint32_t spu_rchcnt_body(spu_context* ctx, uint32_t channel)
+#else
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+#endif
 {
     spu_honour_stop_request(ctx);
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
@@ -1683,6 +1743,22 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     default:                 return 1;  /* default: channel ready */
     }
 }
+
+#ifdef PS3_SPU_JOBCAP
+/* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: so are channel counts. */
+uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+{
+    if (SPU_JOBCAP_ANY()) {
+        uint32_t n;
+        if (spu_jobcap_rchcnt(ctx, channel, &n))
+            return n;
+        n = spu_rchcnt_body(ctx, channel);
+        spu_jobcap_rchcnt_done(ctx, channel, n);
+        return n;
+    }
+    return spu_rchcnt_body(ctx, channel);
+}
+#endif
 
 /* ===========================================================================
  * Indirect-branch dispatch + function registry
@@ -2850,6 +2926,9 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* SPU_JOB_CAPTURE: a policy module starting a job (spu_jobcap.c). */
+    if (SPU_JOBCAP_ARMED())
+        spu_jobcap_maybe_begin(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -2901,7 +2980,12 @@ void spu_indirect_branch(spu_context* ctx)
              * entry, and jobs that ran since may have overwritten it. */
             { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
                                   ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
-              if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
+              if (sp) {
+                  if (SPU_JOBCAP_ANY())
+                      spu_jobcap_kernel_line(ctx, sp);   /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY */
+                  else
+                      memcpy(ctx->ls + 0x100, vm_base + sp, 0x80);
+              } }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

@@ -26,6 +26,7 @@
 #include "spu_coherency.h"
 #include "../platform/win32_compat.h"
 #include "spu_workload.h"
+#include "spu_jobcap.h"
 #include "spu_coherency.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +158,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
                           uint32_t spu_num)
 {
+    { static volatile long s_jc;
+      if (!s_jc && !__atomic_exchange_n(&s_jc, 1, __ATOMIC_ACQ_REL)) spu_jobcap_init(); }
     if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
 
@@ -234,6 +237,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     resident->pm = pm_host; resident->size = pm_size;
     resident->entry = entry; resident->image_id = image_id;
     ctx->image_id    = image_id;
+    t_spu_pm_img     = image_id;   /* SPU_JOB_CAPTURE: the policy module's code */
     ctx->policy_mode = 1;
 
     /* PM image at its load base (first entry only -- LS persists). */

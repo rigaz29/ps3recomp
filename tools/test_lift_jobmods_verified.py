@@ -235,7 +235,7 @@ int main(void)
         data.write_text("".join(
             f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
             f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
-        sources = ["spu_channels.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
+        sources = ["spu_channels.c", "spu_drain.c", "spu_jobcap.c", "spu_lockstep.c", "spu_coherency.c",
                    "spu_workload.c", "spurs_policy.c", "spurs_job.c", "spu_tsp_weak.c",
                    "spu_vm_pagemap.c", "spurs_policy_blob_weak.c", "spu_interp.c"]
         lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]

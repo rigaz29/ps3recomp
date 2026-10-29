@@ -5,7 +5,7 @@ from pathlib import Path
 if os.name=='nt':
  print('SKIP: guarded MFC cache fixtures require POSIX mmap/pthreads');raise SystemExit(0)
 root=Path(__file__).resolve().parents[1];spu=root/'runtime/spu'
-common=['spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c']
+common=['spu_drain.c','spu_jobcap.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c']
 with tempfile.TemporaryDirectory(prefix='spu-mfc-cache-') as tmp:
  exe=Path(tmp)/'cache'
  flags=['-std=gnu17','-O2','-UNDEBUG']

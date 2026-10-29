@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_jobcap.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
 #include <stdint.h>
@@ -203,8 +204,13 @@ static inline void spu_put_bytes(uint8_t* dst, const uint8_t* src, uint32_t size
     }
 }
 
+#ifdef PS3_SPU_JOBCAP
+static inline int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                        uint32_t size, uint32_t cmd)
+#else
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
+#endif
 {
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
@@ -864,6 +870,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     return 0;
 }
+
+#ifdef PS3_SPU_JOBCAP
+/* SPU_JOB_CAPTURE / SPU_JOB_REPLAY (spu_jobcap.c): a replay serves the
+ * transfer from its record; a capture records it once it is done (its bytes
+ * read from the local store, whichever way they went). */
+void spu_jobcap_transfer_done(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                   uint32_t size, uint32_t cmd)
+{
+    if (SPU_JOBCAP_ANY()) {
+        if (spu_jobcap_transfer(spu, lsa, ea, size, cmd))
+            return 0;
+        const int rc = mfc_do_transfer_body(spu, lsa, ea, size, cmd);
+        if (rc == 0)
+            spu_jobcap_transfer_done(spu, lsa, ea, size, cmd);
+        return rc;
+    }
+    return mfc_do_transfer_body(spu, lsa, ea, size, cmd);
+}
+#endif
 
 /*
  * Execute a DMA list command (scatter/gather).

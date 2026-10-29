@@ -10,7 +10,7 @@ if os.name == 'nt':
     raise SystemExit(0)
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
-sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
+sources = ['spu_channels.c', 'spu_drain.c', 'spu_jobcap.c', 'spu_lockstep.c', 'spu_coherency.c',
            'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
            'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
 with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:

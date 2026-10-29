@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_jobcap.h"
 #include "spu_lockstep.h"
 #include <setjmp.h>
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
@@ -420,6 +421,8 @@ void spu_irqwait_diag(spu_context* ctx)
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
+    if (SPU_JOBCAP_ON(1))
+        spu_jobcap_abandon("interrupt");
     /* Stall-and-notify still settling: let the SPU run on (see above). */
     if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
         if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
@@ -538,7 +541,11 @@ typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 
+#ifdef PS3_SPU_JOBCAP
+static void spu_drain_call_run(spu_context* ctx, uint32_t return_pc)
+#else
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+#endif
 {
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     spu_depth_guard_check(ctx);
@@ -628,3 +635,14 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     }
 #undef SPU_DRAIN_POP_IRQ
 }
+
+#ifdef PS3_SPU_JOBCAP
+/* SPU_JOB_CAPTURE (spu_jobcap.c): a job ends where the drain of the policy
+ * module's call into it returns. */
+void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    spu_drain_call_run(ctx, return_pc);
+    if (SPU_JOBCAP_ON(1))
+        spu_jobcap_drain_done(ctx, return_pc);
+}
+#endif

@@ -197,6 +197,9 @@ typedef struct {
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
     u32 vp_x, vp_y, vp_w, vp_h;
+    /* Guest scissor rect at record time (SET_SCISSOR_HORIZONTAL/VERTICAL,
+     * target pixels): the RSX clips draws and clears to it. */
+    u32 sc_x, sc_y, sc_w, sc_h;
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -3807,16 +3810,18 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 fprintf(mf, "op%03u BLIT  0x%X/%u -> 0x%X/%u %ux%u\n", d, r->blit_src, r->blit_sp,
                         r->blit_dst, r->blit_dp, r->blit_w, r->blit_h);
             else if (r->is_clear)
-                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f) mask=0x%X surf=0x%X\n",
+                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f) mask=0x%X surf=0x%X sc=%u,%u,%ux%u\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
-                        r->cc[0], r->cc[1], r->cc[2], r->cc[3], r->clear_mask, r->surf_a);
+                        r->cc[0], r->cc[1], r->cc[2], r->cc[3], r->clear_mask, r->surf_a,
+                        r->sc_x, r->sc_y, r->sc_w, r->sc_h);
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
-                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X\n",
+                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X sc=%u,%u,%ux%u\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
-                        r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw, r->surf_a);
+                        r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw, r->surf_a,
+                        r->sc_x, r->sc_y, r->sc_w, r->sc_h);
                 /* Only the units the program samples: the others carry
                  * whatever earlier draws left bound. */
                 u32 fpm = 0xFFFFFFFFu;
@@ -7165,6 +7170,41 @@ static u32 rec_wpos_win(void)
     return (((w >> 12) & 0xFu) || ((w >> 16) & 0xFu)) ? w : 0;
 }
 
+static void rec_scissor(D3D12DrawRecord* dr)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    dr->sc_x = st ? st->scissor_x : 0;
+    dr->sc_y = st ? st->scissor_y : 0;
+    dr->sc_w = st ? st->scissor_w : 4096;
+    dr->sc_h = st ? st->scissor_h : 4096;
+}
+
+/* RSX_SCISSOR=0: draws clip to their viewport rect and clears cover the whole
+ * surface, whatever the guest scissor. */
+static int rsx_scissor_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_SCISSOR"); on = e ? atoi(e) : 1; }
+    return on;
+}
+
+/* The part of a tw x th target a record's scissor leaves, in `r`; 0 when that
+ * is the whole target (or the scissor is off), so the caller can keep its
+ * full-target path. An empty rect (right <= left) clips everything. */
+static int rec_scissor_rect(const D3D12DrawRecord* dr, LONG tw, LONG th, D3D12_RECT* r)
+{
+    if (!rsx_scissor_on()) return 0;
+    LONG l = (LONG)dr->sc_x, t = (LONG)dr->sc_y;
+    LONG rr = l + (LONG)dr->sc_w, b = t + (LONG)dr->sc_h;
+    if (rr > tw) rr = tw;
+    if (b > th) b = th;
+    if (l > rr) l = rr;
+    if (t > b) t = b;
+    if (l <= 0 && t <= 0 && rr >= tw && b >= th) return 0;
+    r->left = l; r->top = t; r->right = rr; r->bottom = b;
+    return 1;
+}
+
 /* The draw's depth surface (none when the surface format has no depth), and
  * whether it is a depth-only pass: colour target NONE with a depth surface. */
 static void rec_zeta(D3D12DrawRecord* dr)
@@ -9791,14 +9831,26 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     /* Depth/stencil part: one depth buffer serves every
                      * target, and it is reset whenever the pass switches
                      * targets; a clear inside a pass has to land here. */
-                    if (dr->clear_mask & 0x3u) {
+                    /* A clear covers the guest scissor's part of the surface
+                     * only, as on the RSX. */
+                    D3D12_RECT csr, zsr;
+                    const int cpart = rec_scissor_rect(dr,
+                        cur_rt >= 0 ? (LONG)s_d3d.off_rt[cur_rt].w : (LONG)s_d3d.width,
+                        cur_rt >= 0 ? (LONG)s_d3d.off_rt[cur_rt].h : (LONG)s_d3d.height, &csr);
+                    const int zpart = rec_scissor_rect(dr,
+                        cur_z >= 0 ? (LONG)s_d3d.off_ds[cur_z].w : (LONG)s_d3d.width,
+                        cur_z >= 0 ? (LONG)s_d3d.off_ds[cur_z].h : (LONG)s_d3d.height, &zsr);
+                    const int zempty = zpart && (zsr.right <= zsr.left || zsr.bottom <= zsr.top);
+                    const int cempty = cpart && (csr.right <= csr.left || csr.bottom <= csr.top);
+                    if ((dr->clear_mask & 0x3u) && !zempty) {
                         D3D12_CLEAR_FLAGS zf = (D3D12_CLEAR_FLAGS)
                             (((dr->clear_mask & 0x1u) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                              ((dr->clear_mask & 0x2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
                         s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, cur_dsv,
-                            zf, dr->clear_z, dr->clear_s, 0, NULL);
+                            zf, dr->clear_z, dr->clear_s, zpart ? 1 : 0, zpart ? &zsr : NULL);
                         if (cur_z >= 0) { s_d3d.off_ds[cur_z].cleared = 1; s_d3d.off_ds[cur_z].gen++; }
                     }
+                    if (cempty) continue;
                     if (!(dr->clear_mask & 0xF0u) || dr->no_color)
                         continue;
                     { static int cd = -1;
@@ -9807,11 +9859,13 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
                           s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, mag, 0, NULL);
                       } else
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, dr->cc, 0, NULL); }
+                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, dr->cc,
+                                                                        cpart ? 1 : 0, cpart ? &csr : NULL); }
                     for (int _m = 0; _m < 3; _m++)
                         if (cur_m[_m] >= 0) {
                             D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-                            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc, 0, NULL);
+                            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc,
+                                                                          cpart ? 1 : 0, cpart ? &csr : NULL);
                         }
                     continue;
                 }
@@ -9879,6 +9933,18 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
                                       (LONG)(dvp.TopLeftX + dvp.Width),
                                       (LONG)(dvp.TopLeftY + dvp.Height)};
+                    /* The guest scissor clips as well (God of War: Ascension's
+                     * always matches its viewport; its shadow-map clears are
+                     * where its scissor is smaller than the target). */
+                    { D3D12_RECT sr;
+                      if (rec_scissor_rect(dr, (LONG)tw, (LONG)th, &sr)) {
+                          if (sr.left > dsc.left) dsc.left = sr.left;
+                          if (sr.top > dsc.top) dsc.top = sr.top;
+                          if (sr.right < dsc.right) dsc.right = sr.right;
+                          if (sr.bottom < dsc.bottom) dsc.bottom = sr.bottom;
+                          if (dsc.right < dsc.left) dsc.right = dsc.left;
+                          if (dsc.bottom < dsc.top) dsc.bottom = dsc.top;
+                      } }
                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
@@ -10717,6 +10783,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->clear_mask = flags;
             dr->clear_z = depth;
             dr->clear_s = stencil;
+            rec_scissor(dr);
         }
         return;
     }
@@ -12133,6 +12200,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                     dr->vp_h = s_d3d.current_rsx_state->viewport_h;
                 } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+                rec_scissor(dr);
                 dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
                 s_d3d.draw_count++;
@@ -12248,6 +12316,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                 dr->vp_h = s_d3d.current_rsx_state->viewport_h;
             } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+            rec_scissor(dr);
             dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
@@ -12448,6 +12517,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->vp_w = s_d3d.current_rsx_state->viewport_w;
             dr->vp_h = s_d3d.current_rsx_state->viewport_h;
         } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+        rec_scissor(dr);
         dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         if (dr->raw) vp_record_raw_cb(s_d3d.draw_count, s_d3d.current_rsx_state);

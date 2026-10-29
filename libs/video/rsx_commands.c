@@ -905,7 +905,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
     if (method == NV4097_INVALIDATE_L2) {
         /* Post-transform/L2 cache invalidate: the host keeps no such cache,
-         * nothing to drop. */
+         * nothing to drop. Counted: a backend may take it as the point a
+         * target drawn into becomes visible to its texture reads. */
+        state->l2_invalidates++;
         return 0;
     }
 

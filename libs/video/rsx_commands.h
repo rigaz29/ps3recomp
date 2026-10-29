@@ -394,6 +394,7 @@ typedef struct rsx_state {
     u32 vertex_attrib_output_mask;
     u32 vertex_attrib_input_mask;      /* 0x1FF0 */
     u32 transform_branch_bits;         /* 0x1FF8: VP static branch condition bits */
+    u32 l2_invalidates;                /* NV4097_INVALIDATE_L2 commands seen (texture cache) */
     u32 transform_program_load;
     u32 transform_program_start; /* vertex program load slot index */
     u32 transform_constant_load;

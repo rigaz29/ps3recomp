@@ -128,6 +128,7 @@ typedef struct {
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     u32 fp_ctrl;        /* SET_SHADER_CONTROL export bits at draw time (FP_CTRL_BITS) */
+    u32 l2_inval;       /* texture cache invalidates the title had sent by this draw */
     u32 wpos_win;       /* SET_SHADER_WINDOW when it moves WPOS off the host's
                          * top-left, half-pixel position; else 0 (rec_wpos_win) */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
@@ -7128,6 +7129,11 @@ static u32 rec_fp_ctrl(void)
     return c;
 }
 
+static u32 rec_l2_inval(void)
+{
+    return s_d3d.current_rsx_state ? s_d3d.current_rsx_state->l2_invalidates : 0u;
+}
+
 static u32 rec_surface_a(void)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -7620,12 +7626,17 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
     r->st = to;
 }
 
-/* A draw that samples the target it draws into reads the target as it was
- * before the draw, on the RSX -- God of War: Ascension's menu blends each
- * frame into its own 640x360 history target that way. D3D12 cannot read a
- * resource bound as a render target: such a unit reads a copy made just
- * before the draw (RT_FEEDBACK=0: off, the target itself is read). */
-static struct { ID3D12Resource* res; u32 w, h, dxgi; D3D12_RESOURCE_STATES st; } s_fb[MAX_OFF_RTS];
+/* A draw may sample the target it draws into -- God of War: Ascension's menu
+ * blends each frame into its own 640x360 history target that way. D3D12
+ * cannot read a resource bound as a render target: such a unit reads a copy.
+ * The RSX reads a target through its texture cache, which the title
+ * invalidates (NV4097_INVALIDATE_L2) when it wants what was drawn since, so
+ * the copy is made at the first such draw after an invalidate and read until
+ * the next. A copy before every draw cost the first level's opening a 65-170
+ * ms frame on the GPU: runs of up to 128 particles each copied the 1280x720
+ * target, with no invalidate between them. RT_FEEDBACK=1: a copy before
+ * every draw; 0: none, the target itself is read. */
+static struct { ID3D12Resource* res; u32 w, h, dxgi; D3D12_RESOURCE_STATES st; u32 inval; u64 frame; } s_fb[MAX_OFF_RTS];
 
 static ID3D12Resource* fb_copy(int slot)
 {
@@ -8621,7 +8632,8 @@ static int s_gts_slot = -1, s_gts_marked;
 /* And one at every render target change of the draw pass: a frame whose draws
  * took over 50 ms on the GPU prints its longest passes. */
 #define GPS_MAX 256
-typedef struct { u32 from, off, w, h, fp; } GpsPass;
+typedef struct { u32 from, off, w, h, fp, fbc, inval; } GpsPass;
+static u32 s_fb_copies;                 /* RT_FEEDBACK copies made, for the passes */
 static ID3D12QueryHeap* s_gps_heap;
 static ID3D12Resource* s_gps_rb;
 static GpsPass s_gps[FRAME_COUNT][GPS_MAX];
@@ -8667,6 +8679,20 @@ static void gps_pass(u32 from, u32 off, u32 w, u32 h, u32 fp)
     if (s_gps_n[fi] >= GPS_MAX - 1) return;     /* the last one ends the passes */
     GpsPass* p = &s_gps[fi][s_gps_n[fi]];
     p->from = from; p->off = off; p->w = w; p->h = h; p->fp = fp;
+    p->fbc = s_fb_copies;
+    p->inval = 0;
+    /* The pass before this one: how often the title invalidated the texture
+     * cache between its VP draws (the records still hold this frame). */
+    if (s_gps_n[fi] > 0) {
+        GpsPass* q = &s_gps[fi][s_gps_n[fi] - 1];
+        int have = 0; u32 last = 0;
+        for (u32 i = q->from; i < from && i < s_d3d.draw_count && i < MAX_DRAWS; i++) {
+            const D3D12DrawRecord* r = &s_d3d.draws[i];
+            if (!r->is_vp || r->is_clear) continue;
+            if (have && r->l2_inval != last) q->inval++;
+            last = r->l2_inval; have = 1;
+        }
+    }
     s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_gps_heap, D3D12_QUERY_TYPE_TIMESTAMP,
                                      (UINT)(fi * GPS_MAX + s_gps_n[fi]));
     s_gps_n[fi]++;
@@ -8734,9 +8760,10 @@ static void gts_read(void)
         if (best < 0) break;
         done[best] = 1;
         const GpsPass* g = &s_gps[fi][best];
-        fprintf(stderr, " | %.1f ms: target 0x%08X %ux%u, draws %u-%u, fp 0x%08X",
+        fprintf(stderr, " | %.1f ms: target 0x%08X %ux%u, draws %u-%u, fp 0x%08X, own-target copies %u, "
+                        "cache invalidates %u",
                 (double)(ts[best + 1] - ts[best]) * k, g->off, g->w, g->h, g->from,
-                s_gps[fi][best + 1].from, g->fp);
+                s_gps[fi][best + 1].from, g->fp, s_gps[fi][best + 1].fbc - g->fbc, g->inval);
     }
     fprintf(stderr, "%c", 10);
 }
@@ -9858,13 +9885,19 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
                 }
                 { static int fbon = -1;
-                  if (fbon < 0) { const char* e = getenv("RT_FEEDBACK"); fbon = e ? atoi(e) : 1; }
+                  if (fbon < 0) { const char* e = getenv("RT_FEEDBACK"); fbon = e ? atoi(e) : 2; }
                   int done_rt = -1;
                   for (int _u = 0; fbon && !dr->is_clear && _u < VP_TEX_UNITS; _u++) {
                       const int rt = dr->tex_rt[_u];
                       if (rt < 0 || dr->tex_cv[_u] >= 0 || dr->tex_ds[_u] >= 0) continue;
                       if (rt != cur_rt && rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2]) continue;
-                      ID3D12Resource* fr = (done_rt == rt) ? s_fb[rt].res : fb_copy(rt);
+                      /* RT_FEEDBACK=2: the copy made at the title's last texture
+                       * cache invalidate this frame, if there is one. */
+                      const int reuse = done_rt == rt ||
+                          (fbon == 2 && s_fb[rt].res && s_fb[rt].frame == s_d3d.frame_count &&
+                           s_fb[rt].inval == dr->l2_inval);
+                      ID3D12Resource* fr = reuse ? s_fb[rt].res : (s_fb_copies++, fb_copy(rt));
+                      if (fr && !reuse) { s_fb[rt].inval = dr->l2_inval; s_fb[rt].frame = s_d3d.frame_count; }
                       if (!fr) continue;
                       done_rt = rt;
                       srv_write(DRAW_SRV_BASE + d * VP_TEX_UNITS + (u32)_u, fr,
@@ -12052,7 +12085,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->textured       = s_d3d.tex_bound;
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-                dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
+                dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win(); dr->l2_inval = rec_l2_inval();
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -12173,7 +12206,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->textured       = s_d3d.tex_bound;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-            dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
+            dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win(); dr->l2_inval = rec_l2_inval();
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -12374,7 +12407,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-        dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win();
+        dr->fp_ctrl = rec_fp_ctrl(); dr->wpos_win = rec_wpos_win(); dr->l2_inval = rec_l2_inval();
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->poly = rsx_poly_key(s_d3d.current_rsx_state); rec_step2_state(dr, s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;

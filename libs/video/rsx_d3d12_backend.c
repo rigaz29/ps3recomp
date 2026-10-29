@@ -323,6 +323,8 @@ typedef struct {
     int next;           /* the next slot + 1 in this one's lookup chain, 0 = end */
     int linked;         /* in the lookup table */
     u32 levels;         /* mip levels of res */
+    int heap;           /* the texture heap res is placed in + 1, 0 = its own allocation */
+    u64 hoff, hsize;    /* its block in that heap */
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -5783,12 +5785,147 @@ static void vp_tex_unlink(int slot)
     t->next = 0; t->linked = 0;
 }
 
+/* Texture memory: a guest texture is placed in a heap of TEX_HEAP_BYTES that
+ * it shares with others, instead of an allocation of its own. A committed
+ * texture took ~0.6 ms to create on the frame clock thread, and on entering
+ * God of War: Ascension's first level 150-174 are created in one frame: 95-107
+ * ms of it, placed 5-14 ms. Heaps
+ * are made as textures need them, up to what the cache may hold and a little
+ * over, and are not zeroed (an upload writes every texel first). A heap's free
+ * space is a list of blocks by offset, joined again as textures leave. A
+ * texture no heap has room for, or every one with RSX_TEX_PLACED=0, gets an
+ * allocation of its own as before. */
+#define TEX_HEAP_BYTES (64ull << 20)
+#define TEX_HEAPS      48
+static u64 vp_tex_budget(void);
+typedef struct { u64 off, size; } TexFree;
+typedef struct {
+    ID3D12Heap* heap;
+    TexFree* fr;                /* free blocks, by offset */
+    int nfr, capfr;
+} TexHeap;
+static TexHeap s_theap[TEX_HEAPS];
+static int s_theap_n;
+static unsigned s_hl_heap_n;    /* hitch log: heaps made */
+static double s_hl_heap_s;
+
+static int tex_placed_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_TEX_PLACED"); v = e ? (atoi(e) != 0) : 1; }
+    return v;
+}
+
+static int tex_heap_room(TexHeap* th)
+{
+    if (th->nfr < th->capfr) return 1;
+    const int cap = th->capfr ? th->capfr * 2 : 64;
+    TexFree* n = (TexFree*)realloc(th->fr, (size_t)cap * sizeof *n);
+    if (!n) return 0;
+    th->fr = n; th->capfr = cap;
+    return 1;
+}
+
+/* `size` bytes at `align` from the heap's free blocks: the offset, or ~0. */
+static u64 tex_heap_take(TexHeap* th, u64 size, u64 align)
+{
+    for (int i = 0; i < th->nfr; i++) {
+        const u64 b0 = th->fr[i].off, b1 = b0 + th->fr[i].size;
+        const u64 at = (b0 + align - 1) & ~(align - 1);
+        if (at + size > b1) continue;
+        if (at > b0 && at + size < b1) {          /* a block either side */
+            if (!tex_heap_room(th)) return ~0ull;
+            memmove(&th->fr[i + 2], &th->fr[i + 1], (size_t)(th->nfr - i - 1) * sizeof th->fr[0]);
+            th->nfr++;
+            th->fr[i].size = at - b0;
+            th->fr[i + 1].off = at + size; th->fr[i + 1].size = b1 - (at + size);
+        } else if (at > b0) {
+            th->fr[i].size = at - b0;
+        } else if (at + size < b1) {
+            th->fr[i].off = at + size; th->fr[i].size = b1 - (at + size);
+        } else {
+            memmove(&th->fr[i], &th->fr[i + 1], (size_t)(th->nfr - i - 1) * sizeof th->fr[0]);
+            th->nfr--;
+        }
+        return at;
+    }
+    return ~0ull;
+}
+
+/* A block back to the heap, joined to its neighbours. */
+static void tex_heap_give(TexHeap* th, u64 off, u64 size)
+{
+    int i = 0;
+    while (i < th->nfr && th->fr[i].off < off) i++;
+    const int prev = i > 0 && th->fr[i - 1].off + th->fr[i - 1].size == off;
+    const int next = i < th->nfr && off + size == th->fr[i].off;
+    if (prev && next) {
+        th->fr[i - 1].size += size + th->fr[i].size;
+        memmove(&th->fr[i], &th->fr[i + 1], (size_t)(th->nfr - i - 1) * sizeof th->fr[0]);
+        th->nfr--;
+    } else if (prev) {
+        th->fr[i - 1].size += size;
+    } else if (next) {
+        th->fr[i].off = off; th->fr[i].size += size;
+    } else if (tex_heap_room(th)) {
+        memmove(&th->fr[i + 1], &th->fr[i], (size_t)(th->nfr - i) * sizeof th->fr[0]);
+        th->fr[i].off = off; th->fr[i].size = size;
+        th->nfr++;
+    }
+}
+
+/* The texture `td` placed in a heap, its heap + 1 and block in *heap, *off and
+ * *size; NULL when no heap has room and no other may be made. */
+static ID3D12Resource* tex_place(const D3D12_RESOURCE_DESC* td, int* heap, u64* off, u64* size)
+{
+    D3D12_RESOURCE_ALLOCATION_INFO ai;
+    s_d3d.device->lpVtbl->GetResourceAllocationInfo(s_d3d.device, &ai, 0, 1, td);
+    if (!ai.SizeInBytes || ai.SizeInBytes > TEX_HEAP_BYTES) return NULL;
+    const u64 align = ai.Alignment ? ai.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    const u64 sz = (ai.SizeInBytes + align - 1) & ~(align - 1);
+    int h = 0;
+    u64 at = ~0ull;
+    for (; h < s_theap_n; h++)
+        if ((at = tex_heap_take(&s_theap[h], sz, align)) != ~0ull) break;
+    if (at == ~0ull) {
+        if (s_theap_n == TEX_HEAPS || (u64)s_theap_n * TEX_HEAP_BYTES >= vp_tex_budget() + 4 * TEX_HEAP_BYTES)
+            return NULL;
+        const double h0 = perf_now();
+        D3D12_HEAP_DESC hd;
+        memset(&hd, 0, sizeof hd);
+        hd.SizeInBytes = TEX_HEAP_BYTES;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        ID3D12Heap* hp = NULL;
+        if (FAILED(s_d3d.device->lpVtbl->CreateHeap(s_d3d.device, &hd, &IID_ID3D12Heap, (void**)&hp))) {
+            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;   /* a runtime without CREATE_NOT_ZEROED */
+            if (FAILED(s_d3d.device->lpVtbl->CreateHeap(s_d3d.device, &hd, &IID_ID3D12Heap, (void**)&hp)))
+                return NULL;
+        }
+        h = s_theap_n++;
+        s_theap[h].heap = hp;
+        tex_heap_give(&s_theap[h], 0, TEX_HEAP_BYTES);
+        s_hl_heap_n++; s_hl_heap_s += perf_now() - h0;
+        if ((at = tex_heap_take(&s_theap[h], sz, align)) == ~0ull) return NULL;
+    }
+    ID3D12Resource* r = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->CreatePlacedResource(s_d3d.device, s_theap[h].heap, at, td,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&r))) {
+        tex_heap_give(&s_theap[h], at, sz);
+        return NULL;
+    }
+    *heap = h + 1; *off = at; *size = sz;
+    return r;
+}
+
 /* Release a slot's resources. Only ever a slot this batch has not bound: the
  * batches before it have run (rf_open waits for the GPU), so nothing in flight
  * reads them. */
 static void vp_tex_drop(VPTexSlot* t)
 {
     if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+    if (t->heap) { tex_heap_give(&s_theap[t->heap - 1], t->hoff, t->hsize); t->heap = 0; }
     if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
     s_tex_bytes -= t->bytes; t->bytes = 0;
 }
@@ -5892,11 +6029,11 @@ static void tex_stats_note(double dt)
             fprintf(stderr, " %s %.0f (%.2f ms)", name[k], s_ts_n[k] / nf, s_ts_t[k] * 1000.0 / nf);
         static double cr_prev, ev_prev, dc_prev;
         fprintf(stderr, "; evicted %.1f (%.2f ms), created %.1f (%.2f ms), taken over %.1f; decode %.2f ms; "
-                        "%d textures held, %.0f of %.0f MB\n",
+                        "%d textures held, %.0f of %.0f MB, %d heaps\n",
                 s_ts_evict / nf, (s_tex_evict_s - ev_prev) * 1000.0 / nf,
                 s_ts_create / nf, (s_tex_create_s - cr_prev) * 1000.0 / nf, s_ts_reuse / nf,
                 (s_tex_decode_s - dc_prev) * 1000.0 / nf, live,
-                s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0);
+                s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0, s_theap_n);
         cr_prev = s_tex_create_s; ev_prev = s_tex_evict_s; dc_prev = s_tex_decode_s;
         fflush(stderr);
         for (int k = 0; k < TS_N; k++) { s_ts_n[k] = 0; s_ts_t[k] = 0; }
@@ -6181,7 +6318,17 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         td.MipLevels = (UINT16)nlev;
         td.Format = dxfmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        t->heap = 0;
+        if (tex_placed_on()) t->res = tex_place(&td, &t->heap, &t->hoff, &t->hsize);
+        if (t->res) {
+            /* Its memory may have held another texture: this one's use of it
+             * begins here. */
+            D3D12_RESOURCE_BARRIER ab;
+            memset(&ab, 0, sizeof ab);
+            ab.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+            ab.Aliasing.pResourceAfter = t->res;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &ab);
+        } else if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
@@ -7260,18 +7407,20 @@ static void rsx_census_present(void)
           fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms: create %.1f, evict %.1f, decode %.1f), "
                           "shader waits %.1f ms, draws skipped %u, builds queued %u, GPU wait %.1f ms, prepass %.1f ms, "
                           "render_frame %.1f ms; pipelines made here %u (%.1f ms), upload buffers %u (%.1f ms), "
-                          "targets made %u (%.1f ms), all GPU waits %u (%.1f ms), VRAM %llu of %llu MB\n",
+                          "targets made %u (%.1f ms), heaps made %u (%.1f ms), all GPU waits %u (%.1f ms), "
+                          "VRAM %llu of %llu MB\n",
                   (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0,
                   dcr * 1000.0, dev * 1000.0, ddc * 1000.0, s_hl_sjwait_s * 1000.0,
                   s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0,
                   s_hl_miss_n, s_hl_miss_s * 1000.0, s_hl_upbuf_n, s_hl_upbuf_s * 1000.0,
-                  s_hl_rt_n, s_hl_rt_s * 1000.0, s_hl_waits_n, s_hl_waits_s * 1000.0,
+                  s_hl_rt_n, s_hl_rt_s * 1000.0, s_hl_heap_n, s_hl_heap_s * 1000.0,
+                  s_hl_waits_n, s_hl_waits_s * 1000.0,
                   (unsigned long long)(vm.CurrentUsage >> 20), (unsigned long long)(vm.Budget >> 20));
       } }
     s_hl_tex_n = s_hl_skipped = s_hl_jobs = 0;
     s_hl_tex_s = s_hl_sjwait_s = s_hl_gpuwait_s = 0.0;
-    s_hl_miss_n = s_hl_upbuf_n = s_hl_rt_n = s_hl_waits_n = 0;
-    s_hl_miss_s = s_hl_upbuf_s = s_hl_rt_s = s_hl_waits_s = 0.0;
+    s_hl_miss_n = s_hl_upbuf_n = s_hl_rt_n = s_hl_waits_n = s_hl_heap_n = 0;
+    s_hl_miss_s = s_hl_upbuf_s = s_hl_rt_s = s_hl_waits_s = s_hl_heap_s = 0.0;
     s_cen_last_present = now;
     if (s_cen_t0 <= 0.0) s_cen_t0 = now;
     if (now - s_cen_t0 < (double)rsx_census_secs()) return;

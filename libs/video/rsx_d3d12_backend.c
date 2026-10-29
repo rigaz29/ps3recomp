@@ -5738,6 +5738,68 @@ static u64 s_tex_bytes;                           /* held by the slots' resource
 static ID3D12Resource* s_tex_staging[1024];
 static int s_tex_staging_n;
 
+/* Texture uploads that do not fit in the frame's part of the ring go to spill
+ * chunks of TEX_RING_PART, made when a frame first needs them and kept for the
+ * frames after it; one unused for TEX_SPILL_IDLE frames is released. They got
+ * an upload buffer each before: 43-110 on entering God of War: Ascension's
+ * first level, 25-98 ms on the frame clock thread. */
+#define TEX_SPILL_MAX  8
+#define TEX_SPILL_IDLE 600u
+typedef struct { ID3D12Resource* res; u8* ptr; u64 used, last; } TexSpill;
+static TexSpill s_tex_spill[FRAME_COUNT][TEX_SPILL_MAX];
+
+/* `bytes` from frame index fi's spill chunks: the chunk and its offset in *at,
+ * or NULL. */
+static TexSpill* tex_spill_take(u32 fi, u64 bytes, u64* at)
+{
+    if (bytes > TEX_RING_PART) return NULL;
+    for (int i = 0; i < TEX_SPILL_MAX; i++) {
+        TexSpill* c = &s_tex_spill[fi][i];
+        if (!c->res) {
+            const double c0 = perf_now();
+            D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd = {0};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = TEX_RING_PART;
+            bd.Height = 1; bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            void* p = NULL; D3D12_RANGE nr = {0, 0};
+            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                    &IID_ID3D12Resource, (void**)&c->res)))
+                return NULL;
+            if (FAILED(c->res->lpVtbl->Map(c->res, 0, &nr, &p)) || !p) {
+                c->res->lpVtbl->Release(c->res); c->res = NULL;
+                return NULL;
+            }
+            c->ptr = (u8*)p; c->used = 0;
+            s_hl_upbuf_n++; s_hl_upbuf_s += perf_now() - c0;
+        }
+        const u64 a = (c->used + 511u) & ~(u64)511u;   /* placement alignment */
+        if (a + bytes <= TEX_RING_PART) {
+            c->used = a + bytes; c->last = s_d3d.frame_count;
+            *at = a;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* A new frame on index fi: its spill chunks are free again (the batch that
+ * used them has run), and one long unused is released. */
+static void tex_spill_reset(u32 fi)
+{
+    for (int i = 0; i < TEX_SPILL_MAX; i++) {
+        TexSpill* c = &s_tex_spill[fi][i];
+        if (!c->res) continue;
+        c->used = 0;
+        if (s_d3d.frame_count - c->last > TEX_SPILL_IDLE) {
+            c->res->lpVtbl->Release(c->res);
+            memset(c, 0, sizeof *c);
+        }
+    }
+}
+
 static void vp_tex_release_staging(void)
 {
     for (int i = 0; i < s_tex_staging_n; i++)
@@ -6361,11 +6423,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
     ID3D12Resource* up_res = NULL;
     u64 up_base = 0;
+    TexSpill* spill = NULL;
     const u64 ring_at = (s_d3d.tex_ring_used[fi] + 511u) & ~(u64)511u;   /* placement alignment */
     if (s_d3d.tex_ring_ptr && ring_at + up_bytes <= TEX_RING_PART) {
         up_res = s_d3d.tex_ring;
         up_base = (u64)fi * TEX_RING_PART + ring_at;
         s_d3d.tex_ring_used[fi] = ring_at + up_bytes;
+    } else if ((spill = tex_spill_take(fi, up_bytes, &up_base)) != NULL) {
+        up_res = spill->res;
     } else {
         if (!t->up) {
             const double ub0 = perf_now();
@@ -6388,6 +6453,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
     if (up_res == s_d3d.tex_ring) mapped = s_d3d.tex_ring_ptr + up_base;
+    else if (spill) mapped = spill->ptr + up_base;
     else if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
     { static int _tp=0; if (env_str("RTT_DUMP", &s_env_rtt_dump) && PS3_LOG_FIRST(_tp, 6)) {
         const u8* sp = vm_base + off;
@@ -6711,7 +6777,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                                s_lv[_l].w, s_lv[_l].h, &s_lv[_l].tl, rsx_texture_argb_is_rgba());
         }
     s_tex_decode_s += perf_now() - dcl0;
-    if (up_res != s_d3d.tex_ring) t->up->lpVtbl->Unmap(t->up, 0, NULL);
+    if (up_res != s_d3d.tex_ring && !spill) t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
         D3D12_RESOURCE_BARRIER b = {0};
@@ -8529,6 +8595,7 @@ static void rf_open(void)
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
     s_d3d.tex_ring_used[fi] = 0;   /* this frame index's copies are done */
+    tex_spill_reset(fi);
 
     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
      * The atlas is a linear 8-bit coverage map, so a straight row copy (no

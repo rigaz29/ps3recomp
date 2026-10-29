@@ -602,6 +602,48 @@ static void audio_notify_event_queues(void)
 
 #ifdef _WIN32
 static unsigned long long g_audio_underruns;
+
+/* Take a block every 5.33 ms by the performance counter, as the hardware
+ * does, and keep the device queue near AUDIO_PACE_MS (default 30) as the
+ * jitter buffer. Paced on the device's room alone the blocks went in pairs:
+ * shared-mode WASAPI frees about 10 ms at a time, so two were read at once,
+ * and a guest mixer one block ahead found the second already due. God of War:
+ * Ascension's first level: short gaps inside sound 27-35 per 5 s -> 8-9.
+ * AUDIO_PACE=0 paces on the device's room again. */
+static int audio_pace_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char* e = getenv("AUDIO_PACE");
+        const char* t = getenv("AUDIO_PACE_MS");
+        ms = (!e || atoi(e) != 0) ? (t ? atoi(t) : 30) : 0;
+        if (ms && ms < 15) ms = 15;
+    }
+    return ms;
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+/* Sleep until the performance counter reaches `due`: to ~0.5 ms with the
+ * high-resolution waitable timer (Windows 10 1803 on), else Sleep(1). */
+static void audio_sleep_until(long long due, long long freq)
+{
+    static HANDLE timer = (HANDLE)-1;
+    if (timer == (HANDLE)-1)
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const long long left = due - now.QuadPart;
+    if (left <= 0) return;
+    if (timer) {
+        LARGE_INTEGER rel; rel.QuadPart = -(left * 10000000 / freq);
+        if (!rel.QuadPart) rel.QuadPart = -1;
+        if (SetWaitableTimer(timer, &rel, 0, NULL, NULL, FALSE)) { WaitForSingleObject(timer, 20); return; }
+    }
+    Sleep(1);
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -628,9 +670,30 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * With no device, pace on the performance counter instead. */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    const int pace_ms = audio_pace_ms();
+    const long long period = qf.QuadPart * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
+    long long pace_t0 = 0;              /* when block 0 of the paced clock was due */
+    unsigned long long pace_k = 0;      /* blocks taken on it */
+    if (pace_ms) fprintf(stderr, "[cellAudio] a block every 5.33 ms, device queue kept near %d ms%c", pace_ms, 10);
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        if (pace_ms && room >= 0) {
+            const UINT32 queued = s_wasapi_buf_frames - (UINT32)room;
+            const UINT32 target = (UINT32)(CELL_AUDIO_SAMPLE_RATE / 1000) * (UINT32)pace_ms;
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            /* The first blocks are due at once, to fill the queue to the target. */
+            if (!pace_t0) pace_t0 = now.QuadPart - (long long)(target / CELL_AUDIO_BLOCK_SAMPLES) * period;
+            const long long due = pace_t0 + (long long)pace_k * period;
+            if (now.QuadPart - due > 8 * period)     /* a stall: carry on from now, no burst */
+                pace_t0 = now.QuadPart - (long long)pace_k * period;
+            else if (now.QuadPart < due) { audio_sleep_until(due, qf.QuadPart); continue; }
+            pace_k++;
+            /* Within two blocks of the target: the device's clock and the
+             * counter drift apart, and a stall leaves the queue short. */
+            if (queued + 2 * CELL_AUDIO_BLOCK_SAMPLES < target) pace_t0 -= period / 4;
+            else if (queued > target + 2 * CELL_AUDIO_BLOCK_SAMPLES) pace_t0 += period / 4;
+        }
 #if AUDIO_BACKEND_WASAPI
         /* Device queue under half a block: it is about to play silence (an
          * audible click/stutter). AUDIO_RATE reports how often. */
@@ -649,6 +712,14 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
         }
         blocks++;
+        /* AUDIO_RATE: blocks taken within 1.5 ms of the one before (in pairs). */
+        static unsigned s_ar_quick;
+        if (audio_rate_on()) {
+            static long long prev;
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if (prev && (now.QuadPart - prev) * 2000 < qf.QuadPart * 3) s_ar_quick++;
+            prev = now.QuadPart;
+        }
         /* Mix and submit one block */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -680,9 +751,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #else
                         0u, 10);
 #endif
-                fprintf(stderr, "[audio-ring] gaps %u (%u blocks), written after read %u, blocks ahead 0:%u 1:%u 2:%u 3+:%u%c",
-                        s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[0], s_ar_lead[1], s_ar_lead[2], s_ar_lead[3], 10);
-                s_ar_gaps = s_ar_gap_blocks = s_ar_late = 0;
+                fprintf(stderr, "[audio-ring] gaps %u (%u blocks), written after read %u, blocks ahead 0:%u 1:%u 2:%u 3+:%u, "
+                                "taken right after the one before %.0f%%%c",
+                        s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[0], s_ar_lead[1], s_ar_lead[2], s_ar_lead[3],
+                        n ? 100.0 * s_ar_quick / n : 0.0, 10);
+                s_ar_gaps = s_ar_gap_blocks = s_ar_late = s_ar_quick = 0;
                 memset(s_ar_lead, 0, sizeof s_ar_lead);
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 

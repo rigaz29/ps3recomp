@@ -1174,13 +1174,9 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
  * range check leaves to the per-lane path with Inf and NaN (an extended-range operand). The form
  * is chosen by g_spu_float_rz: MXCSR can only be read through memory, and clang neither shares
  * that read between ops nor keeps it off the exact path (it computed both forms and selected). */
-SPU__X8_INLINE __m128i spu__x8_z(__m128i x) {            /* biased exponent 0: an SPU zero */
-    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
-}
 SPU__X8_INLINE __m128i spu__x8_inrange(__m128i s) {      /* |s| < FLT_MAX (Inf and NaN fail) */
     return _mm_cmpgt_epi32(_mm_set1_epi32(0x7F7FFFFF), _mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)));
 }
-SPU__X8_INLINE __m128i spu__x8_flush(__m128i r) { return _mm_andnot_si128(spu__x8_z(r), r); }   /* zero: +0 */
 SPU__X8_INLINE __m128 spu__x8_f(__m128i v) { return _mm_castsi128_ps(v); }
 #if defined(SPU_FLOAT_RZ_CHECK)
 /* Check build (-DSPU_FLOAT_RZ_CHECK): every native result against the integer reference,
@@ -1208,12 +1204,58 @@ static __attribute__((noinline, cold, unused)) u128 spu__x8_rz_check(u128 got, i
 #else
 #define SPU__X8_RZ_CHECK(r, op, a, b, c, np, nc) (r)
 #endif
+/* The redo of a vector with a lane out of the single range (an extended-range operand, or a result
+ * at or past FLT_MAX), every lane one by one, out of line and cold. Operands and result travel in
+ * vector registers -- __vectorcall on Windows, where a 16-byte union goes through memory -- and the
+ * hot path keeps its result in one: with a union on both sides of the choice, clang merged the two
+ * through the stack, a store and a reload on every float operation. The redo takes the operands
+ * with fs's and fma's sign changes applied; lanes that were right come out the same. */
+#if defined(_WIN32)
+#define SPU__X8_VCALL __vectorcall
+#else
+#define SPU__X8_VCALL
+#endif
+SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fa_redo(__m128i x, __m128i y) {
+    const u128 a = spu__x8_st(x), b = spu__x8_st(y); u128 r;
+    for (int i = 0; i < 4; i++) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i]);
+    return spu__x8_ld(r);
+}
+SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fm_redo(__m128i x, __m128i y) {
+    const u128 a = spu__x8_st(x), b = spu__x8_st(y); u128 r;
+    for (int i = 0; i < 4; i++) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+    return spu__x8_ld(r);
+}
+SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fma_redo(__m128i x, __m128i y, __m128i z) {
+    const u128 a = spu__x8_st(x), b = spu__x8_st(y), c = spu__x8_st(z); u128 r;
+    for (int i = 0; i < 4; i++) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], 0, 0);
+    return spu__x8_ld(r);
+}
+/* What the RZ forms do with the native result s:
+ *  - zero: the SPU's is +0. In this mode the only results with biased exponent 0 are +-0 (FTZ), so
+ *    "s != 0 ? s : +0" is two operations (NaN, unordered, is kept for the redo).
+ *    SPU_FLOAT_APPROX (lifted code built for it, with SPU_FLOAT_RZ_ONLY) keeps the host's -0
+ *    instead -- -x * 0, -0 + -0, an underflow of a negative result -- which reads as zero to
+ *    every SPU float operation and comparison; only its bits differ.
+ *  - out of range: Inf and NaN come only from extended-range operands (and 0 times one), and an
+ *    overflow gives FLT_MAX in this mode; those vectors are redone. Titles count on the extended
+ *    range: God of War: Ascension's EDGE jobs make all-ones masks as x * 0xFFFFFFFF (-0 or a
+ *    saturated -max) and its physics refines 1/0 (0x7FFFF800) with fma; done natively, the masks
+ *    came out NaN and the jobs culled differently. The check stays in both modes. */
+#if defined(SPU_FLOAT_APPROX) && !defined(SPU_FLOAT_RZ_ONLY)
+#error "SPU_FLOAT_APPROX is for lifted code built with SPU_FLOAT_RZ_ONLY"
+#endif
+#if defined(SPU_FLOAT_APPROX)
+#define SPU__X8_ZERO(s) (s)
+#else
+#define SPU__X8_ZERO(s) _mm_and_si128(s, _mm_castps_si128(_mm_cmp_ps(spu__x8_f(s), _mm_setzero_ps(), _CMP_NEQ_UQ)))
+#endif
+#define SPU__X8_OUT(s) __builtin_expect(!spu__x8_all4(spu__x8_inrange(s)), 0)
 SPU__X8_INLINE u128 spu__x8_rz_fa(u128 a, u128 b, uint32_t negb) {
     const __m128i x = spu__x8_ld(a), y = _mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb));
     const __m128i s = _mm_castps_si128(_mm_add_ps(spu__x8_f(x), spu__x8_f(y)));
-    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
-    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb),
-                            0, a, b, b, 0, negb);
+    __m128i r = SPU__X8_ZERO(s);
+    if (SPU__X8_OUT(s)) r = spu__x8_fa_redo(x, y);
+    return SPU__X8_RZ_CHECK(spu__x8_st(r), 0, a, b, b, 0, negb);
 }
 /* fm and fma take the operands as they are: DAZ reads an SPU zero (biased exponent 0) as zero,
  * so a zero product is zero and a zero addend adds nothing, and the one case the SPU defines
@@ -1224,9 +1266,9 @@ SPU__X8_INLINE u128 spu__x8_rz_fa(u128 a, u128 b, uint32_t negb) {
 SPU__X8_INLINE u128 spu__x8_rz_fm(u128 a, u128 b) {
     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
     const __m128i s = _mm_castps_si128(_mm_mul_ps(spu__x8_f(x), spu__x8_f(y)));
-    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
-    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b),
-                            1, a, b, b, 0, 0);
+    __m128i r = SPU__X8_ZERO(s);
+    if (SPU__X8_OUT(s)) r = spu__x8_fm_redo(x, y);
+    return SPU__X8_RZ_CHECK(spu__x8_st(r), 1, a, b, b, 0, 0);
 }
 SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const __m128i x = _mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp)), y = spu__x8_ld(b);
@@ -1240,9 +1282,9 @@ SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32
     const __m128i s = _mm_castps_si128(_mm256_cvtpd_ps(_mm256_add_pd(
         _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), spu__x8_wide(z))));
 #endif
-    const __m128i ok = spu__x8_inrange(s), r = spu__x8_flush(s);
-    return SPU__X8_RZ_CHECK(spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc),
-                            2, a, b, c, negp, negc);
+    __m128i r = SPU__X8_ZERO(s);
+    if (SPU__X8_OUT(s)) r = spu__x8_fma_redo(x, y, z);
+    return SPU__X8_RZ_CHECK(spu__x8_st(r), 2, a, b, c, negp, negc);
 }
 #if defined(SPU_FLOAT_RZ_ONLY)
 /* SPU_FLOAT_RZ_ONLY: code built to run only in the RZ mode -- a port that always runs with

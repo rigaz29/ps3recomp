@@ -12,7 +12,9 @@
  * Build (arm64, or x86 with -mavx2 -mfma):
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * On x86 also with -mavx2 alone (the fma's double form) and with -msse4.1 alone (the scalar forms
- * the interpreter uses); each runs the passes again in SPU_FLOAT_RZ's MXCSR mode.
+ * the interpreter uses); each runs the passes again in SPU_FLOAT_RZ's MXCSR mode. With
+ * -DSPU_FLOAT_RZ_ONLY -DSPU_FLOAT_APPROX (x86, AVX2) a -0 result where the SPU has +0 is
+ * counted, not failed: the one difference that mode allows.
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
 #include "../../../tests/spu_ls_watch_fixture.h"
@@ -30,7 +32,7 @@ static const uint32_t k_frac[] = { 0x000000u, 0x000001u, 0x000002u, 0x400000u, 0
                                    0x3FFFFFu, 0x555555u, 0x0F0F0Fu, 0x100000u };
 #define NFRAC (sizeof k_frac / sizeof k_frac[0])
 
-static long s_bad, s_lanes;
+static long s_bad, s_lanes, s_zero_sign;
 static const char* const k_ops[6] = { "fa", "fs", "fm", "fma", "fms", "fnms" };
 
 static void run(int op, u128 a, u128 b, u128 c)
@@ -45,10 +47,16 @@ static void run(int op, u128 a, u128 b, u128 c)
     default: got = spu_fnms(a, b, c); ref = spu_fnms_ref(a, b, c); break;
     }
     s_lanes += 4;
-    for (int i = 0; i < 4; i++)
-        if (got._u32[i] != ref._u32[i] && s_bad++ < 20)
+    for (int i = 0; i < 4; i++) {
+        if (got._u32[i] == ref._u32[i]) continue;
+#if defined(SPU_FLOAT_APPROX)
+        /* the one difference SPU_FLOAT_APPROX allows: -0 where the SPU has +0 */
+        if (got._u32[i] == 0x80000000u && ref._u32[i] == 0) { s_zero_sign++; continue; }
+#endif
+        if (s_bad++ < 20)
             printf("MISMATCH %s a=%08X b=%08X c=%08X got=%08X ref=%08X\n", k_ops[op],
                    a._u32[i], b._u32[i], c._u32[i], got._u32[i], ref._u32[i]);
+    }
 }
 
 static inline uint32_t word(uint32_t sign, uint32_t be, uint32_t frac) { return sign << 31 | be << 23 | frac; }
@@ -115,7 +123,7 @@ static void gen_lane(int kind, uint32_t* x, uint32_t* y, uint32_t* z)
 
 static __attribute__((noinline)) int all_passes(long scale, const char* mode)
 {
-    s_bad = 0; s_lanes = 0;
+    s_bad = 0; s_lanes = 0; s_zero_sign = 0;
     printf("test_spu_float_exact: FPCR %s\n", mode);
 
     /* pass 1: every pair of the class words for fa, fs, fm */
@@ -167,7 +175,12 @@ static __attribute__((noinline)) int all_passes(long scale, const char* mode)
     printf("test_spu_float_exact: pass 3 (random): %ld lanes, %ld mismatches\n", s_lanes - lanes2, s_bad);
 
     if (s_bad) { printf("test_spu_float_exact: FAILED, %ld mismatching lanes of %ld\n", s_bad, s_lanes); return 1; }
+#if defined(SPU_FLOAT_APPROX)
+    printf("test_spu_float_exact: ok, %ld lanes, all bit-identical but %ld -0 for +0 (SPU_FLOAT_APPROX)\n",
+           s_lanes, s_zero_sign);
+#else
     printf("test_spu_float_exact: ok, %ld lanes bit-identical\n", s_lanes);
+#endif
     return 0;
 }
 

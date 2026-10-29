@@ -33,9 +33,11 @@
  * Each job runs from its saved context with every input served from the
  * record, in order, and every output compared with it: PUT bytes, outbound
  * mailbox words, and at the end the local store and the registers. A request
- * that differs from the record (another address or size) is a divergence. It
- * prints the time per job (fastest run, and the median) and each workload's
- * totals, and writes replay.csv next to the captures.
+ * that differs from the record (another address or size) is a divergence; an
+ * output word that differs is read as a single and counted as two SPU zeros
+ * (a sign apart), within 1, 16 or 256 ulps, or other. It prints the time per job
+ * (fastest run, and the median) and each workload's totals, and writes
+ * replay.csv next to the captures.
  */
 #include "spu_jobcap.h"
 #include "spu_context.h"
@@ -126,6 +128,9 @@ typedef struct {
     const uint8_t* ev; size_t len, pos;
     uint32_t idx, n_ev;
     uint32_t diverged, put_bytes_differ, out_differ;
+    /* the PUT/atomic words that differ, as singles: both an SPU zero (sign or
+     * fraction only), same sign within 1 / 16 / 256 ulps, anything else */
+    uint32_t w_zero, w_ulp1, w_ulp16, w_ulp256, w_other, max_ulp;
     char first[200];
     spu_context* ctx;
     jmp_buf jb;                 /* back to the replay driver at the job's end */
@@ -346,6 +351,29 @@ static uint32_t jc_class(uint32_t cmd)
     return JC_PUT;
 }
 
+/* Output bytes against the record: every byte that differs, and each 4-byte
+ * word (by its offset in the transfer) read as a big-endian single. */
+static void rep_cmp_out(jc_rep* r, const spu_context* ctx, uint32_t lsa, const uint8_t* d, uint32_t n)
+{
+    lsa &= SPU_LS_MASK;
+    if (lsa + n <= SPU_LS_SIZE && !memcmp(&ctx->ls[lsa], d, n)) return;   /* the usual case, timed with the job */
+    for (uint32_t w = 0; w < n; w += 4) {
+        uint32_t got = 0, want = 0, diff = 0;
+        for (uint32_t i = w; i < w + 4 && i < n; i++) {
+            const uint8_t g = ctx->ls[(lsa + i) & SPU_LS_MASK];
+            if (g != d[i]) { r->put_bytes_differ++; diff = 1; }
+            got = got << 8 | g; want = want << 8 | d[i];
+        }
+        if (!diff) continue;
+        const uint32_t eg = got & 0x7F800000u, ew = want & 0x7F800000u;
+        if (!eg && !ew) { r->w_zero++; continue; }
+        if ((got ^ want) >> 31 || !eg || !ew || eg == 0x7F800000u || ew == 0x7F800000u) { r->w_other++; continue; }
+        const uint32_t u = got > want ? got - want : want - got;
+        if (u > r->max_ulp) r->max_ulp = u;
+        if (u <= 1) r->w_ulp1++; else if (u <= 16) r->w_ulp16++; else if (u <= 256) r->w_ulp256++; else r->w_other++;
+    }
+}
+
 int spu_jobcap_transfer(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd)
 {
     jc_rep* r = t_rep;
@@ -358,8 +386,7 @@ int spu_jobcap_transfer(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t si
         ls_write(ctx, lsa, d, size);
         spu_overlay_note_get(ctx, (uint32_t)ea, &ctx->ls[lsa & SPU_LS_MASK], size);
     } else if (k == JC_PUT) {
-        for (uint32_t i = 0; i < size; i++)
-            if (ctx->ls[(lsa + i) & SPU_LS_MASK] != d[i]) r->put_bytes_differ++;
+        rep_cmp_out(r, ctx, lsa, d, size);
     }
     return 1;
 }
@@ -391,8 +418,7 @@ int spu_jobcap_atomic(spu_context* ctx, uint32_t cmd)
     if (cmd == 0xD0u) {                                     /* GETLLAR: the line read */
         memcpy(&ctx->ls[lsa], d, 128);
     } else {
-        for (uint32_t i = 0; i < 128; i++)
-            if (ctx->ls[lsa + i] != d[i]) r->put_bytes_differ++;
+        rep_cmp_out(r, ctx, lsa, d, 128);
     }
     ctx->atomic_stat = e->c >> 16;
     return 1;
@@ -565,8 +591,10 @@ static int replay_one(const char* dir, const char* name, int reps, jc_row* row)
             for (uint32_t o = 0; o < SPU_LS_SIZE; o++)
                 if (ctx->ls[o] != end_ls[o]) { if (!nd++) first = o; last = o; }
             if (ok)
-                fprintf(stderr, "[replay] %s run %d differs: %s%s%u PUT/atomic bytes, %u mailbox words, local store: %u bytes differ (0x%05X..0x%05X), registers %s\n",
-                        name, i, r->diverged ? r->first : "", r->diverged ? "; " : "", r->put_bytes_differ, r->out_differ,
+                fprintf(stderr, "[replay] %s run %d differs: %s%s%u PUT/atomic bytes (words: %u zero, %u/%u/%u within 1/16/256 ulps, %u other; max %u ulps), "
+                        "%u mailbox words, local store: %u bytes differ (0x%05X..0x%05X), registers %s\n",
+                        name, i, r->diverged ? r->first : "", r->diverged ? "; " : "", r->put_bytes_differ,
+                        r->w_zero, r->w_ulp1, r->w_ulp16, r->w_ulp256, r->w_other, r->max_ulp, r->out_differ,
                         nd, first, last, gpr_same ? "same" : "differ");
             ok = 0;
         }

@@ -42,6 +42,8 @@ from wrap_spu_elf import wrap                     # noqa: E402
 from lift_jobmods import elf_load_segments        # noqa: E402
 
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
+# Options every spu_lifter.py run gets (--float-spec).
+LIFTER_ARGS = []
 LIFT_BASE = 0x30000
 PIC_IMAGE_BASE = 400
 
@@ -78,7 +80,7 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix):
     cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(LIFT_BASE),
            "--pic", "--symbol-prefix", prefix, "-o", os.path.join(outdir, name),
            "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h",
-           "--code-end", hex(LIFT_BASE + end)]
+           "--code-end", hex(LIFT_BASE + end)] + LIFTER_ARGS
     if len(entries) > 1:
         cmd += ["--extra-funcs", ",".join(hex(LIFT_BASE + e) for e in entries[1:])]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -177,7 +179,13 @@ def main():
     ap.add_argument("--out", required=True, help="output directory, one subdirectory per piece")
     ap.add_argument("--register", default=None, help="registration TU (default <out>/pic_register.c)")
     ap.add_argument("--symbol-prefix", default="port")
+    ap.add_argument("--float-spec", type=int, default=0, metavar="N",
+                    help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
+                         "each function with no store, channel op, call or internal branch "
+                         "and at least N single-precision float ops.")
     args = ap.parse_args()
+    if args.float_spec:
+        LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
 
     segs = elf_load_segments(open(args.elf, "rb").read())
     listed = json.load(open(args.list))

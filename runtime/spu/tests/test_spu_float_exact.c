@@ -14,7 +14,8 @@
  * On x86 also with -mavx2 alone (the fma's double form) and with -msse4.1 alone (the scalar forms
  * the interpreter uses); each runs the passes again in SPU_FLOAT_RZ's MXCSR mode. With
  * -DSPU_FLOAT_RZ_ONLY -DSPU_FLOAT_APPROX (x86, AVX2) a -0 result where the SPU has +0 is
- * counted, not failed: the one difference that mode allows.
+ * counted, not failed: the one difference that mode allows. With SPU_FLOAT_RZ_ONLY the speculative
+ * forms (spu_fa_sp & co.) are checked too: where their range test passes, the exact result.
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
 #include "../../../tests/spu_ls_watch_fixture.h"
@@ -32,7 +33,27 @@ static const uint32_t k_frac[] = { 0x000000u, 0x000001u, 0x000002u, 0x400000u, 0
                                    0x3FFFFFu, 0x555555u, 0x0F0F0Fu, 0x100000u };
 #define NFRAC (sizeof k_frac / sizeof k_frac[0])
 
-static long s_bad, s_lanes, s_zero_sign;
+static long s_bad, s_lanes, s_zero_sign, s_spec_out;
+#if defined(SPU_SPEC_FLOAT_NATIVE)
+#define TEST_SPEC 1
+/* The speculative forms: where spu_spec_out says no result left the range, every lane must be
+ * what the exact form gives. */
+static u128 run_spec(int op, u128 a, u128 b, u128 c, int* out)
+{
+    spu_spec_acc acc = spu_spec_init();
+    u128 r;
+    switch (op) {
+    case 0:  r = spu_fa_sp(a, b, &acc); break;
+    case 1:  r = spu_fs_sp(a, b, &acc); break;
+    case 2:  r = spu_fm_sp(a, b, &acc); break;
+    case 3:  r = spu_fma_sp(a, b, c, &acc); break;
+    case 4:  r = spu_fms_sp(a, b, c, &acc); break;
+    default: r = spu_fnms_sp(a, b, c, &acc); break;
+    }
+    *out = spu_spec_out(acc);
+    return r;
+}
+#endif
 static const char* const k_ops[6] = { "fa", "fs", "fm", "fma", "fms", "fnms" };
 
 static void run(int op, u128 a, u128 b, u128 c)
@@ -47,6 +68,14 @@ static void run(int op, u128 a, u128 b, u128 c)
     default: got = spu_fnms(a, b, c); ref = spu_fnms_ref(a, b, c); break;
     }
     s_lanes += 4;
+#if defined(TEST_SPEC)
+    { int out; const u128 sp = run_spec(op, a, b, c, &out);
+      if (out) s_spec_out++;
+      else for (int i = 0; i < 4; i++)
+          if (sp._u32[i] != got._u32[i] && s_bad++ < 20)
+              printf("SPEC MISMATCH %s a=%08X b=%08X c=%08X spec=%08X exact=%08X\n", k_ops[op],
+                     a._u32[i], b._u32[i], c._u32[i], sp._u32[i], got._u32[i]); }
+#endif
     for (int i = 0; i < 4; i++) {
         if (got._u32[i] == ref._u32[i]) continue;
 #if defined(SPU_FLOAT_APPROX)
@@ -123,7 +152,7 @@ static void gen_lane(int kind, uint32_t* x, uint32_t* y, uint32_t* z)
 
 static __attribute__((noinline)) int all_passes(long scale, const char* mode)
 {
-    s_bad = 0; s_lanes = 0; s_zero_sign = 0;
+    s_bad = 0; s_lanes = 0; s_zero_sign = 0; s_spec_out = 0;
     printf("test_spu_float_exact: FPCR %s\n", mode);
 
     /* pass 1: every pair of the class words for fa, fs, fm */
@@ -175,6 +204,10 @@ static __attribute__((noinline)) int all_passes(long scale, const char* mode)
     printf("test_spu_float_exact: pass 3 (random): %ld lanes, %ld mismatches\n", s_lanes - lanes2, s_bad);
 
     if (s_bad) { printf("test_spu_float_exact: FAILED, %ld mismatching lanes of %ld\n", s_bad, s_lanes); return 1; }
+#if defined(TEST_SPEC)
+    printf("test_spu_float_exact: speculative forms: %ld vectors out of range (redone), the rest as exact\n",
+           s_spec_out);
+#endif
 #if defined(SPU_FLOAT_APPROX)
     printf("test_spu_float_exact: ok, %ld lanes, all bit-identical but %ld -0 for +0 (SPU_FLOAT_APPROX)\n",
            s_lanes, s_zero_sign);

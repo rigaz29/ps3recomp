@@ -1307,6 +1307,48 @@ SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return SPU__X8_FM(a, b); }
 SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0); }            /* a*b + c */
 SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__X8_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+#if defined(SPU_FLOAT_RZ_ONLY)
+/* Speculative forms, for a lifted function that can run again from its entry (spu_lifter.py
+ * --float-spec: no store, channel op or call, straight-line): the native result with the +0
+ * rule, as the RZ forms give it when it is in range, and its magnitude folded into *acc. No test,
+ * no branch and no redo call per operation; SPU_SPEC_OUT(acc) at each exit tells whether any
+ * result left the single range -- the condition the RZ forms test one by one -- and then the
+ * function runs again from its entry with the exact forms. */
+#define SPU_SPEC_FLOAT_NATIVE 1
+typedef __m128i spu_spec_acc;
+SPU__X8_INLINE spu_spec_acc spu_spec_init(void) { return _mm_setzero_si128(); }
+SPU__X8_INLINE __m128i spu__x8_sp(__m128i s, spu_spec_acc* acc) {
+    *acc = _mm_max_epu32(*acc, _mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)));
+    return SPU__X8_ZERO(s);
+}
+SPU__X8_INLINE u128 spu__x8_sp_fa(u128 a, u128 b, uint32_t negb, spu_spec_acc* acc) {
+    const __m128i y = _mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb));
+    return spu__x8_st(spu__x8_sp(_mm_castps_si128(_mm_add_ps(spu__x8_f(spu__x8_ld(a)), spu__x8_f(y))), acc));
+}
+SPU__X8_INLINE u128 spu__x8_sp_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc, spu_spec_acc* acc) {
+    const __m128i x = _mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp));
+    const __m128i z = _mm_xor_si128(spu__x8_ld(c), _mm_set1_epi32((int)negc));
+#if defined(__FMA__)
+    const __m128i s = _mm_castps_si128(_mm_fmadd_ps(spu__x8_f(x), spu__x8_f(spu__x8_ld(b)), spu__x8_f(z)));
+#else   /* as spu__x8_rz_fma's double form */
+    const __m128i s = _mm_castps_si128(_mm256_cvtpd_ps(_mm256_add_pd(
+        _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(spu__x8_ld(b))), spu__x8_wide(z))));
+#endif
+    return spu__x8_st(spu__x8_sp(s, acc));
+}
+SPU__X8_INLINE u128 spu_fa_sp(u128 a, u128 b, spu_spec_acc* acc) { return spu__x8_sp_fa(a, b, 0, acc); }
+SPU__X8_INLINE u128 spu_fs_sp(u128 a, u128 b, spu_spec_acc* acc) { return spu__x8_sp_fa(a, b, 0x80000000u, acc); }
+SPU__X8_INLINE u128 spu_fm_sp(u128 a, u128 b, spu_spec_acc* acc) {
+    return spu__x8_st(spu__x8_sp(_mm_castps_si128(_mm_mul_ps(spu__x8_f(spu__x8_ld(a)), spu__x8_f(spu__x8_ld(b)))), acc));
+}
+SPU__X8_INLINE u128 spu_fma_sp(u128 a, u128 b, u128 c, spu_spec_acc* acc)  { return spu__x8_sp_fma(a, b, c, 0, 0, acc); }
+SPU__X8_INLINE u128 spu_fms_sp(u128 a, u128 b, u128 c, spu_spec_acc* acc)  { return spu__x8_sp_fma(a, b, c, 0, 0x80000000u, acc); }
+SPU__X8_INLINE u128 spu_fnms_sp(u128 a, u128 b, u128 c, spu_spec_acc* acc) { return spu__x8_sp_fma(a, b, c, 0x80000000u, 0, acc); }
+SPU__X8_INLINE int spu_spec_out(spu_spec_acc acc) {
+    return !spu__x8_all4(spu__x8_inrange(acc));
+}
+#define SPU_SPEC_OUT(acc) __builtin_expect(spu_spec_out(acc), 0)
+#endif
 #else
 static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
 static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
@@ -1314,6 +1356,19 @@ static inline u128 spu_fm(u128 a, u128 b) { return spu__fm_s(a, b); }
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__fma_s(a, b, c); }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__fms_s(a, b, c); }
 static inline u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__fnms_s(a, b, c); }
+#endif
+#if !defined(SPU_SPEC_FLOAT_NATIVE)
+/* Lifted --float-spec code built for anything but the RZ-only AVX2 forms: the exact forms, and an
+ * exit check that never sends a function back to its exact copy. */
+typedef int spu_spec_acc;
+#define spu_spec_init() 0
+#define spu_fa_sp(a, b, acc)      ((void)(acc), spu_fa(a, b))
+#define spu_fs_sp(a, b, acc)      ((void)(acc), spu_fs(a, b))
+#define spu_fm_sp(a, b, acc)      ((void)(acc), spu_fm(a, b))
+#define spu_fma_sp(a, b, c, acc)  ((void)(acc), spu_fma(a, b, c))
+#define spu_fms_sp(a, b, c, acc)  ((void)(acc), spu_fms(a, b, c))
+#define spu_fnms_sp(a, b, c, acc) ((void)(acc), spu_fnms(a, b, c))
+#define SPU_SPEC_OUT(acc)         ((void)(acc), 0)
 #endif
 /* The exact path alone, for tests that check the fast path against it. */
 SPU__SF_V2(spu_fa_ref, spu__fa_lane(x, y))

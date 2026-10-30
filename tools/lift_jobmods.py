@@ -47,6 +47,8 @@ from wrap_spu_elf import wrap
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
+# Options every spu_lifter.py run gets (--float-spec).
+LIFTER_ARGS = []
 BASE   = 0x4000
 
 # Per-module code/data boundary, keyed by the module's content hash -- so this
@@ -277,6 +279,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         cmd += ["--code-end", hex(end)]
     if merge_chunks:
         cmd += ["--merge-chunks"]
+    cmd += LIFTER_ARGS
     inside = module_seeds(raw, base, name)
     if code_end:
         inside = [a for a in inside if int(a, 0) < code_end]
@@ -378,7 +381,13 @@ def main():
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
                          "instead of chunks linked by trampolines.")
+    ap.add_argument("--float-spec", type=int, default=0, metavar="N",
+                    help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
+                         "each function with no store, channel op, call or internal branch "
+                         "and at least N single-precision float ops.")
     args = ap.parse_args()
+    if args.float_spec:
+        LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 

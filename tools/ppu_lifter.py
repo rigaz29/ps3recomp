@@ -798,6 +798,30 @@ _CRBR_RE = re.compile(
     r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
 # A line PPULifter._patched_translate wrote; group 1 is its guard symbol.
 _INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+_INSN_HOOK_RE = re.compile(r"^([A-Za-z_]\w*)\(ctx, 0x([0-9A-F]{8})u\);  /\* insn hook \*/$")
+
+
+def load_insn_hooks(path: str) -> dict[int, str]:
+    """Read an --insn-hooks file:
+
+        {"hooks": [{"addr": "0x0049D708", "fn": "gowa_poll_wait",
+                    "note": "..."}, ...]}
+
+    -> {addr: fn}. Each hook is called as fn(ctx, addr) before the
+    instruction at addr, after its branch label: at a loop head it runs on
+    every pass. The port defines fn; it must leave the guest state alone."""
+    with open(path) as f:
+        spec = json.load(f)
+    out: dict[int, str] = {}
+    for e in spec.get("hooks", []):
+        addr = int(str(e["addr"]), 0)
+        fn = str(e["fn"])
+        if not re.fullmatch(r"[A-Za-z_]\w*", fn):
+            sys.exit(f"[ppu_lifter] {path}: hook {fn!r} is not a C identifier")
+        if addr & 3 or addr in out:
+            sys.exit(f"[ppu_lifter] {path}: bad or duplicate address 0x{addr:08X}")
+        out[addr] = fn
+    return out
 
 
 def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
@@ -1043,6 +1067,9 @@ class PPULifter:
         # {addr -> (original word, replacement word, guard symbol)}. See
         # _patched_translate.
         self.insn_patches: dict[int, tuple[int, int, str]] = {}
+        # Port functions called before an instruction (--insn-hooks):
+        # {addr -> function name}.
+        self.insn_hooks: dict[int, str] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1147,6 +1174,9 @@ class PPULifter:
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
+            hook = self.insn_hooks.get(insn.addr)
+            if hook is not None:
+                func.body_lines.append(f"    {hook}(ctx, 0x{insn.addr:08X}u);  /* insn hook */")
 
             patch = self.insn_patches.get(insn.addr)
             if patch is not None:
@@ -4176,6 +4206,12 @@ class PPULifter:
         for g in guards:
             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
                       f"extern int {g};", "#endif"]
+        # And each --insn-hooks function it calls: the port defines those too.
+        hooks = sorted({m.group(1) for bl in func.body_lines
+                        for m in [_INSN_HOOK_RE.match(bl.strip())] if m})
+        for h in hooks:
+            lines += ["#ifdef __cplusplus", f'extern "C" void {h}(ppu_context* ctx, uint32_t addr);',
+                      "#else", f"void {h}(ppu_context* ctx, uint32_t addr);", "#endif"]
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
         lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
@@ -4905,7 +4941,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, insn_patches=None):
+                 toc_base=0, insn_patches=None, insn_hooks=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4921,6 +4957,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
+    _WORKER_STATE["insn_hooks"] = insn_hooks or {}
 
 
 def _worker_lift(task):
@@ -4937,6 +4974,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
+    lifter.insn_hooks = _WORKER_STATE.get("insn_hooks", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -4972,7 +5010,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.insn_patches))
+                             lifter.insn_patches, lifter.insn_hooks))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5058,6 +5096,12 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--insn-hooks", metavar="FILE", default=None,
+                        help="JSON list of port functions to call before chosen "
+                             "instructions: each {addr, fn} is emitted as "
+                             "`fn(ctx, addr);` ahead of the instruction, after "
+                             "its label, fn being a function the port defines "
+                             "(at a polling loop's head, a host wait).")
     parser.add_argument("--insn-patches", metavar="FILE", default=None,
                         help="JSON list of instruction patches to lift as "
                              "run-time switches: each {addr, orig, new, guard} "
@@ -5523,6 +5567,9 @@ def main() -> None:
     if args.insn_patches:
         lifter.insn_patches = load_insn_patches(args.insn_patches)
         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
+    if args.insn_hooks:
+        lifter.insn_hooks = load_insn_hooks(args.insn_hooks)
+        print(f"  insn-hooks: {len(lifter.insn_hooks)} from {args.insn_hooks}")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -5578,6 +5625,13 @@ def main() -> None:
         missing = sorted(set(lifter.insn_patches) - landed)
         if missing:
             sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
+                     ", ".join(f"0x{a:08X}" for a in missing))
+    if lifter.insn_hooks:
+        landed = {int(m.group(2), 16) for f in lifter.functions for bl in f.body_lines
+                  for m in [_INSN_HOOK_RE.match(bl.strip())] if m}
+        missing = sorted(set(lifter.insn_hooks) - landed)
+        if missing:
+            sys.exit("[ppu_lifter] insn hooks at no lifted instruction: " +
                      ", ".join(f"0x{a:08X}" for a in missing))
 
     os.makedirs(args.output, exist_ok=True)

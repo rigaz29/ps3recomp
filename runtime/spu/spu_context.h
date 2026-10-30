@@ -634,10 +634,21 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
     g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
 }
 
+/* SPU_LS_NO_DIAG (a port's lifted SPU code, for play): no gate at all. Those
+ * accesses are then invisible to the diagnostics above; the interpreter and
+ * the runtime keep their gates. */
+#if defined(SPU_LS_NO_DIAG)
+#define SPU_LS_RDIAG() 0
+#define SPU_LS_WDIAG() 0
+#else
+#define SPU_LS_RDIAG() __builtin_expect(g_spu_ls_rdiag != 0, 0)
+#define SPU_LS_WDIAG() __builtin_expect(g_spu_ls_wdiag != 0, 0)
+#endif
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+    if (SPU_LS_RDIAG())
         spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
@@ -754,7 +765,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+    if (SPU_LS_WDIAG())
         spu_ls_write_diag(ctx, lsa, val);
 }
 

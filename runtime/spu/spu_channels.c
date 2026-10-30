@@ -2953,6 +2953,54 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+/* Resolve both fresh launches and mid-function resumes from TaskInfo.
+ * A scheduler call temporarily leaves the task region, but its return PC
+ * is usually not an ELF entry. Prefer the policy's selected ELF so tasks
+ * sharing an entry address cannot shadow one another. Keep the legacy
+ * entry-only mapping for runners that have not registered ELF metadata. */
+static inline void spu_ib_resolve_task(spu_context* ctx)
+{
+    if (ctx->pc < SPU_TASKSET_TASK_LO) {
+        ctx->resident_task = 0;
+    } else {
+        int ti = spu_taskset_resident_image(ctx);
+        if (ti && !ctx->resident_task && ctx->host_depth &&
+            s_spu_halt_armed && !ctx->policy_mode) {
+            /* The policy restored a task's guest registers and branches to
+             * its saved PC. Its host frames still belong to the scheduler or
+             * an earlier task invocation; none can satisfy this task's return.
+             * Resume at depth zero so SPU_RET follows the restored guest link. */
+            ctx->resident_task = ti;
+            g_spu_trampoline_fn = 0;
+            SPU_LONGJMP(s_spu_halt_env, 2);
+        }
+        if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
+        if (ti) ctx->resident_task = ti;
+    }
+}
+
+/* The diagnostics spu_indirect_branch reads from the environment, any of them
+ * set: those runs take the full path at every branch. */
+static int spu_ib_diag(void)
+{
+    static int s_diag = -1;
+    int d = __atomic_load_n(&s_diag, __ATOMIC_RELAXED);
+    if (d < 0) {
+        static const char* const names[] = { "SPU_IRQTRACE", "SPURS_PM_TRACE", "SPU_IBCOV", "SPU_POLLTRACE",
+                                             "YDKJ_POLTRACE", "SPU_JOBTRACE", "LBP_HLE_JOBDONE", "SPU_JOBEXEC" };
+        d = 0;
+        for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+            if (getenv(names[i])) d = 1;
+        __atomic_store_n(&s_diag, d, __ATOMIC_RELAXED);
+    }
+    return d;
+}
+
+/* Above every address the full path below treats specially before its lookup
+ * (the kernel services 0x9C0/0x9D0, the policy entry 0xA00, the task syscall
+ * 0xA70). */
+#define SPU_IB_PLAIN_LO 0xA80u
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -2964,6 +3012,27 @@ void spu_indirect_branch(spu_context* ctx)
     /* SPU_JOB_CAPTURE: a policy module starting a job (spu_jobcap.c). */
     if (SPU_JOBCAP_ARMED())
         spu_jobcap_maybe_begin(ctx);
+    /* The common branch -- a target above the special addresses, no interrupt
+     * return pending, not the resolver-only image, no diagnostic set -- gets
+     * what the full path below does for it: the task resolution, the lookup,
+     * the stack-reset check and the call. The full path tests two dozen special
+     * cases first, most behind statics; 3.7% of a RenderJobs worker's time.
+     * A miss goes on to the full path, which repeats the resolution (it changes
+     * nothing the second time) and handles it. */
+    if (__builtin_expect(ctx->pc >= SPU_IB_PLAIN_LO && !ctx->irq_saved &&
+                         ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID && !spu_ib_diag(), 1)) {
+        spu_ib_resolve_task(ctx);
+        spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+        if (fn && (ctx->policy_mode || ctx->pc != SPU_JOB_RETURN_LS)) {
+            spu_check_stack_reset(ctx, fn);
+#if defined(__clang__)
+            __attribute__((musttail)) return fn(ctx);
+#else
+            fn(ctx);
+            return;
+#endif
+        }
+    }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -3111,28 +3180,7 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         } }
     }
-    /* Resolve both fresh launches and mid-function resumes from TaskInfo.
-     * A scheduler call temporarily leaves the task region, but its return PC
-     * is usually not an ELF entry. Prefer the policy's selected ELF so tasks
-     * sharing an entry address cannot shadow one another. Keep the legacy
-     * entry-only mapping for runners that have not registered ELF metadata. */
-    if (ctx->pc < SPU_TASKSET_TASK_LO) {
-        ctx->resident_task = 0;
-    } else {
-        int ti = spu_taskset_resident_image(ctx);
-        if (ti && !ctx->resident_task && ctx->host_depth &&
-            s_spu_halt_armed && !ctx->policy_mode) {
-            /* The policy restored a task's guest registers and branches to
-             * its saved PC. Its host frames still belong to the scheduler or
-             * an earlier task invocation; none can satisfy this task's return.
-             * Resume at depth zero so SPU_RET follows the restored guest link. */
-            ctx->resident_task = ti;
-            g_spu_trampoline_fn = 0;
-            SPU_LONGJMP(s_spu_halt_env, 2);
-        }
-        if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
-        if (ti) ctx->resident_task = ti;
-    }
+    spu_ib_resolve_task(ctx);
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.

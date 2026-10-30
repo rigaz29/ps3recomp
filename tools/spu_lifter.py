@@ -121,6 +121,11 @@ void spu_halt(spu_context* ctx);
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+/* SPU_INLINE_MFC_PARAMS: the MFC command parameters as stores into the context
+ * (spu_wrch_inline, runtime/spu/spu_context.h). */
+#if defined(SPU_INLINE_MFC_PARAMS)
+#  define spu_wrch(ctx, ch, v) spu_wrch_inline(ctx, ch, v)
+#endif
 
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);

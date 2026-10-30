@@ -1089,6 +1089,30 @@ void spu_direct_init(void);
  * host-frame return as SPU_RET, publishing the register actually branched. */
 #define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
 
+/* A write of an MFC command parameter whose channel is a constant -- lifted
+ * code names it -- is the store into the context that mfc_channel_write makes,
+ * without the call, the channel tests and the MFC engine lookup: six of them
+ * set up every DMA. The command itself and every other channel go to spu_wrch.
+ * Lifted code built with SPU_INLINE_MFC_PARAMS gets this through its generated
+ * header. */
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+static inline __attribute__((always_inline)) void spu_wrch_inline(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_constant_p(channel)) {
+        const uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v; return;
+        case MFC_EAH:       ctx->mfc_eah = v; return;
+        case MFC_EAL:       ctx->mfc_eal = v; return;
+        case MFC_Size:      ctx->mfc_size = v; return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F; return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v; return;
+        default: break;
+        }
+    }
+    spu_wrch(ctx, channel, value);
+}
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

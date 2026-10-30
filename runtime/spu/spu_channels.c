@@ -2015,8 +2015,13 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
  *    same address starts with id 0 and takes a fresh one.
  * A verified slot is not re-compared, as without the cache (verify once per
  * load); a store by SPU code into a verified span is not tracked, the same as
- * there. Misses (NULL) are not cached, so a rejected or unlifted target is
- * resolved every time, as before. SPU_DISPATCH_CACHE=shadow runs the full
+ * there. A miss (NULL) is kept too: the interpreter asks at every step whether
+ * it can rejoin lifted code, and each of those misses was a full resolution
+ * (3.4 million a second in God of War: Ascension's first level, a third of all
+ * lookups). Nothing outside the key changes that answer: a pending span
+ * is verified by the resolution itself, a rejected one stays rejected until a
+ * GET into it bumps dcache_residency, and an unlifted address stays unlifted
+ * until a registration moves the count. SPU_DISPATCH_CACHE=shadow runs the full
  * resolver on every hit, counts disagreements and returns its answer. */
 typedef struct {
     spu_lifted_fn fn;
@@ -2064,7 +2069,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
      * a count newer than the registry it saw. */
     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
     spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
-    if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
+    if (e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
         if (mode == 2) {
@@ -2088,14 +2093,12 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         spu_dcache_shadow_stats();
     }
     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
-    if (fn) {
-        /* The resolver may have verified a pending slot; the entry records the
-         * residency it resolved against, read after it. */
-        e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
-        e->residency = c->dcache_residency; e->image = c->image_id;
-        e->ovl = c->resident_ovl; e->task = c->resident_task;
-        e->pic_base = c->pic_base;
-    }
+    /* The resolver may have verified a pending slot; the entry records the
+     * residency it resolved against, read after it. */
+    e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
+    e->residency = c->dcache_residency; e->image = c->image_id;
+    e->ovl = c->resident_ovl; e->task = c->resident_task;
+    e->pic_base = c->pic_base;
     return fn;
 }
 
@@ -2423,6 +2426,28 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
                 ea, size, os, on, ns, nn); }
 }
 
+/* A GET from a verified span's own source wrote [lsa, lsa + size). Did it leave
+ * the span's code as it was? Only the bytes it wrote can differ, so only those
+ * that fall on a code segment are compared. The job manager loads a module it
+ * runs again, and modules DMA their own data next to their code: compared once
+ * per GET, the span stays verified and the dispatch cache keeps its entries,
+ * where marking it pending compared every segment again at the next dispatch
+ * (1.5 GB a second in God of War: Ascension's first level). */
+static int spu_overlay_get_kept_code(const spu_context* ctx, unsigned slot, uint32_t lsa, uint32_t size)
+{
+    if (ctx->resident_code[slot].verify_state != SPU_OVERLAY_VERIFIED ||
+        lsa + size > SPU_LS_SIZE) return 0;
+    const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+    const uint32_t moved = ctx->resident_code[slot].lsa - o->load_lsa;
+    for (unsigned i = 0; i < o->code_count; ++i) {
+        const uint32_t c0 = o->code[i].lsa + moved, c1 = c0 + o->code[i].size;
+        if (c1 > SPU_LS_SIZE || c1 < c0) return 0;
+        const uint32_t a = lsa > c0 ? lsa : c0, b = lsa + size < c1 ? lsa + size : c1;
+        if (a < b && memcmp(ctx->ls + a, o->code[i].bytes + (a - c0), b - a)) return 0;
+    }
+    return 1;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -2444,7 +2469,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               (uint32_t)ctx->pc & SPU_LS_MASK); }
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
-            } else if (ctx->resident_code[slot].verify_state) {
+            } else if (ctx->resident_code[slot].verify_state &&
+                       !spu_overlay_get_kept_code(ctx, slot, lsa, size)) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
                 spu_dcache_residency_changed(ctx);
             }
@@ -2462,6 +2488,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 /* Verified code was lifted for one load address, unless it is
                  * position-independent. */
                 if (o->code && !o->pic && lsa != o->load_lsa) continue;
+                /* The same module again where it already is, its code still as
+                 * verified (spu_overlay_get_kept_code above) or none to verify:
+                 * nothing changed, and the dispatch cache keeps its entries. */
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+                    if (ctx->resident_code[slot].image_id == o->image_id &&
+                        ctx->resident_code[slot].lsa == lsa && ctx->resident_code[slot].source_ea == ea &&
+                        ctx->resident_code[slot].source_index == i &&
+                        ctx->resident_code[slot].verify_state == (o->code ? SPU_OVERLAY_VERIFIED : 0))
+                        return;
                 for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;

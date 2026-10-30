@@ -18,8 +18,10 @@ typedef struct spu_overlay_code_segment {
  * spu_overlay_register_region, plus the code bytes its lifted functions were
  * generated from. A GET from content_ea into local store at load_lsa marks the
  * overlay resident but unverified; the first dispatch into its span compares
- * the segments once and then dispatches by residency until another DMA lands in
- * the span. A mismatch leaves the span interpreted until the next load.
+ * the segments once and then dispatches by residency until a DMA writes code
+ * bytes in the span that differ from the lift (a GET of the same bytes -- the
+ * module loaded again -- or of data beside the code leaves it verified). A
+ * mismatch leaves the span interpreted until the next load.
  * Prefer a span covering the lifted code only, not the whole loaded image:
  * code that DMAs its own data into the image above the code would otherwise
  * clear residency with every such GET, sending later dispatch to the

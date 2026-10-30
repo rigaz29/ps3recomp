@@ -2023,6 +2023,34 @@ static inline u128 spu_fsmbi(int32_t imm) {
  * both cbd-generated and immediate/LS-constant controls. */
 /* The base pattern (selector 0x10+t at SPU byte t) is these four host words; the loops that
  * built it byte by byte were a visible cost (cbd/chd is how the SPU stores a byte/halfword). */
+#if SPU_X86
+/* x86: a compare against the lane numbers and one blend. Built in memory -- the base's word
+ * stores, a store at a variable index, then the result read back as one 16-byte value -- the
+ * read missed store-to-load forwarding every time: cwx alone was 7.7% of a God of War:
+ * Ascension RenderJobs job's lifted code. */
+static inline __m128i spu__ctl_base_x(void) {
+    return _mm_setr_epi32(0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F);
+}
+static inline u128 spu_cbd_pos(int pos) {           /* a's preferred byte = SPU byte 3 */
+    const __m128i m = _mm_cmpeq_epi8(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                                     _mm_set1_epi8((char)SPU_W(pos & 0xF)));
+    return spu__xs(_mm_blendv_epi8(spu__ctl_base_x(), _mm_set1_epi8(0x03), m));
+}
+static inline u128 spu_chd_pos(int pos) {           /* host halfword ((p & ~1) >> 1) ^ 1 = 0x0203 */
+    const __m128i m = _mm_cmpeq_epi16(_mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7),
+                                      _mm_set1_epi16((short)((((pos & 0xF) & ~1) >> 1) ^ 1)));
+    return spu__xs(_mm_blendv_epi8(spu__ctl_base_x(), _mm_set1_epi16(0x0203), m));
+}
+static inline u128 spu_cwd_pos(int pos) {           /* a SPU bytes 0..3 (preferred word) */
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((pos >> 2) & 3));
+    return spu__xs(_mm_blendv_epi8(spu__ctl_base_x(), _mm_set1_epi32(0x00010203), m));
+}
+static inline u128 spu_cdd_pos(int pos) {           /* a SPU bytes 0..7 (preferred dword) */
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 0, 1, 1), _mm_set1_epi32((pos >> 3) & 1));
+    return spu__xs(_mm_blendv_epi8(spu__ctl_base_x(),
+                                   _mm_setr_epi32(0x00010203, 0x04050607, 0x00010203, 0x04050607), m));
+}
+#else
 static inline u128 spu__ctl_base(void) {
     u128 r; r._u32[0] = 0x10111213u; r._u32[1] = 0x14151617u; r._u32[2] = 0x18191A1Bu; r._u32[3] = 0x1C1D1E1Fu;
     return r;
@@ -2049,6 +2077,7 @@ static inline u128 spu_cdd_pos(int pos) {
     r._u32[w] = 0x00010203u; r._u32[w + 1] = 0x04050607u;
     return r;
 }
+#endif
 static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }

@@ -2174,6 +2174,37 @@ static void wid_prof_note(u32 wid, u64 ns, unsigned polls)
     fflush(stderr);
 }
 
+/* SPURS_WID_SLOW=<wid>:<percent>[,<wid>:<percent>...]: after each policy-module
+ * run of such a workload the worker spins for that share of the run's time, the
+ * workload still counted on the SPU -- as if its code were that much slower. A
+ * probe of what the frame waits on: a workload on the frame's critical path
+ * lengthens the frame, one with slack does not. */
+static int s_wid_slow[WID_PROF_MAX];
+static int wid_slow_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPURS_WID_SLOW");
+        v = 0;
+        while (e && *e) {
+            char* end;
+            const unsigned long w = strtoul(e, &end, 0);
+            if (*end != ':') break;
+            const long pct = strtol(end + 1, &end, 0);
+            if (w < WID_PROF_MAX && pct > 0) { s_wid_slow[w] = (int)pct; v = 1; }
+            e = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+        if (v) {
+            fprintf(stderr, "[spurs] SPURS_WID_SLOW:");
+            for (u32 w = 0; w < WID_PROF_MAX; w++)
+                if (s_wid_slow[w]) fprintf(stderr, " w%u +%d%%", w, s_wid_slow[w]);
+            fprintf(stderr, "\n");
+        }
+    }
+    return v;
+}
+
 /* The workload each policy-module worker is running, by host thread id (-1
  * between runs), for the PS3_SAMPLE_THREAD profiler: it records it with each
  * sample of a worker, so a profile splits by workload as SPURS_WID_PROF does. */
@@ -2280,9 +2311,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ReleaseSRWLockExclusive(&si->lock);
         const u64 wp_t0 = wid_prof_secs() ? wid_prof_now_ns() : 0;
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        const u64 ws_t0 = wid_slow_on() ? wid_prof_now_ns() : 0;
         if (now_i < PM_NOW_MAX) s_pm_now_wid[now_i] = (LONG)slot->wid;
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        if (ws_t0 && slot->wid < WID_PROF_MAX && s_wid_slow[slot->wid]) {
+            const u64 t = wid_prof_now_ns(), until = t + (t - ws_t0) * (u64)s_wid_slow[slot->wid] / 100;
+            while (wid_prof_now_ns() < until) YieldProcessor();
+        }
         if (now_i < PM_NOW_MAX) s_pm_now_wid[now_i] = -1;
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;

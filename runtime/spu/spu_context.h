@@ -437,6 +437,9 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+    /* Its slot in spu_coherency.c's array of reserved lines, 1-based (0 = none).
+     * Assigned under the lock-line lock with the list node. */
+    uint32_t coh_slot;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own

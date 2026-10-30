@@ -538,7 +538,7 @@ static int replay_one(const char* dir, const char* name, int reps, jc_row* row)
         memcpy(ctx, snap, sizeof(spu_context));
         ctx->ls = ctx->ls_store;
         ctx->ch_wait_cv = NULL; ctx->ch_wait_lock = NULL;
-        ctx->irq_frame = NULL; ctx->coh_listed = 0; ctx->stop_request = 0;
+        ctx->irq_frame = NULL; ctx->coh_listed = 0; ctx->coh_slot = 0; ctx->stop_request = 0;
         memset(r, 0, sizeof *r);
         r->ev = ev; r->len = h.ev_len; r->n_ev = h.n_ev; r->ctx = ctx;
         t_rep = r;

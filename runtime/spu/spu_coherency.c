@@ -139,6 +139,68 @@ typedef struct spu_coh_entry {
 static spu_coh_entry* s_coh_ctxs;
 static spu_coh_watch* s_coh_watches;
 
+/* The line each listed context reserved last, in one array the notifiers scan
+ * instead of walking the list. In God of War: Ascension ~99 contexts are listed,
+ * and each of ~400,000 notifies a second walked all of them -- every node and
+ * every context, under the lock-line lock -- to find on average 0.13 holding
+ * the written line. A hint: it is not cleared when a reservation ends, so a
+ * notifier that finds its line here still asks the context (spu_coh_holds). It
+ * never misses a reservation: a context stores the line before it takes one --
+ * spu_coh_reserve under the lock, spu_coh_reserve_fast before its fence, the
+ * same store-buffering argument as for resv_valid (below).
+ *
+ * A context gets a slot with its list node (coh_slot, 1-based); the slot is
+ * freed with the node and reused. Slots and their owners change under the lock
+ * only; s_coh_hint is also stored by spu_coh_reserve_fast. Past SPU_COH_SLOTS
+ * listed contexts the rest have no slot, and from then on the notifiers also
+ * walk the list for those. */
+#define SPU_COH_SLOTS 4096u
+static uint32_t s_coh_hint[SPU_COH_SLOTS];
+static spu_context* s_coh_slot_ctx[SPU_COH_SLOTS];
+static uint32_t s_coh_nslots;       /* slots [0, s_coh_nslots) may be in use */
+static int s_coh_unslotted;         /* a context was listed without a slot */
+
+/* Read before writing, as for the bitmap: the policy modules' contexts poll
+ * the same few lines, their slots share cache lines, and a store of the same
+ * line would take the line away from the other SPU threads on every GETLLAR.
+ * A hint already equal to the line was stored before an earlier fence. */
+static inline void spu_coh_hint_set(uint32_t slot, uint32_t ea)
+{
+    if (__atomic_load_n(&s_coh_hint[slot - 1], __ATOMIC_RELAXED) != (ea & ~127u))
+        __atomic_store_n(&s_coh_hint[slot - 1], ea & ~127u, __ATOMIC_RELAXED);
+}
+
+/* ctx's slot, assigned if it has none, or a stale one (a context copied over
+ * another, as the job replay does); 0 if all are taken. Under the lock. */
+static uint32_t spu_coh_slot_of(spu_context* ctx)
+{
+    const uint32_t s = ctx->coh_slot;
+    if (s && s <= s_coh_nslots && s_coh_slot_ctx[s - 1] == ctx) return s;
+    uint32_t free_slot = 0;
+    for (uint32_t i = 0; i < s_coh_nslots; i++) {
+        if (s_coh_slot_ctx[i] == ctx) { ctx->coh_slot = i + 1; return i + 1; }
+        if (!s_coh_slot_ctx[i] && !free_slot) free_slot = i + 1;
+    }
+    if (!free_slot && s_coh_nslots < SPU_COH_SLOTS) free_slot = ++s_coh_nslots;
+    if (free_slot) {
+        __atomic_store_n(&s_coh_hint[free_slot - 1], 0u, __ATOMIC_RELAXED);
+        s_coh_slot_ctx[free_slot - 1] = ctx;
+    }
+    ctx->coh_slot = free_slot;
+    return free_slot;
+}
+
+/* Free every slot of ctx. Under the lock. */
+static void spu_coh_slot_free(const spu_context* ctx)
+{
+    for (uint32_t i = 0; i < s_coh_nslots; i++) {
+        if (s_coh_slot_ctx[i] != ctx) continue;
+        s_coh_slot_ctx[i] = NULL;
+        __atomic_store_n(&s_coh_hint[i], 0u, __ATOMIC_RELAXED);
+    }
+    while (s_coh_nslots && !s_coh_slot_ctx[s_coh_nslots - 1]) s_coh_nslots--;
+}
+
 unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
@@ -155,17 +217,30 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
         g_spu_coh_bits = s_coh_bitmap;
 
     if (!ctx) return;
+    int listed = 0;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
-    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
-    if (!entry) {
-        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* A missed holder loses invalidation events, including ABA. */
+        if (entry->ctx == ctx) { listed = 1; break; }
+    if (!listed) {
+        spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
+        if (!entry) {
+            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+            fflush(stderr);
+            abort(); /* A missed holder loses invalidation events, including ABA. */
+        }
+        entry->ctx = ctx;
+        entry->next = s_coh_ctxs;
+        s_coh_ctxs = entry;
     }
-    entry->ctx = ctx;
-    entry->next = s_coh_ctxs;
-    s_coh_ctxs = entry;
+    /* The line goes into the slot the notifiers scan before the caller takes
+     * the reservation; it holds the lock until then. */
+    const uint32_t slot = spu_coh_slot_of(ctx);
+    if (slot) {
+        spu_coh_hint_set(slot, ea);
+    } else if (!s_coh_unslotted) {
+        s_coh_unslotted = 1;
+        fprintf(stderr, "[spu-coh] more than %u reservation holders: the rest are walked\n",
+                SPU_COH_SLOTS);
+    }
     __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
 }
 
@@ -224,6 +299,8 @@ void spu_coh_unregister(spu_context* ctx)
         free(entry);
         break;
     }
+    spu_coh_slot_free(ctx);
+    ctx->coh_slot = 0;
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
     spu_lockline_unlock();
 }
@@ -250,6 +327,10 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         } else {
             link = &entry->next;
         }
+    }
+    for (uint32_t i = 0; i < s_coh_nslots; i++) {
+        const uintptr_t c = (uintptr_t)s_coh_slot_ctx[i];
+        if (c >= lo && c < hi) spu_coh_slot_free((const spu_context*)c);
     }
     spu_lockline_unlock();
 }
@@ -333,14 +414,41 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
 }
 
+/* The next context that holds a reservation on line, or NULL: the slots from
+ * *i whose hint is the line, then (only if some context has no slot) the
+ * listed contexts without one, from *e. Under the lock. */
+static inline spu_context* spu_coh_next_holder(uint32_t line, uint32_t* i, spu_coh_entry** e)
+{
+    while (*i < s_coh_nslots) {
+        const uint32_t k = (*i)++;
+        if (__atomic_load_n(&s_coh_hint[k], __ATOMIC_RELAXED) != line) continue;
+        spu_context* c = s_coh_slot_ctx[k];
+        if (c && spu_coh_holds(c, line)) return c;
+    }
+    if (!s_coh_unslotted) return NULL;
+    while (*e) {
+        spu_context* c = (*e)->ctx;
+        *e = (*e)->next;
+        if (c && !c->coh_slot && spu_coh_holds(c, line)) return c;
+    }
+    return NULL;
+}
+
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 {
     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
         !spu_coh_is_reserved(ea))
         return 0;
+    /* A context copied over another (the job replay) can carry a slot that is
+     * not its own; the lock path gives it one. */
+    const uint32_t slot = ctx->coh_slot;
+    if (!slot || slot > SPU_COH_SLOTS || s_coh_slot_ctx[slot - 1] != ctx)
+        return 0;
     /* Retire any older reservation before retargeting it. The fence is what
-     * the argument above rests on. */
+     * the argument above rests on; the line goes into the notifiers' hint
+     * array before it. */
     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+    spu_coh_hint_set(slot, ea);
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -353,15 +461,14 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
-        if (!c || (const void*)c == self) continue;
-        if (spu_coh_holds(c, line)) {
-            SPU_EVENT_SET(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
-            g_spu_lr_raise++;
-            spu_ch_wake(c);
-        }
+    uint32_t ci = 0;
+    spu_coh_entry* ce = s_coh_ctxs;
+    for (spu_context* c; (c = spu_coh_next_holder(line, &ci, &ce)) != NULL;) {
+        if ((const void*)c == self) continue;
+        SPU_EVENT_SET(c, SPU_EVENT_LR);
+        __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
+        g_spu_lr_raise++;
+        spu_ch_wake(c);
     }
 }
 
@@ -409,10 +516,10 @@ void spu_coh_notify_write(uint32_t ea)
         if (s_coh_stats < 0) s_coh_stats = getenv("SPU_COH_STATS") ? 1 : 0;
         if (s_coh_stats) spu_coh_stats(line);
     }
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
-        if (!c) continue;
-        if (spu_coh_holds(c, line)) {
+    uint32_t ci = 0;
+    spu_coh_entry* ce = s_coh_ctxs;
+    for (spu_context* c; (c = spu_coh_next_holder(line, &ci, &ce)) != NULL;) {
+        {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that

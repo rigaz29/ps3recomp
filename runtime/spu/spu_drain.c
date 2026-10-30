@@ -541,10 +541,13 @@ typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 
-#ifdef PS3_SPU_JOBCAP
-static void spu_drain_call_run(spu_context* ctx, uint32_t return_pc)
+/* The drain loop, for a call that came back with a transfer pending or somewhere
+ * else than its return address. Out of line: its frame -- an interrupt frame with
+ * a jmp_buf, so a stack cookie too -- was set up and torn down for every call. */
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
 #else
-void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+static __attribute__((noinline)) void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
 #endif
 {
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
@@ -634,6 +637,27 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
     }
 #undef SPU_DRAIN_POP_IRQ
+}
+
+/* After a lifted call (brsl, bisl): almost always the callee returned to its
+ * caller -- no transfer pending, the pc at the return address -- and the loop
+ * above would only run its depth check and return. */
+#ifdef PS3_SPU_JOBCAP
+static void spu_drain_call_run(spu_context* ctx, uint32_t return_pc)
+#else
+void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+#endif
+{
+    if (__builtin_expect(!g_spu_trampoline_fn && g_spu_direct >= 0 &&
+                         (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK), 1)) {
+        spu_depth_guard_check(ctx);
+        return;
+    }
+#if defined(__clang__)
+    __attribute__((musttail)) return spu_drain_call_full(ctx, return_pc);
+#else
+    spu_drain_call_full(ctx, return_pc);
+#endif
 }
 
 #ifdef PS3_SPU_JOBCAP

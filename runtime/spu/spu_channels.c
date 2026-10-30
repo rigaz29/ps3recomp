@@ -3001,6 +3001,16 @@ static int spu_ib_diag(void)
  * 0xA70). */
 #define SPU_IB_PLAIN_LO 0xA80u
 
+/* Everything spu_indirect_branch does but the common branch. A function of its
+ * own: in one function with the common branch, its large frame -- eight saved
+ * registers, xmm6, a 0x338-byte frame with a stack cookie -- was set up and
+ * torn down for every branch, the common one too. */
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_indirect_branch_full(spu_context* ctx);
+#else
+static __attribute__((noinline)) void spu_indirect_branch_full(spu_context* ctx);
+#endif
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -3033,6 +3043,15 @@ void spu_indirect_branch(spu_context* ctx)
 #endif
         }
     }
+#if defined(__clang__)
+    __attribute__((musttail)) return spu_indirect_branch_full(ctx);
+#else
+    spu_indirect_branch_full(ctx);
+#endif
+}
+
+static void spu_indirect_branch_full(spu_context* ctx)
+{
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

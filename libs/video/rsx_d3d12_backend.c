@@ -2367,18 +2367,31 @@ static int init_d3d12(u32 width, u32 height)
  * -----------------------------------------------------------------------*/
 
 static void wait_for_gpu_once(void);
-static void wait_for_gpu(void)
+/* PERF=1: the frame clock thread's waits for the GPU, by the line that asks. */
+static double s_perf_gpuwait;
+static struct { int line; u32 n; double s; } s_perf_gw[16];
+static void wait_for_gpu_at(int line)
 {
     const double w0 = perf_now();
     wait_for_gpu_once();
-    s_hl_waits_n++; s_hl_waits_s += perf_now() - w0;
+    const double w = perf_now() - w0;
+    s_hl_waits_n++; s_hl_waits_s += w;
+    s_perf_gpuwait += w;
+    for (int i = 0; i < 16; i++)
+        if (s_perf_gw[i].line == line || !s_perf_gw[i].line) {
+            s_perf_gw[i].line = line; s_perf_gw[i].n++; s_perf_gw[i].s += w;
+            break;
+        }
 }
+#define wait_for_gpu() wait_for_gpu_at(__LINE__)
 
+static u64 s_fence_last;   /* the last value signalled on the queue */
 static void wait_for_gpu_once(void)
 {
     u32 fi = s_d3d.frame_index;
     s_d3d.fence_values[fi]++;
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, s_d3d.fence_values[fi]);
+    s_fence_last = s_d3d.fence_values[fi];
 
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
@@ -3198,10 +3211,13 @@ static void present_to_backbuffer(u32 fi)
     pp_barrier(disp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
+static double s_rf_last_submit;   /* RF_WAITLOG: when the last batch was submitted */
 static void move_to_next_frame(void)
 {
+    s_rf_last_submit = perf_now();
     u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
+    s_fence_last = current_fence;
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
@@ -9173,6 +9189,7 @@ static void zq_read(void)
       } }
 }
 
+static int s_rf_open_ahead;   /* RF_WAITLOG: rf_open called by record-ahead */
 static void rf_open(void)
 {
     u32 fi = s_d3d.frame_index;
@@ -9184,9 +9201,27 @@ static void rf_open(void)
      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
+    /* When the last value signalled is done, so is everything the backend gave
+     * the queue (a batch's list, its present, the signal after them), and the
+     * wait is skipped. Its own signal took 3-17 ms there in God of War:
+     * Ascension's first level (~10 ms a frame, with the drain stopped behind
+     * it), though the batch before had finished. RF_IDLE_WAIT=1 waits anyway. */
     { const double t0 = perf_now();
-      wait_for_gpu();
-      s_hl_gpuwait_s += perf_now() - t0; }
+      const u64 done0 = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+      static int idle_wait = -1;
+      if (idle_wait < 0) { const char* e = getenv("RF_IDLE_WAIT"); idle_wait = e ? atoi(e) != 0 : 0; }
+      if (idle_wait || done0 < s_fence_last)
+          wait_for_gpu();
+      s_hl_gpuwait_s += perf_now() - t0;
+      /* RF_WAITLOG=1: every 50th open -- who opened the batch, how long after
+       * the last submit, what the GPU had done by then, and the wait. */
+      { static int on = -1; static long n;
+        if (on < 0) on = getenv("RF_WAITLOG") ? 1 : 0;
+        if (on && (++n % 50) == 0)
+            fprintf(stderr, "[rf-wait] #%ld by %s: %.1f ms after the last submit, fence done %llu, last signalled %llu, waited %.1f ms, %u records%c",
+                    n, s_rf_open_ahead ? "record-ahead" : "render_frame",
+                    (t0 - s_rf_last_submit) * 1000.0, (unsigned long long)done0,
+                    (unsigned long long)s_fence_last, (perf_now() - t0) * 1000.0, s_d3d.draw_count, 10); } }
     gts_read();
     zq_read();
     rf_release_dead();   /* the batch that last referenced them has run */
@@ -10618,6 +10653,12 @@ static void render_frame(void)
             fprintf(stderr, "[PERF] texture view windows: %u written (%u views copied, %u made in the cache), %u shared%c",
                     s_srvq_written, s_srvq_copied, s_srvq_made, s_srvq_reused, 10);
             s_srvq_written = s_srvq_reused = s_srvq_copied = s_srvq_made = 0;
+            fprintf(stderr, "[PERF] waits for the GPU: %.0f ms;", s_perf_gpuwait * 1000.0);
+            for (int i = 0; i < 16 && s_perf_gw[i].line; i++)
+                fprintf(stderr, " line %d: %u, %.1f ms;", s_perf_gw[i].line, s_perf_gw[i].n, s_perf_gw[i].s * 1000.0);
+            fprintf(stderr, "%c", 10);
+            s_perf_gpuwait = 0.0;
+            memset(s_perf_gw, 0, sizeof s_perf_gw);
             fprintf(stderr, "[PERF] caches: %d vertex programs (%u replaced), %d fragment pipelines (%u dropped)%c",
                     s_d3d.vp_vs_n, s_perf_vs_replaced, s_d3d.vp_fp_n, s_perf_fp_dropped, 10);
             s_perf_vs_replaced = s_perf_fp_dropped = 0;
@@ -13404,7 +13445,9 @@ void rsx_d3d12_backend_record_ahead(void)
         if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) + 1 <
             s_d3d.fence_values[s_d3d.frame_index])
             return;
+        s_rf_open_ahead = 1;
         rf_open();
+        s_rf_open_ahead = 0;
         rf_target();
         rf_vp_begin();
         s_rf.open = 1;

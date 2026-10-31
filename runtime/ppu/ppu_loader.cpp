@@ -2786,8 +2786,14 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
     ps3_indirect_call(ctx);
 }
 
+/* A hook every indirect call runs first, for a port's probes (GowARecomp's
+ * GOWA_MAIN_SLOW lengthens the main thread's own work through it, a slice at
+ * each call). NULL, as it stays without one: a load and a branch. */
+extern "C" { void (*g_ppu_icall_hook)(ppu_context*) = nullptr; }
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    if (__builtin_expect(g_ppu_icall_hook != nullptr, 0)) g_ppu_icall_hook(ctx);
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;

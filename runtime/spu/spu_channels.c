@@ -3241,8 +3241,59 @@ void spu_indirect_branch(spu_context* ctx)
 #endif
 }
 
+/* SPU_IBFULL=<seconds>: the indirect branches that took the full path, by the
+ * image owning the target (its resident span's, else the context's), the
+ * target and the kind: low (a special address below SPU_IB_PLAIN_LO), iret
+ * (the interrupt resume point), miss (no lifted function there). The 16 most
+ * taken, every <seconds>, across all SPU threads (approximate counts). */
+static void spu_ibfull_note(const spu_context* ctx)
+{
+    static long secs = -1;
+    if (secs < 0) { const char* e = getenv("SPU_IBFULL"); secs = e ? atol(e) : 0; }
+    if (!secs) return;
+    enum { N = 4096 };
+    static struct { uint32_t pc, kind, off; int img; unsigned long n; } tab[N];
+    static unsigned long long t0;
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    int img = ctx->image_id;
+    uint32_t off = pc;   /* the target's offset in the owning span (its address with none) */
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+        if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
+            pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+            img = ctx->resident_code[slot].image_id;
+            off = pc - ctx->resident_code[slot].lsa;
+            break;
+        }
+    const uint32_t kind = pc < SPU_IB_PLAIN_LO ? 0u
+                        : (ctx->irq_saved && pc == (ctx->irq_resume_pc & SPU_LS_MASK)) ? 1u : 2u;
+    uint32_t h = ((pc >> 2) ^ ((uint32_t)img * 2654435761u)) & (N - 1);
+    for (int probe = 0; probe < 16; probe++, h = (h + 1) & (N - 1)) {
+        if (tab[h].n && (tab[h].pc != pc || tab[h].img != img || tab[h].kind != kind)) continue;
+        tab[h].pc = pc; tab[h].img = img; tab[h].kind = kind; tab[h].off = off; tab[h].n++;
+        break;
+    }
+    const unsigned long long now = ps3_ft_now();
+    if (!t0) t0 = now;
+    if (now - t0 < (unsigned long long)secs * 1000000000ull) return;
+    t0 = now;
+    static const char* const kinds[] = { "low", "iret", "miss" };
+    unsigned long total = 0;
+    for (int i = 0; i < N; i++) total += tab[i].n;
+    fprintf(stderr, "[ibfull] %lu full-path branches in %ld s; most taken:\n", total, secs);
+    for (int k = 0; k < 16; k++) {
+        int best = -1;
+        for (int i = 0; i < N; i++) if (tab[i].n && (best < 0 || tab[i].n > tab[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "[ibfull]   img=%d pc=0x%05X (+0x%X in its span) %s %lu\n", tab[best].img,
+                tab[best].pc, tab[best].off, kinds[tab[best].kind], tab[best].n);
+        tab[best].n = 0;
+    }
+    memset(tab, 0, sizeof tab);
+}
+
 static void spu_indirect_branch_full(spu_context* ctx)
 {
+    spu_ibfull_note(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

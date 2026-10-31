@@ -88,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix="lift-spu-pic-") as tmp:
     check(manifest[0]["code_end"] == hex(CODE_END), "code ends where the pool starts")
     name = manifest[0]["name"]
     src = (tmp / "out" / name / "spu_recomp.c").read_text()
-    starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* ctx\)\s*\{",
+    starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* (?:SPU_RESTRICT )?ctx\)\s*\{",
                                               src, re.M)}
     check({LIFT_BASE, LIFT_BASE + 0x14} <= starts, "entry and helper lifted")
     reg = (tmp / "out/pic_register.c").read_text()

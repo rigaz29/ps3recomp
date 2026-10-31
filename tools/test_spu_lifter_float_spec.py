@@ -182,8 +182,8 @@ class FloatSpecShape(unittest.TestCase):
 
     def test_ordinary_body_is_the_exact_copy(self):
         src = lift().emit_source('lifted.h')
-        exact = src.index('static void spu_func_00000000_exact(spu_context* ctx) {')
-        spec = src.index('void spu_func_00000000(spu_context* ctx) {')
+        exact = src.index('static void spu_func_00000000_exact(spu_context* SPU_RESTRICT ctx) {')
+        spec = src.index('void spu_func_00000000(spu_context* SPU_RESTRICT ctx) {')
         self.assertLess(exact, spec)
         self.assertIn('spu_fa(ctx->gpr[3], ctx->gpr[4])', src[exact:spec])
         self.assertNotIn('_exact', src[src.index('void spu_func_00000024('):])

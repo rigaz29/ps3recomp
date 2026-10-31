@@ -125,7 +125,7 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
           "module is the initialised image (imageSize - 32)")
     for m in manifest:
         src = (tmp / "out" / m["name"] / "spu_recomp.c").read_text()
-        starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* ctx\)\s*\{",
+        starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* (?:SPU_RESTRICT )?ctx\)\s*\{",
                                                   src, re.M)}
         check(starts and max(starts) < m["code_end"], f"{m['name']}: nothing lifted past code_end")
         check(m["entry"] in starts and BASE + 0x30 in starts, f"{m['name']}: entry and +0x30 lifted")

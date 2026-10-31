@@ -2391,7 +2391,8 @@ int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t lift_lsa,
     if (!spu_overlay_register_verified_region(content_ea, lift_lsa, span, image_id, code, count))
         return 0;
     s_ovl_src[s_ovl_src_count - 1].pic = 1;
-    spu_pic_sigs_add(s_ovl_src_count - 1);
+    { const char* e = getenv("SPU_PIC_ADOPT");   /* SPU_PIC_ADOPT=0: found by EA only */
+      if (!e || atoi(e) != 0) spu_pic_sigs_add(s_ovl_src_count - 1); }
     return 1;
 }
 

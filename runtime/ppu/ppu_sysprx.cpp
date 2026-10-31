@@ -628,6 +628,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
+extern "C" void cellSpurs_register_ctx_handlers(void);    /* libs/spurs/cellSpurs.c */
 extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
@@ -963,6 +964,9 @@ extern "C" void ppu_sysprx_register(void)
      * (userdata) is on the guest stack, so they need the full context too.
      * Registered here so no project has to remember the call. */
     cellSaveData_register_ctx_handlers();
+    /* _cellSpursWorkloadAttributeInitialize's ninth argument, maxContention,
+     * is on the guest stack too. */
+    cellSpurs_register_ctx_handlers();
     /* cellVideoOutSetGamma's float argument is in f1. */
     avconf_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every

@@ -618,6 +618,11 @@ extern uint8_t* vm_base;
  * be written over, and the SPU would never learn the line had changed. Same
  * lock, same critical sections, now shared with the PPU store paths. */
 
+/* The SPURS kernel's answer to a policy module's poll (libs/spurs/cellSpurs.c
+ * sets it when its scheduler starts): (workload << 32) | status for the SPU
+ * and the polling module's workload. NULL, the intercept answers workload 0. */
+uint64_t (*g_spurs_kernel_poll)(uint32_t ea, uint32_t spu_num, uint32_t cur_wid) = NULL;
+
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;
@@ -3112,6 +3117,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
+        extern uint64_t (*g_spurs_kernel_poll)(uint32_t, uint32_t, uint32_t);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
@@ -3127,8 +3133,11 @@ static void spu_indirect_branch_full(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
-             * (The host scheduler admits bounded workers; this service does not preempt.) */
+            /* cellSpursModulePoll: the kernel's choice for this SPU now, in the
+             * preferred doubleword (workload << 32 | status); the module goes
+             * on when the workload is its own (wklCurrentId, LS 0x1DC). The
+             * SPURS kernel (libs/spurs) answers through g_spurs_kernel_poll;
+             * without it, workload 0, the old answer. */
             unsigned n = ++g_spurs_pm_polls;
             /* The count restarts with every policy-module run, and a job
              * manager runs dozens of times a second, so these lines follow the
@@ -3142,7 +3151,13 @@ static void spu_indirect_branch_full(spu_context* ctx)
               if (s_t && (n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 64)
                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                           n, ctx->gpr[3]._u32[0]); }
-            ctx->gpr[3] = spu_make_preferred_u32(0);
+            { const uint8_t* k = ctx->ls;
+              const uint32_t sp = ((uint32_t)k[0x1C4] << 24) | ((uint32_t)k[0x1C5] << 16) | ((uint32_t)k[0x1C6] << 8) | k[0x1C7];
+              const uint32_t sn = ((uint32_t)k[0x1C8] << 24) | ((uint32_t)k[0x1C9] << 16) | ((uint32_t)k[0x1CA] << 8) | k[0x1CB];
+              const uint32_t cur = ((uint32_t)k[0x1DC] << 24) | ((uint32_t)k[0x1DD] << 16) | ((uint32_t)k[0x1DE] << 8) | k[0x1DF];
+              const uint64_t r = (sp && g_spurs_kernel_poll) ? g_spurs_kernel_poll(sp, sn, cur) : 0;
+              ctx->gpr[3] = spu_make_preferred_u32((uint32_t)(r >> 32));
+              ctx->gpr[3]._u32[1] = (uint32_t)r; }
             /* The kernel's selection copies the instance's first line into the
              * context's tempArea (LS 0x100) on every call, not only at module
              * entry, and jobs that ran since may have overwritten it. */

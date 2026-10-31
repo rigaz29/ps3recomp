@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/commit_hooks.h"
+#include "../../runtime/ppu/ppu_context.h"   /* the context handler for the ninth argument */
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -1812,9 +1813,13 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
                 *(vm_base + info + 0x18 + b) = priority_h ? priority_h[b] : 1;
             spurs_prio_log(i, s_workloads[i].priority);
             *(vm_base + spurs_ea + wkl_state_off(i)) = 2;        /* runnable */
-            if (i < 16)   /* minimum contention has no second set */
+            /* The minimum has no second set, and a 32-workload instance leaves
+             * the field unused (RPCS3 writes it for CellSpurs only). The
+             * maximum is capped at 8 SPUs, as SPURS caps it. */
+            if (!si->is2)
                 *(vm_base + spurs_ea + SPURS_WKL_MINCONT + i) = (u8)(minContention ? minContention : 1);
-            wkl_count_set(spurs_ea, SPURS_WKL_MAXCONT, i, si->is2, maxContention ? maxContention : 1);
+            wkl_count_set(spurs_ea, SPURS_WKL_MAXCONT, i, si->is2,
+                          maxContention ? (maxContention > 8 ? 8 : maxContention) : 1);
             vm_write32(spurs_ea + SPURS_WKL_ENABLED,
                        vm_read32(spurs_ea + SPURS_WKL_ENABLED) | (0x80000000u >> i));
             *(vm_base + spurs_ea + SPURS_SYSSRV_MSG) = 0xFF;
@@ -1988,11 +1993,11 @@ s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set)
 }
 
 /* The SDK-versioned workload-attribute initializer (the import the game links;
- * NID differs from the non-underscore inline wrapper). Args arrive raw in
- * r3..r10; writes the REAL BE layout so AddWorkloadWithAttribute round-trips. */
-s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVersion,
-                                          u64 pm_ea, u32 size, u64 data,
-                                          u64 prio_ea, u32 minContention)
+ * NID differs from the non-underscore inline wrapper). Writes the REAL BE
+ * layout so AddWorkloadWithAttribute round-trips. */
+static s32 spurs_workload_attr_init(u64 attr_ea, u32 revision, u32 sdkVersion,
+                                    u64 pm_ea, u32 size, u64 data,
+                                    u64 prio_ea, u32 minContention, u32 maxContention)
 {
     if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
@@ -2004,14 +2009,45 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
     vm_write32((u32)attr_ea + WKATTR_HOOK_ARG, 0);
-    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
-           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
+    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u maxC=%u)\n",
+           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention, maxContention);
     return CELL_OK;
+}
+
+/* The generic binding passes r3..r10 only, so maxContention, the ninth
+ * argument, does not reach it; it stays for a host that does not register the
+ * context handler below, with the old answer, 1. */
+s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVersion,
+                                          u64 pm_ea, u32 size, u64 data,
+                                          u64 prio_ea, u32 minContention)
+{
+    return spurs_workload_attr_init(attr_ea, revision, sdkVersion, pm_ea, size, data,
+                                    prio_ea, minContention, 1);
+}
+
+/* maxContention is in the caller's parameter save area: PPC64 ELFv1 puts the
+ * back chain, CR, LR, two reserved doublewords and the TOC in the first 0x30
+ * bytes above SP, then one doubleword per argument, so the ninth is at SP+0x70
+ * (cellSaveData's UserAutoLoad reads its ninth the same way). Written as 1, it
+ * held every Wws workload of God of War: Ascension to one SPU; the title asks
+ * for 5, 6 or 8 (RPCS3, which reads it, shows those in the instance). */
+static void hle_spurs_workload_attr_init(ppu_context* ctx)
+{
+    const u32 maxContention = (u32)vm_read64((u32)ctx->gpr[1] + 0x70);
+    ctx->gpr[3] = (u64)(s64)spurs_workload_attr_init(ctx->gpr[3], (u32)ctx->gpr[4], (u32)ctx->gpr[5],
+                                                     ctx->gpr[6], (u32)ctx->gpr[7], ctx->gpr[8],
+                                                     ctx->gpr[9], (u32)ctx->gpr[10], maxContention);
+}
+
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+void cellSpurs_register_ctx_handlers(void)
+{
+    ps3_hle_register_ctx(0xEFEB2679u, "_cellSpursWorkloadAttributeInitialize", hle_spurs_workload_attr_init);
 }
 
 s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameInstance_ea)
@@ -2079,12 +2115,13 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
 /* ---------------------------------------------------------------------------
  * The SPURS "kernel": a coordinator plus the configured virtual-SPU workers.
  *
- * The game kicks work by storing a nonzero wklReadyCount1[wid] byte or a
- * wklSignal1 bit into the instance — mostly with INLINED atomics (LBP never
- * calls an API for it beyond cellSpursReadyCountStore). The kernel thread
- * polls those real BE fields, consumes one ready unit (decrement / clear the
- * signal bit, like the real kernel's dispatch), and runs the workload's
- * policy module to completion via spu_run_policy_module.
+ * The game asks for SPUs by storing a workload's ready count (how many SPUs
+ * it wants) or a signal bit into the instance -- mostly with INLINED atomics
+ * (LBP never calls an API for it beyond cellSpursReadyCountStore). The
+ * coordinator and the workers read those real BE fields, choose for each SPU
+ * as the SPURS kernel does (spurs_pick, spurs_claim; the ready count stays,
+ * the signal bit is cleared), and run the workload's policy module via
+ * spu_run_policy_module until it exits.
  * -----------------------------------------------------------------------*/
 typedef struct {
     spu_lifted_entry_fn fn;
@@ -2380,9 +2417,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 }
 
 /* SPURS_MAXCONT=<wid>=<n>[,<wid>=<n>...]: let a workload run on up to n SPUs
- * at once whatever maximum contention the title set. A diagnostic: God of
- * War: Ascension sets 1 for every workload, and its three EDGE job lists then
- * run one after another on one SPU while four others wait. */
+ * at once whatever maximum contention the title set. A diagnostic, from when
+ * the title's maxima were lost (_cellSpursWorkloadAttributeInitialize's ninth
+ * argument) and every workload ran on one SPU. */
 static u32 spurs_maxcont_override(u32 wid, u32 maxcont)
 {
     static int parsed;
@@ -2402,20 +2439,67 @@ static u32 spurs_maxcont_override(u32 wid, u32 maxcont)
     return (wid < SPURS_MAX_WID && over[wid]) ? over[wid] : maxcont;
 }
 
-/* The next workload for an idle slot: round robin from the instance's cursor
- * over the enabled, running workloads this lane may take (nonzero priority),
- * under their maximum contention, that are kicked -- ready count, signal or
- * workload flag -- or, by mode:
- *   SPURS_PICK_FULL  a coordinator pass: also the unkicked ones whose idle
- *                    back-off probe is due this pass
- *   SPURS_PICK_KICK  a pass after a request line commit: the kicked ones only
- *   SPURS_PICK_SELF  a worker whose run just ended: also the unkicked ones that
+/* SPURS_SELECT=rr: the scheduler before 2026-10-31, for comparison -- round
+ * robin over the eligible workloads, one taken from the ready count at each
+ * pick, and every poll answered with workload 0 (which made every other
+ * workload's policy module end its run at its first poll). */
+static int spurs_select_rr(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_SELECT"); v = e && strcmp(e, "rr") == 0; }
+    return v;
+}
+
+/* A workload's claim on SPU sn, weighed as the SPURS kernel weighs it
+ * (spursKernel2SelectWorkload in RPCS3's cellSpursSpu.cpp is the reference
+ * for the behaviour). It may take the SPU when it is enabled and runnable, has
+ * a policy module, a nonzero priority on this SPU and fewer SPUs than its
+ * maximum contention. It is asked for (*asked) when its flag is pulled to 0,
+ * its signal bit is set, or its ready count is above its contention: the job
+ * manager stores there how many SPUs it wants, and the kernel never changes
+ * it. The weight is the priority turned over (0x10 - p, so priority 1 is the
+ * strongest) in the high nibble, plus 4 for the workload this SPU ran last.
+ * Returns 0 when it may not take the SPU at all. God of War: Ascension's
+ * first level: CollisL 1, audio 1 (SPU 5 only), Batch 2, the EDGE lists 3
+ * (SPUs 0-3 only), RenJobSet 8, RenderJobs 10-12, General6 11-13. */
+static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, u32 enabled, u32 contention,
+                       u32 last_wid, int* asked)
+{
+    const u32 ea = si->ea;
+    *asked = 0;
+    if (!(enabled & (0x80000000u >> wid)) || vm_read8(ea + wkl_state_off(wid)) != 2 ||
+        !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
+        return 0;
+    const u32 prio = vm_read8(ea + wkl_info_off(wid) + 0x18 + sn) & 0x0Fu;
+    if (!prio)
+        return 0;
+    const u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
+    if (contention >= maxcont || !spurs_resolve_pm(wid))
+        return 0;
+    const u32 ready = vm_read8(ea + wkl_ready_off(wid));
+    const int signal = (vm_read16(ea + wkl_signal_off(wid)) & wkl_signal_bit(wid)) != 0;
+    const int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid && vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
+    *asked = flagged || signal || ready > contention;
+    return ((0x10u - prio) << 4) | (wid == last_wid ? 4u : 0u);
+}
+
+/* The next workload for an idle slot, chosen as the SPURS kernel chooses
+ * (spurs_claim): the strongest of the workloads that are asked for -- flag,
+ * signal bit, or a ready count above their contention -- or, when none is and
+ * by mode, an idle back-off probe of one that is not:
+ *   SPURS_PICK_FULL  a coordinator pass: the unasked ones whose probe is due
+ *                    this pass
+ *   SPURS_PICK_KICK  a pass after a request line commit: asked-for ones only
+ *   SPURS_PICK_SELF  a worker whose run just ended: also the unasked ones that
  *                    found work last time (idle 0), which every full pass takes;
  *                    the back-off probes stay with the coordinator, whose passes
  *                    count them.
- * Takes one from the ready count and the signal bit, counts the contention and
- * sets the slot busy; returns 1 if it got one. The instance lock and the
- * workload registry lock are held. */
+ * Clears the signal bit (and pulls the flag, for its receiver), counts the
+ * contention and sets the slot busy; returns 1 if it got one. The ready count
+ * stays: it is how many SPUs the job manager wants, not a count of kicks.
+ * SPURS_SELECT=rr goes back to the scheduler before 2026-10-31: round robin
+ * from the instance's cursor, one taken from the ready count at each pick.
+ * The instance lock and the workload registry lock are held. */
 
 /* The scheduler's state as spurs_pick reads it, for a stall: per instance,
  * what each worker slot is doing, and per workload the fields that decide
@@ -2487,13 +2571,79 @@ static int spurs_boost_wid(u32 wid)
     return wid < 32 && ((mask >> wid) & 1u);
 }
 
+/* Give SPU slot workload wid: clear its signal bit (and pull its flag, for its
+ * receiver), count the contention and set the slot busy. rr also takes one from
+ * the ready count, as the round-robin scheduler did. */
+static void spurs_take(struct SpursInst* si, struct SpursPmSlot* slot, u32 wid, int rr)
+{
+    const u32 ea = si->ea;
+    WklPm* const pm = spurs_resolve_pm(wid);
+    spu_lockline_lock();
+    const u32 ready = vm_read8(ea + wkl_ready_off(wid));
+    const u32 signal = vm_read16(ea + wkl_signal_off(wid));
+    if (ready && rr) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+    if (signal & wkl_signal_bit(wid))
+        ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
+    if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
+        ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
+    ef_line_end(ea);
+    if (kick_prof_secs()) kick_prof_pick(ea, wid);
+    slot->fn = pm->fn; slot->image_id = pm->image_id;
+    slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+    slot->pm_size = s_workloads[wid].sizePm;
+    slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
+    slot->wid = wid; slot->ea = ea;
+    { const int b = spurs_boost_wid(wid);
+      if (b != slot->boosted && slot->thread) {
+          SetThreadPriority(slot->thread, b ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL);
+          slot->boosted = b;
+      } }
+    si->active[wid]++;
+    spu_lockline_lock();
+    wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
+    ef_line_end(ea);
+    if (dispatch_prof_secs()) {
+        const u64 t = wid_prof_now_ns();
+        if (slot->t_end && slot->last_polls && slot->last_wid == wid) {
+            InterlockedAdd64(&s_dp_again_ns, (LONG64)(t - slot->t_end));
+            InterlockedIncrement64(&s_dp_again_n);
+        }
+        slot->t_set = t;
+    }
+    slot->busy = 1;
+}
+
+/* Whether mode lets a workload that is not asked for run as an idle back-off
+ * probe. */
+static int spurs_probe_due(const struct SpursInst* si, u32 wid, int mode)
+{
+    return !(mode == SPURS_PICK_KICK || (mode == SPURS_PICK_SELF && si->idle[wid]) ||
+             (mode == SPURS_PICK_FULL && (si->pass_no & ((1u << si->idle[wid]) - 1))));
+}
+
 static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
 {
     const u32 ea = si->ea, sn = slot->spu_num;
     const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
     const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    if (!spurs_select_rr()) {
+        u32 pick = SPURS_MAX_WID, best = 0;
+        for (u32 wid = 0; wid < nwid; wid++) {
+            int asked;
+            const u32 w = spurs_claim(si, wid, sn, enabled, si->active[wid], slot->wid, &asked);
+            if (!w) continue;
+            if (asked) si->idle[wid] = 0;
+            else if (!spurs_probe_due(si, wid, mode)) continue;
+            /* An asked-for workload outweighs any probe; a tie keeps the lower id. */
+            const u32 key = (asked ? 0x100u : 0u) | w;
+            if (key > best) { best = key; pick = wid; }
+        }
+        if (pick == SPURS_MAX_WID) return 0;
+        spurs_take(si, slot, pick, 0);
+        return 1;
+    }
     for (u32 checked = 0; checked < nwid; checked++) {
-        u32 wid = si->cursor % nwid;
+        const u32 wid = si->cursor % nwid;
         si->cursor = (wid + 1) % nwid;
         if (!(enabled & (0x80000000u >> wid)) ||
             vm_read8(ea + wkl_state_off(wid)) != 2 ||
@@ -2503,8 +2653,7 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
             continue; /* priority zero makes this physical lane ineligible */
         u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
         if (!maxcont || si->active[wid] >= maxcont) continue;
-        WklPm* pm = spurs_resolve_pm(wid);
-        if (!pm) continue;
+        if (!spurs_resolve_pm(wid)) continue;
         u32 signal = vm_read16(ea + wkl_signal_off(wid));
         u32 ready = vm_read8(ea + wkl_ready_off(wid));
         /* The workload flag: the PPU stores 0 into it to make the
@@ -2513,45 +2662,62 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
                       vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
         int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
         if (kicked) si->idle[wid] = 0;
-        if (!kicked && (mode == SPURS_PICK_KICK || (mode == SPURS_PICK_SELF && si->idle[wid]) ||
-                        (mode == SPURS_PICK_FULL && (si->pass_no & ((1u << si->idle[wid]) - 1)))))
+        if (!kicked && !spurs_probe_due(si, wid, mode))
             continue;
-        spu_lockline_lock();
-        ready = vm_read8(ea + wkl_ready_off(wid));
-        signal = vm_read16(ea + wkl_signal_off(wid));
-        if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
-        if (signal & wkl_signal_bit(wid))
-            ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
-        if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
-            ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
-        ef_line_end(ea);
-        if (kick_prof_secs()) kick_prof_pick(ea, wid);
-        slot->fn = pm->fn; slot->image_id = pm->image_id;
-        slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-        slot->pm_size = s_workloads[wid].sizePm;
-        slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
-        slot->wid = wid; slot->ea = ea;
-        { const int b = spurs_boost_wid(wid);
-          if (b != slot->boosted && slot->thread) {
-              SetThreadPriority(slot->thread, b ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL);
-              slot->boosted = b;
-          } }
-        si->active[wid]++;
-        spu_lockline_lock();
-        wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
-        ef_line_end(ea);
-        if (dispatch_prof_secs()) {
-            const u64 t = wid_prof_now_ns();
-            if (slot->t_end && slot->last_polls && slot->last_wid == wid) {
-                InterlockedAdd64(&s_dp_again_ns, (LONG64)(t - slot->t_end));
-                InterlockedIncrement64(&s_dp_again_n);
-            }
-            slot->t_set = t;
-        }
-        slot->busy = 1;
+        spurs_take(si, slot, wid, 1);
         return 1;
     }
     return 0;
+}
+
+
+/* The kernel's answer to a policy module that polls (selectWorkload with r3 =
+ * 1; cellSpursModulePollStatus in the module compares the answer's workload
+ * with its own and ends its run when they differ). The workload this SPU would
+ * take now, with the polling module's own SPU left out of its workload's
+ * contention, as spursKernel2SelectWorkload does in poll mode: the module goes
+ * on while its workload is still asked for and nothing stronger is. When the
+ * answer is its own workload, its signal bit is cleared and its flag pulled,
+ * as at a selection. Returns (wid << 32) | status, status 1 for a ready count
+ * above the contention, 2 for the signal, 4 for the flag; wid 0x20 (the system
+ * service) when nothing may take the SPU. The Wws job manager polls between
+ * jobs; answered with workload 0, every module but workload 0's ended its run
+ * at its first poll, about one job a run. */
+static uint64_t spurs_kernel_poll(uint32_t ea, uint32_t sn, uint32_t cur)
+{
+    struct SpursInst* si = spurs_inst_find(ea);
+    if (!si || cur >= SPURS_MAX_WID || sn >= 8)
+        return 0;
+    AcquireSRWLockExclusive(&si->lock);
+    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+    const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    u32 pick = 0x20, best = 0;
+    for (u32 wid = 0; wid < nwid; wid++) {
+        const u32 cont = si->active[wid] - (wid == cur && si->active[wid] ? 1u : 0u);
+        int asked;
+        const u32 w = spurs_claim(si, wid, sn, enabled, cont, cur, &asked);
+        if (w && asked && w > best) { best = w; pick = wid; }
+    }
+    u32 status = 0;
+    if (pick == cur) {
+        const u32 cont = si->active[cur] ? si->active[cur] - 1u : 0u;
+        spu_lockline_lock();
+        const u32 ready = vm_read8(ea + wkl_ready_off(cur));
+        const u32 signal = vm_read16(ea + wkl_signal_off(cur));
+        const int receiver = vm_read8(ea + SPURS_WKL_FLAG_RECV) == cur;
+        if (ready > cont) status |= 1;
+        if (signal & wkl_signal_bit(cur)) {
+            status |= 2;
+            ef_w16(ea + wkl_signal_off(cur), (u16)(signal & ~wkl_signal_bit(cur)));
+        }
+        if (receiver && vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0) status |= 4;
+        if (receiver) ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
+        ef_line_end(ea);
+    }
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    ReleaseSRWLockExclusive(&si->lock);
+    return ((uint64_t)pick << 32) | status;
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
@@ -2597,6 +2763,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
+    extern uint64_t (*g_spurs_kernel_poll)(uint32_t, uint32_t, uint32_t);
+    if (!spurs_select_rr()) g_spurs_kernel_poll = spurs_kernel_poll;
     si->stopping = 0; si->cursor = si->pass_no = 0;
     __atomic_store_n(&si->kick, 0, __ATOMIC_RELAXED);
     { extern void (*g_spu_line_commit_hook)(uint32_t);

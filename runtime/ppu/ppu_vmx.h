@@ -270,21 +270,86 @@ VMX_INL float vmx_minf(float x, float y) {
     if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
     return x < y ? x : y;
 }
-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
+VMX_FBIN(vmx_vaddfp_ref, vmx_f(x) + vmx_f(y), 1)
+VMX_FBIN(vmx_vsubfp_ref, vmx_f(x) - vmx_f(y), 1)
 VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
 VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vmaddfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, y))), vscr)); } VMX_OUT; }
-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vnmsubfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+        /* the sign flipped as bits: -fmaf() lets a compiler fuse the negation
+         * into fnmadd, which gives +0 where the negated a*c - b is -0 */
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, -y)) ^ 0x80000000u), vscr)); } VMX_OUT; }
+
+/* The four lanes at once where the host has FMA3 (the lifted PPU code is built
+ * with it): the scalar forms above lane for lane, which stay as the reference
+ * (tests/test_ppu_vmx_float_vec.c). Out of line and a byte at a time,
+ * vmx_vmaddfp alone was 5.5% of God of War: Ascension's main thread, a seventh
+ * of its own work. VSCR[NJ] flushes inputs and results to a signed zero, a NaN
+ * result becomes 0x7FC00000, and vaddfp/vsubfp hand on an operand NaN (A,
+ * then B) quieted. vnmsubfp negates the fused a*c - b, as the scalar form
+ * negates fmaf(a, c, -b): fnmadd would give +0 where that gives -0. */
+#if defined(__FMA__) && (defined(__x86_64__) || defined(_M_X64)) && !defined(VMX_SCALAR_FLOAT)
+#include <immintrin.h>
+VMX_INL __m128i vmx__bswap(__m128i v) {
+    return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
+VMX_INL __m128i vmx__ld4(const void* p) { return vmx__bswap(_mm_loadu_si128((const __m128i*)p)); }
+VMX_INL void vmx__st4(void* p, __m128i v) { _mm_storeu_si128((__m128i*)p, vmx__bswap(v)); }
+VMX_INL __m128i vmx__flush4(__m128i x, uint32_t vscr) {
+    if (!(vscr & VMX_NJ)) return x;
+    const __m128i den = _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    return _mm_andnot_si128(_mm_and_si128(den, _mm_set1_epi32(0x7FFFFFFF)), x);
+}
+VMX_INL __m128i vmx__nanmask(__m128i x) {
+    return _mm_castps_si128(_mm_cmpunord_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(x)));
+}
+VMX_INL __m128i vmx__fix4(__m128i r) {
+    return _mm_blendv_epi8(r, _mm_set1_epi32(0x7FC00000), vmx__nanmask(r));
+}
+/* vnan2 lane for lane: B's NaN, then A's over it, else the fixed result. */
+VMX_INL __m128i vmx__vnan2_4(__m128i r, __m128i x, __m128i y) {
+    const __m128i q = _mm_set1_epi32(0x7FC00000);
+    r = _mm_blendv_epi8(vmx__fix4(r), _mm_or_si128(y, q), vmx__nanmask(y));
+    return _mm_blendv_epi8(r, _mm_or_si128(x, q), vmx__nanmask(x));
+}
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmx__flush4(vmx__ld4(a_), vscr), y = vmx__flush4(vmx__ld4(b_), vscr);
+    const __m128i z = _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)));
+    vmx__st4(d_, vmx__flush4(vmx__vnan2_4(z, x, y), vscr));
+}
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmx__flush4(vmx__ld4(a_), vscr), y = vmx__flush4(vmx__ld4(b_), vscr);
+    const __m128i z = _mm_castps_si128(_mm_sub_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)));
+    vmx__st4(d_, vmx__flush4(vmx__vnan2_4(z, x, y), vscr));
+}
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const __m128i x = vmx__flush4(vmx__ld4(a_), vscr), y = vmx__flush4(vmx__ld4(b_), vscr),
+                  z = vmx__flush4(vmx__ld4(c_), vscr);
+    const __m128i r = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(z), _mm_castsi128_ps(y)));
+    vmx__st4(d_, vmx__flush4(vmx__fix4(r), vscr));
+}
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const __m128i x = vmx__flush4(vmx__ld4(a_), vscr), y = vmx__flush4(vmx__ld4(b_), vscr),
+                  z = vmx__flush4(vmx__ld4(c_), vscr);
+    const __m128i r = _mm_xor_si128(_mm_castps_si128(_mm_fmsub_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(z),
+                                                                  _mm_castsi128_ps(y))),
+                                    _mm_set1_epi32((int)0x80000000u));
+    vmx__st4(d_, vmx__flush4(vmx__fix4(r), vscr));
+}
+#else
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vaddfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vsubfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_ref(d_, a_, b_, c_, vscr); }
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_ref(d_, a_, b_, c_, vscr); }
+#endif
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \

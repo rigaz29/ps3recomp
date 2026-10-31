@@ -2218,6 +2218,24 @@ int spurs_pm_current_wid(unsigned long tid)
         if ((unsigned long)s_pm_now_tid[i] == tid) return (int)s_pm_now_wid[i];
     return -1;
 }
+/* SPU_JOB_TIME (spu_jobcap.c, measurement builds): while this worker runs a
+ * job, its workload reads as wid + 64, so a profile tells the jobs from the
+ * policy module and kernel work around them (gowa.py symbolize --wid <wid + 64>). */
+#ifdef PS3_SPU_JOBCAP
+extern void (*g_spu_job_mark_hook)(int in_job);   /* runtime/spu/spu_jobcap.c */
+static void spurs_pm_mark_job(int in_job)
+{
+    const LONG tid = (LONG)GetCurrentThreadId();
+    const LONG n = s_pm_now_n < PM_NOW_MAX ? s_pm_now_n : PM_NOW_MAX;
+    for (LONG i = 0; i < n; i++)
+        if (s_pm_now_tid[i] == tid) {
+            const LONG w = s_pm_now_wid[i];
+            if (w >= 0) s_pm_now_wid[i] = (w & 63) | (in_job ? 64 : 0);
+            return;
+        }
+}
+#endif
+
 /* The workloads the workers are running right now, as a mask (bit wid), for
  * probes that attribute an event to whatever ran when it happened. */
 unsigned spurs_pm_running_mask(void)
@@ -2226,7 +2244,7 @@ unsigned spurs_pm_running_mask(void)
     unsigned m = 0;
     for (LONG i = 0; i < n; i++) {
         const LONG w = s_pm_now_wid[i];
-        if (w >= 0 && w < 32) m |= 1u << w;
+        if (w >= 0) m |= 1u << (w & 31);   /* & 31: SPU_JOB_TIME's in-job tag */
     }
     return m;
 }
@@ -2297,6 +2315,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         now_i = InterlockedIncrement(&s_pm_now_n) - 1;
         if (now_i < PM_NOW_MAX) { s_pm_now_wid[now_i] = -1; s_pm_now_tid[now_i] = (LONG)GetCurrentThreadId(); }
     }
+#endif
+#ifdef PS3_SPU_JOBCAP
+    g_spu_job_mark_hook = spurs_pm_mark_job;
 #endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {

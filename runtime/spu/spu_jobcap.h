@@ -44,6 +44,9 @@ extern SPU_THREAD_LOCAL int t_spu_pm_img;
 #endif
 
 void spu_jobcap_init(void);
+/* SPU_JOB_TIME: told at each timed job's start (1) and end (0); the SPURS
+ * runtime sets it to tag its worker's profiler samples (cellSpurs.c). */
+extern void (*g_spu_job_mark_hook)(int in_job);
 /* spu_indirect_branch, before it calls the target. */
 void spu_jobcap_maybe_begin(spu_context* ctx);
 /* spu_drain_call, after the drain with return_pc ends. */

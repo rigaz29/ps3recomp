@@ -25,6 +25,12 @@
  * stops or halts is not kept: what follows depends on more than the record
  * holds. Interrupts are kept (see spu_jobcap_abandon).
  *
+ * Timing, SPU_JOB_TIME=<seconds> (no capture):
+ *   every so many seconds, per workload: jobs a second and the time from each
+ *   job call to its return, as the replay times a job -- what the same job
+ *   costs in the game. The policy module's own work around its jobs is the
+ *   rest of a run (SPURS_WID_PROF's us/run).
+ *
  * Both need a build with PS3_SPU_JOBCAP (spu_jobcap.h).
  *
  * Replay, SPU_JOB_REPLAY=<dir> (the port starts it instead of the game):
@@ -146,8 +152,71 @@ typedef struct {
 static SPU_THREAD_LOCAL jc_cap* t_cap;
 static void jc_finish(spu_context* ctx);
 
+/* SPU_JOB_TIME: per workload, jobs timed, their total, and a log2 histogram of
+ * job lengths in us (bucket k: under 2^k us), reported every s_time_every_us. */
+static uint64_t s_time_every_us;
+static volatile int64_t s_time_n[32], s_time_sum[32], s_time_hist[32][16];
+static volatile int64_t s_time_last;
+static SPU_THREAD_LOCAL uint64_t t_time_t0;
+static SPU_THREAD_LOCAL uint32_t t_time_wid;
+static SPU_THREAD_LOCAL spu_context* t_time_ctx;
+void (*g_spu_job_mark_hook)(int in_job);
+
+static void jc_time_report(uint64_t now)
+{
+    int64_t last = __atomic_load_n(&s_time_last, __ATOMIC_RELAXED);
+    if (!last) { __atomic_compare_exchange_n(&s_time_last, &last, (int64_t)now, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return; }
+    if (now - (uint64_t)last < s_time_every_us ||
+        !__atomic_compare_exchange_n(&s_time_last, &last, (int64_t)now, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+    const double win = (double)(now - (uint64_t)last) / 1e6;
+    fprintf(stderr, "[jobtime] %.1f s: per job, from its call to its return\n", win);
+    for (int w = 0; w < 32; w++) {
+        const int64_t n = __atomic_exchange_n(&s_time_n[w], 0, __ATOMIC_SEQ_CST);
+        const int64_t sum = __atomic_exchange_n(&s_time_sum[w], 0, __ATOMIC_SEQ_CST);
+        int64_t h[16], acc = 0;
+        for (int k = 0; k < 16; k++) h[k] = __atomic_exchange_n(&s_time_hist[w][k], 0, __ATOMIC_SEQ_CST);
+        if (!n) continue;
+        int p50 = 15, p90 = 15;
+        for (int k = 0; k < 16; k++) {
+            acc += h[k];
+            if (p50 == 15 && acc * 2 >= n) p50 = k;
+            if (p90 == 15 && acc * 10 >= n * 9) { p90 = k; break; }
+        }
+        fprintf(stderr, "[jobtime]   w%-2d %8.0f jobs/s  %8.1f us/job  median < %u us  p90 < %u us\n",
+                w, n / win, (double)sum / (double)n, 1u << p50, 1u << p90);
+    }
+    fflush(stderr);
+}
+
+static void jc_time_end(void)
+{
+    const uint64_t now = jc_now_us(), d = now - t_time_t0;
+    const uint32_t w = t_time_wid;
+    int k = 0;
+    while (k < 15 && (1ull << k) <= d) k++;
+    __atomic_add_fetch(&s_time_n[w], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_time_sum[w], (int64_t)d, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_time_hist[w][k], 1, __ATOMIC_RELAXED);
+    t_spu_jobcap = 0;
+    t_time_ctx = NULL;
+    if (g_spu_job_mark_hook) g_spu_job_mark_hook(0);
+    jc_time_report(now);
+}
+
 void spu_jobcap_init(void)
 {
+    const char* tm = getenv("SPU_JOB_TIME");
+    if (tm && atof(tm) > 0 && !getenv("SPU_JOB_CAPTURE")) {
+#ifndef PS3_SPU_JOBCAP
+        fprintf(stderr, "[jobtime] SPU_JOB_TIME needs a build with PS3_SPU_JOBCAP (gowa.py build --jobcap)\n");
+        return;
+#endif
+        s_time_every_us = (uint64_t)(atof(tm) * 1e6);
+        fprintf(stderr, "[jobtime] timing job calls returning to 0x%05X, every %.0f s\n", s_link, atof(tm));
+        g_spu_jobcap_armed = 1;
+        return;
+    }
     const char* d = getenv("SPU_JOB_CAPTURE");
     if (!d || !*d) return;
 #ifndef PS3_SPU_JOBCAP
@@ -208,7 +277,9 @@ void spu_jobcap_maybe_begin(spu_context* ctx)
      * that runs in a nested drain, so the drain of the call does not see it). */
     if (t_spu_jobcap) {
         if ((ctx->pc & SPU_LS_MASK) == s_link) {
-            if (t_spu_jobcap == 1 && t_cap && t_cap->ctx == ctx)
+            if (t_spu_jobcap == 3 && t_time_ctx == ctx)
+                jc_time_end();
+            else if (t_spu_jobcap == 1 && t_cap && t_cap->ctx == ctx)
                 jc_finish(ctx);
             else if (t_spu_jobcap == 2 && t_rep && t_rep->ctx == ctx)
                 longjmp(t_rep->jb, 1);
@@ -226,6 +297,15 @@ void spu_jobcap_maybe_begin(spu_context* ctx)
     const uint32_t pc = ctx->pc & SPU_LS_MASK, link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
     if (pc < 0x4000 || link != s_link) return;
     const uint32_t wid = be32(ctx->ls + 0x1DC);
+    if (s_time_every_us) {   /* SPU_JOB_TIME: every workload, every job */
+        if (wid >= 32) return;
+        t_time_t0 = jc_now_us();
+        t_time_wid = wid;
+        t_time_ctx = ctx;
+        t_spu_jobcap = 3;
+        if (g_spu_job_mark_hook) g_spu_job_mark_hook(1);
+        return;
+    }
     if (wid >= 32 || !(s_wids & (1u << wid))) return;
     const uint64_t now = jc_now_us();
     if (!s_first_us) s_first_us = now;
@@ -247,6 +327,12 @@ void spu_jobcap_maybe_begin(spu_context* ctx)
 
 void spu_jobcap_abandon(const char* why)
 {
+    if (t_spu_jobcap == 3 && strcmp(why, "interrupt")) {   /* a timed job that stopped: not counted */
+        t_spu_jobcap = 0;
+        t_time_ctx = NULL;
+        if (g_spu_job_mark_hook) g_spu_job_mark_hook(0);
+        return;
+    }
     if (t_spu_jobcap != 1) return;
     /* The job manager runs its jobs with interrupts on, and the events behind
      * them are the job's own (tag-status updates it asks for): a replay takes
@@ -291,6 +377,10 @@ static void jc_finish(spu_context* ctx)
 
 void spu_jobcap_drain_done(spu_context* ctx, uint32_t return_pc)
 {
+    if (t_spu_jobcap == 3) {
+        if (t_time_ctx == ctx && (return_pc & SPU_LS_MASK) == s_link) jc_time_end();
+        return;
+    }
     jc_cap* c = t_cap;
     if (t_spu_jobcap != 1 || !c || c->ctx != ctx || (return_pc & SPU_LS_MASK) != c->link) return;
     jc_finish(ctx);

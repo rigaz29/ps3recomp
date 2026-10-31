@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ppu_vmx.h: the vector forms of vaddfp/vsubfp/vmaddfp/vnmsubfp equal the scalar ones bit for bit.
+"""ppu_vmx.h: the vector forms (float ops, compares, estimates, conversions, vperm and the
+unaligned loads) equal the scalar ones bit for bit.
 
 Builds runtime/ppu/tests/test_ppu_vmx_float_vec.c twice: with FMA3 (x86-64 only), where the
 vector forms are used, and without, where the public names call the scalar forms.

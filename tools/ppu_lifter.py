@@ -3006,27 +3006,16 @@ class PPULifter:
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
         # zero-fills the right; lvrx is the mirror (fills the right end). lvlxl
-        # is lvlx with a cache hint (same data). Byte-loop matches the raw-byte
-        # convention used by vperm/lvsl.
-        if mn == "lvlx" or mn == "lvlxl":
+        # is lvlx with a cache hint (same data). The helpers (ppu_vmx.h) keep
+        # the raw-byte convention used by vperm/lvsl; written out as byte loops
+        # here, clang unrolled each to ~85 instructions without a pshufb.
+        if mn == "lvlx" or mn == "lvlxl" or mn == "lvrx" or mn == "lvrxl":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
+            fn = "vmx_lvlx" if mn.startswith("lvl") else "vmx_lvrx"
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0; }}")
-
-        if mn == "lvrx" or mn == "lvrxl":
-            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
-            ra = _reg_idx(ops[1])
-            rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
+                    f"{fn}(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -3060,27 +3049,18 @@ class PPULifter:
             # lvsl: for byte offset b, generates {b, b+1, b+2, ..., b+15}
             # lvsr: generates {16-b, 17-b, ..., 31-b}
             if mn == "lvsl":
-                return (f"{{ uint8_t b = (uint8_t)(({_xea(ra,rb)}) & 0xF); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                return f"vmx_lvs(&ctx->vr[{vd}], (uint32_t)(({_xea(ra,rb)}) & 0xF));"
             else:
-                return (f"{{ uint8_t b = (uint8_t)(16 - (({_xea(ra,rb)}) & 0xF)); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                return f"vmx_lvs(&ctx->vr[{vd}], 16u - (uint32_t)(({_xea(ra,rb)}) & 0xF));"
 
-        # VMX permute (vperm) — critical for unaligned loads
+        # VMX permute (vperm) — critical for unaligned loads. Two pshufb and a
+        # blend in ppu_vmx.h; as a byte loop here it was ~119 instructions.
         if mn == "vperm":
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ uint8_t* a = (uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b = (uint8_t*)&ctx->vr[{vb}]; "
-                    f"uint8_t* c = (uint8_t*)&ctx->vr[{vc}]; "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"uint8_t tmp[16]; "
-                    f"for (int i = 0; i < 16; i++) {{ "
-                    f"uint8_t sel = c[i] & 0x1F; "
-                    f"tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }} "
-                    f"memcpy(d, tmp, 16); }}")
+            return f"vmx_vperm(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
         # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
         if mn == "vspltw":

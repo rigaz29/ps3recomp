@@ -250,6 +250,21 @@ VMX_INL void vmx_vslo(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (b[15] >> 3)
 VMX_INL void vmx_vsro(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (b[15] >> 3) & 15;
     for (int i = 0; i < 16; i++) r[i] = i - n >= 0 ? a[i - n] : 0; VMX_OUT; }
 
+/* ---- vperm and the Cell's unaligned loads ----
+ * m is the aligned quadword that holds the effective address, sh = EA & 15.
+ * lvlx loads bytes sh..15 of it left-justified and zero-fills the right; lvrx
+ * loads bytes 0..sh-1 right-justified (nothing when sh is 0); lvsl/lvsr build
+ * the permute control b, b+1, ..., b+15 (b = sh, or 16 - sh). */
+VMX_INL void vmx_vperm_ref(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+    for (int i = 0; i < 16; i++) { const uint8_t sel = c[i] & 0x1F; r[i] = sel < 16 ? a[sel] : b[sel - 16]; }
+    VMX_OUT; }
+VMX_INL void vmx_lvlx_ref(VMX_D, const uint8_t* m, uint32_t sh) { uint8_t r[16];
+    for (int i = 0; i < 16; i++) r[i] = sh + (uint32_t)i < 16 ? m[sh + i] : 0; VMX_OUT; }
+VMX_INL void vmx_lvrx_ref(VMX_D, const uint8_t* m, uint32_t sh) { uint8_t r[16];
+    for (int i = 0; i < 16; i++) r[i] = (uint32_t)i >= 16u - sh ? m[i - (int)(16u - sh)] : 0; VMX_OUT; }
+VMX_INL void vmx_lvs_ref(VMX_D, uint32_t b) { uint8_t r[16];
+    for (int i = 0; i < 16; i++) r[i] = (uint8_t)(b + (uint32_t)i); VMX_OUT; }
+
 /* ======================================================================
  * floating point
  * ==================================================================== */
@@ -272,8 +287,8 @@ VMX_INL float vmx_minf(float x, float y) {
 }
 VMX_FBIN(vmx_vaddfp_ref, vmx_f(x) + vmx_f(y), 1)
 VMX_FBIN(vmx_vsubfp_ref, vmx_f(x) - vmx_f(y), 1)
-VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
-VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+VMX_FBIN(vmx_vmaxfp_ref, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
+VMX_FBIN(vmx_vminfp_ref, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
 VMX_INL void vmx_vmaddfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
@@ -356,14 +371,14 @@ VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8
     for (int i = 0; i < 4; i++) { uint32_t y = vmx_w(b, i); if (flush_in) y = vmx_flush(y, vscr); \
         float f = vmx_f(y); uint32_t z = vmx_u(expr); \
         vmx_sw(r, i, nanmode == 2 ? vmx_flush(vmx_vnan1(z, y), vscr) : vmx_fix(z)); } VMX_OUT; }
-VMX_FUN(vmx_vrefp, 1.0f / f, 1, 2)
-VMX_FUN(vmx_vrsqrtefp, 1.0f / sqrtf(f), 1, 2)
+VMX_FUN(vmx_vrefp_ref, 1.0f / f, 1, 2)
+VMX_FUN(vmx_vrsqrtefp_ref, 1.0f / sqrtf(f), 1, 2)
 VMX_FUN(vmx_vexptefp, exp2f(f), 0, 1)
 VMX_FUN(vmx_vlogefp, log2f(f), 0, 1)
-VMX_FUN(vmx_vrfin, nearbyintf(f), 0, 2)      /* host default rounding: to nearest even */
-VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
-VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
-VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
+VMX_FUN(vmx_vrfin_ref, nearbyintf(f), 0, 2)      /* host default rounding: to nearest even */
+VMX_FUN(vmx_vrfiz_ref, truncf(f), 0, 2)
+VMX_FUN(vmx_vrfip_ref, ceilf(f), 1, 2)
+VMX_FUN(vmx_vrfim_ref, floorf(f), 1, 2)
 
 /* int <-> float with a 2^uimm scale. uimm is 5 bits, so 2^-uimm and 2^uimm are
  * normal floats and the scaling is exact: the same results as ldexpf, without
@@ -372,10 +387,10 @@ VMX_INL float vmx_pow2(int e) { return vmx_f((uint32_t)(127 + e) << 23); }
 VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
     const float s = vmx_pow2(-(int)(uimm & 31u));
     for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)vmx_w(b, i) * s)); VMX_OUT; }
-VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
+VMX_INL void vmx_vcfsx_ref(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
     const float s = vmx_pow2(-(int)(uimm & 31u));
     for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)(int32_t)vmx_w(b, i) * s)); VMX_OUT; }
-VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
+VMX_INL void vmx_vctsxs_ref(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
     for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); int32_t v;
         if (f != f) v = 0;
         else if (f < -2147483648.0f) { v = INT32_MIN; *vscr |= VMX_SAT; }
@@ -400,21 +415,158 @@ VMX_INL void vmx_sh64(uint8_t* v, int i, uint64_t x) { vmx_sh(v, i, (uint16_t)x)
 VMX_INL void vmx_sw64(uint8_t* v, int i, uint64_t x) { vmx_sw(v, i, (uint32_t)x); }
 VMX_CMP(vmx_vcmpequb, 16, vmx_b, vmx_sb64, x == y)
 VMX_CMP(vmx_vcmpequh, 8, vmx_h, vmx_sh64, x == y)
-VMX_CMP(vmx_vcmpequw, 4, vmx_w, vmx_sw64, x == y)
+VMX_CMP(vmx_vcmpequw_ref, 4, vmx_w, vmx_sw64, x == y)
 VMX_CMP(vmx_vcmpgtub, 16, vmx_b, vmx_sb64, x > y)
 VMX_CMP(vmx_vcmpgtuh, 8, vmx_h, vmx_sh64, x > y)
-VMX_CMP(vmx_vcmpgtuw, 4, vmx_w, vmx_sw64, x > y)
+VMX_CMP(vmx_vcmpgtuw_ref, 4, vmx_w, vmx_sw64, x > y)
 VMX_CMP(vmx_vcmpgtsb, 16, vmx_b, vmx_sb64, (int8_t)x > (int8_t)y)
 VMX_CMP(vmx_vcmpgtsh, 8, vmx_h, vmx_sh64, (int16_t)x > (int16_t)y)
-VMX_CMP(vmx_vcmpgtsw, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
-VMX_CMP(vmx_vcmpeqfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgefp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgtfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgtsw_ref, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
+VMX_CMP(vmx_vcmpeqfp_ref, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgefp_ref, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgtfp_ref, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
 /* vcmpbfp: bit 31 = !(a <= b), bit 30 = !(a >= -b); CR6 EQ = every lane in bounds */
 VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int inb = 1;
     for (int i = 0; i < 4; i++) { float x = vmx_f(vmx_w(a, i)), y = vmx_f(vmx_w(b, i));
         uint32_t v = (!(x <= y) ? 0x80000000u : 0) | (!(x >= -y) ? 0x40000000u : 0);
         inb &= v == 0; vmx_sw(r, i, v); } VMX_OUT; return (uint32_t)(inb << 1); }
+
+/* ======================================================================
+ * vector forms of the moves, compares, estimates and conversions
+ * ==================================================================== */
+/* As for the float ops above: where the lifted PPU code is built with FMA3 (so
+ * SSE4.1 and AVX) the public names do sixteen bytes or four lanes at once, and
+ * the _ref forms stay as the reference (tests/test_ppu_vmx_float_vec.c checks
+ * every pair byte for byte).
+ *   - vperm and lvlx/lvrx/lvsl/lvsr were byte loops written into the lifted
+ *     code, which clang unrolls to 85-119 instructions: God of War: Ascension
+ *     has 13,610 lvlx and 12,711 vperm sites.
+ *   - The estimates are 1/x and 1/sqrt(x) correctly rounded, as the scalar
+ *     forms compute them, and the roundings are exact: the same results.
+ *   - The compares give all-ones or zero lanes, which read the same in either
+ *     byte order, so they store without the swap. */
+#if defined(__FMA__) && (defined(__x86_64__) || defined(_M_X64)) && !defined(VMX_SCALAR_FLOAT)
+/* bytes 0-15, sixteen 0x80 (pshufb: zero), bytes 0-15: lvlx's control starts
+ * at sh, lvrx's at 16 + sh */
+static const uint8_t vmx__lvx_tab[48] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+};
+VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) {
+    const __m128i c = _mm_loadu_si128((const __m128i*)c_), i = _mm_and_si128(c, _mm_set1_epi8(0x0F));
+    const __m128i ra = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)a_), i);
+    const __m128i rb = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)b_), i);
+    /* bit 4 of a control byte picks B: shifted to bit 7, the blend's select */
+    _mm_storeu_si128((__m128i*)d_, _mm_blendv_epi8(ra, rb, _mm_slli_epi16(c, 3)));
+}
+/* The whole aligned quadword is read: the bytes lvlx reads are in it, so it is
+ * on their page. */
+VMX_INL void vmx_lvlx(VMX_D, const uint8_t* m, uint32_t sh) {
+    _mm_storeu_si128((__m128i*)d_, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)m),
+                                                     _mm_loadu_si128((const __m128i*)(vmx__lvx_tab + sh))));
+}
+/* lvrx with sh 0 reads no byte, and its quadword may be the first of an
+ * unmapped page (lvrx at EA + 16 completes an lvlx at EA): read the table. */
+VMX_INL void vmx_lvrx(VMX_D, const uint8_t* m, uint32_t sh) {
+    const uint8_t* src = sh ? m : vmx__lvx_tab;
+    _mm_storeu_si128((__m128i*)d_, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)src),
+                                                     _mm_loadu_si128((const __m128i*)(vmx__lvx_tab + 16 + sh))));
+}
+VMX_INL void vmx_lvs(VMX_D, uint32_t b) {
+    _mm_storeu_si128((__m128i*)d_, _mm_add_epi8(_mm_set1_epi8((char)b),
+                                                _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)));
+}
+
+/* CR6 of a record form, [all, 0, none, 0], from the lanes' masks */
+VMX_INL uint32_t vmx__cr6(__m128i m) {
+    const int k = _mm_movemask_ps(_mm_castsi128_ps(m));
+    return (uint32_t)((k == 15) << 3 | (k == 0) << 1);
+}
+#define VMX_CMP4(name, expr) \
+VMX_INL uint32_t name(VMX_D, VMX_A, VMX_B) { const __m128i x = vmx__ld4(a_), y = vmx__ld4(b_); \
+    const __m128i m = (expr); _mm_storeu_si128((__m128i*)d_, m); return vmx__cr6(m); }
+#define VMX__PS(v) _mm_castsi128_ps(v)
+#define VMX__SI(v) _mm_castps_si128(v)
+VMX_CMP4(vmx_vcmpequw, _mm_cmpeq_epi32(x, y))
+VMX_CMP4(vmx_vcmpgtsw, _mm_cmpgt_epi32(x, y))
+VMX_CMP4(vmx_vcmpgtuw, _mm_cmpgt_epi32(_mm_xor_si128(x, _mm_set1_epi32((int)0x80000000u)),
+                                       _mm_xor_si128(y, _mm_set1_epi32((int)0x80000000u))))
+VMX_CMP4(vmx_vcmpeqfp, VMX__SI(_mm_cmpeq_ps(VMX__PS(x), VMX__PS(y))))
+VMX_CMP4(vmx_vcmpgefp, VMX__SI(_mm_cmpge_ps(VMX__PS(x), VMX__PS(y))))
+VMX_CMP4(vmx_vcmpgtfp, VMX__SI(_mm_cmpgt_ps(VMX__PS(x), VMX__PS(y))))
+#undef VMX_CMP4
+
+/* maxps/minps are the scalar forms' x > y ? x : y and x < y ? x : y. Equal
+ * lanes -- +0 and -0 the only ones whose bits differ -- take x & y for the
+ * maximum (+0 unless both are -0) and x | y for the minimum. NaN lanes are
+ * vnan2's, as in the scalar forms; no input flush. */
+VMX_INL void vmx_vmaxfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmx__ld4(a_), y = vmx__ld4(b_);
+    const __m128 eq = _mm_cmpeq_ps(VMX__PS(x), VMX__PS(y));
+    const __m128 z = _mm_blendv_ps(_mm_max_ps(VMX__PS(x), VMX__PS(y)), _mm_and_ps(VMX__PS(x), VMX__PS(y)), eq);
+    vmx__st4(d_, vmx__flush4(vmx__vnan2_4(VMX__SI(z), x, y), vscr));
+}
+VMX_INL void vmx_vminfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmx__ld4(a_), y = vmx__ld4(b_);
+    const __m128 eq = _mm_cmpeq_ps(VMX__PS(x), VMX__PS(y));
+    const __m128 z = _mm_blendv_ps(_mm_min_ps(VMX__PS(x), VMX__PS(y)), _mm_or_ps(VMX__PS(x), VMX__PS(y)), eq);
+    vmx__st4(d_, vmx__flush4(vmx__vnan2_4(VMX__SI(z), x, y), vscr));
+}
+
+/* VMX_FUN with nanmode 2: B's NaN quieted, else the fixed result, flushed */
+VMX_INL __m128i vmx__vnan1_4(__m128i r, __m128i y) {
+    return _mm_blendv_epi8(vmx__fix4(r), _mm_or_si128(y, _mm_set1_epi32(0x7FC00000)), vmx__nanmask(y));
+}
+#define VMX_FUN4(name, expr, flush_in) \
+VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { __m128i y = vmx__ld4(b_); if (flush_in) y = vmx__flush4(y, vscr); \
+    const __m128 f = VMX__PS(y); vmx__st4(d_, vmx__flush4(vmx__vnan1_4(VMX__SI(expr), y), vscr)); }
+VMX_FUN4(vmx_vrefp, _mm_div_ps(_mm_set1_ps(1.0f), f), 1)
+VMX_FUN4(vmx_vrsqrtefp, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(f)), 1)
+VMX_FUN4(vmx_vrfin, _mm_round_ps(f, _MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC), 0)
+VMX_FUN4(vmx_vrfiz, _mm_round_ps(f, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC), 0)
+VMX_FUN4(vmx_vrfip, _mm_round_ps(f, _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC), 1)
+VMX_FUN4(vmx_vrfim, _mm_round_ps(f, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC), 1)
+#undef VMX_FUN4
+
+VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) {
+    const __m128 f = _mm_cvtepi32_ps(vmx__ld4(b_));
+    vmx__st4(d_, VMX__SI(_mm_mul_ps(f, _mm_set1_ps(vmx_pow2(-(int)(uimm & 31u))))));
+}
+/* cvttps2dq gives 0x80000000 out of range and for a NaN: that is the low
+ * bound's answer; the high bound takes INT32_MAX and a NaN 0. */
+VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) {
+    const __m128 f = _mm_mul_ps(VMX__PS(vmx__ld4(b_)), _mm_set1_ps(vmx_pow2((int)(uimm & 31u))));
+    const __m128 hi = _mm_cmpge_ps(f, _mm_set1_ps(2147483648.0f)), lo = _mm_cmplt_ps(f, _mm_set1_ps(-2147483648.0f));
+    __m128i v = _mm_blendv_epi8(_mm_cvttps_epi32(f), _mm_set1_epi32(INT32_MAX), VMX__SI(hi));
+    v = _mm_andnot_si128(vmx__nanmask(VMX__SI(f)), v);
+    if (_mm_movemask_ps(_mm_or_ps(hi, lo))) *vscr |= VMX_SAT;
+    vmx__st4(d_, v);
+}
+#undef VMX__PS
+#undef VMX__SI
+#else
+VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) { vmx_vperm_ref(d_, a_, b_, c_); }
+VMX_INL void vmx_lvlx(VMX_D, const uint8_t* m, uint32_t sh) { vmx_lvlx_ref(d_, m, sh); }
+VMX_INL void vmx_lvrx(VMX_D, const uint8_t* m, uint32_t sh) { vmx_lvrx_ref(d_, m, sh); }
+VMX_INL void vmx_lvs(VMX_D, uint32_t b) { vmx_lvs_ref(d_, b); }
+VMX_INL uint32_t vmx_vcmpequw(VMX_D, VMX_A, VMX_B) { return vmx_vcmpequw_ref(d_, a_, b_); }
+VMX_INL uint32_t vmx_vcmpgtsw(VMX_D, VMX_A, VMX_B) { return vmx_vcmpgtsw_ref(d_, a_, b_); }
+VMX_INL uint32_t vmx_vcmpgtuw(VMX_D, VMX_A, VMX_B) { return vmx_vcmpgtuw_ref(d_, a_, b_); }
+VMX_INL uint32_t vmx_vcmpeqfp(VMX_D, VMX_A, VMX_B) { return vmx_vcmpeqfp_ref(d_, a_, b_); }
+VMX_INL uint32_t vmx_vcmpgefp(VMX_D, VMX_A, VMX_B) { return vmx_vcmpgefp_ref(d_, a_, b_); }
+VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) { return vmx_vcmpgtfp_ref(d_, a_, b_); }
+VMX_INL void vmx_vmaxfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vmaxfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vminfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vminfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vrefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrefp_ref(d_, b_, vscr); }
+VMX_INL void vmx_vrsqrtefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrsqrtefp_ref(d_, b_, vscr); }
+VMX_INL void vmx_vrfin(VMX_D, VMX_B, uint32_t vscr) { vmx_vrfin_ref(d_, b_, vscr); }
+VMX_INL void vmx_vrfiz(VMX_D, VMX_B, uint32_t vscr) { vmx_vrfiz_ref(d_, b_, vscr); }
+VMX_INL void vmx_vrfip(VMX_D, VMX_B, uint32_t vscr) { vmx_vrfip_ref(d_, b_, vscr); }
+VMX_INL void vmx_vrfim(VMX_D, VMX_B, uint32_t vscr) { vmx_vrfim_ref(d_, b_, vscr); }
+VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { vmx_vcfsx_ref(d_, b_, uimm); }
+VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { vmx_vctsxs_ref(d_, b_, uimm, vscr); }
+#endif
 
 #ifdef __cplusplus
 }

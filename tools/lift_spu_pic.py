@@ -15,7 +15,10 @@ spu_overlay_register_pic_region() under an image id of its own, once per EA it
 streams from. A GET of it marks it resident wherever it lands, the first
 dispatch compares the bytes there with the lifted ones, and dispatch runs the
 lifted code with ctx->pic_base set to that placement's distance from
-LIFT_BASE.
+LIFT_BASE. Only the instructions are compared: the lifted code reads the
+constant pool from local store as the SPU does, and a piece may store into it.
+A piece that arrives inside a block from somewhere else (a buffer the PPU
+assembled) is found by its bytes when dispatch finds nothing where it is.
 
 The list of pieces is the title's, found by running it (SPU_DMA_RANGE_UNIQ for
 where they come from and land, SPU_INTERP_BYSIG for the entries):
@@ -96,7 +99,7 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix):
             unsup = int(t.split()[0])
     print(f"  {name:24} {len(raw):5d} bytes, code 0x{end:X}, funcs={funcs:2d} unsup={unsup}"
           + ("  <-- UNSUPPORTED" if unsup else ""))
-    return {"funcs": funcs, "unsup": unsup}
+    return {"funcs": funcs, "unsup": unsup, "code_end": end}
 
 
 def emit_register(pieces, register_c, sym_prefix):
@@ -115,8 +118,10 @@ def emit_register(pieces, register_c, sym_prefix):
     for p in pieces:
         L.append(f"extern void {p['prefix']}spu_recomp_register(void);")
     L.append("")
+    # Only the instructions are verified: the lifted code reads the constant
+    # pool after them from local store (lqr), and a piece may store into it.
     for p in pieces:
-        b = p["raw"]
+        b = p["raw"][:p["code_end"]]
         L.append(f"static const uint8_t code_{p['image']}[{len(b)}] = {{")
         for k in range(0, len(b), 16):
             L.append("    " + ",".join(f"0x{x:02X}" for x in b[k:k + 16]) + ",")
@@ -153,7 +158,7 @@ def emit_register(pieces, register_c, sym_prefix):
             L.append(f"          if (!any) {{ any = 1; spu_begin_image({img}); "
                      f"{p['prefix']}spu_recomp_register(); }}")
             L.append(f"          if (!spu_overlay_register_pic_region(0x{ea:08X}u, 0x{LIFT_BASE:X}u, "
-                     f"sizeof code_{img}, {img}, &seg, 1))")
+                     f"{len(p['raw'])}u, {img}, &seg, 1))")
             L.append(f'              fprintf(stderr, "[spu-pic] image {img}: region 0x{ea:08X} '
                      f'not registered, interpreted\\n");')
             L.append("      }")
@@ -217,12 +222,15 @@ def main():
         r = lift_piece(p["raw"], p["name"], p["entries"], args.out, tmp_elf, p["prefix"])
         if r is None or r["unsup"]:
             failed += 1
+        else:
+            p["code_end"] = r["code_end"]
     if os.path.exists(tmp_elf):
         os.remove(tmp_elf)
     if failed:
         sys.exit(f"{failed} piece(s) failed or have unsupported instructions")
     manifest = [{"name": p["name"], "image": p["image"], "eas": [hex(e) for e in p["eas"]],
-                 "size": len(p["raw"]), "entries": [hex(e) for e in p["entries"]]} for p in order]
+                 "size": len(p["raw"]), "code_end": hex(p["code_end"]),
+                 "entries": [hex(e) for e in p["entries"]]} for p in order]
     with open(os.path.join(args.out, "pic_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     register_c = args.register or os.path.join(args.out, "pic_register.c")

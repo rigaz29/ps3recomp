@@ -1973,7 +1973,16 @@ int spu_have_function(uint32_t addr)
  * through would execute stale code registered under another image. Task and
  * unbounded overlay misses retain their existing primary-image fallback. */
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
+static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa);
+static unsigned s_pic_sig_n;
+static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t lsa);
 static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+{
+    spu_lifted_fn f = spu_lifted_lookup_owned(ctx, lsa);
+    if (!f && ctx && s_pic_sig_n) f = spu_pic_adopt((spu_context*)ctx, lsa);
+    return f;
+}
+static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t lsa)
 {
     /* Every probe below goes through #436's per-thread memo rather than
      * spu_lookup() directly: the resolver makes up to three of them per
@@ -2077,6 +2086,16 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
+        /* A kept miss outlives a GET that ends no resident span, and a block
+         * with a position-independent piece inside is such a GET: look for
+         * one there again (spu_pic_adopt). */
+        if (!e->fn && s_pic_sig_n) {
+            const spu_lifted_fn f = spu_pic_adopt(c, lsa);
+            if (f) {
+                e->fn = f; e->residency = c->dcache_residency; e->pic_base = c->pic_base;
+                return f;
+            }
+        }
         if (mode == 2) {
             __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
@@ -2246,12 +2265,133 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     return 1;
 }
 
+/* Position-independent pieces found by their bytes. A job can take a piece
+ * out of a block the PPU assembled on its heap: God of War: Ascension's batch
+ * jobs GET 16 KB at a time from heap buffers, and their 2.9 KB piece is
+ * somewhere inside, so no GET starts at the piece or comes from the EA it is
+ * registered under. It ran interpreted: 90% of the level's interpreted SPU
+ * steps and most of Batch's time. When the resolver finds nothing at an
+ * address no resident span covers, the 16 bytes there are looked up among the
+ * starts of the pieces' lifted functions. On a hit the piece's instructions
+ * are compared where that start puts them, and if all of them are there the
+ * placement becomes a verified resident span with no source EA, as if a GET
+ * had brought it: the next GET into it ends it, as for any span. The span
+ * covers the instructions only, not the constant pool after them, which the
+ * lifted code reads from local store like the SPU does. A start can be shared
+ * (pieces carry the same helpers), so every candidate is tried.
+ * SPU_PIC_ADOPTLOG=1 logs adoptions and candidates whose bytes differ. */
+enum { SPU_PIC_SIG_N = 2048 };   /* power of two, filled to 3/4 at most */
+static struct { uint64_t head[2]; uint32_t src, off; int used; } s_pic_sig[SPU_PIC_SIG_N];
+static uint32_t spu_pic_sig_hash(uint64_t head) { return (uint32_t)((head * 0x9E3779B97F4A7C15ull) >> 53); }
+static uint32_t spu_pic_code_extent(const spu_ovl_src* o)
+{
+    uint32_t end = 0;
+    for (unsigned i = 0; i < o->code_count; ++i)
+        if (o->code[i].lsa - o->load_lsa + o->code[i].size > end)
+            end = o->code[i].lsa - o->load_lsa + o->code[i].size;
+    return end;
+}
+/* Registration time only, before any SPU thread runs. */
+static void spu_pic_sigs_add(int src)
+{
+    const spu_ovl_src* o = &s_ovl_src[src];
+    for (int i = 0; i < src; ++i)   /* the same piece under another EA */
+        if (s_ovl_src[i].pic && s_ovl_src[i].image_id == o->image_id) return;
+    for (unsigned i = 0; i < o->code_count; ++i) {
+        const spu_overlay_code_segment* c = &o->code[i];
+        for (uint32_t k = 0; k + 16 <= c->size; k += 4) {
+            if (!spu_lookup(c->lsa + k, o->image_id)) continue;
+            if (s_pic_sig_n >= SPU_PIC_SIG_N * 3 / 4) {
+                fprintf(stderr, "[spu-pic] signature table full: image %d is found by its EA only\n",
+                        o->image_id);
+                return;
+            }
+            uint64_t head[2];
+            memcpy(head, c->bytes + k, 16);
+            uint32_t h = spu_pic_sig_hash(head[0]);
+            while (s_pic_sig[h].used) h = (h + 1) & (SPU_PIC_SIG_N - 1);
+            s_pic_sig[h].head[0] = head[0]; s_pic_sig[h].head[1] = head[1];
+            s_pic_sig[h].src = (uint32_t)src;
+            s_pic_sig[h].off = c->lsa - o->load_lsa + k;
+            s_pic_sig[h].used = 1;
+            __atomic_store_n(&s_pic_sig_n, s_pic_sig_n + 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa)
+{
+    if ((lsa & 3) || lsa > SPU_LS_SIZE - 16) return NULL;
+    uint64_t head[2];
+    memcpy(head, ctx->ls + lsa, 16);
+    uint32_t h = spu_pic_sig_hash(head[0]);
+    if (!s_pic_sig[h].used) return NULL;   /* nearly every miss ends here */
+    /* Inside a resident span the span's image decides, even where it has no
+     * function: a module can carry a piece's bytes in its own code. */
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+        if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+            lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) return NULL;
+    for (; s_pic_sig[h].used; h = (h + 1) & (SPU_PIC_SIG_N - 1)) {
+        if (s_pic_sig[h].head[0] != head[0] || s_pic_sig[h].head[1] != head[1] || lsa < s_pic_sig[h].off)
+            continue;
+        const spu_ovl_src* o = &s_ovl_src[s_pic_sig[h].src];
+        const uint32_t place = lsa - s_pic_sig[h].off;   /* where the piece's load_lsa is now */
+        const uint32_t extent = spu_pic_code_extent(o);
+        if (extent > SPU_LS_SIZE - place) continue;
+        int match = 1;
+        for (unsigned i = 0; match && i < o->code_count; ++i)
+            match = !memcmp(ctx->ls + place + (o->code[i].lsa - o->load_lsa), o->code[i].bytes, o->code[i].size);
+        if (!match) {
+            static int on = -1; static long n;
+            if (on < 0) on = getenv("SPU_PIC_ADOPTLOG") ? 1 : 0;
+            if (on && (++n <= 32 || (n & 65535) == 0)) {
+                uint32_t at = 0, cnt = 0;
+                for (unsigned i = 0; i < o->code_count; ++i)
+                    for (uint32_t k = 0; k < o->code[i].size; ++k)
+                        if (ctx->ls[place + (o->code[i].lsa - o->load_lsa) + k] != o->code[i].bytes[k] && !cnt++)
+                            at = o->code[i].lsa - o->load_lsa + k;
+                fprintf(stderr, "[pic-adopt] candidate #%ld image=%d at LS 0x%05X: %u bytes differ, first at +0x%X\n",
+                        n, o->image_id, place, cnt, at);
+            }
+            continue;
+        }
+        /* A span the piece's bytes overlap is not there any more. */
+        int free_slot = -1;
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+            if (ctx->resident_code[slot].image_id &&
+                ctx->resident_code[slot].lsa < place + extent &&
+                place < ctx->resident_code[slot].lsa + ctx->resident_code[slot].size)
+                ctx->resident_code[slot].image_id = 0;
+            if (!ctx->resident_code[slot].image_id && free_slot < 0) free_slot = (int)slot;
+        }
+        spu_dcache_residency_changed(ctx);
+        if (free_slot < 0) return NULL;
+        ctx->resident_code[free_slot].lsa = place;
+        ctx->resident_code[free_slot].size = extent;
+        ctx->resident_code[free_slot].source_ea = 0;
+        ctx->resident_code[free_slot].image_id = o->image_id;
+        ctx->resident_code[free_slot].verify_state = SPU_OVERLAY_VERIFIED;
+        ctx->resident_code[free_slot].source_index = (int)s_pic_sig[h].src;
+        ctx->resident_code[free_slot].pic = 1;
+        ctx->resident_code[free_slot].pic_delta = place - o->load_lsa;
+        { static int on = -1; static long n;
+          if (on < 0) on = getenv("SPU_PIC_ADOPTLOG") ? 1 : 0;
+          if (on && (++n <= 64 || (n & 4095) == 0))
+              fprintf(stderr, "[pic-adopt] #%ld image=%d at LS 0x%05X (entry 0x%05X) pc=0x%05X\n",
+                      n, o->image_id, place, lsa, (uint32_t)ctx->pc & SPU_LS_MASK); }
+        const spu_lifted_fn f = (spu_lifted_fn)spu_lookup_memoized(o->load_lsa + s_pic_sig[h].off, o->image_id);
+        if (f) ctx->pic_base = place - o->load_lsa;
+        return f;
+    }
+    return NULL;
+}
+
 int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t lift_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
 {
     if (!spu_overlay_register_verified_region(content_ea, lift_lsa, span, image_id, code, count))
         return 0;
     s_ovl_src[s_ovl_src_count - 1].pic = 1;
+    spu_pic_sigs_add(s_ovl_src_count - 1);
     return 1;
 }
 

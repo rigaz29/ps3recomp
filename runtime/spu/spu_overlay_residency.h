@@ -35,7 +35,13 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
  * it has room: lifted once at lift_lsa, it is resident wherever a GET from
  * content_ea lands it. The segments are compared at that placement, and
  * dispatch into it runs the function registered at the same offset from
- * lift_lsa with ctx->pic_base set to the difference. */
+ * lift_lsa with ctx->pic_base set to the difference. A piece that arrives
+ * inside a GET from anywhere else is found by its bytes: where dispatch finds
+ * nothing and no resident span decides, 16 bytes that start one of the piece's
+ * lifted functions place the segments, and if they all match there that
+ * placement is resident (verified, with no source EA, so the next GET into it
+ * ends it). Give the instructions as the segments, not a constant pool the
+ * piece stores into. */
 int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t lift_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code,
     unsigned count);

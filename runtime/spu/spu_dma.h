@@ -262,6 +262,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_DMA_LSA=<lo>-<hi> (hex LS): each distinct GET (ea, size, lsa) that
+     * lands in [lo,hi), once -- where code that runs at a local-store address
+     * no transfer from the executable reaches came from. */
+    { static uint32_t s_llo = 1, s_lhi;
+      if (s_llo == 1) { const char* e = getenv("SPU_DMA_LSA"); s_llo = 0;
+          if (e) { char* d; s_llo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_lhi = (uint32_t)strtoul(d + 1, 0, 16); } }
+      if (s_lhi && (cmd & 0xF0) == 0x40 && lsa < s_lhi && lsa + size > s_llo) {
+          enum { N = 1024 };
+          static uint32_t k_ea[N], k_sz[N], k_ls[N]; static volatile long n;
+          int seen = 0;
+          for (long i = 0; i < n && i < N; i++)
+              if (k_ea[i] == (uint32_t)ea && k_sz[i] == size && k_ls[i] == lsa) { seen = 1; break; }
+          if (!seen) {
+              const long k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+              if (k < N) {
+                  k_ea[k] = (uint32_t)ea; k_sz[k] = size; k_ls[k] = lsa;
+                  fprintf(stderr, "[dma-lsa] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                          (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              }
+          } } }
     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
     { static uint32_t s_lo = 1, s_hi;

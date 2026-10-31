@@ -193,6 +193,8 @@ typedef struct {
     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
     int tex_cv[VP_TEX_UNITS];   /* pre-pass: OffRT holding unit u's RGBA8 target read as Y16_X16_FLOAT, -1 = none */
     int tex_ds[VP_TEX_UNITS];   /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
+    u32 srv_win;        /* pre-pass: the draw whose t0-t15 window this one binds (itself, or an
+                         * earlier draw of the batch with the same 16 views: srvq_commit) */
     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
@@ -334,6 +336,10 @@ typedef struct {
     u32 levels;         /* mip levels of res */
     int heap;           /* the texture heap res is placed in + 1, 0 = its own allocation */
     u64 hoff, hsize;    /* its block in that heap */
+    /* Views of res made in the view cache (srvc_tex), up to SRVC_VARIANTS
+     * format/swizzle/cube combinations; cleared when res goes (vp_tex_drop). */
+    u32 srv_fmt[4], srv_map[4];
+    u8 srv_cube[4], srv_n, srv_next;
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -6075,8 +6081,13 @@ static ID3D12Resource* tex_place(const D3D12_RESOURCE_DESC* td, int* heap, u64* 
 /* Release a slot's resources. Only ever a slot this batch has not bound: the
  * batches before it have run (rf_open waits for the GPU), so nothing in flight
  * reads them. */
+static u32 s_srvq_gen = 1;
+static void srvq_forget(ID3D12Resource* res);
 static void vp_tex_drop(VPTexSlot* t)
 {
+    t->srv_n = 0;
+    s_srvq_gen++;
+    if (t->res) srvq_forget(t->res);
     if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
     if (t->heap) { tex_heap_give(&s_theap[t->heap - 1], t->hoff, t->hsize); t->heap = 0; }
     if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
@@ -7643,10 +7654,204 @@ static void rsx_census_present(void)
     s_cen_mips = s_cen_binds = 0;
 }
 
+/* A draw's t0-t15 views, collected by the prepass instead of written one by
+ * one: a draw whose 16 views equal an earlier draw's in the same batch binds
+ * that draw's window, and only a new set is written, copied from the view
+ * cache below. Creating the views was 14 ms of the frame clock thread's
+ * ~55 ms a frame in God of War: Ascension's first level (~1,800 windows a
+ * frame, 16 views each, CreateShaderResourceView every time). Within a batch
+ * nothing a view names is released (releases wait for the next batch's GPU
+ * wait), so equal pointers are the same resources -- except a texture slot
+ * dropped to be made again at other dimensions, whose drop starts a new map
+ * (vp_tex_drop). A draw that samples an offscreen target neither shares nor lends its
+ * window: the draw pass may put a copy of its own target in it
+ * (RT_FEEDBACK). SRV_DEDUPE=0 writes every window as before. */
+typedef struct { ID3D12Resource* res; u32 fmt, mapping, cube; int ts; } SrvKey;   /* no padding: hashed and compared whole */
+#define SRVQ_MAP (2 * MAX_DRAWS)   /* a power of two, at most half full */
+typedef char srvq_map_pow2[(SRVQ_MAP & (SRVQ_MAP - 1)) == 0 ? 1 : -1];
+static SrvKey s_srvk[MAX_DRAWS][VP_TEX_UNITS];   /* each window's views, for the compare */
+static struct { u32 gen, hash, win; } s_srvq_map[SRVQ_MAP];
+/* s_srvq_gen (declared with vp_tex_drop): bumped at each batch and at each texture
+ * slot's release, so the map's entries are this batch's, and name only live views. */
+static int s_srvq_on;          /* collecting the window at s_srvq_base */
+static u32 s_srvq_base;
+static SrvKey s_srvq_keys[VP_TEX_UNITS];
+static u32 s_srvq_written, s_srvq_reused, s_srvq_copied, s_srvq_made;
+static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+                         UINT mapping, int cube);
+static void srv_create_at(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* res, DXGI_FORMAT fmt,
+                          UINT mapping, int cube);
+
+/* The view cache: a CPU-only heap holding the null view and each texture
+ * slot's views, copied into a draw's window (CopyDescriptors) instead of
+ * creating them there. A slot's views go with its resource (vp_tex_drop). */
+#define SRVC_VARIANTS 4
+static ID3D12DescriptorHeap* s_srvc_heap;
+static D3D12_CPU_DESCRIPTOR_HANDLE s_srvc_base;
+static int srvc_ready(void)
+{
+    static int failed;
+    if (s_srvc_heap) return 1;
+    if (failed || !s_d3d.device) return 0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd;
+    memset(&hd, 0, sizeof hd);
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 1 + VP_TEX_SLOTS * SRVC_VARIANTS;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
+                                                          (void**)&s_srvc_heap))) {
+        s_srvc_heap = NULL;
+        failed = 1;
+        fprintf(stderr, "[D3D12] view cache heap not made: views are created per draw%c", 10);
+        return 0;
+    }
+    s_srvc_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_srvc_heap, &s_srvc_base);
+    srv_create_at(s_srvc_base, NULL, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0);
+    return 1;
+}
+static D3D12_CPU_DESCRIPTOR_HANDLE srvc_at(u32 i)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = s_srvc_base;
+    h.ptr += (SIZE_T)i * s_d3d.srv_inc;
+    return h;
+}
+static D3D12_CPU_DESCRIPTOR_HANDLE srvc_tex(int ts, const SrvKey* k)
+{
+    VPTexSlot* t = &s_d3d.vp_tex[ts];
+    for (int v = 0; v < t->srv_n; v++)
+        if (t->srv_fmt[v] == k->fmt && t->srv_map[v] == k->mapping && t->srv_cube[v] == k->cube)
+            return srvc_at(1u + (u32)ts * SRVC_VARIANTS + (u32)v);
+    const int v = t->srv_n < SRVC_VARIANTS ? t->srv_n++ : (t->srv_next++ % SRVC_VARIANTS);
+    t->srv_fmt[v] = k->fmt; t->srv_map[v] = k->mapping; t->srv_cube[v] = (u8)k->cube;
+    const D3D12_CPU_DESCRIPTOR_HANDLE h = srvc_at(1u + (u32)ts * SRVC_VARIANTS + (u32)v);
+    srv_create_at(h, t->res, (DXGI_FORMAT)k->fmt, k->mapping, (int)k->cube);
+    s_srvq_made++;
+    return h;
+}
+static int srvq_dedupe_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SRV_DEDUPE"); v = e ? atoi(e) != 0 : 1; }
+    return v;
+}
+static void srvq_begin(u32 d)
+{
+    if (!srvq_dedupe_on()) return;
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        s_srvq_keys[u].res = NULL;
+        s_srvq_keys[u].fmt = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
+        s_srvq_keys[u].mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        s_srvq_keys[u].cube = 0;
+        s_srvq_keys[u].ts = -1;
+    }
+    s_srvq_base = DRAW_SRV_BASE + d * VP_TEX_UNITS;
+    s_srvq_on = 1;
+}
+/* A texture slot's resource released while a draw's views are being
+ * collected (the same texture bound again at other dimensions): what the
+ * draw named from it becomes the null view, not a view of freed memory. */
+static void srvq_forget(ID3D12Resource* res)
+{
+    if (!s_srvq_on) return;
+    for (int u = 0; u < VP_TEX_UNITS; u++)
+        if (s_srvq_keys[u].res == res) {
+            s_srvq_keys[u].res = NULL;
+            s_srvq_keys[u].fmt = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
+            s_srvq_keys[u].mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            s_srvq_keys[u].cube = 0;
+            s_srvq_keys[u].ts = -1;
+        }
+}
+static void srvq_commit(D3D12DrawRecord* dr, u32 d)
+{
+    if (!s_srvq_on) return;
+    s_srvq_on = 0;
+    int share = 1;
+    for (int u = 0; u < VP_TEX_UNITS; u++)
+        if (dr->tex_rt[u] >= 0 || dr->tex_cv[u] >= 0 || dr->tex_ds[u] >= 0) share = 0;
+    u32 h = 2166136261u;
+    if (share) {
+        const u32* w = (const u32*)s_srvq_keys;
+        for (size_t i = 0; i < sizeof s_srvq_keys / 4; i++) h = (h ^ w[i]) * 16777619u;
+        const u32 mask = SRVQ_MAP - 1;
+        for (u32 i = (h * 2654435761u) & mask;; i = (i + 1) & mask) {
+            if (s_srvq_map[i].gen != s_srvq_gen) break;
+            if (s_srvq_map[i].hash == h &&
+                !memcmp(s_srvk[s_srvq_map[i].win], s_srvq_keys, sizeof s_srvq_keys)) {
+                dr->srv_win = s_srvq_map[i].win;
+                s_srvq_reused++;
+                return;
+            }
+        }
+    }
+    memcpy(s_srvk[d], s_srvq_keys, sizeof s_srvq_keys);
+    /* The null view and texture slots' views are copied from the cache; the
+     * rest (targets, snapshots, copies) are made in place. */
+    D3D12_CPU_DESCRIPTOR_HANDLE dst[VP_TEX_UNITS], src[VP_TEX_UNITS];
+    UINT ones[VP_TEX_UNITS];
+    UINT n = 0;
+    const int cache = srvc_ready();
+    D3D12_CPU_DESCRIPTOR_HANDLE wbase;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &wbase);
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        const SrvKey* k = &s_srvq_keys[u];
+        const u32 slot = DRAW_SRV_BASE + d * VP_TEX_UNITS + (u32)u;
+        const int null_view = !k->res && k->fmt == (u32)DXGI_FORMAT_R8G8B8A8_UNORM &&
+                              k->mapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING && !k->cube;
+        if (cache && (null_view || (k->ts >= 0 && k->res && s_d3d.vp_tex[k->ts].res == k->res))) {
+            dst[n] = wbase; dst[n].ptr += (SIZE_T)slot * s_d3d.srv_inc;
+            src[n] = null_view ? srvc_at(0) : srvc_tex(k->ts, k);
+            ones[n] = 1;
+            n++;
+        } else {
+            srv_write_ex(slot, k->res, (DXGI_FORMAT)k->fmt, k->mapping, (int)k->cube);
+        }
+    }
+    if (n) {
+        s_d3d.device->lpVtbl->CopyDescriptors(s_d3d.device, n, dst, ones, n, src, ones,
+                                              D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        s_srvq_copied += n;
+    }
+    dr->srv_win = d;
+    s_srvq_written++;
+    if (share) {
+        const u32 mask = SRVQ_MAP - 1;
+        u32 i = (h * 2654435761u) & mask;
+        while (s_srvq_map[i].gen == s_srvq_gen) i = (i + 1) & mask;
+        s_srvq_map[i].gen = s_srvq_gen; s_srvq_map[i].hash = h; s_srvq_map[i].win = d;
+    }
+}
+
 /* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
- * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
+ * heap slot. Used to fill per-draw t0-t15 descriptor windows. */
 static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
                          UINT mapping, int cube)
+{
+    if (s_srvq_on && heap_slot - s_srvq_base < VP_TEX_UNITS) {
+        SrvKey* k = &s_srvq_keys[heap_slot - s_srvq_base];
+        k->res = res; k->fmt = (u32)fmt; k->mapping = mapping; k->cube = cube ? 1u : 0u;
+        k->ts = -1;
+        return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
+    h.ptr += (u64)heap_slot * s_d3d.srv_inc;
+    srv_create_at(h, res, fmt, mapping, cube);
+}
+
+/* A texture slot's view: through the view cache when the window is collected. */
+static void srv_write_tex(u32 heap_slot, int ts, DXGI_FORMAT fmt, UINT mapping, int cube)
+{
+    if (s_srvq_on && heap_slot - s_srvq_base < VP_TEX_UNITS) {
+        srv_write_ex(heap_slot, s_d3d.vp_tex[ts].res, fmt, mapping, cube);
+        s_srvq_keys[heap_slot - s_srvq_base].ts = ts;
+        return;
+    }
+    srv_write_ex(heap_slot, s_d3d.vp_tex[ts].res, fmt, mapping, cube);
+}
+
+static void srv_create_at(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* res, DXGI_FORMAT fmt,
+                          UINT mapping, int cube)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
@@ -7659,9 +7864,6 @@ static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
         sv.TextureCube.MostDetailedMip = 0;
         sv.TextureCube.ResourceMinLODClamp = 0.0f;
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
-    h.ptr += (u64)heap_slot * s_d3d.srv_inc;
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
 }
 
@@ -9253,6 +9455,7 @@ static void rf_open(void)
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
     for (int _i = 0; _i < s_tex_hw; _i++) s_d3d.vp_tex[_i].used = 0;
     s_rf.pre_done = s_rf.done = 0;
+    s_srvq_gen++;
 }
 
 /* The RT and texture prepass for records [from, to). */
@@ -9283,6 +9486,7 @@ static void rf_prepass(u32 from, u32 to)
                           ? blit_snap_get(dr->snap_ea) : -1;
         alias_note(dr);
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) dr->tex_ds[_u] = dr->tex_cv[_u] = -1;   /* set below for draws */
+        dr->srv_win = _d;
     }
     for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
@@ -9394,6 +9598,7 @@ static void rf_prepass(u32 from, u32 to)
               const u32 fo = cellGcmResolveLocated((dr->fp_addr & 3u) == 1, dr->fp_addr & ~3u);
               if (fo != 0xFFFFFFFFu) fp_units = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
           } }
+        srvq_begin(_d);
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -9530,7 +9735,7 @@ static void rf_prepass(u32 from, u32 to)
                         /* The upload's own format: an X16 font atlas bound
                          * as R8 over an R16 resource sampled nothing. */
                         DXGI_FORMAT sf = vp_tex_dxgi(dr->tex[_u].fmt);
-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
+                        srv_write_tex(wslot, ts, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
                                   _cube);
@@ -9551,6 +9756,7 @@ static void rf_prepass(u32 from, u32 to)
             srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         }
+        srvq_commit(dr, _d);
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
         /* Queue every build the frame needs before waiting for any: the draw
@@ -10156,7 +10362,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         off_rt_transition(dr->tex_cv[_u], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
-                gh.ptr += (u64)(DRAW_SRV_BASE + d * VP_TEX_UNITS) * s_d3d.srv_inc;
+                gh.ptr += (u64)(DRAW_SRV_BASE + dr->srv_win * VP_TEX_UNITS) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
                 if (s_d3d.samp_heap) {
                     D3D12_GPU_DESCRIPTOR_HANDLE sb;
@@ -10409,6 +10615,9 @@ static void render_frame(void)
                 s_shc_stat_compiled = s_shc_stat_hits = s_shc_stat_pso = 0;
                 s_shc_stat_compile_s = s_shc_stat_pso_s = 0.0;
             }
+            fprintf(stderr, "[PERF] texture view windows: %u written (%u views copied, %u made in the cache), %u shared%c",
+                    s_srvq_written, s_srvq_copied, s_srvq_made, s_srvq_reused, 10);
+            s_srvq_written = s_srvq_reused = s_srvq_copied = s_srvq_made = 0;
             fprintf(stderr, "[PERF] caches: %d vertex programs (%u replaced), %d fragment pipelines (%u dropped)%c",
                     s_d3d.vp_vs_n, s_perf_vs_replaced, s_d3d.vp_fp_n, s_perf_fp_dropped, 10);
             s_perf_vs_replaced = s_perf_fp_dropped = 0;

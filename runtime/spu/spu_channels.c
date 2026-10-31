@@ -2107,7 +2107,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; uint64_t sig64[2]; int has_sig; uint32_t span;
                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
                  int pic; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
@@ -2151,6 +2151,37 @@ static int spu_ovl_ea_known(uint32_t ea)
     for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
         if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return 0;
         if (s_ovl_ea_set[i] == ea) return 1;
+    }
+    return 1;   /* full (cannot happen): never filter */
+}
+
+/* A GET of 512 bytes or more was compared with every signature source's 16
+ * bytes, one memcmp call each: in God of War: Ascension's first level ~60
+ * sources, against every vertex block an EDGE job manager stages (~1.5 GB/s).
+ * The first 8 bytes of every registered signature go in an insert-only set
+ * built as the EA set above, so a GET whose first 8 bytes are in neither
+ * skips the scan; the scan compares the 16 bytes inline. */
+#define SPU_OVL_SIG_SET 1024u
+static uint64_t s_ovl_sig_set[SPU_OVL_SIG_SET];
+static uint8_t s_ovl_sig_used[SPU_OVL_SIG_SET];
+static unsigned spu_ovl_sig_slot(uint64_t k) { return (unsigned)((k * 0x9E3779B97F4A7C15ull) >> 54); }
+static void spu_ovl_sig_add(uint64_t k)
+{
+    for (unsigned i = spu_ovl_sig_slot(k), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_sig_set[i] == k) return;
+            continue;
+        }
+        s_ovl_sig_set[i] = k;
+        __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static int spu_ovl_sig_known(uint64_t k)
+{
+    for (unsigned i = spu_ovl_sig_slot(k), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_sig_set[i] == k) return 1;
     }
     return 1;   /* full (cannot happen): never filter */
 }
@@ -2367,8 +2398,10 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = 0;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
+        memcpy(s_ovl_src[s_ovl_src_count].sig64, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
-        s_ovl_src_count++;
+        spu_ovl_sig_add(s_ovl_src[s_ovl_src_count].sig64[0]);
+        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -2477,10 +2510,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
-    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+    /* A source matches by EA, or (512 bytes or more) by its 16-byte signature:
+     * with the EA in neither set and the head in no signature, none can. */
+    const int big = size >= 512;
+    uint64_t head[2] = { 0, 0 };
+    if (big) memcpy(head, ls, 16);
+    if (!spu_ovl_ea_known(ea) && (!big || !spu_ovl_sig_known(head[0]))) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+        int hit = o->has_sig ? (big && o->sig64[0] == head[0] && o->sig64[1] == head[1])
                              : (o->src_ea == ea);
         if (hit) {
             if (o->span) {

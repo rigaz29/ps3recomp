@@ -1105,6 +1105,18 @@ static void test_overlay_source_prefilter(void)
     check(c->resident_ovl == 5, "a small GET carrying a signature at an unregistered EA does not match");
     spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 512);
     check(c->resident_ovl == 330, "a 512-byte GET still matches by signature");
+    /* The signature set holds the first 8 bytes; the scan compares all 16. */
+    c->ls[0x20000 + 12] ^= 0xFF;
+    c->resident_ovl = 5;
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 512);
+    check(c->resident_ovl == 5, "a GET that differs from a signature in its last 8 bytes does not match");
+    c->ls[0x20000 + 12] ^= 0xFF;
+    c->ls[0x20000 + 3] ^= 0xFF;
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 4096);
+    check(c->resident_ovl == 5, "a large GET whose head is in no signature, at an unregistered EA, changes nothing");
+    c->ls[0x20000 + 3] ^= 0xFF;
+    spu_overlay_note_get(c, prefilter_ea(1), c->ls + 0x20000, 4096);
+    check(c->resident_ovl == 201, "a large GET at a registered EA is still scanned");
     for (int t = 0; t < 3; ++t) free(ctx[t]);
 }
 

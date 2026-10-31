@@ -3060,14 +3060,21 @@ void spu_indirect_branch(spu_context* ctx)
     /* SPU_JOB_CAPTURE: a policy module starting a job (spu_jobcap.c). */
     if (SPU_JOBCAP_ARMED())
         spu_jobcap_maybe_begin(ctx);
-    /* The common branch -- a target above the special addresses, no interrupt
-     * return pending, not the resolver-only image, no diagnostic set -- gets
+    /* The common branch -- a target above the special addresses, not an
+     * interrupt return, not the resolver-only image, no diagnostic set -- gets
      * what the full path below does for it: the task resolution, the lookup,
      * the stack-reset check and the call. The full path tests two dozen special
      * cases first, most behind statics; 3.7% of a RenderJobs worker's time.
      * A miss goes on to the full path, which repeats the resolution (it changes
-     * nothing the second time) and handles it. */
-    if (__builtin_expect(ctx->pc >= SPU_IB_PLAIN_LO && !ctx->irq_saved &&
+     * nothing the second time) and handles it.
+     *
+     * Inside an interrupt handler only the branch to the saved resume point can
+     * be the iret that spu_irq_regs_maybe_restore acts on; every other branch
+     * the handler makes is a common one. They all took the full path, and the
+     * Wws job manager takes ~4 interrupts a job (its DMA lists stall and
+     * notify): ~20 of an EDGE run's 27 full branches. */
+    if (__builtin_expect(ctx->pc >= SPU_IB_PLAIN_LO &&
+                         (!ctx->irq_saved || ctx->pc != (ctx->irq_resume_pc & SPU_LS_MASK)) &&
                          ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID && !spu_ib_diag(), 1)) {
         spu_ib_resolve_task(ctx);
         spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);

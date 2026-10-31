@@ -2386,6 +2386,11 @@ static int gcm_report_hold(void)
     return 0;
 }
 
+/* A hook the walker runs at each command header, for a port's probes
+ * (GowARecomp's RSX_SLOW lengthens the drain thread's own work through it, a
+ * slice at each command). NULL, as it stays without one: a load and a branch. */
+void (*g_gcm_walker_hook)(void) = NULL;
+
 /* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
  * on every semaphore method. getenv walks the whole environment and showed in
  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
@@ -2554,6 +2559,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        if (g_gcm_walker_hook) g_gcm_walker_hook();
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */

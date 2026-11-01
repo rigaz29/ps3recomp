@@ -184,6 +184,8 @@ typedef struct {
      * DRAW_LIMIT) would otherwise make every surviving draw read some other
      * object's MVP -- silently transforming it somewhere else entirely. */
     u32 cb_slot;
+    const u8* fp_snap;  /* its fragment program as recorded (fp_snapshot), or NULL */
+    u32 fp_snap_len;
     u32 fpcb_off;       /* its b1 slot in this frame's half of vp_fpcb */
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
@@ -4882,16 +4884,21 @@ static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char
  * sRGB keeps its colour textures sRGB-encoded too and has the fetch decode
  * them; without the decode they come out too light once the output encodes.
  * RSX_NO_SRGB=1 turns this off with the output side. */
-static u64 dr_gamma_key(const D3D12DrawRecord* dr)
+static u32 dr_gamma_mask(const D3D12DrawRecord* dr, int u)
 {
     static int no_srgb = -1;
     if (no_srgb < 0) no_srgb = getenv("RSX_NO_SRGB") ? 1 : 0;
-    if (no_srgb) return 0;
+    if (no_srgb || !dr->tex[u].set) return 0;
+    return rsx_texture_gamma_mask(dr->tex[u].fmt, dr->tex[u].ctrl1, dr->tex[u].filter,
+                                  dr->tex[u].addr) & 15u;
+}
+
+/* A program compiled with the masks in (FP_CONSTBUF=0) is keyed on them; a
+ * buffered one reads them from b1 (fp_tcscale[u].z, written at replay). */
+static u64 dr_gamma_key(const D3D12DrawRecord* dr)
+{
     u64 k = 0;
-    for (int u = 0; u < VP_TEX_UNITS; u++)
-        if (dr->tex[u].set)
-            k |= (u64)(rsx_texture_gamma_mask(dr->tex[u].fmt, dr->tex[u].ctrl1, dr->tex[u].filter,
-                                              dr->tex[u].addr) & 15u) << (4 * u);
+    for (int u = 0; u < VP_TEX_UNITS; u++) k |= (u64)dr_gamma_mask(dr, u) << (4 * u);
     return k;
 }
 
@@ -5087,6 +5094,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
     if (off == 0xFFFFFFFFu) return NULL;
+    /* The program as it was when the draw was recorded (fp_snapshot). */
+    const u8* prog = (udr && udr->fp_snap && udr->fp_addr == fp_addr) ? udr->fp_snap : vm_base + off;
+    const u32 prog_max = prog != vm_base + off ? udr->fp_snap_len : FP_MAX_BYTES;
 
     /* The key's program part. Buffered (the default): the shader reads the
      * program's inline constants from b1 (fp_constants[], refilled for every
@@ -5101,12 +5111,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         static int cb_on = -1;
         if (cb_on < 0) { const char* e = getenv("FP_CONSTBUF"); cb_on = !(e && e[0] == '0'); }
         u32 nk = 0;
-        const u64 sh = cb_on ? rsx_fp_structural_hash_n(vm_base + off, FP_MAX_BYTES, 1469598103934665603ull, &nk) : 0;
+        const u64 sh = cb_on ? rsx_fp_structural_hash_n(prog, prog_max, 1469598103934665603ull, &nk) : 0;
         if (sh && nk <= FP_CB_MAX_K) {
             buffered = 1;
             uhash = (u32)(sh ^ (sh >> 32));
         } else {
-            u32 usz = rsx_fp_program_size(vm_base + off, FP_MAX_BYTES);
+            u32 usz = rsx_fp_program_size(prog, prog_max);
             if (cb_on) {
                 static int _w = 0;
                 if (PS3_LOG_FIRST(_w, 8))
@@ -5114,10 +5124,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                                        : "[FP] fp=0x%08X: no end within %u bytes; constants compiled in%c",
                             fp_addr, sh ? nk : FP_MAX_BYTES, 10);
             }
-            if (usz == 0) usz = FP_MAX_BYTES;
+            if (usz == 0) usz = prog_max;
             s_perf_pso_hashbytes += (int)usz;
             uhash = 2166136261u;
-            const u8* up = vm_base + off;
+            const u8* up = prog;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         }
     }
@@ -5126,6 +5136,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * compiled in (its reference is fp_alpha.x, or a literal). NO_ALPHATEST=1
      * leaves it out. */
     if (buffered) unnorm = 0;
+    /* Nor, buffered, on the units' gamma decode or on which are cubes. The
+     * decode is chosen when the program runs (_rsx_gamma_dyn, its lanes in
+     * fp_tcscale[u].z), and every unit's coordinate takes its scale from b1,
+     * a cube's being 1 (dr_coord_scales); the buffered decompile declares the
+     * 2D array, which the cube rewrite below does not change. Compiled in,
+     * each combination of a program's bindings was a program of its own: God
+     * of War: Ascension with its MLAA off added 250-700 to the shader cache a
+     * run and skipped ~80K draws waiting for them. */
+    if (buffered) { gamma = 0; cube_mask = 0; }
     const u32 wpos_key = (!buffered && udr) ? udr->wpos_win : 0u;
     u32 atest = 0;
     if (udr && ((udr->alpha_ctl >> 16) & 1u) && ((udr->alpha_ctl >> 8) & 0xFFu) < 7u &&
@@ -5248,9 +5267,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int u = 0; u < VP_TEX_UNITS; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
     u32 nk = 0;
     int n = buffered
-        ? rsx_fp_decompile_buffered_color_ex(vm_base + off, FP_MAX_BYTES, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
-                                             hlsl, sizeof(hlsl), &nk)
-        : rsx_fp_decompile_color_ex(vm_base + off, FP_MAX_BYTES, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
+        ? rsx_fp_decompile_buffered_color_dyn_ex(prog, prog_max, fp_ctrl, 0u,
+                                                 hlsl, sizeof(hlsl), &nk)
+        : rsx_fp_decompile_color_ex(prog, prog_max, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
                                     hlsl, sizeof(hlsl));
     /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
      * before they reach an integer target. */
@@ -5279,6 +5298,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             return NULL;
         }
         hlsl_replace_all(hlsl, sizeof hlsl, from, to);
+        hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_gamma_mask(u) 0u\n",
+                         "#define _rsx_gamma_mask(u) ((uint)fp_tcscale[u].z)\n");
         fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~cube_mask, NULL);
     } else if (unnorm && udr) {
         float sc[VP_TEX_UNITS][2];
@@ -5321,7 +5342,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       if (PS3_LOG_FIRST(_d, _cap)) {
         FILE* f = fopen("fp_dump.hlsl", _d==1 ? "w" : "a");
         if (f) {
-            const u8* uc = vm_base + off;
+            const u8* uc = prog;
             fprintf(f, "/* fp_addr=0x%08X vmoff=0x%08X raw:", fp_addr, off);
             for (int _b = 0; _b < 32; _b++) fprintf(f, " %02X", uc[_b]);
             fprintf(f, " */\n%s\n", hlsl); fclose(f);
@@ -7008,6 +7029,58 @@ static void vp_record_raw_cb(u32 slot, const rsx_state* st)
 /* b1 slots taken from the half of vp_fpcb this frame's records use. */
 static u32 s_fpcb_used;
 
+/* The fragment programs as they were when their draws were recorded. The
+ * pipeline is built at the batch's end (vp_get_fp_pso), and by then a title
+ * may have written its next programs over them, once the walk has passed the
+ * label that frees the memory: God of War: Ascension with its MLAA off does,
+ * in 0.2% of the lookups (bursts of ~2,000 in a second). Built from those
+ * bytes a pipeline was a mix of two programs -- a wrong draw, and a shader
+ * never seen before every time (300-400 compiled a run, never settling). So a
+ * draw keeps its program's bytes: copied once a batch for each program
+ * address, again only if they changed, into a half of s_fpsnap taken by
+ * vp_parity as b1's slots are. FP_SNAPSHOT=0 reads them at the build, as
+ * before. */
+#define FP_SNAP_HALF  (4u << 20)
+#define FP_SNAP_SLOTS 1024u
+static u8* s_fpsnap;
+static u32 s_fpsnap_used, s_fpsnap_gen = 1;
+static struct { u32 addr, off, len, gen; } s_fpsnap_idx[FP_SNAP_SLOTS];
+
+static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
+{
+    static int on = -1;
+    dr->fp_snap = NULL;
+    dr->fp_snap_len = 0;
+    if (on < 0) { const char* e = getenv("FP_SNAPSHOT"); on = !(e && e[0] == '0'); }
+    if (!on) return;
+    if (!s_fpsnap && !(s_fpsnap = (u8*)malloc(2u * (size_t)FP_SNAP_HALF))) { on = 0; return; }
+    u8* half = s_fpsnap + (size_t)s_d3d.vp_parity * FP_SNAP_HALF;
+    const u32 slot = (dr->fp_addr * 2654435761u) >> 22;            /* FP_SNAP_SLOTS */
+    if (s_fpsnap_idx[slot].gen == s_fpsnap_gen && s_fpsnap_idx[slot].addr == dr->fp_addr &&
+        !memcmp(half + s_fpsnap_idx[slot].off, prog, s_fpsnap_idx[slot].len)) {
+        dr->fp_snap = half + s_fpsnap_idx[slot].off;
+        dr->fp_snap_len = s_fpsnap_idx[slot].len;
+        return;
+    }
+    const u32 len = rsx_fp_program_size(prog, FP_MAX_BYTES);
+    if (!len) return;                     /* no end: read at the build, as before */
+    if (s_fpsnap_used + len > FP_SNAP_HALF) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 4))
+            fprintf(stderr, "[D3D12] fragment program snapshots full this batch (%u bytes); the rest read at the build%c",
+                    s_fpsnap_used, 10);
+        return;
+    }
+    memcpy(half + s_fpsnap_used, prog, len);
+    s_fpsnap_idx[slot].addr = dr->fp_addr;
+    s_fpsnap_idx[slot].off = s_fpsnap_used;
+    s_fpsnap_idx[slot].len = len;
+    s_fpsnap_idx[slot].gen = s_fpsnap_gen;
+    dr->fp_snap = half + s_fpsnap_used;
+    dr->fp_snap_len = len;
+    s_fpsnap_used += (len + 15u) & ~15u;
+}
+
 static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -7023,7 +7096,11 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         int nk = 0;
         if (dr->fp_addr && vm_base) {
             const u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1, dr->fp_addr & ~0x3u);
-            if (foff != 0xFFFFFFFFu) nk = rsx_fp_collect_constants(vm_base + foff, FP_MAX_BYTES, &kb);
+            if (foff != 0xFFFFFFFFu) {
+                fp_snapshot(dr, vm_base + foff);
+                nk = rsx_fp_collect_constants(dr->fp_snap ? dr->fp_snap : vm_base + foff,
+                                              dr->fp_snap ? dr->fp_snap_len : FP_MAX_BYTES, &kb);
+            }
             if (nk < 0) nk = 0;
             if (nk > (int)FP_CB_MAX_K) nk = (int)FP_CB_MAX_K;
         }
@@ -10412,7 +10489,8 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     }
                 }
                 /* Per-draw constants: this draw's vp_cb, and its b1 slot with
-                 * the coordinate scale of each unit's texture as bound now. */
+                 * the coordinate scale of each unit's texture as bound now, and
+                 * in .z the lanes its fetches decode from sRGB (_rsx_gamma_dyn). */
                 if (s_d3d.vp_fpcb_mapped && !dr->is_clear) {
                     float sc[VP_TEX_UNITS][2];
                     dr_coord_scales(dr, sc);
@@ -10420,7 +10498,8 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         + (u64)s_d3d.vp_parity * FPCB_HALF + dr->fpcb_off);
                     for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                         ts[_u * 4 + 0] = sc[_u][0]; ts[_u * 4 + 1] = sc[_u][1];
-                        ts[_u * 4 + 2] = 0.0f;      ts[_u * 4 + 3] = 0.0f;
+                        ts[_u * 4 + 2] = (float)dr_gamma_mask(dr, _u);
+                        ts[_u * 4 + 3] = 0.0f;
                     }
                 }
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
@@ -10711,6 +10790,8 @@ static void render_frame(void)
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
     s_fpcb_used = 0;
+    s_fpsnap_used = 0;     /* and their program snapshots */
+    s_fpsnap_gen++;
 
     /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
      * into a readback buffer this frame and writes rt_save.bmp (half-float

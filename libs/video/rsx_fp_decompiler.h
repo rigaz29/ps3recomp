@@ -216,6 +216,16 @@ u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
 int rsx_fp_decompile_buffered_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count);
+/* As above, with the gamma decode chosen when the program runs: every
+ * TEX/TXP/TXB/TXL fetch without EXP_TEX is wrapped in _rsx_gamma_dyn(sample,
+ * unit), which decodes the lanes _rsx_gamma_mask(unit) names. The source
+ * defines _rsx_gamma_mask(u) as 0u; the backend redefines it to read the draw's
+ * masks, so that one shader serves every binding of the program, where the
+ * masks compiled in make one per combination. TXD, TEXBEM and TXPBEM fetches
+ * are not decoded (with compiled-in masks such a program is refused). */
+int rsx_fp_decompile_buffered_color_dyn_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count);
 /* Both: depth comparison per unit and post-filter gamma per unit. */
 /* Texture sign expansion (SET_TEXTURE_ADDRESS UNSIGNED_REMAP_BIASED):
  * expand_masks[u] is a post-remap RGBA lane mask of the lanes unit u

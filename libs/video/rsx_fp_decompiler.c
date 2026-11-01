@@ -627,6 +627,21 @@ static void fp_gamma_helper(Out* out)
         "                  (mask & 8u) ? decoded.a : v.a);\n}\n");
 }
 
+/* rsx_fp_decompile_buffered_color_dyn_ex: the decode with the lanes the
+ * program reads when it runs, so that one shader serves every binding of it.
+ * _rsx_gamma_mask(u) is 0 here; a backend using this entry point redefines it
+ * to read the draw's masks (the D3D12 backend: fp_tcscale[u].z). A uniform
+ * branch skips the decode on a unit without one. */
+static void fp_gamma_dyn_helper(Out* out)
+{
+    out_puts(out,
+        "#define _rsx_gamma_mask(u) 0u\n"
+        "float4 _rsx_gamma_dyn(float4 v, uint u) {\n"
+        "    const uint m = _rsx_gamma_mask(u);\n"
+        "    [branch] if (m == 0u) return v;\n"
+        "    return _rsx_gamma_input(v, m);\n}\n");
+}
+
 /* Texture sign expansion: units a TEX/TXP/TXB/TXL fetches from whose
  * expand mask is set. The same walk as the gamma one. */
 u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes,
@@ -684,11 +699,11 @@ static void fp_expand_helper(Out* out)
         "                  (mask & 8u) ? e.a : v.a);\n}\n");
 }
 
-static int rsx_fp_decompile_internal(
+static int rsx_fp_decompile_internal2(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
     int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
     const u8* expand_masks,
-    char* out, u32 out_size, u32* out_constant_count)
+    char* out, u32 out_size, u32* out_constant_count, int gamma_dyn)
 {
     rsx_fp_census_flush(); s_fpc_flags = 16;
     if (!ucode || !out || out_size == 0) return -1;
@@ -1134,6 +1149,13 @@ static int rsx_fp_decompile_internal(
             const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
                                         sample, gamma_masks[tex_unit] & 15u);
             if (length < 0 || (size_t)length >= sizeof rhs) return -1;
+        } else if (gamma_dyn && !(w0 & (1u << 21)) &&
+                   (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            /* rsx_fp_decompile_buffered_color_dyn_ex: the same fetches on every
+             * unit, the lanes read when the program runs. */
+            char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
+            const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_dyn(%s, %uu)", sample, tex_unit);
+            if (length < 0 || (size_t)length >= sizeof rhs) return -1;
         }
         /* Texture sign expansion (RPCS3 _process_texel). A unit whose
          * SET_TEXTURE_ADDRESS asks for UNSIGNED_REMAP_BIASED returns every
@@ -1406,7 +1428,9 @@ static int rsx_fp_decompile_internal(
      * so a program with branches can desynchronise them. God of War:
      * Ascension's level had programs that called _rsx_expand_input with no
      * definition and failed to compile. */
-    if (gamma_units || strstr(o.p, "_rsx_gamma_input(")) fp_gamma_helper(&p);
+    const int gamma_dyn_used = strstr(o.p, "_rsx_gamma_dyn(") != NULL;
+    if (gamma_units || gamma_dyn_used || strstr(o.p, "_rsx_gamma_input(")) fp_gamma_helper(&p);
+    if (gamma_dyn_used) fp_gamma_dyn_helper(&p);
     if (expand_units || bx2_units || strstr(o.p, "_rsx_expand_input(")) fp_expand_helper(&p);
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
@@ -1447,6 +1471,17 @@ static int rsx_fp_decompile_internal(
     memmove(out + p.len, out, o.len + 1);
     memcpy(out, preamble, p.len);
     return count;
+}
+
+static int rsx_fp_decompile_internal(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
+    const u8* expand_masks,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal2(ucode, max_bytes, ctrl, tex_cube_mask, tex_vol_mask, buffered,
+                                      shadow, gamma_masks, expand_masks, out, out_size,
+                                      out_constant_count, 0);
 }
 
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
@@ -1953,4 +1988,12 @@ int rsx_fp_decompile_buffered_color_ex(
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
         1, NULL, gamma_masks, NULL, out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_color_dyn_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal2(ucode, max_bytes, ctrl, tex_cube_mask, 0,
+        1, NULL, NULL, NULL, out, out_size, out_constant_count, 1);
 }

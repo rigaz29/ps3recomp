@@ -591,6 +591,46 @@ int main(void)
 
     }
 
+    /* rsx_fp_decompile_buffered_color_dyn_ex: the gamma decode read when the
+     * program runs, so one shader serves every binding. */
+    {
+        u8 prog[16];
+        char hlsl[16384], plain[16384];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(3) | END); /* TEX TC0, unit 3 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_color_dyn_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("gamma_dyn_wrapped", hlsl,
+              "_rsx_gamma_dyn(rsx_tex[3].Sample(rsx_samp[3], ((input.tc0).xyzw).xy), 3u)");
+        check("gamma_dyn_mask_macro", hlsl, "#define _rsx_gamma_mask(u) 0u\n");
+        check("gamma_dyn_helper", hlsl, "float4 _rsx_gamma_dyn(float4 v, uint u)");
+        check("gamma_dyn_branch", hlsl, "[branch] if (m == 0u) return v;");
+        check("gamma_dyn_decode", hlsl, "float4 _rsx_gamma_input(float4 v, uint mask)");
+        /* The macro comes before the helper that reads it. */
+        check_true("gamma_dyn_order",
+                   strstr(hlsl, "#define _rsx_gamma_mask") < strstr(hlsl, "float4 _rsx_gamma_dyn"));
+        /* The compiled-in entry point, with no masks, is as it was. */
+        rsx_fp_decompile_buffered_color_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, plain, sizeof plain, &nk);
+        check_absent("gamma_dyn_static_untouched", plain, "_rsx_gamma");
+        /* ...and with a mask it compiles that mask in. */
+        u8 gamma[16] = {0}; gamma[3] = 0x7;
+        rsx_fp_decompile_buffered_color_ex(prog, sizeof prog, CTRL_32BIT, 0, gamma, plain, sizeof plain, &nk);
+        check("gamma_static_wrapped", plain,
+              "_rsx_gamma_input(rsx_tex[3].Sample(rsx_samp[3], ((input.tc0).xyzw).xy), 7u)");
+        check_absent("gamma_static_no_dyn", plain, "_rsx_gamma_dyn");
+        /* EXP_TEX (_bx2) skips the decode, here as there. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(3) | (1u << 21) | END);
+        rsx_fp_decompile_buffered_color_dyn_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_absent("gamma_dyn_bx2", hlsl, "_rsx_gamma_dyn(");
+        check("gamma_dyn_bx2_expands", hlsl, "_rsx_expand_input(rsx_tex[3].Sample(");
+        /* A program without a fetch has neither helper. */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_color_dyn_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_absent("gamma_dyn_no_fetch", hlsl, "_rsx_gamma");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -10513,9 +10513,18 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 }
                 if (dr->zq_op) { zq_op_replay(dr); continue; }
                 if (!dr->is_clear) zq_before_draw();
+                /* The targets and depth surface this draw binds (as the retarget
+                 * below picks them): a copy of one of those is not refreshed here
+                 * -- not of whatever the draw before left bound. */
+                const int own_rt = (dr->rt_off && !dr->no_color) ? off_rt_find(dr->rt_off) : -1;
+                int own_m[3];
+                for (int _m = 0; _m < 3; _m++)
+                    own_m[_m] = (dr->rt_mrt[_m] && !dr->no_color) ? off_rt_find(dr->rt_mrt[_m]) : -1;
+                const int own_z = (dr->zeta_off && (own_rt >= 0 || dr->no_color)) ? off_ds_find(dr->zeta_off) : -1;
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     if (dr->is_clear || dr->tex_cv[_u] < 0 || dr->tex_rt[_u] < 0 ||
-                        dr->tex_rt[_u] == cur_rt)
+                        dr->tex_rt[_u] == own_rt || dr->tex_rt[_u] == own_m[0] ||
+                        dr->tex_rt[_u] == own_m[1] || dr->tex_rt[_u] == own_m[2])
                         continue;
                     y16_convert(dr->tex_rt[_u], dr->tex_cv[_u], dr->tex[_u].w, dr->tex[_u].h);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
@@ -10527,7 +10536,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 }
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     const int ds = dr->tex_ds[_u];
-                    if (ds < 0 || ds == cur_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
+                    if (ds < 0 || ds == own_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
                         continue;
                     ds_convert(ds, dr->tex_rt[_u]);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);

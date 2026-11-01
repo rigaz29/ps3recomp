@@ -3857,10 +3857,11 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                         r->sc_x, r->sc_y, r->sc_w, r->sc_h);
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
-                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X sc=%u,%u,%ux%u z=0x%X zs=0x%llX\n",
+                            "n=%u cmask=%X blend=%d srgb=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X surf=0x%X sc=%u,%u,%ux%u z=0x%X zs=0x%llX\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
-                        r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
+                        r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend,
+                        (r->fp_ctrl & FP_CTRL_SRGB_OUT) ? 1 : 0, r->blend_key,
                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw, r->surf_a,
                         r->sc_x, r->sc_y, r->sc_w, r->sc_h, r->zeta_off, (unsigned long long)r->zs_key);
                 if (r->dbt) {

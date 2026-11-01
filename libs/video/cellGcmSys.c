@@ -377,8 +377,76 @@ void (*cellGcm_zpass_observer)(int op, u32 value_ea);   /* op 0: clear, 1: repor
 #define ZP_N 16384u
 #define ZP_PROBE 64u     /* a full table costs a bounded search, then a reuse */
 static u32 s_zp_ea[ZP_N], s_zp_count[ZP_N];
+/* GCM_ZPASS_TRACE=<from_ms>:<count>: from <from_ms> after the start, the next
+ * <count> events of the ZPASS reports, with the time and the walker's flip
+ * count: W the walker writes a report at GET_REPORT (the value it writes),
+ * R the GPU's count reaches it (the value it replaces), S an SPU GET that
+ * covers reports (its range and how many). A diagnostic. */
+static int s_zt_on = -1;
+static unsigned long long s_zt_from;
+static volatile long s_zt_left;
+#define ZT_SET 8192u
+static u32 s_zt_ea[ZT_SET];
+static u8 s_zt_page[65536 / 8];      /* 64 KB pages that hold a report */
+static int zt_active(void)
+{
+    extern unsigned long long ps3_ms_now(void);
+    if (s_zt_on < 0) {
+        const char* e = getenv("GCM_ZPASS_TRACE");
+        unsigned long a = 0, b = 0;
+        s_zt_on = e && sscanf(e, "%lu:%lu", &a, &b) == 2 && b > 0;
+        s_zt_from = a; s_zt_left = (long)b;
+    }
+    return s_zt_on && s_zt_left > 0 && ps3_ms_now() >= s_zt_from;
+}
+static void zt_add(u32 value_ea)
+{
+    s_zt_page[(value_ea >> 16) >> 3] |= (u8)(1u << ((value_ea >> 16) & 7u));
+    u32 h = (value_ea >> 4) * 2654435761u;
+    for (u32 i = 0; i < 64; i++) {
+        const u32 j = (h + i) & (ZT_SET - 1u);
+        if (s_zt_ea[j] == value_ea) return;
+        if (!s_zt_ea[j]) { s_zt_ea[j] = value_ea; return; }
+    }
+}
+static int zt_has(u32 value_ea)
+{
+    u32 h = (value_ea >> 4) * 2654435761u;
+    for (u32 i = 0; i < 64; i++) {
+        const u32 j = (h + i) & (ZT_SET - 1u);
+        if (s_zt_ea[j] == value_ea) return 1;
+        if (!s_zt_ea[j]) return 0;
+    }
+    return 0;
+}
+static void zt_spu_get(uint32_t ea, uint32_t size)
+{
+    if (!size || !(s_zt_page[(ea >> 16) >> 3] & (1u << ((ea >> 16) & 7u)))) return;
+    if (!zt_active()) return;
+    u32 n = 0, first = 0;
+    for (u32 a = (ea & ~15u) + 8u; a < ea + size; a += 16u)
+        if (zt_has(a)) { if (!n) first = a; n++; }
+    if (!n) return;
+    extern unsigned long long ps3_ms_now(void);
+    __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[zt] S %llu f=%u ea=0x%08X size=%u reports=%u first=0x%08X\n",
+            ps3_ms_now(), s_flip_request_count, ea, size, n, first);
+}
+static void zt_init_observer(void)
+{
+    extern void (*g_spu_get_observer)(uint32_t ea, uint32_t size);
+    static int done;
+    if (!done) { done = 1; if (s_zt_on < 0) (void)zt_active(); if (s_zt_on) g_spu_get_observer = zt_spu_get; }
+}
+
 void cellGcm_zpass_result(u32 value_ea, u32 count)
 {
+    if (s_zt_on && zt_active()) {
+        extern unsigned long long ps3_ms_now(void);
+        __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[zt] R %llu f=%u ea=0x%08X count=%u was=%u\n",
+                ps3_ms_now(), s_flip_request_count, value_ea, count, vm_read32(value_ea));
+    }
     const u32 h = (value_ea >> 4) * 2654435761u;
     u32 k = h & (ZP_N - 1u);
     for (u32 i = 0; i < ZP_PROBE; i++) {
@@ -2478,6 +2546,14 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
     if (m == 0x1A8) s_report_dma = v;
     /* NV4097_CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT): a query starts. */
     if (m == 0x17C8 && v == 1u && cellGcm_zpass_observer) cellGcm_zpass_observer(0, 0);
+    /* GCM_ZPASS_TRACE: CLEAR_REPORT_VALUE 0x17C8, SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC,
+     * SET_ZCULL_STATS_ENABLE 0x1804, SET_RENDER_ENABLE 0x1E98. */
+    if ((m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98) && s_zt_on > 0 && zt_active()) {
+        extern unsigned long long ps3_ms_now(void);
+        __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[zt] M %llu f=%u m=0x%04X v=0x%08X fifo=0x%08X\n",
+                ps3_ms_now(), s_flip_request_count, m, v, s_fifo_getoff);
+    }
     if (m == 0x1800) {
         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
         u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
@@ -2490,6 +2566,19 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
             if (rea) {
                 const int zp = (v >> 24) == 1u && cellGcm_zpass_observer;
                 if (zp) gcm_zpass_last(rea + 8u, &val);
+                if (zp) {
+                    zt_init_observer();
+                    if (s_zt_on) {
+                        zt_add(rea + 8u);
+                        if (zt_active()) {
+                            extern unsigned long long ps3_ms_now(void);
+                            __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
+                            fprintf(stderr, "[zt] W %llu f=%u ea=0x%08X wrote=%u was=%u fifo=0x%08X\n",
+                                    ps3_ms_now(), s_flip_request_count, rea + 8u, val, vm_read32(rea + 8u),
+                                    s_fifo_getoff);
+                        }
+                    }
+                }
                 vm_write32(rea, (u32)(ts >> 32));
                 vm_write32(rea + 4u, (u32)ts);
                 vm_write32(rea + 8u, val);

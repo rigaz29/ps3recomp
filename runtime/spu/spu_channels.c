@@ -1170,6 +1170,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 }
 #endif
 
+/* Told of every SPU GET before its copy, when set (a port's or library's
+ * probe: cellGcmSys.c's GCM_ZPASS_TRACE). NULL: one load and a branch. */
+void (*g_spu_get_observer)(uint32_t ea, uint32_t size) = NULL;
+
 static int channel_is_mfc(uint32_t ch)
 {
     switch (ch) {

@@ -696,6 +696,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
         /* GET: main memory -> local store */
+        { extern void (*g_spu_get_observer)(uint32_t ea, uint32_t size);
+          if (g_spu_get_observer) g_spu_get_observer((uint32_t)ea, size); }
         memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */

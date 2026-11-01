@@ -34,6 +34,7 @@ ps3_guest_caller_fn g_ps3_guest_caller;
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 u32 g_rsx_last_reference;
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+void (*g_spu_get_observer)(uint32_t ea, uint32_t size);
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void spurs_debug_dump(const char* why) { (void)why; }

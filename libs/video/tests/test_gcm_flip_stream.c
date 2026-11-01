@@ -48,6 +48,7 @@ ps3_guest_caller_fn g_ps3_guest_caller;
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 u32 g_rsx_last_reference;
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+void (*g_spu_get_observer)(uint32_t ea, uint32_t size);
 void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
 /* gcm_fifo_next_segment wakes the drain thread; this fixture has none, and
  * runtime/platform/win32_compat.c is not linked. */

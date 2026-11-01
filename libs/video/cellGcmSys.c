@@ -1766,12 +1766,69 @@ static void gcm_pp_patched(u32 io, u32 size)
     if (gcm_park_prof_secs()) s_pp_patch = gcm_pp_now_us();
 }
 
+/* With GCM_PARK_DUMP_MS, every SPU PUT into RSX-visible memory also goes into a
+ * ring: where, how much, when, and who wrote it (gcm_spu_put_who_hook, set by
+ * the port: the SPURS workload the writing worker runs, -1 for an SPU thread
+ * outside SPURS). A park dump then lists what the SPUs wrote into the park's
+ * MB before it stood, and what last covered the park's offset in the other
+ * MBs, so a hole an EDGE job never filled can be told from one it filled late
+ * or somewhere else. */
+#define GCM_PUT_TRACE_N 262144u   /* ~18 s at the menu's ~14K PUTs a second, audio included */
+static struct { u32 io, size, t_ms; int who; } s_put_tr[GCM_PUT_TRACE_N];
+static u32 s_put_tr_w;
+/* And the main-memory GET_REPORTs the walker wrote: the command's FIFO offset,
+ * the report's EA, the value, when. A park dump lists the newest with each
+ * slot as it reads now, so a slot re-armed after its report landed (its last
+ * word nonzero again) shows. */
+#define GCM_REP_TRACE_N 512u
+static struct { u32 fifo, ea, val, t_ms; } s_rep_tr[GCM_REP_TRACE_N];
+static u32 s_rep_tr_w;
+/* And its NV406E semaphore releases: the label offset, the value written and
+ * the one it replaced (equal: two releases with no consumer in between), the
+ * FIFO offset, when. */
+#define GCM_SEM_TRACE_N 512u
+static struct { u32 off, val, old, fifo, t_ms; } s_sem_tr[GCM_SEM_TRACE_N];
+static u32 s_sem_tr_w;
+/* The ring, the newest 8 releases of each label (a label released at every
+ * ring segment would otherwise fill the listing), with each label as it reads
+ * now. Also called by a port's own dumps. */
+void gcm_sem_ring_dump(void)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const u32 ns = s_sem_tr_w, now = (u32)ps3_ms_now();
+    u32 offs[16], cnt[16]; int no = 0;
+    fprintf(stderr, "[park-dump] %u semaphore releases; per label the newest 8 (value, value it replaced, "
+                    "FIFO offset, the label now, age):\n", ns);
+    for (u32 k = 1; k <= ns && k <= GCM_SEM_TRACE_N; k++) {
+        const u32 i = (ns - k) % GCM_SEM_TRACE_N, off = s_sem_tr[i].off;
+        int j = 0;
+        while (j < no && offs[j] != off) j++;
+        if (j == no) { if (no == 16) continue; offs[no] = off; cnt[no] = 0; no++; }
+        if (cnt[j]++ >= 8) continue;
+        fprintf(stderr, "[park-sem] off 0x%03X val %08X old %08X%s fifo %08X | now %08X | %u ms ago\n",
+                off, s_sem_tr[i].val, s_sem_tr[i].old, s_sem_tr[i].old == s_sem_tr[i].val ? " (same)" : "       ",
+                s_sem_tr[i].fifo, vm_read32(GCM_LABEL_GUEST_BASE + off), now - s_sem_tr[i].t_ms);
+    }
+}
+int (*gcm_spu_put_who_hook)(void);
+static unsigned long long gcm_park_dump_ms(void);
+static void gcm_put_trace(u32 io, u32 size)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const u32 i = __atomic_fetch_add(&s_put_tr_w, 1u, __ATOMIC_RELAXED) % GCM_PUT_TRACE_N;
+    s_put_tr[i].io = io;
+    s_put_tr[i].size = size;
+    s_put_tr[i].t_ms = (u32)ps3_ms_now();
+    s_put_tr[i].who = gcm_spu_put_who_hook ? gcm_spu_put_who_hook() : -1;
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
+    if (gcm_park_dump_ms()) gcm_put_trace(io, size);
 
     /* Coalesce with the previous block when an SPU emits one buffer in several
      * transfers -- otherwise only the last fragment is remembered and the
@@ -1800,6 +1857,18 @@ static unsigned long long gcm_park_dump_ms(void)
 /* The title's own state for a park dump, set by the port (main.cpp): the
  * runtime does not know its job lists. */
 void (*gcm_park_dump_hook)(void);
+/* GCM_PARK_STALL_MS=<ms> (off by default): once a self-JUMP park has stood
+ * that long with put elsewhere, and again every <ms> while it stands, the
+ * port's gcm_park_stall_hook is called with the park and how long it has
+ * stood. The runtime cannot tell what the hole waits on; a port that knows the
+ * title's job lists can (GowARecomp re-kicks a stranded EDGE list). */
+void (*gcm_park_stall_hook)(u32 park_io, unsigned long long stood_ms);
+static unsigned long long gcm_park_stall_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_STALL_MS"); ms = e ? atoll(e) : 0; }
+    return (unsigned long long)ms;
+}
 static void gcm_park_dump(u32 off, u32 put, unsigned long long ms)
 {
     fprintf(stderr, "[park-dump] parked at 0x%08X, put 0x%08X, %llu ms; last SPU blocks (newest first):", off, put, ms);
@@ -1809,6 +1878,77 @@ static void gcm_park_dump(u32 off, u32 put, unsigned long long ms)
     }
     fprintf(stderr, "\n");
     gcm_fifo_dump_around(off);
+    /* The park and what follows it: a hole the SPU half filled shows words
+     * after the self-JUMP. */
+    fprintf(stderr, "[park-dump] words from the park:");
+    for (u32 k = 0; k < 32; k++) {
+        const u32 ea = gcm_io2ea(off + 4u * k);
+        fprintf(stderr, " %08X", ea ? vm_read32(ea) : 0xDEADDEADu);
+    }
+    fprintf(stderr, "\n[park-dump] the park's offset in the MBs around it:");
+    for (int d = -6; d <= 6; d++) {
+        const u32 io = off + (u32)(d * 0x100000), ea = d ? gcm_io2ea(io) : 0;
+        if (ea) fprintf(stderr, " %08X=%08X", io, vm_read32(ea));
+    }
+    fprintf(stderr, "\n");
+    {
+        extern unsigned long long ps3_ms_now(void);
+        const u32 w = __atomic_load_n(&s_put_tr_w, __ATOMIC_RELAXED), now = (u32)ps3_ms_now();
+        const u32 mb = off & ~0xFFFFFu, low = off & 0xFFFFFu;
+        int shown = 0, other = 0;
+        fprintf(stderr, "[park-dump] %u SPU PUTs traced; the newest into the park's MB, and every "
+                        "one over its offset in another MB:\n", w);
+        for (u32 k = 1; k <= GCM_PUT_TRACE_N && k <= w; k++) {
+            const u32 i = (w - k) % GCM_PUT_TRACE_N;
+            const u32 io = s_put_tr[i].io, sz = s_put_tr[i].size;
+            const int same = (io & ~0xFFFFFu) == mb;
+            const u32 tgt = (io & ~0xFFFFFu) | low;
+            const int over = tgt >= io && tgt - io < sz;
+            if (same ? shown >= 64 : (!over || other >= 24)) continue;
+            if (same) shown++; else other++;
+            fprintf(stderr, "[park-put] io %08X+%-5X w%-2d %6u ms ago%s\n", io, sz, s_put_tr[i].who,
+                    now - s_put_tr[i].t_ms,
+                    over ? (same ? "  <-- over the park" : "  (over its offset)") : "");
+        }
+        fprintf(stderr, "[park-dump] the 12 newest SPU PUTs anywhere:");
+        for (u32 k = 1; k <= 12 && k <= w; k++) {
+            const u32 i = (w - k) % GCM_PUT_TRACE_N;
+            fprintf(stderr, " %08X+%X/w%d/%ums", s_put_tr[i].io, s_put_tr[i].size, s_put_tr[i].who,
+                    now - s_put_tr[i].t_ms);
+        }
+        fprintf(stderr, "\n");
+        const u32 nr = s_rep_tr_w;
+        gcm_sem_ring_dump();
+        fprintf(stderr, "[park-dump] %u main-memory reports; the newest (FIFO offset, EA, value; the slot "
+                        "now: timer, value, last word; age):\n", nr);
+        for (u32 k = 1; k <= 24 && k <= nr && k <= GCM_REP_TRACE_N; k++) {
+            const u32 i = (nr - k) % GCM_REP_TRACE_N, ea = s_rep_tr[i].ea;
+            fprintf(stderr, "[park-rep] fifo %08X ea %08X val %X | now %08X%08X %08X %08X | %u ms ago\n",
+                    s_rep_tr[i].fifo, ea, s_rep_tr[i].val, vm_read32(ea), vm_read32(ea + 4u),
+                    vm_read32(ea + 8u), vm_read32(ea + 12u), now - s_rep_tr[i].t_ms);
+        }
+    }
+    /* GET_REPORT headers (one argument, subchannel 0) and self-JUMPs in the
+     * FIFO from 256 KB before the park to 512 KB after it, matched by value
+     * (a data word can look like either). */
+    {
+        int nrep = 0, npark = 0;
+        fprintf(stderr, "[park-dump] around the park: GET_REPORT R@io(arg) and parks P@io:");
+        for (u32 io = off >= 0x40000u ? off - 0x40000u : 0u; io < off + 0x80000u; io += 4u) {
+            const u32 ea = gcm_io2ea(io);
+            if (!ea) { io = (io | 0xFFFFFu) - 3u; continue; }
+            const u32 wd = vm_read32(ea);
+            if (wd == 0x00041800u && nrep < 64) {
+                const u32 ea2 = gcm_io2ea(io + 4u);
+                fprintf(stderr, " R@%08X(%08X)", io, ea2 ? vm_read32(ea2) : 0u);
+                nrep++;
+            } else if ((wd & 0xE0000003u) == 0x20000000u && (wd & 0x1FFFFFFCu) == io && npark < 64) {
+                fprintf(stderr, " P@%08X", io);
+                npark++;
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     extern void spurs_debug_dump(const char* why);
     spurs_debug_dump("park");
     if (gcm_park_dump_hook) gcm_park_dump_hook();
@@ -2337,6 +2477,12 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
                 vm_write32(rea + 8u, val);
                 vm_write32(rea + 12u, 0u);
                 if (zp) cellGcm_zpass_observer(1, rea + 8u);
+                if (gcm_park_dump_ms()) {
+                    extern unsigned long long ps3_ms_now(void);
+                    const u32 i = s_rep_tr_w++ % GCM_REP_TRACE_N;
+                    s_rep_tr[i].fifo = s_fifo_getoff; s_rep_tr[i].ea = rea; s_rep_tr[i].val = val;
+                    s_rep_tr[i].t_ms = (u32)ps3_ms_now();
+                }
             } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
             s_report_data[idx].timestamp = ts;
@@ -2726,6 +2872,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 gcm_park_dump(s_fifo_getoff, put, now - park_since);
                             }
                         } }
+                      { static unsigned long long stall_last;
+                        const unsigned long long sms = gcm_park_stall_ms();
+                        if (sms && gcm_park_stall_hook && park_off == s_fifo_getoff && park_put == put &&
+                            now - park_since >= sms && now - stall_last >= sms) {
+                            stall_last = now;
+                            gcm_park_stall_hook(s_fifo_getoff, now - park_since);
+                        } }
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
                       } else if (now - park_since >= gcm_park_grace_ms() &&
@@ -2837,6 +2990,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         if (!gcm_get_eq_put())
                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
                         atomic_thread_fence(memory_order_release);
+                        if (gcm_park_dump_ms()) {
+                            extern unsigned long long ps3_ms_now(void);
+                            const u32 i = s_sem_tr_w++ % GCM_SEM_TRACE_N;
+                            s_sem_tr[i].off = s_sema_offset & 0xFFFFu; s_sem_tr[i].val = v;
+                            s_sem_tr[i].old = vm_read32(la); s_sem_tr[i].fifo = s_fifo_getoff;
+                            s_sem_tr[i].t_ms = (u32)ps3_ms_now();
+                        }
                         vm_write32(la, v);
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }

@@ -385,6 +385,7 @@ unsigned ppu_thread_prof_pc(unsigned tid)
  * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
  * iterate guest threads without depending on ppu_thread_info's layout. */
 static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+static ppu_context* s_prof_main_ctx;  /* and that context, for ppu_threads_dump */
 
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
@@ -410,12 +411,41 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
+    if (!in_range) {
+        s_prof_main_pc = lr;
+        /* Guest callbacks run on host threads with contexts of their own;
+         * only the main thread's is kept for the dump. */
+        if (((ppu_context*)vctx)->thread_id == 1) s_prof_main_ctx = (ppu_context*)vctx;
+        return;
+    }
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 0))
         fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
                 vctx, (void*)g_ppu_threads, in_range, lr); }
     if (in_range)
         t->prof_pc = lr;
+}
+
+/* For a hang dump: each live guest thread's name, the lv2 syscall it is in
+ * (0 for none; g_sc_inflight), its last syscall/HLE call site and its guest
+ * registers and call chain (ppu_dump_guest_stack). The main thread's context
+ * is the one its last syscall or HLE call ran on. */
+void ppu_threads_dump(const char* why)
+{
+    extern void ppu_dump_guest_stack(ppu_context*, const char*);
+    extern uint32_t g_sc_inflight[64];
+    char tag[128];
+    if (s_prof_main_ctx) {
+        snprintf(tag, sizeof tag, "%s tid=1 main sc=%u last=0x%08X", why, g_sc_inflight[1], s_prof_main_pc);
+        ppu_dump_guest_stack(s_prof_main_ctx, tag);
+    }
+    for (int i = 1; i < PPU_THREAD_MAX; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state != PPU_THREAD_STATE_RUNNING && t->state != PPU_THREAD_STATE_DETACHED) continue;
+        snprintf(tag, sizeof tag, "%s tid=%d %s sc=%u last=0x%08X", why, i + 1, t->name,
+                 i + 1 < 64 ? g_sc_inflight[i + 1] : 0u, t->prof_pc);
+        ppu_dump_guest_stack(&t->ctx, tag);
+    }
+    fflush(stderr);
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)

@@ -9,6 +9,7 @@
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
+#include <stdarg.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1223,6 +1224,26 @@ int spu_taskset_round_busy(uint32_t* taskset_ea, uint32_t* taskId)
     return busy;
 }
 
+/* For a hang dump: each task that works in signal-driven rounds, whether it
+ * is parked in WAIT_SIGNAL (and on which wait object) or busy, and whether its
+ * signal bit is set. */
+void spu_taskset_rounds_dump(void)
+{
+    fprintf(stderr, "[park-tasks] round tasks (taskset/id):");
+    const int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+    for (int i = 0; i < SPU_ROUND_MAX; i++) {
+        const uint64_t key = s_round[i];
+        if (!key) continue;
+        int parked = -1;
+        for (int j = 0; j < hw && parked < 0; j++) if (s_parked[j] == key) parked = j;
+        const uint32_t ts = (uint32_t)(key >> 32), tid = (uint32_t)key - 1u;
+        fprintf(stderr, " %08X/%u:%s%s", ts, tid, parked >= 0 ? "parked" : "busy",
+                spurs_bitset_test(ts + CSTS_SIGNALLED, tid) ? "+signal" : "");
+        if (parked >= 0 && s_parked_obj[parked]) fprintf(stderr, "(obj %08X)", s_parked_obj[parked]);
+    }
+    fprintf(stderr, "\n");
+}
+
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
@@ -1382,6 +1403,45 @@ static void spu_taskset_wake_written(void* opaque)
 #endif
 }
 
+/* SPU_SIG_RING=1: SPU_SIG_TRACE's lines go into a ring instead of stderr, and
+ * spu_sig_ring_dump prints the newest at a hang dump. Printing each one as it
+ * happens slows the very tasks whose timing the trace is after. */
+#define SPU_SIG_RING_N 8192
+static char s_sig_ring[SPU_SIG_RING_N][224];
+static volatile long s_sig_ring_w;
+static int spu_sig_ring_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_SIG_RING") ? 1 : 0;
+    return on;
+}
+void spu_sig_note(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (spu_sig_ring_on()) {
+        const long i = __atomic_fetch_add(&s_sig_ring_w, 1, __ATOMIC_RELAXED) % SPU_SIG_RING_N;
+        vsnprintf(s_sig_ring[i], sizeof s_sig_ring[i], fmt, ap);
+    } else {
+        vfprintf(stderr, fmt, ap);
+    }
+    va_end(ap);
+}
+void spu_sig_ring_dump(int last)
+{
+    const long w = __atomic_load_n(&s_sig_ring_w, __ATOMIC_RELAXED);
+    long from = w - last;
+    if (from < 0) from = 0;
+    if (w - from > SPU_SIG_RING_N) from = w - SPU_SIG_RING_N;
+    fprintf(stderr, "[park-sig] the newest %ld of %ld [sig] lines:\n", w - from, w);
+    for (long k = from; k < w; k++) {
+        const char* l = s_sig_ring[k % SPU_SIG_RING_N];
+        fputs(l, stderr);
+        if (!*l || l[strlen(l) - 1] != '\n') fputc('\n', stderr);
+    }
+    fflush(stderr);
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 /* SPU_SIG_TRACE=<ea>[,<ea>...] (hex, up to 8): 128-byte lines to follow --
  * a taskset (its signalled bitset is at +0x40), a barrier, a control block.
@@ -1410,8 +1470,8 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     if (!taskset_ea || taskId >= 128) return;
     if (spu_sig_trace_hit(taskset_ea)) {   /* SPU_SIG_TRACE */
         extern unsigned long long ps3_ms_now(void);
-        fprintf(stderr, "[sig] %llu SIGNAL task=%08X/%u from the runtime (caller %p)\n",
-                ps3_ms_now(), taskset_ea, taskId, __builtin_return_address(0));
+        spu_sig_note("[sig] %llu SIGNAL task=%08X/%u from the runtime (caller %p)\n",
+                     ps3_ms_now(), taskset_ea, taskId, __builtin_return_address(0));
     }
     /* Update before taking s_sig_lock: watched-line notifications run under
      * lock-line and take s_sig_lock, so lock-line must never nest inside it. */

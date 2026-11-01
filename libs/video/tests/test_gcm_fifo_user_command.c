@@ -32,6 +32,7 @@ u32 g_rsx_last_reference;
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
+void spurs_debug_dump(const char* why) { (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 /* No microcode or constant runs here: the walker hands every word to

@@ -2075,6 +2075,36 @@ extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
     fflush(stderr);
 }
 
+/* With SPU_SIG_RING=1, PPU_WWATCH's stores go into the ring that
+ * runtime/spu/spu_workload.c keeps (spu_sig_note). A build without that file
+ * (the loader fixtures) gets this default instead, which prints the line. Weak
+ * as ppu_hle_register_all is in ppu_hle.cpp. */
+#include <stdarg.h>
+static void spu_sig_note_print(const char* fmt, va_list ap) { vfprintf(stderr, fmt, ap); }
+#if defined(_MSC_VER)
+extern "C" void spu_sig_note_default(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    spu_sig_note_print(fmt, ap);
+    va_end(ap);
+}
+extern "C" void spu_sig_note(const char* fmt, ...);
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/alternatename:_spu_sig_note=_spu_sig_note_default")
+#  else
+#    pragma comment(linker, "/alternatename:spu_sig_note=spu_sig_note_default")
+#  endif
+#else
+extern "C" void spu_sig_note(const char* fmt, ...) __attribute__((weak));
+extern "C" void spu_sig_note(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    spu_sig_note_print(fmt, ap);
+    va_end(ap);
+}
+#endif
 /* Called once PPU_WWATCH has been parsed, so both watches cover the same line. */
 static void ww_arm_inline_window(uint32_t ww)
 {
@@ -2193,11 +2223,21 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
                * as three different guest functions. ctx->lr is written by the
                * lifter at every direct call site, so it names the real caller. */
               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
-                              " lr=0x%08X tid=%u\n",
-                      a, v, width, ppu_prof_resolve_host(ra),
-                      g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
-                      g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
+              /* SPU_SIG_RING=1: into the SPU_SIG_TRACE ring, in order with the
+               * SPU commits to the same lines. */
+              static int s_ring = -1;
+              if (s_ring < 0) s_ring = getenv("SPU_SIG_RING") ? 1 : 0;
+              if (s_ring)
+                  spu_sig_note("[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X lr=0x%08X tid=%u\n",
+                               a, v, width, ppu_prof_resolve_host(ra),
+                               g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
+                               g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
+              else
+                  fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
+                                  " lr=0x%08X tid=%u\n",
+                          a, v, width, ppu_prof_resolve_host(ra),
+                          g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
+                          g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
               /* On the first write to the watched word, dump the guest caller
                * chain so the origin of a null field can be walked up-stack. */
               extern void ppu_dump_guest_stack(ppu_context*, const char*);

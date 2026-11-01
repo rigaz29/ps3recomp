@@ -56,6 +56,7 @@ BOOL SetEvent(HANDLE h) { (void)h; return 1; }
 #endif
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
+void spurs_debug_dump(const char* why) { (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
 /* ZSTENCIL_CLEAR_VALUE writes as each consumer of the methods saw them. */
 static u32 g_zs_state[4], g_zs_engine[4];

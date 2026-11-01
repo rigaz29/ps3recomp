@@ -2891,6 +2891,37 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
                                       u32* old, u32 compare, u32 value)
 { return spurs_ready_exchange(spurs, wid, old, compare, value, 1); }
 
+/* For a port's stall recovery: raise workload wid's signal bit as an SPU's
+ * cellSpursSendWorkloadSignal does (a commit to the instance's first line
+ * under the lock-line lock, no instance lock), and wake the coordinator. */
+void spurs_signal_workload(u32 spurs_ea, u32 wid)
+{
+    struct SpursInst* si = spurs_inst_find(spurs_ea);
+    if (!si || wid >= SPURS_MAX_WID) return;
+    spu_lockline_lock();
+    const u32 a = spurs_ea + wkl_signal_off(wid);
+    ef_w16(a, (u16)(vm_read16(a) | wkl_signal_bit(wid)));
+    ef_line_end(spurs_ea);
+    si->idle[wid] = 0;
+    WakeConditionVariable(&si->wake);
+}
+
+/* Whether workload wid is neither running nor asked for: no SPU in it, a
+ * ready count of 0, no signal, and not the receiver of a raised flag. 1 yes,
+ * 0 no, -1 no such workload. Plain reads: a hint for a stall probe. */
+int spurs_workload_unkicked(u32 spurs_ea, u32 wid)
+{
+    struct SpursInst* si = spurs_inst_find(spurs_ea);
+    if (!si || wid >= SPURS_MAX_WID || !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != spurs_ea)
+        return -1;
+    if (si->active[wid]) return 0;
+    if (vm_read8(spurs_ea + wkl_ready_off(wid))) return 0;
+    if (vm_read16(spurs_ea + wkl_signal_off(wid)) & wkl_signal_bit(wid)) return 0;
+    if (vm_read8(spurs_ea + SPURS_WKL_FLAG_RECV) == wid && vm_read32(spurs_ea + SPURS_WKL_FLAG_WORD) == 0)
+        return 0;
+    return 1;
+}
+
 s32 cellSpursWakeUp(CellSpurs* spurs)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;

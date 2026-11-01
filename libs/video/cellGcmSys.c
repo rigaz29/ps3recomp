@@ -2579,8 +2579,13 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
     /* NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE: the counter counts only while on. */
     if (m == 0x17CC && cellGcm_zpass_observer) cellGcm_zpass_observer(2, v != 0u, 0);
     /* GCM_ZPASS_TRACE: CLEAR_REPORT_VALUE 0x17C8, SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC,
-     * SET_ZCULL_STATS_ENABLE 0x1804, SET_RENDER_ENABLE 0x1E98. */
-    if ((m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98) && s_zt_on > 0 && zt_active()) {
+     * SET_ZCULL_STATS_ENABLE 0x1804, SET_RENDER_ENABLE 0x1E98; and what the title can
+     * synchronise on: NV406E SET_REFERENCE 0x50, SEMAPHORE_OFFSET 0x64, _ACQUIRE 0x68,
+     * _RELEASE 0x6C; NV4097 SET_SEMAPHORE_OFFSET 0x1D6C, BACK_END_WRITE_SEMAPHORE_RELEASE
+     * 0x1D70, TEXTURE_READ_SEMAPHORE_RELEASE 0x1D74. */
+    if ((m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98 || m == 0x50 || m == 0x64 ||
+         m == 0x68 || m == 0x6C || m == 0x1D6C || m == 0x1D70 || m == 0x1D74) &&
+        s_zt_on > 0 && zt_active()) {
         extern unsigned long long ps3_ms_now(void);
         __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
         fprintf(stderr, "[zt] M %llu f=%u m=0x%04X v=0x%08X fifo=0x%08X\n",

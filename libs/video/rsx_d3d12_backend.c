@@ -4055,6 +4055,22 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
         cap_readback_write(r->res, r->w, r->h, r->dxgi, r->st, fi, path);
     }
+    /* RSX_CAP_MEM=<ea>:<bytes>[,...]: those guest memory ranges as they are
+     * (mem_<ea>.bin), e.g. the CPU-written tables a frame samples. */
+    { const char* e = getenv("RSX_CAP_MEM");
+      extern uint8_t* vm_base;
+      while (e && *e && vm_base) {
+          char* end = NULL;
+          const unsigned long ea = strtoul(e, &end, 16);
+          if (end == e || *end != ':') break;
+          const unsigned long len = strtoul(end + 1, &end, 0);
+          if (len && len <= (64ul << 20)) {
+              snprintf(path, sizeof path, "%s/mem_%08lX.bin", dir, ea);
+              FILE* f = fopen(path, "wb");
+              if (f) { fwrite(vm_base + ea, 1, len, f); fclose(f); }
+          }
+          e = (*end == ',') ? end + 1 : NULL;
+      } }
     if (cap_raw_on())
         for (int i = 0; i < MAX_OFF_DS; i++) {
             if (!s_d3d.off_ds[i].res) continue;
@@ -7385,6 +7401,21 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
           fa[2] = ((wv >> 16) & 0xFu) ? -0.5f : 0.0f;
           fa[3] = 0.0f; }
         if (dr->fp_addr) {
+            /* FPK_PICK=<hex fp>[:<every>]: that program's inline constants as its
+             * draws get them, every <every>th draw (30), 200 times. A diagnostic. */
+            { static int init = 0; static u32 want = 0, every = 30, seen = 0, shown = 0;
+              if (!init) { init = 1; const char* e = getenv("FPK_PICK");
+                  if (e) { char* end = NULL; want = (u32)strtoul(e, &end, 16);
+                           if (end && *end == ':') every = (u32)strtoul(end + 1, NULL, 10); if (!every) every = 1; } }
+              if (want && dr->fp_addr == want && shown < 200 && (seen++ % every) == 0) {
+                  shown++;
+                  extern unsigned cellGcm_flip_request_count(void);
+                  fprintf(stderr, "[FPKPICK] flip=%u nk=%u", cellGcm_flip_request_count(), nk);
+                  for (u32 i = 0; i < nk && i < 32; i++)
+                      fprintf(stderr, " c%u=(%g %g %g %g)", i, ts[(FPCB_CONSTS + i) * 4 + 0], ts[(FPCB_CONSTS + i) * 4 + 1],
+                              ts[(FPCB_CONSTS + i) * 4 + 2], ts[(FPCB_CONSTS + i) * 4 + 3]);
+                  fprintf(stderr, "%c", 10);
+              } }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the

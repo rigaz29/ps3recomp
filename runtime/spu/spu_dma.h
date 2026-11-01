@@ -289,9 +289,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
       if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
           static int _n = 0;
-          if (PS3_LOG_FIRST(_n, 64))
-              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+          if (PS3_LOG_FIRST(_n, 64)) {
+              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              /* A PUT: its first bytes, as the SPU writes them. */
+              if ((cmd & 0xF0) == 0x20 && size >= 16) {
+                  fprintf(stderr, " data");
+                  for (uint32_t i = 0; i < 16; i++)
+                      fprintf(stderr, "%s%02X", (i & 3) ? "" : " ", spu->ls[(lsa + i) & SPU_LS_MASK]);
+              }
+              fprintf(stderr, "\n");
+          }
           /* SPU_DMA_RANGE_UNIQ=1: also each distinct (ea, size, lsa), once --
            * the set of pieces a job streams and where each one lands. */
           { static int on = -1;

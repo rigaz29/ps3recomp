@@ -7826,16 +7826,21 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
      * render-target buffers (wave fills the height fields with texels of
      * (0,0,0, 1.0f) -- the .w is 'inverse of mass'; from an all-zero GPU
      * resource the water simulation can never boot). Guest data is
-     * big-endian and tightly packed. */
+     * big-endian and tightly packed. RSX_RT_READ=0 leaves it empty instead
+     * (RPCS3's Read Color Buffers off): God of War: Ascension composites its
+     * scene target before drawing a scene into it on its first loading
+     * frames, and the old data in that memory showed as a band of noise. */
     {
         extern uint8_t* vm_base;
         extern u32 cellGcmResolveOffset(u32);
+        static int rt_read = -1;
+        if (rt_read < 0) { const char* e = getenv("RSX_RT_READ"); rt_read = (e && atoi(e) == 0) ? 0 : 1; }
         u32 bpp = (want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u :
                   (want_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16u :
                   (want_fmt == DXGI_FORMAT_R32_FLOAT) ? 4u : 4u;
         u32 pitch = (w * bpp + 255) & ~255u;
         u32 src = cellGcmResolveOffset(off & ~DISP_RT_TAG);
-        if (vm_base && src != 0xFFFFFFFFu) {
+        if (rt_read && vm_base && src != 0xFFFFFFFFu) {
             D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bd = {0};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;

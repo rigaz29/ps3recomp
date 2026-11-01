@@ -51,6 +51,9 @@ LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 LIFTER_ARGS = []
 # Modules lifted without --merge-chunks (--merge-skip).
 MERGE_SKIP = set()
+# --insn-patches, by module name.
+INSN_PATCHES = {}
+INSN_PATCHES_DONE = set()
 BASE   = 0x4000
 
 # Per-module code/data boundary, keyed by the module's content hash -- so this
@@ -257,7 +260,7 @@ def module_seeds(raw, base=BASE, name=None):
 
 
 def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
-                base=BASE):
+                base=BASE, patches=None):
     """Lift one module image at `base` into <outdir>/<name>/. Returns its
     manifest entry, or None if the lifter failed. `base` is the LS address the
     module is linked for -- module_base() reads it out of the header, and it is
@@ -282,6 +285,11 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     if merge_chunks:
         cmd += ["--merge-chunks"]
     cmd += LIFTER_ARGS
+    if patches:                            # --insn-patches: this module's
+        pfile = os.path.join(outdir, "_insn_patches.json")
+        with open(pfile, "w") as f:
+            json.dump({"patches": patches}, f, indent=1)
+        cmd += ["--insn-patches", pfile]
     inside = module_seeds(raw, base, name)
     if code_end:
         inside = [a for a in inside if int(a, 0) < code_end]
@@ -291,6 +299,9 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     if r.returncode != 0:
         print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
         return None
+    for line in r.stdout.splitlines():     # --insn-patches: what landed, what did not
+        if "insn patch" in line:
+            print(f"  {name}: {line.strip()}")
     # parse stats from lifter stdout
     funcs = unsup = 0
     for line in r.stdout.splitlines():
@@ -388,6 +399,11 @@ def main():
                          "without it. A merged run has internal branches, so none of its "
                          "functions gets a --float-spec body; a module whose time is in "
                          "such bodies is faster unmerged. Repeatable.")
+    ap.add_argument("--insn-patches", metavar="FILE", default=None,
+                    help="SPU instructions lifted in both forms behind a guard the port sets "
+                         '(spu_lifter.py --insn-patches): {"patches": [{"module", "addr", "orig", '
+                         '"new", "guard"}]}, addr the local-store address in that module. A '
+                         "module named that is not lifted stops the run.")
     ap.add_argument("--float-spec", type=int, default=0, metavar="N",
                     help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
                          "each function with no store, channel op, call or internal branch "
@@ -396,6 +412,10 @@ def main():
     if args.float_spec:
         LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
     MERGE_SKIP.update(n.strip() for spec in args.merge_skip for n in spec.split(",") if n.strip())
+    if args.insn_patches:
+        for e in json.load(open(args.insn_patches)).get("patches", []):
+            INSN_PATCHES.setdefault(e["module"], []).append(
+                {k: e[k] for k in ("addr", "orig", "new", "guard", "optional") if k in e})
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
@@ -422,7 +442,9 @@ def main():
         raw = open(path, "rb").read()
         name = os.path.splitext(os.path.basename(path))[0]         # jobmod_<sha>_e<entry>
         m = lift_module(raw, name, OUTDIR, tmp_elf, args.merge_chunks and name not in MERGE_SKIP,
-                        base=module_base(raw))
+                        base=module_base(raw), patches=INSN_PATCHES.get(name))
+        if m and name in INSN_PATCHES:
+            INSN_PATCHES_DONE.add(name)
         if m:
             manifest.append(m)
 
@@ -434,6 +456,7 @@ def main():
     tot_unsup = sum(m["unsupported"] for m in manifest)
     print(f"\nLifted {len(manifest)} module(s), {tot_unsup} total unsupported instruction(s)")
     print(f"Manifest: {os.path.join(OUTDIR, 'jobmods_manifest.json')}")
+    insn_patches_check()
 
 
 def lift_engine_elf(args, register_c):
@@ -461,7 +484,10 @@ def lift_engine_elf(args, register_c):
         if code_end is None:
             print(f"  SKIP {name}: no reachable code", file=sys.stderr)
             continue
-        m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks and name not in MERGE_SKIP, code_end)
+        m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks and name not in MERGE_SKIP, code_end,
+                        patches=INSN_PATCHES.get(name))
+        if m and name in INSN_PATCHES:
+            INSN_PATCHES_DONE.add(name)
         if not m:
             continue
         m.update(ea=eas[0], eas=eas, code_end=code_end)
@@ -475,6 +501,18 @@ def lift_engine_elf(args, register_c):
     tot_unsup = sum(m["unsupported"] for m in manifest)
     print(f"\nLifted {len(manifest)} module(s), {tot_unsup} total unsupported instruction(s)")
     print(f"Manifest: {os.path.join(args.out, 'jobmods_manifest.json')}")
+    insn_patches_check()
+
+
+def insn_patches_check():
+    """--insn-patches naming a module that was not lifted stops the run, unless
+    all its patches are optional."""
+    missing = sorted(set(INSN_PATCHES) - INSN_PATCHES_DONE)
+    required = [m for m in missing if not all(e.get("optional") for e in INSN_PATCHES[m])]
+    if required:
+        sys.exit("--insn-patches: no module lifted for " + ", ".join(required))
+    for m in missing:
+        print(f"  optional insn patches for {m}: the module was not lifted, not applied")
 
 # Image ids for the job-code overlays. Well clear of the fingerprint-dispatched
 # images (1..25), the FMOD overlays (60..65) and the taskset policy (100).

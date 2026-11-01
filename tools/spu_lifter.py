@@ -267,6 +267,39 @@ _HOIST_BARRIER = {"brsl", "brasl", "bisl", "bisled", "bi", "bid", "bie", "biz", 
                   "bihz", "bihnz", "iret", "stop", "stopd", "rdch", "wrch", "rchcnt"}
 
 
+# --insn-patches: a replacement keeps the control flow the function was lifted
+# with and stays among the registers: no branch, hint, call, return, channel op,
+# stop, sync or halt.
+_PATCH_REFUSED = _HOIST_BARRIER | {
+    "br", "bra", "brz", "brnz", "brhz", "brhnz", "hbr", "hbra", "hbrr",
+    "sync", "syncc", "dsync", "heq", "heqi", "hgt", "hgti", "hlgt", "hlgti"}
+
+
+def load_insn_patches(path):
+    """Read an --insn-patches file, local-store addresses of the image lifted:
+
+        {"patches": [{"addr": "0xDAF4", "orig": "0x18264284", "new": "0x40800004",
+                      "guard": "g_port_flag", "optional": false, "note": "..."}, ...]}
+
+    -> ({addr: (orig, new, guard)}, {the optional addrs}). An optional patch may
+    lie outside the lifted code (where the image is never lifted, it would run
+    interpreted, unpatched): that is reported, not an error."""
+    with open(path) as f:
+        spec = json.load(f)
+    out, optional = {}, set()
+    for e in spec.get("patches", []):
+        addr = int(str(e["addr"]), 0)
+        guard = str(e["guard"])
+        if not re.fullmatch(r"[A-Za-z_]\w*", guard):
+            sys.exit(f"[spu_lifter] {path}: guard {guard!r} is not a C identifier")
+        if addr & 3 or addr in out:
+            sys.exit(f"[spu_lifter] {path}: bad or duplicate address 0x{addr:X}")
+        out[addr] = (int(str(e["orig"]), 0) & 0xFFFFFFFF, int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
+        if e.get("optional"):
+            optional.add(addr)
+    return out, optional
+
+
 # RRR (4-operand) SPU ops write their destination in bits 21-27; the low 7 bits
 # (raw & 0x7F) are the RC *source* for these. Every other format writes bits 0-6.
 _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
@@ -577,6 +610,12 @@ class SPULifter:
         # before the loop (_shufb_hoists).
         self.shufb_hoist = os.environ.get("SPU_LIFT_NO_SHUFB_HOIST") != "1"
         self._shufb_pre = {}
+        # --insn-patches: {LS address: (original word, replacement word, guard)},
+        # each lifted as `if (guard) { replacement } else { original }`
+        # (_patched_translate); the addresses that landed in a function.
+        self.insn_patches = {}
+        self.insn_patches_optional = set()
+        self.insn_patches_landed = set()
 
     def _shufb_hoists(self, insns, start, end, labels):
         """The loops of [start, end) whose shufb controls can be prepared once.
@@ -611,6 +650,11 @@ class SPULifter:
             if any(i.mnemonic in _HOIST_BARRIER for i in loop):
                 continue
             written = {_dest_reg(i) for i in loop if i.mnemonic not in _NO_RT_WRITE}
+            for i in loop:                     # --insn-patches: either form may run
+                if i.addr in self.insn_patches:
+                    alt = spu_decode(self.insn_patches[i.addr][1], i.addr)
+                    if alt.mnemonic not in _NO_RT_WRITE:
+                        written.add(_dest_reg(alt))
             for i in loop:
                 if i.mnemonic == "shufb" and (i.raw & 0x7F) not in written:
                     rc = i.raw & 0x7F
@@ -657,7 +701,8 @@ class SPULifter:
                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
                     f"{{ {self._pset()}ctx->pc = {self._A(insn.addr)}; g_spu_trampoline_fn = "
                     f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
-            c = self._translate(insn, func)
+            patch = self.insn_patches.get(insn.addr)
+            c = self._patched_translate(insn, func, patch) if patch else self._translate(insn, func)
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
@@ -774,6 +819,28 @@ class SPULifter:
                            + [f"    u128 spu_r{r} = ctx->gpr[{r}];" if r in entry else f"    u128 spu_r{r};"
                               for r in sorted(seen)]
                            + out)
+
+    def _patched_translate(self, insn, func, patch):
+        """--insn-patches: both forms of a patched instruction, chosen when the
+        code runs: `if (guard) { replacement } else { original }`, the guard an
+        int the port defines and sets. A static recompilation never runs the
+        local store's words, so a patch written there does nothing to lifted
+        code; this one needs no second lift. The original must be the word the
+        patch expects (a patch for one build of a module must never land on
+        another), and the replacement may not change the control flow or
+        leave the registers (_PATCH_REFUSED)."""
+        orig, new, guard = patch
+        if insn.raw != orig:
+            sys.exit(f"[spu_lifter] insn patch at 0x{insn.addr:X}: the image has 0x{insn.raw:08X}, "
+                     f"the patch expects 0x{orig:08X} (another build of it?)")
+        alt = spu_decode(new, insn.addr)
+        alt_c = self._translate(alt, func) if alt.mnemonic not in _PATCH_REFUSED else ""
+        if not alt_c or "TODO" in alt_c or "spu_unsupported" in alt_c:
+            sys.exit(f"[spu_lifter] insn patch at 0x{insn.addr:X}: the replacement 0x{new:08X} "
+                     f"({alt.mnemonic}) cannot be lifted as one")
+        self.insn_patches_landed.add(insn.addr)
+        return (f"if ({guard}) {{ {alt_c} }} else {{ {self._translate(insn, func) or ';'} }}"
+                f"  /* insn patch 0x{insn.addr:X}: {orig:08X} -> {new:08X} */")
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -1279,6 +1346,10 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        guards = sorted({g for _, _, g in self.insn_patches.values()})
+        if guards:
+            lines.append("/* --insn-patches: their guards, set by the port before this code runs. */")
+            lines += [f"extern int {g};" for g in guards] + [""]
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             # --float-spec: the ordinary body becomes the exact copy the speculative one
@@ -1387,6 +1458,11 @@ def main() -> None:
                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                         "which append a zlib inflate string table + float tables "
                         "after the code at 0xAE68 / 0xAE48).")
+    p.add_argument("--insn-patches", metavar="FILE", default=None,
+                   help="Instructions lifted in both forms behind a guard the port sets: "
+                        '{"patches": [{"addr", "orig", "new", "guard"}]} with local-store '
+                        "addresses of this image. The original must be the word there; the "
+                        "replacement may not branch, call, hint, stop or use a channel.")
     p.add_argument("--no-shufb-hoist", action="store_true",
                    help="Keep every shufb as it is. By default a shufb whose control "
                         "register a loop never writes gets the control prepared once, "
@@ -1541,6 +1617,8 @@ def main() -> None:
     lifter.float_spec = args.float_spec
     if args.no_shufb_hoist:
         lifter.shufb_hoist = False
+    if args.insn_patches:
+        lifter.insn_patches, lifter.insn_patches_optional = load_insn_patches(args.insn_patches)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1573,6 +1651,16 @@ def main() -> None:
               f"(--merge-chunks, max {args.max_group_insns} insns)")
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
+    if lifter.insn_patches:
+        missing = set(lifter.insn_patches) - lifter.insn_patches_landed
+        required = sorted(missing - lifter.insn_patches_optional)
+        if required:
+            sys.exit("[spu_lifter] insn patch(es) in no lifted function: "
+                     + ", ".join(f"0x{a:X}" for a in required))
+        for a in sorted(missing):
+            print(f"  optional insn patch at 0x{a:X}: in no lifted function, not applied "
+                  f"(code there would run interpreted)")
+        print(f"  {len(lifter.insn_patches_landed)} insn patch(es), lifted both ways")
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)

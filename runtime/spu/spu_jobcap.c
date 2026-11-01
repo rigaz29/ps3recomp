@@ -70,6 +70,9 @@
 
 SPU_THREAD_LOCAL int t_spu_jobcap;
 SPU_THREAD_LOCAL int t_spu_pm_img = -1;
+#ifdef PS3_SPU_JOBCAP
+SPU_THREAD_LOCAL uint64_t t_spu_js[SPU_JS_N];
+#endif
 int g_spu_jobcap_armed;
 
 extern void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size);
@@ -160,6 +163,10 @@ static volatile int64_t s_time_last;
 static SPU_THREAD_LOCAL uint64_t t_time_t0;
 static SPU_THREAD_LOCAL uint32_t t_time_wid;
 static SPU_THREAD_LOCAL spu_context* t_time_ctx;
+#ifdef PS3_SPU_JOBCAP
+static SPU_THREAD_LOCAL uint64_t t_js0[SPU_JS_N];   /* t_spu_js at the job's start */
+static volatile int64_t s_js[32][SPU_JS_N];
+#endif
 void (*g_spu_job_mark_hook)(int in_job);
 
 static void jc_time_report(uint64_t now)
@@ -185,6 +192,29 @@ static void jc_time_report(uint64_t now)
         }
         fprintf(stderr, "[jobtime]   w%-2d %8.0f jobs/s  %8.1f us/job  median < %u us  p90 < %u us\n",
                 w, n / win, (double)sum / (double)n, 1u << p50, 1u << p90);
+#ifdef PS3_SPU_JOBCAP
+        { int64_t s[SPU_JS_N]; const double q = 1.0 / (double)n;
+          for (int j = 0; j < SPU_JS_N; j++) s[j] = __atomic_exchange_n(&s_js[w][j], 0, __ATOMIC_SEQ_CST);
+          fprintf(stderr, "[jobstat]   w%-2d per job: calls %.1f, branches %.1f (full %.2f: low %.2f, iret %.2f), "
+                  "lookups %.1f (missed %.2f, resolved %.2f), drain loops %.2f, kernel polls %.2f\n", w,
+                  s[SPU_JS_CALL] * q, s[SPU_JS_IB] * q, s[SPU_JS_IB_FULL] * q, s[SPU_JS_IB_LOW] * q,
+                  s[SPU_JS_IB_IRET] * q, s[SPU_JS_LOOKUP] * q, s[SPU_JS_LOOKUP_MISS] * q,
+                  s[SPU_JS_LOOKUP_FULL] * q, s[SPU_JS_DRAIN_FULL] * q, s[SPU_JS_KPOLL] * q);
+          fprintf(stderr, "[jobstat]   w%-2d per job: GET %.1f / %.1f KB, PUT %.1f / %.1f KB, lists %.2f (%.1f elements), "
+                  "GET notes %.1f, into code %.1f KB, code compared %.1f KB\n", w,
+                  s[SPU_JS_GET] * q, s[SPU_JS_GET_B] * q / 1024.0, s[SPU_JS_PUT] * q, s[SPU_JS_PUT_B] * q / 1024.0,
+                  s[SPU_JS_LIST] * q, s[SPU_JS_LIST_EL] * q, s[SPU_JS_NOTE_GET] * q,
+                  s[SPU_JS_CODE_GET_B] * q / 1024.0, s[SPU_JS_KEPT_CMP_B] * q / 1024.0);
+          fprintf(stderr, "[jobstat]   w%-2d per job: GETLLAR %.2f, PUTLLC %.2f, PUTLLUC %.2f, lock %.2f (waited %.2f, "
+                  "%.0f pauses), rdch %.1f, rchcnt %.1f, wrch %.1f (event acks %.2f), interrupts %.2f\n", w,
+                  s[SPU_JS_LLAR] * q, s[SPU_JS_LLC] * q, s[SPU_JS_LLUC] * q, s[SPU_JS_LOCK] * q,
+                  s[SPU_JS_LOCK_WAIT] * q, s[SPU_JS_LOCK_SPIN] * q, s[SPU_JS_RDCH] * q, s[SPU_JS_RCHCNT] * q,
+                  s[SPU_JS_WRCH] * q, s[SPU_JS_EVACK] * q, s[SPU_JS_IRQ] * q);
+          fprintf(stderr, "[jobstat]   w%-2d per job: code spans ended by a GET %.2f, set to verify by one %.2f, "
+                  "new %.2f, placed %.2f; code verified %.1f KB\n", w,
+                  s[SPU_JS_RES_DROP] * q, s[SPU_JS_RES_PEND] * q, s[SPU_JS_RES_NEW] * q, s[SPU_JS_RES_PIC] * q,
+                  s[SPU_JS_VERIFY_B] * q / 1024.0); }
+#endif
     }
     fflush(stderr);
 }
@@ -198,6 +228,11 @@ static void jc_time_end(void)
     __atomic_add_fetch(&s_time_n[w], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_time_sum[w], (int64_t)d, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_time_hist[w][k], 1, __ATOMIC_RELAXED);
+#ifdef PS3_SPU_JOBCAP
+    for (int j = 0; j < SPU_JS_N; j++)
+        if (t_spu_js[j] != t_js0[j])
+            __atomic_add_fetch(&s_js[w][j], (int64_t)(t_spu_js[j] - t_js0[j]), __ATOMIC_RELAXED);
+#endif
     t_spu_jobcap = 0;
     t_time_ctx = NULL;
     if (g_spu_job_mark_hook) g_spu_job_mark_hook(0);
@@ -299,6 +334,9 @@ void spu_jobcap_maybe_begin(spu_context* ctx)
     const uint32_t wid = be32(ctx->ls + 0x1DC);
     if (s_time_every_us) {   /* SPU_JOB_TIME: every workload, every job */
         if (wid >= 32) return;
+#ifdef PS3_SPU_JOBCAP
+        memcpy(t_js0, t_spu_js, sizeof t_js0);
+#endif
         t_time_t0 = jc_now_us();
         t_time_wid = wid;
         t_time_ctx = ctx;

@@ -43,6 +43,26 @@ extern SPU_THREAD_LOCAL int t_spu_pm_img;
 #define SPU_JOBCAP_ON(state) 0
 #endif
 
+/* SPU_JOB_TIME: what the runtime does for a job, counted per host thread in
+ * its hot paths (measurement builds only). spu_jobcap.c takes each timed job's
+ * share and reports it per workload, per job, beside the job's time. */
+enum {
+    SPU_JS_CALL, SPU_JS_IB, SPU_JS_IB_FULL, SPU_JS_IB_LOW, SPU_JS_IB_IRET,
+    SPU_JS_LOOKUP, SPU_JS_LOOKUP_MISS, SPU_JS_LOOKUP_FULL, SPU_JS_DRAIN_FULL, SPU_JS_KPOLL,
+    SPU_JS_GET, SPU_JS_GET_B, SPU_JS_PUT, SPU_JS_PUT_B, SPU_JS_LIST, SPU_JS_LIST_EL,
+    SPU_JS_NOTE_GET, SPU_JS_CODE_GET_B, SPU_JS_KEPT_CMP_B,
+    SPU_JS_LLAR, SPU_JS_LLC, SPU_JS_LLUC, SPU_JS_LOCK, SPU_JS_LOCK_WAIT, SPU_JS_LOCK_SPIN,
+    SPU_JS_RDCH, SPU_JS_RCHCNT, SPU_JS_WRCH, SPU_JS_EVACK, SPU_JS_IRQ,
+    SPU_JS_RES_DROP, SPU_JS_RES_PEND, SPU_JS_RES_NEW, SPU_JS_RES_PIC, SPU_JS_VERIFY_B,
+    SPU_JS_N
+};
+#ifdef PS3_SPU_JOBCAP
+extern SPU_THREAD_LOCAL uint64_t t_spu_js[SPU_JS_N];
+#define SPU_JS_ADD(k, n) ((void)(t_spu_js[k] += (uint64_t)(n)))
+#else
+#define SPU_JS_ADD(k, n) ((void)0)
+#endif
+
 void spu_jobcap_init(void);
 /* SPU_JOB_TIME: told at each timed job's start (1) and end (0); the SPURS
  * runtime sets it to tag its worker's profiler samples (cellSpurs.c). */

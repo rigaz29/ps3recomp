@@ -421,6 +421,7 @@ void spu_irqwait_diag(spu_context* ctx)
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
+    SPU_JS_ADD(SPU_JS_IRQ, 1);
     if (SPU_JOBCAP_ON(1))
         spu_jobcap_abandon("interrupt");
     /* Stall-and-notify still settling: let the SPU run on (see above). */
@@ -550,6 +551,7 @@ static __declspec(noinline) void spu_drain_call_full(spu_context* ctx, uint32_t 
 static __attribute__((noinline)) void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
 #endif
 {
+    SPU_JS_ADD(SPU_JS_DRAIN_FULL, 1);
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     spu_depth_guard_check(ctx);
     /* On the way out, the enclosing drain's return pc is the innermost one
@@ -665,6 +667,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
  * module's call into it returns. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
+    SPU_JS_ADD(SPU_JS_CALL, 1);
     spu_drain_call_run(ctx, return_pc);
     if (SPU_JOBCAP_ON(1))
         spu_jobcap_drain_done(ctx, return_pc);

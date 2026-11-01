@@ -899,6 +899,9 @@ void spu_jobcap_transfer_done(spu_context* ctx, uint32_t lsa, uint64_t ea, uint3
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    { const uint32_t c = cmd & 0xFFu, hi = c & 0xF0u;
+      if (c != 0x64u && (hi == 0x40u || hi == 0x50u)) { SPU_JS_ADD(SPU_JS_GET, 1); SPU_JS_ADD(SPU_JS_GET_B, size); }
+      else if (c != 0x64u) { SPU_JS_ADD(SPU_JS_PUT, 1); SPU_JS_ADD(SPU_JS_PUT_B, size); } }
     if (SPU_JOBCAP_ANY()) {
         if (spu_jobcap_transfer(spu, lsa, ea, size, cmd))
             return 0;
@@ -1050,6 +1053,7 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
+    SPU_JS_ADD(SPU_JS_LIST, 1); SPU_JS_ADD(SPU_JS_LIST_EL, num_elements);
     return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
                         spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
                         spu->mfc_tag);

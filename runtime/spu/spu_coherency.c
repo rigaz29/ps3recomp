@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "ps3emu/log_first.h"
+#ifdef PS3_SPU_JOBCAP
+#include "spu_jobcap.h"   /* SPU_JS_ADD: SPU_JOB_TIME's per-job counts */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,12 +46,22 @@ static volatile long g_lockline = 0;
 void spu_lockline_lock(void)
 {
     unsigned spins = 0;
+#ifdef PS3_SPU_JOBCAP
+    unsigned long long paused = 0;
+#endif
     while (_InterlockedExchange(&g_lockline, 1)) {
         do {
             _mm_pause();
+#ifdef PS3_SPU_JOBCAP
+            paused++;
+#endif
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
         } while (g_lockline);
     }
+#ifdef PS3_SPU_JOBCAP
+    SPU_JS_ADD(SPU_JS_LOCK, 1);
+    if (paused) { SPU_JS_ADD(SPU_JS_LOCK_WAIT, 1); SPU_JS_ADD(SPU_JS_LOCK_SPIN, paused); }
+#endif
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #elif defined(_WIN32)

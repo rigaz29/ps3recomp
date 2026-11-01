@@ -1153,6 +1153,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
  * from its record; a capture records it, line and status, after it ran. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    if (cmd == MFC_GETLLAR_CMD) SPU_JS_ADD(SPU_JS_LLAR, 1);
+    else if (cmd == MFC_PUTLLC_CMD) SPU_JS_ADD(SPU_JS_LLC, 1);
+    else if (cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) SPU_JS_ADD(SPU_JS_LLUC, 1);
     if (SPU_JOBCAP_ANY() &&
         (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD ||
          cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD)) {
@@ -1186,6 +1189,7 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    SPU_JS_ADD(SPU_JS_WRCH, 1);
     /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: an outbound mailbox word is a job's
      * output; a replay compares it with the record and drops it. */
     if (SPU_JOBCAP_ANY() &&
@@ -1269,6 +1273,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
+        SPU_JS_ADD(SPU_JS_EVACK, 1);
         /* Under the lock-line lock, because every producer of the LR bit sets
          * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
          * PUTLLUC or plain PUT. A bare read-modify-write here can read
@@ -1538,6 +1543,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: channel reads are a job's other input. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    SPU_JS_ADD(SPU_JS_RDCH, 1);
     if (SPU_JOBCAP_ANY()) {
         u128 v;
         if (spu_jobcap_rdch(ctx, channel, &v))
@@ -1755,6 +1761,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: so are channel counts. */
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    SPU_JS_ADD(SPU_JS_RCHCNT, 1);
     if (SPU_JOBCAP_ANY()) {
         uint32_t n;
         if (spu_jobcap_rchcnt(ctx, channel, &n))
@@ -1980,6 +1987,7 @@ static unsigned s_pic_sig_n;
 static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t lsa);
 static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
 {
+    SPU_JS_ADD(SPU_JS_LOOKUP_FULL, 1);
     spu_lifted_fn f = spu_lifted_lookup_owned(ctx, lsa);
     if (!f && ctx && s_pic_sig_n) f = spu_pic_adopt((spu_context*)ctx, lsa);
     return f;
@@ -2073,6 +2081,7 @@ static void spu_dcache_shadow_stats(void)
 }
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    SPU_JS_ADD(SPU_JS_LOOKUP, 1);
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
     spu_context* c = (spu_context*)ctx;
@@ -2114,6 +2123,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         c->pic_base = e->pic_base;
         return e->fn;
     }
+    SPU_JS_ADD(SPU_JS_LOOKUP_MISS, 1);
     if (mode == 2) {   /* shared counters only in shadow mode: they would bounce between SPU threads */
         __atomic_fetch_add(&s_dcache_misses, 1, __ATOMIC_RELAXED);
         spu_dcache_shadow_stats();
@@ -2365,6 +2375,7 @@ static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa)
                 ctx->resident_code[slot].image_id = 0;
             if (!ctx->resident_code[slot].image_id && free_slot < 0) free_slot = (int)slot;
         }
+        SPU_JS_ADD(SPU_JS_RES_PIC, 1);
         spu_dcache_residency_changed(ctx);
         if (free_slot < 0) return NULL;
         ctx->resident_code[free_slot].lsa = place;
@@ -2407,9 +2418,11 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
          * position-independent code that moved with its placement. */
         const uint32_t moved = ctx->resident_code[slot].lsa - o->load_lsa;
         int match = 1;
-        for (unsigned i = 0; match && i < o->code_count; ++i)
+        for (unsigned i = 0; match && i < o->code_count; ++i) {
+            SPU_JS_ADD(SPU_JS_VERIFY_B, o->code[i].size);
             match = !memcmp(ctx->ls + ((o->code[i].lsa + moved) & SPU_LS_MASK), o->code[i].bytes,
                             o->code[i].size);
+        }
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         /* SPU_OVL_VERIFYLOG=1: a resident span whose bytes do not match its
          * lift, with the first differing address (the span runs interpreted). */
@@ -2624,6 +2637,7 @@ static int spu_overlay_get_kept_code(const spu_context* ctx, unsigned slot, uint
         const uint32_t c0 = o->code[i].lsa + moved, c1 = c0 + o->code[i].size;
         if (c1 > SPU_LS_SIZE || c1 < c0) return 0;
         const uint32_t a = lsa > c0 ? lsa : c0, b = lsa + size < c1 ? lsa + size : c1;
+        if (a < b) SPU_JS_ADD(SPU_JS_KEPT_CMP_B, b - a);
         if (a < b && memcmp(ctx->ls + a, o->code[i].bytes + (a - c0), b - a)) return 0;
     }
     return 1;
@@ -2632,12 +2646,14 @@ static int spu_overlay_get_kept_code(const spu_context* ctx, unsigned slot, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    SPU_JS_ADD(SPU_JS_NOTE_GET, 1);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
+            SPU_JS_ADD(SPU_JS_CODE_GET_B, size);
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
                 /* SPU_OVL_CLEARLOG=1: the GET that ends a resident code span's
                  * residency (its lifted code goes to the interpreter after). */
@@ -2649,10 +2665,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               ctx->resident_code[slot].source_ea, ea, lsa, size,
                               (uint32_t)ctx->pc & SPU_LS_MASK); }
                 ctx->resident_code[slot].image_id = 0;
+                SPU_JS_ADD(SPU_JS_RES_DROP, 1);
                 spu_dcache_residency_changed(ctx);
             } else if (ctx->resident_code[slot].verify_state &&
                        !spu_overlay_get_kept_code(ctx, slot, lsa, size)) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
+                SPU_JS_ADD(SPU_JS_RES_PEND, 1);
                 spu_dcache_residency_changed(ctx);
             }
         }
@@ -2694,6 +2712,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_index = i;
                     ctx->resident_code[slot].pic = o->pic;
                     ctx->resident_code[slot].pic_delta = lsa - o->load_lsa;
+                    SPU_JS_ADD(SPU_JS_RES_NEW, 1);
                     spu_dcache_residency_changed(ctx);
                     return;
                 }
@@ -3200,6 +3219,7 @@ static __attribute__((noinline)) void spu_indirect_branch_full(spu_context* ctx)
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    SPU_JS_ADD(SPU_JS_IB, 1);
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
      * Without this, any indirect branch through such a value fails the lookup
@@ -3297,6 +3317,11 @@ static void spu_ibfull_note(const spu_context* ctx)
 static void spu_indirect_branch_full(spu_context* ctx)
 {
     spu_ibfull_note(ctx);
+#ifdef PS3_SPU_JOBCAP
+    SPU_JS_ADD(SPU_JS_IB_FULL, 1);
+    if (ctx->pc < SPU_IB_PLAIN_LO) SPU_JS_ADD(SPU_JS_IB_LOW, 1);
+    else if (ctx->irq_saved && ctx->pc == (ctx->irq_resume_pc & SPU_LS_MASK)) SPU_JS_ADD(SPU_JS_IB_IRET, 1);
+#endif
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -3328,6 +3353,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
+            SPU_JS_ADD(SPU_JS_KPOLL, 1);
             /* cellSpursModulePoll: the kernel's choice for this SPU now, in the
              * preferred doubleword (workload << 32 | status); the module goes
              * on when the workload is its own (wklCurrentId, LS 0x1DC). The

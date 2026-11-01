@@ -200,6 +200,7 @@ typedef struct {
     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
     int tex_cv[VP_TEX_UNITS];   /* pre-pass: OffRT holding unit u's RGBA8 target read as Y16_X16_FLOAT, -1 = none */
     int tex_ds[VP_TEX_UNITS];   /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
+    int tex_dz[VP_TEX_UNITS];   /* pre-pass: OffDS whose depth plane unit u samples as a depth texture, -1 = none */
     u32 srv_win;        /* pre-pass: the draw whose t0-t15 window this one binds (itself, or an
                          * earlier draw of the batch with the same 16 views: srvq_commit) */
     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
@@ -429,6 +430,7 @@ typedef struct {
     u32 mrt;                /* MRT 1-3 masks and blend enables, rsx_pso_mrt (PSO key) */
     u64 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     u64 unnorm;             /* texel-coordinate units and their sizes (PSO key) */
+    u64 shadow;             /* depth-compared units, dr_shadow_descs (PSO key) */
     u32 wpos;               /* rec_wpos_win of the draw, literal programs (PSO key) */
     u32 atest;              /* alpha test compiled in: CELL_GCM function, and for a
                              * literal program the reference above bit 16 (PSO key) */
@@ -5029,6 +5031,60 @@ static u64 dr_gamma_key(const D3D12DrawRecord* dr)
     return k;
 }
 
+/* A depth texture (DEPTH24_D8, DEPTH16 and their float forms) on unit u. */
+static int dr_tex_depth_fmt(const D3D12DrawRecord* dr, int u)
+{
+    const u32 b = dr->tex[u].fmt & 0x9Fu;
+    return dr->tex[u].set && b >= 0x90u && b <= 0x93u;
+}
+
+/* The units the RSX samples with a depth comparison: a depth texture whose
+ * SET_TEXTURE_ADDRESS zfunc is 1-6 (rsx_fp_shadow_desc_from_texture). God of
+ * War: Ascension builds its screen-space shadow mask this way, its shadow map
+ * on unit 5 with GEQUAL and bilinear filtering. Their descriptors for the
+ * decompiler and a key over them, 0 with none. A layout the decompiler does
+ * not translate (float depth, mips, cube) is left as it was. */
+static u64 dr_shadow_descs(const D3D12DrawRecord* dr, rsx_fp_shadow_desc sd[16])
+{
+    memset(sd, 0, 16 * sizeof *sd);
+    u64 k = 0;
+    int any = 0;
+    for (int u = 0; u < VP_TEX_UNITS && u < 16; u++) {
+        if (!dr_tex_depth_fmt(dr, u)) continue;
+        rsx_fp_shadow_desc_from_texture(&sd[u], dr->tex[u].fmt, 2u, dr->tex[u].cube, dr->tex[u].mips,
+                                        dr->tex[u].filter, dr->tex[u].addr, dr->tex[u].ctrl0);
+        if (sd[u].enabled != 1) { memset(&sd[u], 0, sizeof sd[u]); continue; }
+        any = 1;
+        k = (k ^ (u64)(u + 1)) * 1099511628211ull;
+        k = (k ^ ((u64)sd[u].func | (u64)sd[u].linear << 4 | (u64)sd[u].unnormalized << 5)) * 1099511628211ull;
+    }
+    return any ? (k ? k : 1u) : 0u;
+}
+
+/* A normalized depth texture is a region of the depth surface its view
+ * covers (the title's shadow maps of each light, 578x796 and the like in a
+ * 1408x1406 surface): its coordinate takes the scale to that region from b1
+ * (fp_tcscale[u].xy, dr_coord_scales), as a 2D fetch's does in
+ * fp_apply_coord_scale. A texel-coordinate one divides by the view's size in
+ * the helper already. */
+static void fp_shadow_scale(char* hlsl, size_t cap, const rsx_fp_shadow_desc sd[16])
+{
+    static const char from[] = "    float2 uv = coordinate.xy;\n";
+    for (u32 u = 0; u < 16; u++) {
+        if (sd[u].enabled != 1 || sd[u].unnormalized) continue;
+        char head[64], to[80];
+        snprintf(head, sizeof head, "float4 _rsx_shadow%u(float3 coordinate) {", u);
+        char* hp = strstr(hlsl, head);
+        char* at = hp ? strstr(hp, from) : NULL;
+        if (!at) continue;
+        snprintf(to, sizeof to, "    float2 uv = coordinate.xy * fp_tcscale[%u].xy;\n", u);
+        const size_t fl = sizeof from - 1, tl = strlen(to), used = strlen(hlsl);
+        if (used + tl - fl + 1 > cap) return;
+        memmove(at + tl, at + fl, used - (size_t)(at + fl - hlsl) + 1);
+        memcpy(at, to, tl);
+    }
+}
+
 /* Per unit, the factor the program's texture coordinate is multiplied by, and
  * the units that need one:
  *  - a texel-coordinate unit (SET_TEXTURE_FORMAT bit 6): 1/size of what is
@@ -5048,6 +5104,10 @@ static u32 dr_coord_scales(const D3D12DrawRecord* dr, float sc[VP_TEX_UNITS][2])
         const int rt = dr->tex_rt[u];
         if (rt >= 0 && rt < MAX_OFF_RTS && s_d3d.off_rt[rt].res) {
             rw = s_d3d.off_rt[rt].w; rh = s_d3d.off_rt[rt].h;
+        }
+        const int dz = dr->tex_dz[u];
+        if (dz >= 0 && dz < MAX_OFF_DS && s_d3d.off_ds[dz].res) {
+            rw = s_d3d.off_ds[dz].w; rh = s_d3d.off_ds[dz].h;
         }
         if (dr->tex[u].fmt & 0x40) {
             sc[u][0] = 1.0f / (float)rw; sc[u][1] = 1.0f / (float)rh; mask |= 1u << u;
@@ -5279,6 +5339,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         gamma = dr_gamma_key(udr);
         unnorm = dr_unnorm_key(udr);
     }
+    /* Depth textures the RSX compares (shadow maps): the comparison is compiled
+     * in (_rsx_shadowN) and keyed on, and with it the gamma decode of the
+     * program's other units (the shadow entry point takes the masks rather
+     * than choosing them at run time). */
+    rsx_fp_shadow_desc shd[16];
+    const u64 shadow = (buffered && udr) ? dr_shadow_descs(udr, shd) : 0u;
+    if (shadow) gamma = dr_gamma_key(udr);
     /* Nor, buffered, on the units' gamma decode or on which are cubes. The
      * decode is chosen when the program runs (_rsx_gamma_dyn, its lanes in
      * fp_tcscale[u].z), and every unit's coordinate takes its scale from b1,
@@ -5312,6 +5379,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
+            s_d3d.vp_fp[i].shadow == shadow &&
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
             s_d3d.vp_fp[i].poly == pkey &&
             s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
@@ -5408,7 +5476,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     u8 gamma_masks[16] = {0};
     for (int u = 0; u < VP_TEX_UNITS; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
     u32 nk = 0;
-    int n = buffered
+    int n = (buffered && shadow)
+        ? rsx_fp_decompile_buffered_shadow_color_ex(prog, prog_max, fp_ctrl, 0u, shd, gamma_masks,
+                                                    hlsl, sizeof(hlsl), &nk)
+        : buffered
         ? rsx_fp_decompile_buffered_color_dyn_ex(prog, prog_max, fp_ctrl, 0u,
                                                  hlsl, sizeof(hlsl), &nk)
         : rsx_fp_decompile_color_ex(prog, prog_max, fp_ctrl, 0u, gamma ? gamma_masks : NULL,
@@ -5443,6 +5514,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_gamma_mask(u) 0u\n",
                          "#define _rsx_gamma_mask(u) ((uint)fp_tcscale[u].z)\n");
         fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~cube_mask, NULL);
+        if (shadow) fp_shadow_scale(hlsl, sizeof(hlsl), shd);
     } else if (unnorm && udr) {
         float sc[VP_TEX_UNITS][2];
         const u32 mask = dr_coord_scales(udr, sc);
@@ -5892,6 +5964,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].gamma     = gamma;
     s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm    = unnorm;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].shadow    = shadow;
     s_d3d.vp_fp[s_d3d.vp_fp_n].wpos      = wpos_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].atest     = atest;
     s_d3d.vp_fp[s_d3d.vp_fp_n].last_use  = s_d3d.frame_count;
@@ -8031,7 +8104,7 @@ static void srvq_commit(D3D12DrawRecord* dr, u32 d)
     s_srvq_on = 0;
     int share = 1;
     for (int u = 0; u < VP_TEX_UNITS; u++)
-        if (dr->tex_rt[u] >= 0 || dr->tex_cv[u] >= 0 || dr->tex_ds[u] >= 0) share = 0;
+        if (dr->tex_rt[u] >= 0 || dr->tex_cv[u] >= 0 || dr->tex_ds[u] >= 0 || dr->tex_dz[u] >= 0) share = 0;
     u32 h = 2166136261u;
     if (share) {
         const u32* w = (const u32*)s_srvq_keys;
@@ -9819,12 +9892,13 @@ static void rf_prepass(u32 from, u32 to)
             dr->snap_slot = (!dr->snap_src || off_rt_find(dr->snap_src) >= 0)
                           ? blit_snap_get(dr->snap_ea) : -1;
         alias_note(dr);
-        for (int _u = 0; _u < VP_TEX_UNITS; _u++) dr->tex_ds[_u] = dr->tex_cv[_u] = -1;   /* set below for draws */
+        for (int _u = 0; _u < VP_TEX_UNITS; _u++) dr->tex_ds[_u] = dr->tex_cv[_u] = dr->tex_dz[_u] = -1;   /* set below for draws */
         dr->srv_win = _d;
     }
     for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
         for (int _u = 0; _u < VP_TEX_UNITS && dr->is_vp && !dr->is_clear; _u++) {
+            if (dr_tex_depth_fmt(dr, _u)) continue;   /* its depth plane, no colour copy */
             const int ds = tex_reads_depth(dr, _u) ? off_ds_find(dr->tex[_u].raw) : -1;
             if (ds < 0) continue;
             s_d3d.off_ds[ds].last_frame = s_d3d.frame_count;
@@ -9943,6 +10017,22 @@ static void rf_prepass(u32 from, u32 to)
                 continue;
             }
             if (rsx_census_secs() && dr->tex[_u].set) rsx_census_bind(dr->tex[_u].fmt, dr->tex[_u].mips);
+            /* A depth texture (a shadow map): the depth plane of the depth
+             * surface at its offset, which the program compares
+             * (_rsx_shadowN); with none there, a null view. */
+            if (dr_tex_depth_fmt(dr, _u)) {
+                const int ds = off_ds_find(dr->tex[_u].raw);
+                if (ds >= 0) {
+                    dr->tex_dz[_u] = ds;
+                    s_d3d.off_ds[ds].last_frame = s_d3d.frame_count;
+                    srv_write(wslot, s_d3d.off_ds[ds].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                } else {
+                    srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                }
+                continue;
+            }
             /* A depth surface read as a texture: its colour copy (made in the
              * RT pre-pass), refreshed from the depth buffer just before this
              * draw (ds_convert). */
@@ -10696,6 +10786,14 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     if (dr->tex_cv[_u] >= 0)
                         off_rt_transition(dr->tex_cv[_u], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    const int dz = dr->tex_dz[_u];
+                    if (dz >= 0) {
+                        if (dz != cur_z)
+                            off_ds_transition(dz, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        else   /* the surface it draws into: not readable here */
+                            srv_write(DRAW_SRV_BASE + dr->srv_win * VP_TEX_UNITS + (u32)_u, NULL,
+                                      DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    }
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + dr->srv_win * VP_TEX_UNITS) * s_d3d.srv_inc;
@@ -13472,7 +13570,11 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
           * decodes: X16 (God of War: Ascension's 256x256 font atlas -- without
           * it every glyph drew as a solid quad), Y16_X16, X32_FLOAT and
           * Y16_X16_FLOAT (its post-process intermediates). */
-         base_fmt == 0x94 || base_fmt == 0x95 || base_fmt == 0x9C || base_fmt == 0x9F)) {
+         base_fmt == 0x94 || base_fmt == 0x95 || base_fmt == 0x9C || base_fmt == 0x9F ||
+         /* Depth textures, read from the depth surface at their offset
+          * (dr_tex_depth_fmt): God of War: Ascension's shadow maps. Dropped,
+          * the unit kept the texture bound before. */
+         (base_fmt >= 0x90 && base_fmt <= 0x93))) {
         /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to

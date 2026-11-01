@@ -240,8 +240,9 @@ typedef struct {
      * flip named at this point of the batch (d3d12_flip_observed). */
     u32   flip_key;
     /* ZPASS query op (also is_clear): 1 = CLEAR_REPORT_VALUE, 2 = GET_REPORT,
-     * whose count goes into the value word at zq_ea (d3d12_zpass_observed). */
-    u32   zq_op, zq_ea;
+     * whose count goes into the value word at zq_ea (report number zq_seq),
+     * 3 = SET_ZPASS_PIXEL_COUNT_ENABLE, on or off in zq_ea (d3d12_zpass_observed). */
+    u32   zq_op, zq_ea, zq_seq;
     u16   tex_zok;      /* prepass: units whose offset a depth surface wrote
                          * last (or nothing seen yet), so may be read as depth */
     u32   blit_src, blit_sp, blit_dst, blit_dp, blit_w, blit_h;
@@ -3219,12 +3220,14 @@ static void present_to_backbuffer(u32 fi)
 }
 
 static double s_rf_last_submit;   /* RF_WAITLOG: when the last batch was submitted */
+static void zq_submitted(u32 fi, u64 fence);   /* the ZPASS block, below */
 static void move_to_next_frame(void)
 {
     s_rf_last_submit = perf_now();
     u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
     s_fence_last = current_fence;
+    zq_submitted(s_d3d.frame_index, current_fence);
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
@@ -3846,7 +3849,8 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
             else if (r->flip_key)
                 fprintf(mf, "op%03u FLIP  0x%08X\n", d, r->flip_key);
             else if (r->zq_op)
-                fprintf(mf, "op%03u ZPASS %s 0x%08X\n", d, r->zq_op == 1 ? "clear" : "report", r->zq_ea);
+                fprintf(mf, "op%03u ZPASS %s 0x%08X\n", d,
+                        r->zq_op == 1 ? "clear" : r->zq_op == 2 ? "report" : "count", r->zq_ea);
             else if (r->is_blit)
                 fprintf(mf, "op%03u BLIT  0x%X/%u -> 0x%X/%u %ux%u\n", d, r->blit_src, r->blit_sp,
                         r->blit_dst, r->blit_dp, r->blit_w, r->blit_h);
@@ -9181,13 +9185,15 @@ static void gts_read(void)
  * RSX_ZPASS=0: off, every count "visible". */
 #define ZQ_MAX     4096
 #define ZQ_REP_MAX 2048
-typedef struct { u32 ea, q0, q1; } ZqRep;      /* q0 = 0xFFFFFFFF: not counted */
+typedef struct { u32 ea, seq, q0, q1; } ZqRep; /* q0 = 0xFFFFFFFF: not counted */
 static ID3D12QueryHeap* s_zq_heap;
 static ID3D12Resource* s_zq_rb;
 static ZqRep s_zq_rep[FRAME_COUNT][ZQ_REP_MAX];
 static u32 s_zq_nrep[FRAME_COUNT], s_zq_n[FRAME_COUNT];
 static int s_zq_resolved[FRAME_COUNT];
+static u64 s_zq_fence[FRAME_COUNT];   /* the fence value its batch was submitted with, 0 = not yet */
 static int s_zq_open = -1, s_zq_counting, s_zq_lost;
+static int s_zq_enabled = 1;   /* SET_ZPASS_PIXEL_COUNT_ENABLE as the stream has it: on until told */
 static unsigned long long s_zq_stat[4];      /* [1] visible [2] hidden [3] not counted */
 static u32 s_zq_acc0;
 static int zq_wanted(void)
@@ -9217,16 +9223,18 @@ static int zq_on(void)
     printf("[D3D12] ZPASS counts: %s\n", v ? "occlusion queries" : "could not create the query heap, reported visible");
     return v;
 }
-/* cellGcm_zpass_observer: a query's clear (op 0) or report (op 1, its value
- * word at value_ea), recorded where it falls among the draws. */
-static void d3d12_zpass_observed(int op, u32 value_ea)
+/* cellGcm_zpass_observer: the counter's clear (op 0), a report (op 1, its
+ * value word at a, its number b) or the counter switched on or off (op 2, a),
+ * recorded where it falls among the draws. */
+static void d3d12_zpass_observed(int op, u32 a, u32 b)
 {
     if (!s_d3d.initialized || s_d3d.draw_count >= MAX_DRAWS) return;
     D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
     memset(dr, 0, sizeof(*dr));
     dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1; dr->snap_slot = -1;
     dr->zq_op = (u32)op + 1u;
-    dr->zq_ea = value_ea;
+    dr->zq_ea = a;
+    dr->zq_seq = b;
     s_d3d.merge_prev_draw = 0;
     s_ix_run_valid = 0;
     s_raw_run_valid = 0;
@@ -9244,19 +9252,31 @@ static void zq_op_replay(const D3D12DrawRecord* dr)
     const u32 fi = s_rf.fi;
     zq_close();
     if (dr->zq_op == 1) { s_zq_counting = 1; s_zq_acc0 = s_zq_n[fi]; s_zq_lost = 0; return; }
+    if (dr->zq_op == 3) { s_zq_enabled = dr->zq_ea != 0; return; }
     if (s_zq_nrep[fi] < ZQ_REP_MAX) {
         ZqRep* r = &s_zq_rep[fi][s_zq_nrep[fi]++];
         r->ea = dr->zq_ea;
-        /* A report with no clear before it in this batch, or whose draws ran
-         * out of queries, keeps the count the walker gave it. */
+        r->seq = dr->zq_seq;
+        /* The count since the clear: every query opened after it. A report
+         * with no clear before it in this batch, or whose draws ran out of
+         * queries, keeps what the walker wrote ("visible"). */
         r->q0 = (s_zq_counting && !s_zq_lost) ? s_zq_acc0 : 0xFFFFFFFFu;
         r->q1 = s_zq_n[fi];
     }
-    s_zq_counting = 0;
+    /* The counter goes on after a report: the next one, before a clear,
+     * reports the total so far (God of War: Ascension writes one count into
+     * eight reports). */
+}
+/* A draw that was to be counted is not drawn (its pipeline is still being
+ * built): the count would read 0 and drop the object, so the reports up to
+ * the next clear keep what the walker wrote ("visible"). */
+static void zq_draw_lost(void)
+{
+    if (s_zq_counting && s_zq_enabled) s_zq_lost = 1;
 }
 static void zq_before_draw(void)
 {
-    if (!s_zq_counting || s_zq_open >= 0 || !zq_on()) return;
+    if (!s_zq_counting || !s_zq_enabled || s_zq_open >= 0 || !zq_on()) return;
     const u32 fi = s_rf.fi;
     if (s_zq_n[fi] >= ZQ_MAX) { s_zq_lost = 1; return; }
     s_zq_open = (int)s_zq_n[fi]++;
@@ -9273,35 +9293,71 @@ static void zq_resolve(void)
                                                  (UINT)(fi * ZQ_MAX), s_zq_n[fi], s_zq_rb, 8ull * ZQ_MAX * fi);
     s_zq_resolved[fi] = 1;
 }
-/* After the wait for the GPU: every batch submitted has run. */
-static void zq_read(void)
+/* Hand a submitted batch's counts to the reports (cellGcm_zpass_result). */
+static void zq_deliver(u32 fi)
 {
-    if (!zq_on()) return;
-    extern void cellGcm_zpass_result(u32 value_ea, u32 count);
-    for (u32 fi = 0; fi < FRAME_COUNT; fi++) {
-        /* A list reset without being submitted took its queries with it. */
-        if (!s_zq_resolved[fi]) { s_zq_nrep[fi] = 0; s_zq_n[fi] = 0; continue; }
-        if (s_zq_nrep[fi] && s_zq_n[fi]) {
+    extern void cellGcm_zpass_result(u32 value_ea, u32 count, u32 seq);
+    {
+        if (s_zq_nrep[fi]) {
+            /* A report whose counter was off from its clear on counted nothing:
+             * its range is empty and its answer 0, in a batch with no query too
+             * (God of War: Ascension clears, switches the counter off at once
+             * and reports, in two reports a frame). */
             void* p = NULL;
-            D3D12_RANGE rr = { (SIZE_T)8 * ZQ_MAX * fi, (SIZE_T)8 * ZQ_MAX * fi + (SIZE_T)8 * s_zq_n[fi] };
-            if (SUCCEEDED(s_zq_rb->lpVtbl->Map(s_zq_rb, 0, &rr, &p)) && p) {
-                const u64* q = (const u64*)((const u8*)p + (size_t)8 * ZQ_MAX * fi);
-                for (u32 k = 0; k < s_zq_nrep[fi]; k++) {
-                    const ZqRep* r = &s_zq_rep[fi][k];
-                    if (r->q0 == 0xFFFFFFFFu || r->q1 > s_zq_n[fi]) { s_zq_stat[3]++; continue; }
-                    u64 sum = 0;
-                    for (u32 i = r->q0; i < r->q1; i++) sum += q[i];
-                    const u32 c = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)sum;
-                    cellGcm_zpass_result(r->ea, c);
-                    s_zq_stat[c ? 1 : 2]++;
-                }
+            const u64* q = NULL;
+            if (s_zq_n[fi]) {
+                D3D12_RANGE rr = { (SIZE_T)8 * ZQ_MAX * fi, (SIZE_T)8 * ZQ_MAX * fi + (SIZE_T)8 * s_zq_n[fi] };
+                if (SUCCEEDED(s_zq_rb->lpVtbl->Map(s_zq_rb, 0, &rr, &p)) && p)
+                    q = (const u64*)((const u8*)p + (size_t)8 * ZQ_MAX * fi);
+            }
+            for (u32 k = 0; k < s_zq_nrep[fi]; k++) {
+                const ZqRep* r = &s_zq_rep[fi][k];
+                if (r->q0 == 0xFFFFFFFFu || r->q1 > s_zq_n[fi] || (r->q1 > r->q0 && !q)) { s_zq_stat[3]++; continue; }
+                u64 sum = 0;
+                for (u32 i = r->q0; i < r->q1; i++) sum += q[i];
+                const u32 c = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)sum;
+                cellGcm_zpass_result(r->ea, c, r->seq);
+                s_zq_stat[c ? 1 : 2]++;
+            }
+            if (p) {
                 D3D12_RANGE wr = {0, 0};
                 s_zq_rb->lpVtbl->Unmap(s_zq_rb, 0, &wr);
             }
         }
-        s_zq_resolved[fi] = 0; s_zq_nrep[fi] = 0; s_zq_n[fi] = 0;
+        s_zq_resolved[fi] = 0; s_zq_nrep[fi] = 0; s_zq_n[fi] = 0; s_zq_fence[fi] = 0;
+    }
+}
+/* The batch whose queries were resolved into frame fi went to the GPU with this fence. */
+static void zq_submitted(u32 fi, u64 fence)
+{
+    if (fi < FRAME_COUNT && s_zq_resolved[fi]) s_zq_fence[fi] = fence;
+}
+/* Between walker passes: a batch the GPU has finished hands its counts on
+ * now, not when the next batch starts. The title reads a frame's reports
+ * during the next one and writes the same reports again a frame later, so
+ * counts that waited for the next batch's start came after the reports had
+ * been taken again (2,348 of them in 40,000 trace events of the menu). */
+static void zq_poll(void)
+{
+    if (!zq_on() || !s_d3d.fence) return;
+    const u64 done = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++)
+        if (s_zq_resolved[fi] && s_zq_fence[fi] && done >= s_zq_fence[fi])
+            zq_deliver(fi);
+}
+/* After the wait for the GPU: every batch submitted has run. */
+static void zq_read(void)
+{
+    if (!zq_on()) return;
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++) {
+        /* A list reset without being submitted took its queries with it. */
+        if (!s_zq_resolved[fi]) { s_zq_nrep[fi] = 0; s_zq_n[fi] = 0; s_zq_fence[fi] = 0; continue; }
+        zq_deliver(fi);
     }
     s_zq_open = -1;   /* a new command list: nothing open in it */
+    /* A clear in an earlier batch: its queries are in that batch's heap, so the
+     * reports of this one cannot add them up; they keep the walker's value. */
+    if (s_zq_counting) s_zq_lost = 1;
     /* With RSX_CENSUS: how the counts came out over each census window. */
     { static ULONGLONG t0;
       const unsigned secs = rsx_census_secs();
@@ -10424,9 +10480,10 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 s_sj_nowait = 0;
                 if (dr->fp_addr && !dpso && s_pso_pending) {
                     if (ahead) break;   /* the final pass waits for it, as it always did */
+                    zq_draw_lost();
                     s_sj_stat_skipped++; s_hl_skipped++; continue;
                 }
-                if (dr->raw && !dpso) continue;    /* the base pipeline reads the input layout */
+                if (dr->raw && !dpso) { zq_draw_lost(); continue; }   /* the base pipeline reads the input layout */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 if (dpso && dr->poly && dyb_ready()) {
@@ -13459,7 +13516,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
       cellGcm_blit_local_observer = d3d12_blit_local_observed;
       extern void (*cellGcm_flip_observer)(u32);
       cellGcm_flip_observer = d3d12_flip_observed;
-      extern void (*cellGcm_zpass_observer)(int, u32);
+      extern void (*cellGcm_zpass_observer)(int, u32, u32);
       if (zq_wanted()) cellGcm_zpass_observer = d3d12_zpass_observed; }
 
     s_d3d.initialized = 1;
@@ -13563,6 +13620,7 @@ static int rf_ahead_on(void)
 #define RF_AHEAD_MIN 16
 void rsx_d3d12_backend_record_ahead(void)
 {
+    if (s_d3d.initialized) zq_poll();   /* ZPASS counts of a batch the GPU has finished */
     if (!s_d3d.initialized || !rf_ahead_on()) return;
     const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
     if (n < 2) return;

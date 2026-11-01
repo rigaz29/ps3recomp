@@ -366,17 +366,26 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 static u32 s_report_dma = 0xFEED0000u;
 static u64 s_report_last_ts;
 
-/* ZPASS counts from the renderer. A query is CLEAR_REPORT_VALUE(1), its
- * draws, GET_REPORT(1); the walker reaches the report long before the GPU has
- * drawn them. The observer (the D3D12 backend) is told of both in stream
- * order, counts the draws between them, and writes the count into the
- * report's value word once the GPU has it (cellGcm_zpass_result). The walker
- * writes the last count that report had -- 0xFFFF, "visible", until there is
- * one -- so a title reading it a frame later gets a measured answer. */
-void (*cellGcm_zpass_observer)(int op, u32 value_ea);   /* op 0: clear, 1: report */
+/* ZPASS counts from the renderer. The RSX's pixel counter is reset by
+ * CLEAR_REPORT_VALUE(1), counts only while SET_ZPASS_PIXEL_COUNT_ENABLE is on,
+ * and every GET_REPORT(1) writes its value so far: one clear can have several
+ * reports. God of War: Ascension clears, counts a bounding shape with the
+ * counter on, turns it off and writes the count into eight reports, and its
+ * SPU jobs drop the objects whose count is 0.
+ *
+ * The walker reaches a report long before the GPU has drawn what it counts.
+ * The observer (the D3D12 backend) is told of the clears, the counter switches
+ * and the reports in stream order, counts the draws as the RSX would, and
+ * hands each report's count back once the GPU has it (cellGcm_zpass_result).
+ * Until then the walker's report reads 0xFFFF, "visible": the title moves its
+ * reports around, so the last count a report's address had belonged to some
+ * other object, and an old 0 dropped objects in view (the menu's black holes).
+ * A count arrives only if no later report has taken the address since. */
+void (*cellGcm_zpass_observer)(int op, u32 a, u32 b);   /* 0 clear; 1 report (value ea, seq); 2 counter on/off */
 #define ZP_N 16384u
 #define ZP_PROBE 64u     /* a full table costs a bounded search, then a reuse */
-static u32 s_zp_ea[ZP_N], s_zp_count[ZP_N];
+static u32 s_zp_ea[ZP_N], s_zp_seq[ZP_N];   /* a report address and its latest report's number */
+static u32 s_zp_next;
 /* GCM_ZPASS_TRACE=<from_ms>:<count>: from <from_ms> after the start, the next
  * <count> events of the ZPASS reports, with the time and the walker's flip
  * count: W the walker writes a report at GET_REPORT (the value it writes),
@@ -439,32 +448,42 @@ static void zt_init_observer(void)
     if (!done) { done = 1; if (s_zt_on < 0) (void)zt_active(); if (s_zt_on) g_spu_get_observer = zt_spu_get; }
 }
 
-void cellGcm_zpass_result(u32 value_ea, u32 count)
+/* The slot of a report address in the table; added when asked and absent. */
+static u32* gcm_zp_slot(u32 value_ea, int add)
 {
-    if (s_zt_on && zt_active()) {
-        extern unsigned long long ps3_ms_now(void);
-        __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
-        fprintf(stderr, "[zt] R %llu f=%u ea=0x%08X count=%u was=%u\n",
-                ps3_ms_now(), s_flip_request_count, value_ea, count, vm_read32(value_ea));
-    }
     const u32 h = (value_ea >> 4) * 2654435761u;
     u32 k = h & (ZP_N - 1u);
     for (u32 i = 0; i < ZP_PROBE; i++) {
         const u32 j = (h + i) & (ZP_N - 1u);
-        if (s_zp_ea[j] == value_ea || !s_zp_ea[j]) { k = j; break; }
+        if (s_zp_ea[j] == value_ea) return &s_zp_seq[j];
+        if (!s_zp_ea[j]) { if (!add) return NULL; k = j; break; }
     }
-    s_zp_ea[k] = value_ea; s_zp_count[k] = count;
-    vm_write32(value_ea, count);
+    if (!add) return NULL;
+    s_zp_ea[k] = value_ea;   /* a full probe run reuses its first slot */
+    return &s_zp_seq[k];
 }
-static int gcm_zpass_last(u32 value_ea, u32* count)
+/* A ZPASS report reached by the walker: its number. */
+static u32 gcm_zp_report(u32 value_ea)
 {
-    const u32 h = (value_ea >> 4) * 2654435761u;
-    for (u32 i = 0; i < ZP_PROBE; i++) {
-        const u32 k = (h + i) & (ZP_N - 1u);
-        if (!s_zp_ea[k]) return 0;
-        if (s_zp_ea[k] == value_ea) { *count = s_zp_count[k]; return 1; }
+    u32* s = gcm_zp_slot(value_ea, 1);
+    const u32 seq = ++s_zp_next ? s_zp_next : ++s_zp_next;   /* never 0 */
+    *s = seq;
+    return seq;
+}
+
+void cellGcm_zpass_result(u32 value_ea, u32 count, u32 seq)
+{
+    const u32* s = gcm_zp_slot(value_ea, 0);
+    const int current = s && *s == seq;
+    if (s_zt_on && zt_active()) {
+        extern unsigned long long ps3_ms_now(void);
+        __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[zt] R %llu f=%u ea=0x%08X count=%u was=%u%s\n",
+                ps3_ms_now(), s_flip_request_count, value_ea, count, vm_read32(value_ea),
+                current ? "" : " (a later report took it)");
     }
-    return 0;
+    if (!current) return;
+    vm_write32(value_ea, count);
 }
 
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
@@ -2545,7 +2564,9 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * every queried object is occluded. */
     if (m == 0x1A8) s_report_dma = v;
     /* NV4097_CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT): a query starts. */
-    if (m == 0x17C8 && v == 1u && cellGcm_zpass_observer) cellGcm_zpass_observer(0, 0);
+    if (m == 0x17C8 && v == 1u && cellGcm_zpass_observer) cellGcm_zpass_observer(0, 0, 0);
+    /* NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE: the counter counts only while on. */
+    if (m == 0x17CC && cellGcm_zpass_observer) cellGcm_zpass_observer(2, v != 0u, 0);
     /* GCM_ZPASS_TRACE: CLEAR_REPORT_VALUE 0x17C8, SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC,
      * SET_ZCULL_STATS_ENABLE 0x1804, SET_RENDER_ENABLE 0x1E98. */
     if ((m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98) && s_zt_on > 0 && zt_active()) {
@@ -2565,7 +2586,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
             const u32 rea = gcm_io2ea(off);
             if (rea) {
                 const int zp = (v >> 24) == 1u && cellGcm_zpass_observer;
-                if (zp) gcm_zpass_last(rea + 8u, &val);
+                const u32 zseq = zp ? gcm_zp_report(rea + 8u) : 0u;
                 if (zp) {
                     zt_init_observer();
                     if (s_zt_on) {
@@ -2583,7 +2604,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
                 vm_write32(rea + 4u, (u32)ts);
                 vm_write32(rea + 8u, val);
                 vm_write32(rea + 12u, 0u);
-                if (zp) cellGcm_zpass_observer(1, rea + 8u);
+                if (zp) cellGcm_zpass_observer(1, rea + 8u, zseq);
                 if (gcm_park_dump_ms()) {
                     extern unsigned long long ps3_ms_now(void);
                     const u32 i = s_rep_tr_w++ % GCM_REP_TRACE_N;

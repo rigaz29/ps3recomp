@@ -427,6 +427,7 @@ typedef struct {
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
     u64 poly;               /* polygon offset, rsx_poly_key (PSO key) */
     u32 ext;                /* 1 depth bounds test, 2 depth clip (PSO key) */
+    u32 aa;                 /* the surface's sample grid, x | y << 4, 0 for 1x1 (PSO key) */
     u32 mrt;                /* MRT 1-3 masks and blend enables, rsx_pso_mrt (PSO key) */
     u64 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     u64 unnorm;             /* texel-coordinate units and their sizes (PSO key) */
@@ -5031,6 +5032,8 @@ static u64 dr_gamma_key(const D3D12DrawRecord* dr)
     return k;
 }
 
+static void rsx_aa_grid(u32 surface_format, u32* sx, u32* sy);   /* the surface's sample grid */
+
 /* A depth texture (DEPTH24_D8, DEPTH16 and their float forms) on unit u. */
 static int dr_tex_depth_fmt(const D3D12DrawRecord* dr, int u)
 {
@@ -5346,6 +5349,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     rsx_fp_shadow_desc shd[16];
     const u64 shadow = (buffered && udr) ? dr_shadow_descs(udr, shd) : 0u;
     if (shadow) gamma = dr_gamma_key(udr);
+    /* An antialiased surface is drawn at its sample grid; WPOS reads the
+     * pixel (rsx_fp_apply_wpos_grid), so the grid is part of the key. */
+    u32 aax = 1, aay = 1;
+    if (udr) rsx_aa_grid(udr->rt_fmt, &aax, &aay);
+    const u32 aa = (aax > 1 || aay > 1) ? (aax | aay << 4) : 0u;
     /* Nor, buffered, on the units' gamma decode or on which are cubes. The
      * decode is chosen when the program runs (_rsx_gamma_dyn, its lanes in
      * fp_tcscale[u].z), and every unit's coordinate takes its scale from b1,
@@ -5379,7 +5387,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
-            s_d3d.vp_fp[i].shadow == shadow &&
+            s_d3d.vp_fp[i].shadow == shadow && s_d3d.vp_fp[i].aa == aa &&
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
             s_d3d.vp_fp[i].poly == pkey &&
             s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
@@ -5519,6 +5527,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         float sc[VP_TEX_UNITS][2];
         const u32 mask = dr_coord_scales(udr, sc);
         fp_apply_coord_scale(hlsl, sizeof(hlsl), mask & ~cube_mask, (const float (*)[2])sc);
+    }
+    if (aa && rsx_fp_apply_wpos_grid(hlsl, sizeof(hlsl), aax, aay) < 0) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: WPOS sample grid not applied (shape)%c", fp_addr, 10);
     }
     /* WPOS in the draw's window convention: y counted up from the bottom edge
      * of a window that tall, and/or integer pixel centres (the draw engine's
@@ -5972,6 +5985,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].poly    = pkey;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ext     = ext;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].aa      = aa;
     s_d3d.vp_fp[s_d3d.vp_fp_n].mrt     = mrt;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp[s_d3d.vp_fp_n].job     = job;
@@ -7556,11 +7570,32 @@ static int rsx_scissor_on(void)
 /* The part of a tw x th target a record's scissor leaves, in `r`; 0 when that
  * is the whole target (or the scissor is off), so the caller can keep its
  * full-target path. An empty rect (right <= left) clips everything. */
+/* SET_SURFACE_FORMAT's antialias field (bits 12-15) as a sample grid. An
+ * antialiased surface is held at its sample resolution, as it lies in guest
+ * memory: DIAGONAL_CENTERED_2 (3) is 2x1 samples a pixel, SQUARE_CENTERED_4
+ * (4) and SQUARE_ROTATED_4 (5) are 2x2 (rsx_dispatch.c, the shared engine).
+ * God of War: Ascension draws its transparent effects into a 640x360 4x
+ * surface over its 1280x720 targets and depth (the same memory, as 1280x720
+ * samples); drawn as a 640x360 viewport they landed shrunk in the top-left
+ * quarter. The viewport and scissor registers stay in pixels and are scaled
+ * by the grid; WPOS gets the pixel back (rsx_fp_apply_wpos_grid).
+ * RSX_AA_GRID=0: off. */
+static void rsx_aa_grid(u32 surface_format, u32* sx, u32* sy)
+{
+    static int off = -1;
+    if (off < 0) { const char* e = getenv("RSX_AA_GRID"); off = (e && atoi(e) == 0) ? 1 : 0; }
+    const u32 aa = (surface_format >> 12) & 0xFu;
+    *sx = (!off && aa >= 3 && aa <= 5) ? 2u : 1u;
+    *sy = (!off && (aa == 4 || aa == 5)) ? 2u : 1u;
+}
+
 static int rec_scissor_rect(const D3D12DrawRecord* dr, LONG tw, LONG th, D3D12_RECT* r)
 {
     if (!rsx_scissor_on()) return 0;
-    LONG l = (LONG)dr->sc_x, t = (LONG)dr->sc_y;
-    LONG rr = l + (LONG)dr->sc_w, b = t + (LONG)dr->sc_h;
+    u32 ax, ay;
+    rsx_aa_grid(dr->rt_fmt, &ax, &ay);
+    LONG l = (LONG)(dr->sc_x * ax), t = (LONG)(dr->sc_y * ay);
+    LONG rr = l + (LONG)(dr->sc_w * ax), b = t + (LONG)(dr->sc_h * ay);
     if (rr > tw) rr = tw;
     if (b > th) b = th;
     if (l > rr) l = rr;
@@ -7642,6 +7677,7 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
     /* Surface clip dims when sane; else the window size. Any size works --
      * passes draw normalized full-surface quads -- this only picks resolution. */
     u32 w = st->surface_clip_w, h = st->surface_clip_h;
+    { u32 ax, ay; rsx_aa_grid(st->surface_format, &ax, &ay); w *= ax; h *= ay; }
     if (w < 16 || w > 2048 || h < 16 || h > 2048) { w = 0; h = 0; }
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
@@ -10724,14 +10760,16 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         th = (float)s_d3d.off_ds[cur_z].h;
                     }
                     D3D12_VIEWPORT dvp = {0, 0, tw, th, 0.0f, 1.0f};
+                    u32 ax, ay;
+                    rsx_aa_grid(dr->rt_fmt, &ax, &ay);   /* an AA surface: samples */
                     /* A 1x1 viewport is sane: a luminance chain ends in one pixel. */
                     if (dr->vp_w >= 1 && dr->vp_h >= 1 &&
-                        (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
-                        (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
-                        dvp.TopLeftX = (float)dr->vp_x;
-                        dvp.TopLeftY = (float)dr->vp_y;
-                        dvp.Width    = (float)dr->vp_w;
-                        dvp.Height   = (float)dr->vp_h;
+                        (float)((dr->vp_x + dr->vp_w) * ax) <= tw + 0.5f &&
+                        (float)((dr->vp_y + dr->vp_h) * ay) <= th + 0.5f) {
+                        dvp.TopLeftX = (float)(dr->vp_x * ax);
+                        dvp.TopLeftY = (float)(dr->vp_y * ay);
+                        dvp.Width    = (float)(dr->vp_w * ax);
+                        dvp.Height   = (float)(dr->vp_h * ay);
                     }
                     D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
                                       (LONG)(dvp.TopLeftX + dvp.Width),

@@ -380,11 +380,17 @@ static u64 s_report_last_ts;
  * Until then the walker's report reads 0xFFFF, "visible": the title moves its
  * reports around, so the last count a report's address had belonged to some
  * other object, and an old 0 dropped objects in view (the menu's black holes).
- * A count arrives only if no later report has taken the address since. */
+ * A count arrives only if no later report has taken the address since, and
+ * only while the report is as the walker wrote it (its time stamp and
+ * "visible"): the title reads a report, takes the value it finds and marks
+ * the report again for its next query (0xFFFFFFFF, or 0), often before the
+ * count is back, and a count written over that mark was a stale count the
+ * title took for its next query (55% of the counts in the menu). */
 void (*cellGcm_zpass_observer)(int op, u32 a, u32 b);   /* 0 clear; 1 report (value ea, seq); 2 counter on/off */
 #define ZP_N 16384u
 #define ZP_PROBE 64u     /* a full table costs a bounded search, then a reuse */
 static u32 s_zp_ea[ZP_N], s_zp_seq[ZP_N];   /* a report address and its latest report's number */
+static u32 s_zp_tslo[ZP_N];                 /* the time stamp's low word the walker wrote with it */
 static u32 s_zp_next;
 /* GCM_ZPASS_TRACE=<from_ms>:<count>: from <from_ms> after the start, the next
  * <count> events of the ZPASS reports, with the time and the walker's flip
@@ -462,12 +468,13 @@ static u32* gcm_zp_slot(u32 value_ea, int add)
     s_zp_ea[k] = value_ea;   /* a full probe run reuses its first slot */
     return &s_zp_seq[k];
 }
-/* A ZPASS report reached by the walker: its number. */
-static u32 gcm_zp_report(u32 value_ea)
+/* A ZPASS report reached by the walker, written with this time stamp: its number. */
+static u32 gcm_zp_report(u32 value_ea, u32 ts_lo)
 {
     u32* s = gcm_zp_slot(value_ea, 1);
     const u32 seq = ++s_zp_next ? s_zp_next : ++s_zp_next;   /* never 0 */
     *s = seq;
+    s_zp_tslo[s - s_zp_seq] = ts_lo;
     return seq;
 }
 
@@ -475,14 +482,18 @@ void cellGcm_zpass_result(u32 value_ea, u32 count, u32 seq)
 {
     const u32* s = gcm_zp_slot(value_ea, 0);
     const int current = s && *s == seq;
+    /* The walker wrote the time stamp (its low word just before the value)
+     * and "visible"; anything else there is the title's own. */
+    const int intact = current && vm_read32(value_ea - 4u) == s_zp_tslo[s - s_zp_seq] &&
+                       vm_read32(value_ea) == 0xFFFFu;
     if (s_zt_on && zt_active()) {
         extern unsigned long long ps3_ms_now(void);
         __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
         fprintf(stderr, "[zt] R %llu f=%u ea=0x%08X count=%u was=%u%s\n",
                 ps3_ms_now(), s_flip_request_count, value_ea, count, vm_read32(value_ea),
-                current ? "" : " (a later report took it)");
+                !current ? " (a later report took it)" : !intact ? " (the title has taken it)" : "");
     }
-    if (!current) return;
+    if (!intact) return;
     vm_write32(value_ea, count);
 }
 
@@ -2586,7 +2597,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
             const u32 rea = gcm_io2ea(off);
             if (rea) {
                 const int zp = (v >> 24) == 1u && cellGcm_zpass_observer;
-                const u32 zseq = zp ? gcm_zp_report(rea + 8u) : 0u;
+                const u32 zseq = zp ? gcm_zp_report(rea + 8u, (u32)ts) : 0u;
                 if (zp) {
                     zt_init_observer();
                     if (s_zt_on) {

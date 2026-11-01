@@ -49,6 +49,8 @@ ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 # Options every spu_lifter.py run gets (--float-spec).
 LIFTER_ARGS = []
+# Modules lifted without --merge-chunks (--merge-skip).
+MERGE_SKIP = set()
 BASE   = 0x4000
 
 # Per-module code/data boundary, keyed by the module's content hash -- so this
@@ -381,6 +383,11 @@ def main():
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
                          "instead of chunks linked by trampolines.")
+    ap.add_argument("--merge-skip", action="append", default=[], metavar="NAME[,NAME...]",
+                    help="With --merge-chunks: lift these modules (jobmod_<sha>_e<entry>) "
+                         "without it. A merged run has internal branches, so none of its "
+                         "functions gets a --float-spec body; a module whose time is in "
+                         "such bodies is faster unmerged. Repeatable.")
     ap.add_argument("--float-spec", type=int, default=0, metavar="N",
                     help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
                          "each function with no store, channel op, call or internal branch "
@@ -388,6 +395,7 @@ def main():
     args = ap.parse_args()
     if args.float_spec:
         LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
+    MERGE_SKIP.update(n.strip() for spec in args.merge_skip for n in spec.split(",") if n.strip())
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
@@ -413,7 +421,7 @@ def main():
     for path in mods:
         raw = open(path, "rb").read()
         name = os.path.splitext(os.path.basename(path))[0]         # jobmod_<sha>_e<entry>
-        m = lift_module(raw, name, OUTDIR, tmp_elf, args.merge_chunks,
+        m = lift_module(raw, name, OUTDIR, tmp_elf, args.merge_chunks and name not in MERGE_SKIP,
                         base=module_base(raw))
         if m:
             manifest.append(m)
@@ -453,7 +461,7 @@ def lift_engine_elf(args, register_c):
         if code_end is None:
             print(f"  SKIP {name}: no reachable code", file=sys.stderr)
             continue
-        m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks, code_end)
+        m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks and name not in MERGE_SKIP, code_end)
         if not m:
             continue
         m.update(ea=eas[0], eas=eas, code_end=code_end)

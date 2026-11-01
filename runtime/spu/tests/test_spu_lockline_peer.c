@@ -558,17 +558,14 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ * The acknowledge clears its bits with an atomic AND and every producer of
+ * the LR bit sets it with an atomic OR (SPU_EVENT_CLEAR / SPU_EVENT_SET), so
+ * neither can overwrite the other in any order, and the acknowledge takes no
+ * lock. A bare read-modify-write lost the raise when it read event_status
+ * before the raise and wrote it back after. Here the raise comes first, made
+ * under the lock-line lock as a peer's commit makes it; the acknowledge then
+ * runs while that lock is still held, which it must not wait for, and the
+ * raise must survive it.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
 
@@ -595,6 +592,11 @@ static void test_ack_keeps_a_concurrent_raise(void)
 
     spu_lockline_lock();
 
+    /* The raise a peer's commit would make, under the lock that peer holds. */
+    spu_coh_notify_write(LINE_A);
+    TEST("the raise lands beside the event being acknowledged");
+    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
+
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
         spu_lockline_unlock();
@@ -603,22 +605,16 @@ static void test_ack_keeps_a_concurrent_raise(void)
         return;
     }
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
-
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
-
-    /* The raise a peer's commit would make, under the lock that peer holds. */
-    spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
+    /* Bounded: an acknowledge that waits for the lock fails here rather
+     * than hanging the test. */
+    for (int i = 0; i < 2000 && !g_ack_done; i++) Sleep(1);
+    TEST("the acknowledge completes while the lock-line lock is held");
+    CHECK(g_ack_done == 1);
 
     spu_lockline_unlock();
     pthread_join(t, NULL);
 
     TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
     CHECK(g_a.resv_valid == 0);
 }

@@ -3223,10 +3223,16 @@ static int spu_ib_diag(void)
     return d;
 }
 
-/* Above every address the full path below treats specially before its lookup
- * (the kernel services 0x9C0/0x9D0, the policy entry 0xA00, the task syscall
- * 0xA70). */
-#define SPU_IB_PLAIN_LO 0xA80u
+/* Every address the full path below treats specially before its lookup is
+ * the kernel services 0x9C0/0x9D0, the policy entry 0xA00 or the task syscall
+ * 0xA70; the rest above them are plain. The WWS job manager's interrupt
+ * handler starts at 0xA2C (LS 0 holds `bra 0xA2C`), ~2 times an EDGE job in
+ * God of War: Ascension, and took the full path when the bound was 0xA80. */
+#define SPU_IB_PLAIN_LO 0x9E0u
+static inline int spu_ib_plain(uint32_t pc)
+{
+    return pc >= SPU_IB_PLAIN_LO && pc != 0xA00u && pc != SPURS_TASKSET_PM_SYSCALL_LS;
+}
 
 /* Everything spu_indirect_branch does but the common branch. A function of its
  * own: in one function with the common branch, its large frame -- eight saved
@@ -3263,7 +3269,7 @@ void spu_indirect_branch(spu_context* ctx)
      * the handler makes is a common one. They all took the full path, and the
      * Wws job manager takes ~4 interrupts a job (its DMA lists stall and
      * notify): ~20 of an EDGE run's 27 full branches. */
-    if (__builtin_expect(ctx->pc >= SPU_IB_PLAIN_LO &&
+    if (__builtin_expect(spu_ib_plain(ctx->pc) &&
                          (!ctx->irq_saved || ctx->pc != (ctx->irq_resume_pc & SPU_LS_MASK)) &&
                          ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID && !spu_ib_diag(), 1)) {
         spu_ib_resolve_task(ctx);
@@ -3287,7 +3293,7 @@ void spu_indirect_branch(spu_context* ctx)
 
 /* SPU_IBFULL=<seconds>: the indirect branches that took the full path, by the
  * image owning the target (its resident span's, else the context's), the
- * target and the kind: low (a special address below SPU_IB_PLAIN_LO), iret
+ * target and the kind: low (a special address, not spu_ib_plain), iret
  * (the interrupt resume point), miss (no lifted function there). The 16 most
  * taken, every <seconds>, across all SPU threads (approximate counts). */
 static void spu_ibfull_note(const spu_context* ctx)
@@ -3308,7 +3314,7 @@ static void spu_ibfull_note(const spu_context* ctx)
             off = pc - ctx->resident_code[slot].lsa;
             break;
         }
-    const uint32_t kind = pc < SPU_IB_PLAIN_LO ? 0u
+    const uint32_t kind = !spu_ib_plain(pc) ? 0u
                         : (ctx->irq_saved && pc == (ctx->irq_resume_pc & SPU_LS_MASK)) ? 1u : 2u;
     uint32_t h = ((pc >> 2) ^ ((uint32_t)img * 2654435761u)) & (N - 1);
     for (int probe = 0; probe < 16; probe++, h = (h + 1) & (N - 1)) {
@@ -3340,7 +3346,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
     spu_ibfull_note(ctx);
 #ifdef PS3_SPU_JOBCAP
     SPU_JS_ADD(SPU_JS_IB_FULL, 1);
-    if (ctx->pc < SPU_IB_PLAIN_LO) SPU_JS_ADD(SPU_JS_IB_LOW, 1);
+    if (!spu_ib_plain(ctx->pc)) SPU_JS_ADD(SPU_JS_IB_LOW, 1);
     else if (ctx->irq_saved && ctx->pc == (ctx->irq_resume_pc & SPU_LS_MASK)) SPU_JS_ADD(SPU_JS_IB_IRET, 1);
 #endif
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):

@@ -114,6 +114,11 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* Flips that found the one before still pending: that frame was never
+ * presented (the drain went on past it, GCM_FIFO_CATCHUP_BYTES, and reached
+ * the next flip before the ticker took it). */
+static volatile u32 s_flip_merged = 0;
+u32 cellGcm_flip_merged_count(void) { return s_flip_merged; }
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -1140,6 +1145,19 @@ static volatile int s_fifo_recycle_waiting = 0;
  * ring plus everything from its start to put -- nearly the whole ring, not
  * nothing. Only computed when both pointers lie inside the title's own ring;
  * any other layout (segments linked by JUMPs) reports 0, as before. */
+/* GCM_FIFO_CATCHUP_BYTES=<n>: the backlog past which the drain does not stop
+ * at a flip (the define is the default). */
+static u32 gcm_fifo_catchup_bytes(void)
+{
+    static u32 v = 0;
+    if (!v) {
+        const char* e = getenv("GCM_FIFO_CATCHUP_BYTES");
+        v = e ? (u32)strtoul(e, NULL, 0) : 0u;
+        if (!v) v = GCM_FIFO_CATCHUP_BYTES;
+    }
+    return v;
+}
+
 static u32 gcm_fifo_backlog(u32 put, u32 get)
 {
     if (put >= get) return put - get;
@@ -2802,6 +2820,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
+                if (s_flip_pending) s_flip_merged++;
                 s_flip_pending = 1;
                 s_flip_request_count++;
                 /* Not past `queued`: a resync may already have written off
@@ -2824,7 +2843,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * 3 MB ring at boot, wraps, and a walker stopping at every flip
              * then crawled ~1 KB a tick while the title wrote over the
              * commands ahead of it. */
-            if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
+            if (gcm_fifo_backlog(put, s_fifo_getoff) < gcm_fifo_catchup_bytes())
                 { why = "flip"; break; }
             continue;
         }
@@ -3694,6 +3713,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
         gcm_set_current_display_buffer(bufferId);
+        if (s_flip_pending) s_flip_merged++;
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
         s_flip_direct_pending = 1;

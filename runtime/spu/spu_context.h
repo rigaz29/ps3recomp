@@ -320,8 +320,9 @@ typedef struct spu_context {
      * context's current lifetime: 0 after spu_context_init (or a zeroed
      * allocation) until its first cached dispatch, so a context reset at the
      * same address never meets an earlier lifetime's entries. dcache_residency
-     * is bumped on every change to resident_code, dropping the cached
-     * resolutions of this context. */
+     * counts the changes to resident_code; each one also bumps dcache_page_gen
+     * (at the end of this struct) for the pages its spans cover, which drops
+     * the cached resolutions of addresses there. */
     uint32_t dcache_id, dcache_residency;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
@@ -440,6 +441,12 @@ typedef struct spu_context {
     /* Its slot in spu_coherency.c's array of reserved lines, 1-based (0 = none).
      * Assigned under the lock-line lock with the list node. */
     uint32_t coh_slot;
+
+    /* Per 4 KB page of local store: bumped by every change to a resident code
+     * span that covers the page (spu_channels.c). A cached resolution keeps
+     * the count of its address's page, so a code piece loaded elsewhere does
+     * not drop it. Last in the struct: nothing before it moves. */
+    uint32_t dcache_page_gen[SPU_LS_SIZE >> 12];
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own

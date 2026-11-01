@@ -2033,8 +2033,15 @@ static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t ls
  *  - the target and the context's image, resident overlay and resident task;
  *  - the registry, by its append-only count (any registration drops every
  *    entry);
- *  - the context's resident code slots, by dcache_residency, which
- *    spu_overlay_note_get (their only runtime writer) bumps on every change;
+ *  - the context's resident code slots, by the count of the target's 4 KB
+ *    page (dcache_page_gen), which every change to a span covering the page
+ *    bumps (spu_overlay_note_get and spu_pic_adopt are their only runtime
+ *    writers). Only spans that contain the target take part in resolving it,
+ *    and each covers the target's page. Per page, not per context: God of
+ *    War: Ascension's EDGE jobs load ~2 KB position-independent pieces in
+ *    turn, ~1.8 span changes a job, and each change used to drop the
+ *    context's every entry -- 21 full resolutions a job, of the job module's
+ *    and the job manager's code that had not moved;
  *  - the context's lifetime, by dcache_id: a context re-initialised at the
  *    same address starts with id 0 and takes a fresh one.
  * A verified slot is not re-compared, as without the cache (verify once per
@@ -2068,7 +2075,16 @@ static int spu_dcache_mode(void)   /* 0 off, 1 on, 2 shadow */
     }
     return m;
 }
-static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
+/* A resident code span [lsa, lsa + size) appeared, went or changed state. */
+static void spu_dcache_span_changed(spu_context* ctx, uint32_t lsa, uint32_t size)
+{
+    ctx->dcache_residency++;
+    if (!size) return;
+    const uint32_t first = (lsa & SPU_LS_MASK) >> 12;
+    uint32_t last = (uint32_t)(((uint64_t)lsa + size - 1u) >> 12);
+    if (last >= (SPU_LS_SIZE >> 12)) last = (SPU_LS_SIZE >> 12) - 1u;
+    for (uint32_t p = first; p <= last; ++p) ctx->dcache_page_gen[p]++;
+}
 static void spu_dcache_shadow_stats(void)
 {
     const unsigned long long n = __atomic_load_n(&s_dcache_hits, __ATOMIC_RELAXED) +
@@ -2093,9 +2109,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     /* Read before the resolver walks the registry: an entry is never keyed by
      * a count newer than the registry it saw. */
     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+    const uint32_t* const pgen = &c->dcache_page_gen[(lsa >> 12) & ((SPU_LS_SIZE >> 12) - 1u)];
     spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
     if (e->id == id && e->lsa == lsa && e->rgen == rgen &&
-        e->residency == c->dcache_residency && e->image == c->image_id &&
+        e->residency == *pgen && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
         /* A kept miss outlives a GET that ends no resident span, and a block
          * with a position-independent piece inside is such a GET: look for
@@ -2103,7 +2120,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         if (!e->fn && s_pic_sig_n) {
             const spu_lifted_fn f = spu_pic_adopt(c, lsa);
             if (f) {
-                e->fn = f; e->residency = c->dcache_residency; e->pic_base = c->pic_base;
+                e->fn = f; e->residency = *pgen; e->pic_base = c->pic_base;
                 return f;
             }
         }
@@ -2129,10 +2146,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         spu_dcache_shadow_stats();
     }
     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
-    /* The resolver may have verified a pending slot; the entry records the
-     * residency it resolved against, read after it. */
+    /* The resolver may have verified a pending slot or placed a piece; the
+     * entry records the page's count it resolved against, read after it. */
     e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
-    e->residency = c->dcache_residency; e->image = c->image_id;
+    e->residency = *pgen; e->image = c->image_id;
     e->ovl = c->resident_ovl; e->task = c->resident_task;
     e->pic_base = c->pic_base;
     return fn;
@@ -2371,12 +2388,14 @@ static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa)
         for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
             if (ctx->resident_code[slot].image_id &&
                 ctx->resident_code[slot].lsa < place + extent &&
-                place < ctx->resident_code[slot].lsa + ctx->resident_code[slot].size)
+                place < ctx->resident_code[slot].lsa + ctx->resident_code[slot].size) {
+                spu_dcache_span_changed(ctx, ctx->resident_code[slot].lsa, ctx->resident_code[slot].size);
                 ctx->resident_code[slot].image_id = 0;
+            }
             if (!ctx->resident_code[slot].image_id && free_slot < 0) free_slot = (int)slot;
         }
         SPU_JS_ADD(SPU_JS_RES_PIC, 1);
-        spu_dcache_residency_changed(ctx);
+        spu_dcache_span_changed(ctx, place, extent);
         if (free_slot < 0) return NULL;
         ctx->resident_code[free_slot].lsa = place;
         ctx->resident_code[free_slot].size = extent;
@@ -2666,12 +2685,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               (uint32_t)ctx->pc & SPU_LS_MASK); }
                 ctx->resident_code[slot].image_id = 0;
                 SPU_JS_ADD(SPU_JS_RES_DROP, 1);
-                spu_dcache_residency_changed(ctx);
+                spu_dcache_span_changed(ctx, base, end - base);
             } else if (ctx->resident_code[slot].verify_state &&
                        !spu_overlay_get_kept_code(ctx, slot, lsa, size)) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
                 SPU_JS_ADD(SPU_JS_RES_PEND, 1);
-                spu_dcache_residency_changed(ctx);
+                spu_dcache_span_changed(ctx, base, end - base);
             }
         }
     }
@@ -2704,6 +2723,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;
+                    if (ctx->resident_code[slot].image_id)   /* the span it replaces */
+                        spu_dcache_span_changed(ctx, lsa, ctx->resident_code[slot].size);
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = ea;
@@ -2713,7 +2734,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].pic = o->pic;
                     ctx->resident_code[slot].pic_delta = lsa - o->load_lsa;
                     SPU_JS_ADD(SPU_JS_RES_NEW, 1);
-                    spu_dcache_residency_changed(ctx);
+                    spu_dcache_span_changed(ctx, lsa, o->span);
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);

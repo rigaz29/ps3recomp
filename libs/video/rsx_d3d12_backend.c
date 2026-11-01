@@ -186,6 +186,11 @@ typedef struct {
     u32 cb_slot;
     const u8* fp_snap;  /* its fragment program as recorded (fp_snapshot), or NULL */
     u32 fp_snap_len;
+    u64 fp_shash;       /* with fp_snap: the program's structural hash, */
+    u32 fp_shash_nk;    /* its inline constant count by that walk, */
+    u32 fp_units;       /* the texture units it samples, */
+    const u8* fp_consts;/* and its constants as rsx_fp_collect_constants gives them */
+    int fp_nconsts;
     u32 fpcb_off;       /* its b1 slot in this frame's half of vp_fpcb */
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
@@ -4987,6 +4992,7 @@ static void fp_apply_coord_scale(char* hlsl, size_t cap, u32 mask, const float s
     }
 }
 
+static int dr_cube_tex_on(void);
 static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 {
     /* ON by default (RSX_CUBE_TEX=0 to disable). This was off while the cube path
@@ -4995,12 +5001,18 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
      * constants hoisted into b1 the cube path costs 0 PSO misses, and with the
      * per-face stride fixed (each face is a whole mip pyramid, not one mip-0
      * image) all six faces decode as clean environment art. */
-    static int en = -1;
-    if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
-    if (!en) return 0;
+    if (!dr_cube_tex_on()) return 0;
     u32 m = 0;
     for (int u = 0; u < VP_TEX_UNITS; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
     return m;
+}
+
+/* RSX_CUBE_TEX=0 turns cube textures off (dr_cube_mask). */
+static int dr_cube_tex_on(void)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
+    return en;
 }
 
 /* The entry's pipeline, taking over a finished worker build. NULL with
@@ -5111,7 +5123,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         static int cb_on = -1;
         if (cb_on < 0) { const char* e = getenv("FP_CONSTBUF"); cb_on = !(e && e[0] == '0'); }
         u32 nk = 0;
-        const u64 sh = cb_on ? rsx_fp_structural_hash_n(prog, prog_max, 1469598103934665603ull, &nk) : 0;
+        u64 sh = 0;
+        if (cb_on && prog != vm_base + off) { sh = udr->fp_shash; nk = udr->fp_shash_nk; }
+        else if (cb_on) sh = rsx_fp_structural_hash_n(prog, prog_max, 1469598103934665603ull, &nk);
         if (sh && nk <= FP_CB_MAX_K) {
             buffered = 1;
             uhash = (u32)(sh ^ (sh >> 32));
@@ -5135,7 +5149,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * too; a literal one has them compiled in. The alpha test's function is
      * compiled in (its reference is fp_alpha.x, or a literal). NO_ALPHATEST=1
      * leaves it out. */
-    if (buffered) unnorm = 0;
+    /* Compiled in, the program is keyed on its units' gamma decode, cubes and
+     * scales; the callers pass 0 for them, and they are worked out here only
+     * then (each walks the 16 units, and both lookups of every draw paid it). */
+    if (!buffered && udr) {
+        cube_mask = dr_cube_mask(udr);
+        gamma = dr_gamma_key(udr);
+        unnorm = dr_unnorm_key(udr);
+    }
     /* Nor, buffered, on the units' gamma decode or on which are cubes. The
      * decode is chosen when the program runs (_rsx_gamma_dyn, its lanes in
      * fp_tcscale[u].z), and every unit's coordinate takes its scale from b1,
@@ -5144,7 +5165,6 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * each combination of a program's bindings was a program of its own: God
      * of War: Ascension with its MLAA off added 250-700 to the shader cache a
      * run and skipped ~80K draws waiting for them. */
-    if (buffered) { gamma = 0; cube_mask = 0; }
     const u32 wpos_key = (!buffered && udr) ? udr->wpos_win : 0u;
     u32 atest = 0;
     if (udr && ((udr->alpha_ctl >> 16) & 1u) && ((udr->alpha_ctl >> 8) & 0xFFu) < 7u &&
@@ -7044,7 +7064,19 @@ static u32 s_fpcb_used;
 #define FP_SNAP_SLOTS 1024u
 static u8* s_fpsnap;
 static u32 s_fpsnap_used, s_fpsnap_gen = 1;
-static struct { u32 addr, off, len, gen; } s_fpsnap_idx[FP_SNAP_SLOTS];
+static struct { u32 addr, off, len, gen; u64 shash; u32 shash_nk, units, koff; int nconsts; }
+    s_fpsnap_idx[FP_SNAP_SLOTS];
+
+static void fp_snapshot_fill(D3D12DrawRecord* dr, const u8* half, u32 slot)
+{
+    dr->fp_snap = half + s_fpsnap_idx[slot].off;
+    dr->fp_snap_len = s_fpsnap_idx[slot].len;
+    dr->fp_shash = s_fpsnap_idx[slot].shash;
+    dr->fp_shash_nk = s_fpsnap_idx[slot].shash_nk;
+    dr->fp_units = s_fpsnap_idx[slot].units;
+    dr->fp_consts = half + s_fpsnap_idx[slot].koff;
+    dr->fp_nconsts = s_fpsnap_idx[slot].nconsts;
+}
 
 static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
 {
@@ -7058,13 +7090,20 @@ static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
     const u32 slot = (dr->fp_addr * 2654435761u) >> 22;            /* FP_SNAP_SLOTS */
     if (s_fpsnap_idx[slot].gen == s_fpsnap_gen && s_fpsnap_idx[slot].addr == dr->fp_addr &&
         !memcmp(half + s_fpsnap_idx[slot].off, prog, s_fpsnap_idx[slot].len)) {
-        dr->fp_snap = half + s_fpsnap_idx[slot].off;
-        dr->fp_snap_len = s_fpsnap_idx[slot].len;
+        fp_snapshot_fill(dr, half, slot);
         return;
     }
     const u32 len = rsx_fp_program_size(prog, FP_MAX_BYTES);
     if (!len) return;                     /* no end: read at the build, as before */
-    if (s_fpsnap_used + len > FP_SNAP_HALF) {
+    /* The program, then its constants: what each draw of it used to work out
+     * twice or three times (the structural hash at both lookups, the texture
+     * units at the prepass, the constants at the record), once a batch. */
+    static rsx_fp_constant_block kb;      /* only the recording thread */
+    int nconsts = rsx_fp_collect_constants(prog, len, &kb);
+    if (nconsts < 0) nconsts = 0;
+    if (nconsts > (int)FP_CB_MAX_K) nconsts = (int)FP_CB_MAX_K;
+    const u32 klen = (u32)nconsts * 16u;
+    if (s_fpsnap_used + ((len + 15u) & ~15u) + klen > FP_SNAP_HALF) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 4))
             fprintf(stderr, "[D3D12] fragment program snapshots full this batch (%u bytes); the rest read at the build%c",
@@ -7072,13 +7111,21 @@ static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
         return;
     }
     memcpy(half + s_fpsnap_used, prog, len);
+    const u32 koff = s_fpsnap_used + ((len + 15u) & ~15u);
+    if (klen) memcpy(half + koff, kb.values, klen);
+    u32 shash_nk = 0;
     s_fpsnap_idx[slot].addr = dr->fp_addr;
     s_fpsnap_idx[slot].off = s_fpsnap_used;
     s_fpsnap_idx[slot].len = len;
     s_fpsnap_idx[slot].gen = s_fpsnap_gen;
-    dr->fp_snap = half + s_fpsnap_used;
-    dr->fp_snap_len = len;
-    s_fpsnap_used += (len + 15u) & ~15u;
+    s_fpsnap_idx[slot].shash = rsx_fp_structural_hash_n(half + s_fpsnap_used, len, 1469598103934665603ull,
+                                                        &shash_nk);
+    s_fpsnap_idx[slot].shash_nk = shash_nk;
+    s_fpsnap_idx[slot].units = rsx_fp_texture_units(half + s_fpsnap_used, len);
+    s_fpsnap_idx[slot].koff = koff;
+    s_fpsnap_idx[slot].nconsts = nconsts;
+    s_fpsnap_used = koff + klen;
+    fp_snapshot_fill(dr, half, slot);
 }
 
 static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
@@ -7094,12 +7141,13 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         extern u32 cellGcmResolveLocated(int, u32);
         static rsx_fp_constant_block kb;   /* only the recording thread */
         int nk = 0;
+        const void* kv = kb.values;
         if (dr->fp_addr && vm_base) {
             const u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1, dr->fp_addr & ~0x3u);
             if (foff != 0xFFFFFFFFu) {
                 fp_snapshot(dr, vm_base + foff);
-                nk = rsx_fp_collect_constants(dr->fp_snap ? dr->fp_snap : vm_base + foff,
-                                              dr->fp_snap ? dr->fp_snap_len : FP_MAX_BYTES, &kb);
+                if (dr->fp_snap) { nk = dr->fp_nconsts; kv = dr->fp_consts; }
+                else nk = rsx_fp_collect_constants(vm_base + foff, FP_MAX_BYTES, &kb);
             }
             if (nk < 0) nk = 0;
             if (nk > (int)FP_CB_MAX_K) nk = (int)FP_CB_MAX_K;
@@ -7116,7 +7164,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             s_fpcb_used += bytes;
         }
         float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped + (u64)s_d3d.vp_parity * FPCB_HALF + dr->fpcb_off);
-        if (nk > 0) memcpy(ts + FPCB_CONSTS * 4, kb.values, (size_t)nk * 16u);
+        if (nk > 0) memcpy(ts + FPCB_CONSTS * 4, kv, (size_t)nk * 16u);
         /* fp_alpha: x the alpha test's reference, y the WPOS window height
          * when its origin is the bottom edge (0 otherwise), z the pixel-centre
          * bias (-0.5 for integer centres): what the buffered decompile
@@ -9708,7 +9756,8 @@ static void rf_prepass(u32 from, u32 to)
           extern u32 cellGcmResolveLocated(int local, u32 offset);
           if (hi && dr->fp_addr && vm_base) {
               const u32 fo = cellGcmResolveLocated((dr->fp_addr & 3u) == 1, dr->fp_addr & ~3u);
-              if (fo != 0xFFFFFFFFu) fp_units = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
+              if (dr->fp_snap) fp_units = dr->fp_units;
+              else if (fo != 0xFFFFFFFFu) fp_units = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
           } }
         srvq_begin(_d);
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
@@ -9827,7 +9876,7 @@ static void rf_prepass(u32 from, u32 to)
                      (_bf >= 0x86 && _bf <= 0x88) || _bf == 0x9A ||
                      _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
-                    int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                    int _cube = dr->tex[_u].cube && dr_cube_tex_on();
                     const double _ts0 = tex_stats_frames() ? perf_now() : 0.0;
                     const double _hl0 = rsx_census_secs() ? perf_now() : 0.0;
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
@@ -9880,8 +9929,8 @@ static void rf_prepass(u32 from, u32 to)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr), dr->raw,
-                                       dr->zs_key, dr_gamma_key(dr), dr_unnorm_key(dr), dr);
+                                       dr->fp_ctrl, dr->cmask, dr->cull, 0u, dr->raw,
+                                       dr->zs_key, 0u, 0u, dr);
         if (_mt0 > 0.0 && s_perf_pso_miss != _m0) { s_hl_miss_n++; s_hl_miss_s += perf_now() - _mt0; }
         s_sj_nowait = 0;
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
@@ -10367,8 +10416,8 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->raw, dr->zs_key,
-                                                dr_gamma_key(dr), dr_unnorm_key(dr), dr) : NULL;
+                                                0u, dr->raw, dr->zs_key,
+                                                0u, 0u, dr) : NULL;
                 /* Its program is still being built: skip the draw this frame
                  * rather than draw it with another one. */
                 s_sj_nowait = 0;

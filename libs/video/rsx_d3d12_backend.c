@@ -12870,6 +12870,69 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     return o;
 }
 
+/* DBT_VTX=<n>: the first n draws with the depth bounds test on (God of War:
+ * Ascension's screen mask passes): primitive, vertex range, viewport, scissor and
+ * the first four values of attribute 0 as the guest wrote them. A diagnostic. */
+static void dbt_vtx_dbg(const rsx_state* st, const char* kind, u32 primitive, u32 first, u32 count)
+{
+    static int cap = -1, n = 0;
+    if (cap < 0) { const char* e = getenv("DBT_VTX"); cap = e ? atoi(e) : 0; }
+    if (!cap || n >= cap || !st || !st->depth_bounds_enable) return;
+    n++;
+    float lo, hi;
+    memcpy(&lo, &st->depth_bounds_min, 4); memcpy(&hi, &st->depth_bounds_max, 4);
+    fprintf(stderr, "[DBTVTX] %s%s prim=%u first=%u count=%u dbt=%.6f..%.6f vp=%u,%u,%ux%u sc=%u,%u,%ux%u"
+                    " vpscale=%g,%g off=%g,%g sref=0x%X",
+            kind, g_rsx_inline ? " inline" : "", primitive, first, count, lo, hi, st->viewport_x, st->viewport_y, st->viewport_w,
+            st->viewport_h, st->scissor_x, st->scissor_y, st->scissor_w, st->scissor_h,
+            st->viewport_scale[0], st->viewport_scale[1], st->viewport_offset[0], st->viewport_offset[1],
+            st->stencil_ref);
+    for (int u = 0; u < 16; u++) {
+        const rsx_texture_state* t = &st->textures[u];
+        if (!(t->control0 & 0x80000000u)) continue;   /* enabled units */
+        fprintf(stderr, " | t%d off=0x%X fmt=0x%X addr=0x%X ctl0=0x%X filt=0x%X rect=%ux%u", u, t->offset,
+                t->format, t->address, t->control0, t->filter, t->image_rect >> 16, t->image_rect & 0xFFFF);
+    }
+    for (int ai = 0; ai < 16; ai++) {
+        const rsx_vertex_attrib* a = &st->vertex_attribs[ai];
+        if (!a->enabled) continue;
+        fprintf(stderr, " | a%d off=0x%X str=%u sz=%u ty=%u:", ai, a->offset, a->stride, a->size, a->type);
+        if (ai > 2) continue;
+        /* As the backend fetches them (inline arrays included). */
+        for (u32 v = 0; v < 6 && v < count; v++) {
+            float f[4];
+            rsx_fetch_attrib(st, ai, first + v, f);
+            fprintf(stderr, " (%g,%g,%g,%g)", f[0], f[1], f[2], f[3]);
+        }
+    }
+    fprintf(stderr, "%c", 10);
+}
+
+/* SURF_DBG=1: each distinct surface set-up a draw renders with (targets,
+ * offsets, pitches, clip, viewport, zeta). A diagnostic. */
+static void surf_dbg(const rsx_state* st)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SURF_DBG"); on = e ? atoi(e) : 0; }
+    if (!on || !st) return;
+    static u32 seen[256]; static int ns = 0;
+    u32 k = 2166136261u;
+    const u32 v[] = { st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
+                      st->surface_color_pitch[0], st->surface_color_pitch[1], st->surface_clip_w,
+                      st->surface_clip_h, st->viewport_w, st->viewport_h, st->surface_zeta_offset,
+                      st->surface_zeta_pitch, st->surface_format };
+    for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) k = (k ^ v[i]) * 16777619u;
+    for (int i = 0; i < ns; i++) if (seen[i] == k) return;
+    if (ns >= 256) return;
+    seen[ns++] = k;
+    extern unsigned cellGcm_flip_request_count(void);
+    fprintf(stderr, "[SURF] flip=%u tgt=0x%X a=0x%X/%u b=0x%X/%u clip=%ux%u vp=%u,%u,%ux%u zeta=0x%X/%u fmt=0x%X fp=0x%X%c",
+            cellGcm_flip_request_count(), st->color_target, st->surface_color_offset[0], st->surface_color_pitch[0],
+            st->surface_color_offset[1], st->surface_color_pitch[1], st->surface_clip_w, st->surface_clip_h,
+            st->viewport_x, st->viewport_y, st->viewport_w, st->viewport_h, st->surface_zeta_offset,
+            st->surface_zeta_pitch, st->surface_format, st->shader_program, 10);
+}
+
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
@@ -12889,6 +12952,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
+    dbt_vtx_dbg(s_d3d.current_rsx_state, "arrays", primitive, first, count);
+    surf_dbg(s_d3d.current_rsx_state);
     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
     if (count == 0 || count > MAX_VERTICES) return;
     vs_arrays(s_d3d.current_rsx_state, primitive, count);
@@ -13136,6 +13201,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                primitive, first, count);
         log_count++;
     }
+    dbt_vtx_dbg(s_d3d.current_rsx_state, "indexed", primitive, first, count);
+    surf_dbg(s_d3d.current_rsx_state);
     if (!s_d3d.pipeline_ready) return;
     if (count == 0 || count > MAX_VERTICES) return;
     if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;

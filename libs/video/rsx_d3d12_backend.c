@@ -3632,6 +3632,28 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
  * a BMP cannot show). */
 static FILE* s_cap_px;
 
+/* RSX_CAP_RAW=1: each captured target's exact bytes as well (<name>.raw, rows of
+ * width x bytes per pixel, no padding): the BMPs keep three bytes a pixel, which
+ * loses a float target's top byte. Depth surfaces too (cap_ds_write). */
+static int cap_raw_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_CAP_RAW"); v = e ? atoi(e) != 0 : 0; }
+    return v;
+}
+static void cap_write_raw(const char* path, const char* ext, const u8* p, u32 row_bytes, u32 h, u32 pitch)
+{
+    char rp[600];
+    snprintf(rp, sizeof rp, "%s%s", path, ext);
+    char* dot = strrchr(rp, '.');
+    /* rt_X.bmp.raw -> rt_X.raw */
+    { char* b = strstr(rp, ".bmp"); if (b && dot && b < dot) memmove(b, dot, strlen(dot) + 1); }
+    FILE* f = fopen(rp, "wb");
+    if (!f) return;
+    for (u32 y = 0; y < h; y++) fwrite(p + (u64)y * pitch, 1, row_bytes, f);
+    fclose(f);
+}
+
 static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
                                D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
 {
@@ -3708,6 +3730,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     const HRESULT mhr = rb->lpVtbl->Map(rb, 0, &rr, &mp);
     if (SUCCEEDED(mhr) && mp) {
         cap_write_bmp(path, mp, w, h, pitch, dxgi);
+        if (cap_raw_on()) cap_write_raw(path, ".raw", (const u8*)mp, w * bpp, h, pitch);
         if (s_cap_px) {
             const char* bn = strrchr(path, '/');
             fprintf(s_cap_px, "%s", bn ? bn + 1 : path);
@@ -3818,6 +3841,71 @@ static int cap_batch_yellow(u32 fi)
     return 0;
 }
 
+/* A depth surface's planes (depth, stencil) as raw rows: <path>.depth.raw and
+ * <path>.stencil.raw, in the formats GetCopyableFootprints gives for them. */
+static void cap_ds_write(OffDS* ds, u32 fi, const char* path)
+{
+    if (!ds->res) return;
+    D3D12_RESOURCE_DESC desc;
+    ds->res->lpVtbl->GetDesc(ds->res, &desc);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[2];
+    UINT rows[2]; UINT64 rowb[2], total = 0;
+    s_d3d.device->lpVtbl->GetCopyableFootprints(s_d3d.device, &desc, 0, 2, 0, fp, rows, rowb, &total);
+    if (!total) return;
+    ID3D12Resource* rb = NULL;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = total; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)) || !rb)
+        return;
+    wait_for_gpu();
+    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = ds->res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (ds->st != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = ds->st;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    for (UINT pl = 0; pl < 2; pl++) {
+        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+        dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = fp[pl];
+        src.pResource = ds->res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = pl;
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    }
+    if (ds->st != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = ds->st;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
+    wait_for_gpu();
+    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)total};
+    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
+        for (UINT pl = 0; pl < 2; pl++)
+            cap_write_raw(path, pl ? ".stencil.raw" : ".depth.raw", (const u8*)mp + fp[pl].Offset,
+                          (u32)rowb[pl], rows[pl], fp[pl].Footprint.RowPitch);
+        fprintf(stderr, "[RSXCAP] %s: depth %ux%u fmt %u row %llu, stencil fmt %u row %llu%c", path,
+                fp[0].Footprint.Width, fp[0].Footprint.Height, (unsigned)fp[0].Footprint.Format,
+                (unsigned long long)rowb[0], (unsigned)fp[1].Footprint.Format,
+                (unsigned long long)rowb[1], 10);
+        D3D12_RANGE wr = {0, 0};
+        rb->lpVtbl->Unmap(rb, 0, &wr);
+    }
+    rb->lpVtbl->Release(rb);
+}
+
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
 {
     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
@@ -3871,7 +3959,8 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 if (r->dbt) {
                     float lo, hi;
                     memcpy(&lo, &r->dbt_min, sizeof lo); memcpy(&hi, &r->dbt_max, sizeof hi);
-                    fprintf(mf, "      dbt %.6f..%.6f z=0x%X\n", lo, hi, r->zeta_off);
+                    fprintf(mf, "      dbt %.6f..%.6f z=0x%X sref=0x%02X\n", lo, hi, r->zeta_off,
+                            (unsigned)r->stencil_ref);
                 }
                 /* Only the units the program samples: the others carry
                  * whatever earlier draws left bound. */
@@ -3925,6 +4014,28 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 }
                 shown++;
             }
+            /* The draws with a depth bounds test (God of War: Ascension's screen
+             * mask passes): the first one's whole bank, then for each of the next
+             * the slots that differ from it. */
+            fprintf(mf, "--- vp constants of depth-bounds draws (slots differing from the first) ---\n");
+            const float* c0 = NULL;
+            int nshown = 0;
+            for (u32 d = 0; d < ndraws && d < MAX_DRAWS && nshown < 48; d++) {
+                const D3D12DrawRecord* r = &s_d3d.draws[d];
+                if (r->is_clear || !r->dbt) continue;
+                const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
+                    + ((u64)par * MAX_DRAWS + d) * VP_CB_STRIDE);
+                fprintf(mf, "op%03u vs=%d n=%u sref=0x%02X\n", d, r->vs_idx, r->vertex_count,
+                        (unsigned)r->stencil_ref);
+                for (int sl = 0; sl < RSX_MAX_VERTEX_CONSTANTS; sl++) {
+                    const float* v = c + sl * 4;
+                    const int nz = v[0] || v[1] || v[2] || v[3];
+                    if (!c0 ? nz : memcmp(v, c0 + sl * 4, 16) != 0)
+                        fprintf(mf, "   c[%3d] = %9.4f %9.4f %9.4f %9.4f\n", sl, v[0], v[1], v[2], v[3]);
+                }
+                if (!c0) c0 = c;
+                nshown++;
+            }
         }
         fclose(mf);
     }
@@ -3941,6 +4052,12 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
         cap_readback_write(r->res, r->w, r->h, r->dxgi, r->st, fi, path);
     }
+    if (cap_raw_on())
+        for (int i = 0; i < MAX_OFF_DS; i++) {
+            if (!s_d3d.off_ds[i].res) continue;
+            snprintf(path, sizeof path, "%s/ds_%08X", dir, s_d3d.off_ds[i].off);
+            cap_ds_write(&s_d3d.off_ds[i], fi, path);
+        }
     cap_dump_snaps(fi, dir);
     if (s_cap_px) { fclose(s_cap_px); s_cap_px = NULL; }
     printf("[RSXCAP] frame %llu -> %s (%u ops)\n",

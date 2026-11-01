@@ -260,6 +260,13 @@ def _bi_target_reg(insn):
     return None
 
 
+# shufb_hoist: a loop with one of these in its body keeps every shufb as it is.
+# A call or an indirect branch can change any register before the loop goes on;
+# a channel op can block, take an interrupt or stop the SPU.
+_HOIST_BARRIER = {"brsl", "brasl", "bisl", "bisled", "bi", "bid", "bie", "biz", "binz",
+                  "bihz", "bihnz", "iret", "stop", "stopd", "rdch", "wrch", "rchcnt"}
+
+
 # RRR (4-operand) SPU ops write their destination in bits 21-27; the low 7 bits
 # (raw & 0x7F) are the RC *source* for these. Every other format writes bits 0-6.
 _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
@@ -565,6 +572,52 @@ class SPULifter:
         # least N single-precision float ops gets a speculative body (_float_spec).
         # 0 = off.
         self.float_spec = 0
+        # shufb_hoist (--no-shufb-hoist or SPU_LIFT_NO_SHUFB_HOIST=1 to turn off): a
+        # shufb whose control a loop never writes gets the control prepared once,
+        # before the loop (_shufb_hoists).
+        self.shufb_hoist = os.environ.get("SPU_LIFT_NO_SHUFB_HOIST") != "1"
+        self._shufb_pre = {}
+
+    def _shufb_hoists(self, insns, start, end, labels):
+        """The loops of [start, end) whose shufb controls can be prepared once.
+
+        A loop is a backward branch from b to a label t with the body [t, b] one
+        block: no other label in (t, b], every branch to t from inside [t, b]
+        (so the only way in from outside is falling into t, or t is the
+        function's entry), and nothing in it that could change a register
+        behind the code's back (_HOIST_BARRIER). A shufb there whose control
+        register no instruction of the body writes gets it prepared right
+        before t. Returns ({t: [rc, ...]}, {shufb address: t})."""
+        if not self.shufb_hoist:
+            return {}, {}
+        body = [i for i in insns if start <= i.addr < end]
+        by_addr = {i.addr: i for i in body}
+        sources = {}
+        for i in body:
+            t = self._branch_target(i)
+            if t is not None and start <= t < end:
+                sources.setdefault(t, []).append(i.addr)
+        preps, pre = {}, {}
+        for t, srcs in sources.items():
+            back = [a for a in srcs if a >= t]
+            if not back:
+                continue
+            b = max(back)
+            if any(a < t or a > b for a in srcs):
+                continue
+            if any(t < x <= b for x in labels):
+                continue
+            loop = [by_addr[a] for a in range(t, b + 4, 4) if a in by_addr]
+            if any(i.mnemonic in _HOIST_BARRIER for i in loop):
+                continue
+            written = {_dest_reg(i) for i in loop if i.mnemonic not in _NO_RT_WRITE}
+            for i in loop:
+                if i.mnemonic == "shufb" and (i.raw & 0x7F) not in written:
+                    rc = i.raw & 0x7F
+                    if rc not in preps.setdefault(t, []):
+                        preps[t].append(rc)
+                    pre[i.addr] = t
+        return preps, pre
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -586,10 +639,17 @@ class SPULifter:
         # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
         # each merged chunk entry hands back to the drain when one is pending.
         merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
+        preps, self._shufb_pre = self._shufb_hoists(insns, start, end, internal | merged_starts)
+        # Declared at the top: right before a loop head there can be a label, and
+        # a declaration can't follow one (before C23).
+        func.body_lines.extend(f"    spu_shufc spu_sc_{t:X}_{rc};"
+                               for t in sorted(preps) for rc in preps[t])
         last_insn = None
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
+            for rc in preps.get(insn.addr, ()):
+                func.body_lines.append(f"    spu_sc_{insn.addr:X}_{rc} = spu_shufc_prep(ctx->gpr[{rc}]);")
             if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             if insn.addr in merged_starts:
@@ -948,6 +1008,9 @@ class SPULifter:
             return f"{g(rt())} = spu_selb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "shufb":
             rc = _reg(ops[3])
+            pre = self._shufb_pre.get(insn.addr)
+            if pre is not None:
+                return f"{g(rt())} = spu_shufb_pre({g(ra())}, {g(rb())}, &spu_sc_{pre:X}_{rc});"
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn in ("fma", "fms", "fnms", "mpya"):
             rc = _reg(ops[3])
@@ -1324,6 +1387,11 @@ def main() -> None:
                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                         "which append a zlib inflate string table + float tables "
                         "after the code at 0xAE68 / 0xAE48).")
+    p.add_argument("--no-shufb-hoist", action="store_true",
+                   help="Keep every shufb as it is. By default a shufb whose control "
+                        "register a loop never writes gets the control prepared once, "
+                        "before the loop (spu_shufc_prep / spu_shufb_pre). "
+                        "SPU_LIFT_NO_SHUFB_HOIST=1 does the same.")
     p.add_argument("--merge-chunks", action="store_true",
                    help="Emit each run of contiguous chunks from one call target "
                         "to the next as ONE C function (branches between them "
@@ -1471,6 +1539,8 @@ def main() -> None:
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
     lifter.pic = args.pic
     lifter.float_spec = args.float_spec
+    if args.no_shufb_hoist:
+        lifter.shufb_hoist = False
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

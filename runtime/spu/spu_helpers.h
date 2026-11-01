@@ -576,6 +576,36 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 #define spu_shufb_ref spu_shufb
 #endif
 
+/* shufb with a control a loop never writes, which the lifter hoists
+ * (tools/spu_lifter.py, shufb_hoist): spu_shufc_prep once before the loop,
+ * spu_shufb_pre in it. The selection is spu_shufb's. On x86 the parts that
+ * depend only on the control -- the source index, the a/b select, the special
+ * selectors' values -- are done once, which leaves two pshufb and two blendv a
+ * shuffle (spu_shufb: ten ops). tests/test_spu_shufb.c checks it against the
+ * reference. */
+#if defined(__SSE4_1__)
+typedef struct { __m128i idx, sel, spec, specm; } spu_shufc;
+static inline spu_shufc spu_shufc_prep(u128 c) {
+    spu_shufc p; __m128i C; memcpy(&C, &c, 16);
+    p.idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(0x03));
+    p.sel = _mm_slli_epi16(C, 3);
+    const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, (char)0xFF, (char)0x80, 0, 0, 0, 0, 0, 0, 0, 0);
+    p.spec = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 5), _mm_set1_epi8(0x07)));
+    p.specm = C;
+    return p;
+}
+static inline u128 spu_shufb_pre(u128 a, u128 b, const spu_shufc* p) {
+    __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16);
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, p->idx), _mm_shuffle_epi8(B, p->idx), p->sel);
+    r = _mm_blendv_epi8(r, p->spec, p->specm);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+#else
+typedef struct { u128 c; } spu_shufc;
+static inline spu_shufc spu_shufc_prep(u128 c) { spu_shufc p; p.c = c; return p; }
+static inline u128 spu_shufb_pre(u128 a, u128 b, const spu_shufc* p) { return spu_shufb(a, b, p->c); }
+#endif
+
 /* ---- shift / rotate immediate (word lanes) ---- */
 static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
 static inline u128 spu_shlhi(u128 a, int sh) { u128 r; sh&=0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); return r; }

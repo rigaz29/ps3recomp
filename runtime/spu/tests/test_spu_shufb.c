@@ -24,8 +24,15 @@ int main(void)
             printf("test_spu_shufb: MISMATCH at iteration %d\n", it);
             return 1;
         }
+        /* the form with the control prepared ahead (the lifter's shufb_hoist) */
+        const spu_shufc p = spu_shufc_prep(c);
+        u128 z = spu_shufb_pre(a, b, &p);
+        if (memcmp(&z, &y, 16)) {
+            printf("test_spu_shufb: spu_shufb_pre MISMATCH at iteration %d\n", it);
+            return 1;
+        }
     }
-    puts("test_spu_shufb: ok (200000 random cases)");
+    puts("test_spu_shufb: ok (200000 random cases, spu_shufb and spu_shufb_pre)");
     return 0;
 #endif
 }

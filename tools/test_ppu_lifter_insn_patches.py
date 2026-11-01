@@ -63,6 +63,26 @@ def main():
 
         r, _ = lift(root, [dict(good[0], addr="0x20000")])
         assert r.returncode != 0 and "0x00020000" in r.stderr, r.stderr[-400:]
+
+    # 4. A call patched out: the original keeps its call, link and drain.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "code.bin").write_bytes(bytes.fromhex(
+            "7c0802a6"    # 0x10000 mflr r0
+            "f8010010"    # 0x10004 std  r0, 16(r1)
+            "48000011"    # 0x10008 bl   0x10018
+            "e8010010"    # 0x1000C ld   r0, 16(r1)
+            "7c0803a6"    # 0x10010 mtlr r0
+            "4e800020"    # 0x10014 blr
+            "38600007"    # 0x10018 li   r3, 7
+            "4e800020"))  # 0x1001C blr
+        (root / "functions.json").write_text(json.dumps(
+            [{"start": "0x10000", "end": "0x10018"}, {"start": "0x10018", "end": "0x10020"}]))
+        r, text = lift(root, [{"addr": "0x10008", "orig": "0x48000011", "new": "0x60000000",
+                               "guard": "g_skip"}])
+        assert r.returncode == 0, r.stderr
+        assert ("if (g_skip) { /* nop */; } else { ctx->lr = 0x0001000C; func_00010018(ctx); "
+                "DRAIN_TRAMPOLINE(ctx); }") in text, text
     print("PASS: insn patches lift both forms behind their guard and refuse a mismatch")
 
 

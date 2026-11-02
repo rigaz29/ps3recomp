@@ -6960,17 +6960,13 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * aligned) in. Assuming mip-0-sized strides made face 1 land inside face 0's
      * mip chain -- which is exactly what the dumps showed, every face after the
      * first a progressively smaller copy of the first. */
+    /* rsx_texture_cube_face_stride has the pyramid's size: here it was summed
+     * with 8 bytes a block whatever the format (bpp is 1 for any compressed
+     * one), so a DXT3/DXT5 cube read faces 1-5 from half their offsets -- God
+     * of War: Ascension's menu rocks reflected noise once its cubes were
+     * sampled as cubes. */
     u32 _face_bytes = dxt ? (blkrow * blkrows) : (w * h * bpp);
-    if (is_cube) {
-        u32 total = 0;
-        for (u32 lw = w, lh = h, l = 0; l < (mips ? mips : 1u); l++) {
-            total += dxt ? (((lw + 3) / 4) * (bpp == 8 ? 16u : 8u) * ((lh + 3) / 4))
-                         : (lw * lh * bpp);
-            if (lw > 1) lw >>= 1;
-            if (lh > 1) lh >>= 1;
-        }
-        _face_bytes = (total + 127u) & ~127u;
-    }
+    if (is_cube) _face_bytes = rsx_texture_cube_face_stride(fmt, w, h, mips ? mips : 1u, 0);
     /* A volume is decoded below, slice by slice (tex_decode_volume). */
     const u32 _nfaces     = vol ? 0u : is_cube ? 6u : 1u;
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;

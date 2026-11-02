@@ -616,6 +616,69 @@ class SPULifter:
         self.insn_patches = {}
         self.insn_patches_optional = set()
         self.insn_patches_landed = set()
+        # --ijmp-local: a computed jump (`bi $rX`, the bi*z forms; not a return) to an
+        # entry of the C function it is in -- its start or a chunk merged into it -- that
+        # an `ila` of the image loads goes there with a goto when SPU_IJMP_LOCAL allows
+        # (spu_context.h) instead of through the dispatcher (_ijmp_goto). The entries of
+        # the function being lifted, the image's ila values, and the sites done.
+        self.ijmp_local = False
+        self._ijmp_cands = ()
+        self._ila_cache = (None, frozenset())
+        self.ijmp_sites = 0
+
+    def _ila_targets(self, insns) -> frozenset:
+        """Every value an `ila` of the image loads: an 18-bit absolute address, the way
+        SPU code takes a code address (the head of a loop that ends `selb $rX, $head,
+        $exit, $cond; bi $rX`). Kept for the image's instruction list."""
+        if self._ila_cache[0] is not insns:
+            self._ila_cache = (insns, frozenset((i.raw >> 7) & 0x3FFFF
+                                                for i in insns if i.mnemonic == "ila"))
+        return self._ila_cache[1]
+
+    def _computed_jump(self, insn) -> bool:
+        """A bi/biz/binz/bihz/bihnz that _translate lowers as a jump through the
+        dispatcher, not as a return (SPU_RET, SPU_RET_REG)."""
+        if insn.mnemonic not in ("bi", "biz", "binz", "bihz", "bihnz"):
+            return False
+        reg = _bi_target_reg(insn)
+        if reg is None:
+            return False
+        return not ((reg == "0" and insn.addr not in self.bi_r0_jump)
+                    or insn.addr in self.link_return)
+
+    def _ijmp_goto(self) -> str:
+        """--ijmp-local: what a computed jump does first, ctx->pc set: to an entry of
+        this function (_ijmp_cands), a goto to its ijmp_ label when SPU_IJMP_LOCAL
+        allows -- SPU_DIRECT's tests, so a pending interrupt, a stack-reset entry or a
+        diagnostic that watches every step still goes through the drain loop."""
+        if not self._ijmp_cands:
+            return ""
+        self.ijmp_sites += 1
+        return self._ijmp_text(self._ijmp_cands)
+
+    def _ijmp_text(self, cands) -> str:
+        def arm(c):
+            return (f"if (SPU_IJMP_LOCAL(ctx, 0x{c:X}u, {self.prefix}spu_func_{c:08X})) "
+                    f"{{ ctx->pc = 0x{c:X}u; goto ijmp_{c:08X}; }}")
+        if len(cands) == 1:
+            return f"if ((ctx->pc & SPU_LS_MASK) == 0x{cands[0]:X}u) {arm(cands[0])} "
+        cases = " ".join(f"case 0x{c:X}u: {arm(c)} break;" for c in cands)
+        return f"switch (ctx->pc & SPU_LS_MASK) {{ {cases} default: break; }} "
+
+    def _ijmp_strip(self, lines):
+        """The lines without --ijmp-local's labels and gotos -- the computed jumps as
+        without the option -- and how many gotos there were."""
+        if not self._ijmp_cands:
+            return lines, 0
+        goto = self._ijmp_text(self._ijmp_cands)
+        labels = {f"ijmp_{c:08X}: ;" for c in self._ijmp_cands}
+        out, n = [], 0
+        for line in lines:
+            if line.strip() in labels:
+                continue
+            n += line.count(goto)
+            out.append(line.replace(goto, ""))
+        return out, n
 
     def _shufb_hoists(self, insns, start, end, labels):
         """The loops of [start, end) whose shufb controls can be prepared once.
@@ -670,12 +733,15 @@ class SPULifter:
                               start_addr=start, end_addr=end)
 
         internal: set[int] = set()
+        has_ijmp = False
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+            if self.ijmp_local and not has_ijmp and self._computed_jump(insn):
+                has_ijmp = True
 
         # Chunks merged into this function (--merge-chunks) are otherwise entered
         # through the drain loop, which delivers a pending SPU interrupt before
@@ -683,6 +749,13 @@ class SPULifter:
         # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
         # each merged chunk entry hands back to the drain when one is pending.
         merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
+        # --ijmp-local: the entries of this function a computed jump in it reaches by a
+        # goto (_ijmp_goto). Not for --pic: a piece's addresses move with it.
+        self._ijmp_cands = ()
+        if has_ijmp and not self.pic:
+            ila = self._ila_targets(insns)
+            self._ijmp_cands = tuple(sorted(a for a in {start} | merged_starts if a in ila))
+        ijmp_labels = set(self._ijmp_cands)
         preps, self._shufb_pre = self._shufb_hoists(insns, start, end, internal | merged_starts)
         # Declared at the top: right before a loop head there can be a label, and
         # a declaration can't follow one (before C23).
@@ -692,6 +765,10 @@ class SPULifter:
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
+            if insn.addr in ijmp_labels:
+                # Ahead of the loop's shufb preparations: a computed jump back here
+                # makes them again, as an entry through the drain loop does.
+                func.body_lines.append(f"ijmp_{insn.addr:08X}: ;")
             for rc in preps.get(insn.addr, ()):
                 func.body_lines.append(f"    spu_sc_{insn.addr:X}_{rc} = spu_shufc_prep(ctx->gpr[{rc}]);")
             if insn.addr in internal or insn.addr in merged_starts:
@@ -746,6 +823,12 @@ class SPULifter:
 
         if self.float_spec and not self.trace:
             self._float_spec(func, body_insns)
+        if func.spec_lines and self._ijmp_cands:
+            # The speculative body wins: it and its exact copy keep the dispatcher for
+            # their computed jumps, as without --ijmp-local (a loop that fell back to the
+            # exact copy once would otherwise stay in it).
+            func.body_lines, n = self._ijmp_strip(func.body_lines)
+            self.ijmp_sites -= n
         self.functions.append(func)
         return func
 
@@ -778,7 +861,7 @@ class SPULifter:
 
         out, seen, entry, written = [], set(), set(), []
         falls_off = True
-        for line in func.body_lines:
+        for line in self._ijmp_strip(func.body_lines)[0]:   # --ijmp-local: as without it
             text = line.strip()
             if text.endswith(":") or "goto " in text:
                 return
@@ -1226,8 +1309,9 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
-            # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            # Computed indirect tail: set pc + trampoline to the dispatcher, unwind
+            # (--ijmp-local: to an entry of this function by a goto first, _ijmp_goto).
+            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ijmp_goto()}"
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
@@ -1274,7 +1358,7 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ijmp_goto()}"
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
@@ -1468,6 +1552,13 @@ def main() -> None:
                         "register a loop never writes gets the control prepared once, "
                         "before the loop (spu_shufc_prep / spu_shufb_pre). "
                         "SPU_LIFT_NO_SHUFB_HOIST=1 does the same.")
+    p.add_argument("--ijmp-local", action="store_true",
+                   help="A computed jump (bi $rX, not a return) to an entry of the C "
+                        "function it is in -- its start or a merged chunk -- that an ila of "
+                        "the image loads goes there with a goto when SPU_IJMP_LOCAL allows "
+                        "(spu_context.h), not through the dispatcher. The SPU compiler's "
+                        "branch-free loops (selb $rX, $head, $exit, $cond; bi $rX) then stay "
+                        "in their function.")
     p.add_argument("--merge-chunks", action="store_true",
                    help="Emit each run of contiguous chunks from one call target "
                         "to the next as ONE C function (branches between them "
@@ -1617,6 +1708,7 @@ def main() -> None:
     lifter.float_spec = args.float_spec
     if args.no_shufb_hoist:
         lifter.shufb_hoist = False
+    lifter.ijmp_local = args.ijmp_local
     if args.insn_patches:
         lifter.insn_patches, lifter.insn_patches_optional = load_insn_patches(args.insn_patches)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
@@ -1683,6 +1775,9 @@ def main() -> None:
     if args.float_spec:
         print(f"  {sum(1 for f in lifter.functions if f.spec_lines)} with a speculative float body "
               f"(--float-spec {args.float_spec})")
+    if lifter.ijmp_local:
+        print(f"  {lifter.ijmp_sites} computed jump(s) with an entry of their function "
+              f"by a goto (--ijmp-local)")
     print(f"  {len(lifter.call_targets)} call target(s)")
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())

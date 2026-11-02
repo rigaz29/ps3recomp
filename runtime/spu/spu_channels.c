@@ -2159,6 +2159,28 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     return fn;
 }
 
+/* SPU_IJMP_LOCAL=shadow (spu_context.h): a computed jump's goto to an entry of its
+ * own function, checked against what the dispatcher would run there. The goto is
+ * taken only when the lookup gives that entry's function; the rest go through the
+ * dispatcher and the first 16 are reported. */
+int spu_ijmp_shadow(spu_context* ctx, uint32_t pc, void (*fn)(spu_context*))
+{
+    static unsigned long long s_n, s_bad;
+    const spu_lifted_fn f = spu_lifted_lookup(ctx, pc);
+    const unsigned long long n = __atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED);
+    if (f != (spu_lifted_fn)fn) {
+        if (__atomic_fetch_add(&s_bad, 1, __ATOMIC_RELAXED) < 16)
+            fprintf(stderr, "[spu-ijmp] shadow mismatch img=%d ovl=%d task=%d pc=0x%05X "
+                            "goto=%p lookup=%p\n", ctx->image_id, (int)ctx->resident_ovl,
+                    (int)ctx->resident_task, pc, (void*)fn, (void*)f);
+        return 0;
+    }
+    if ((n & ((1ull << 24) - 1)) == 0)
+        fprintf(stderr, "[spu-ijmp] shadow: %llu gotos, %llu mismatches\n", n,
+                __atomic_load_n(&s_bad, __ATOMIC_RELAXED));
+    return 1;
+}
+
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
  * A title registers each runtime-streamed overlay's SOURCE content EA with
  * the image id its lifted functions were registered under. The MFC GET path

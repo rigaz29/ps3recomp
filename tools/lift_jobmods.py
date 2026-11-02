@@ -47,7 +47,7 @@ from wrap_spu_elf import wrap
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
-# Options every spu_lifter.py run gets (--float-spec).
+# Options every spu_lifter.py run gets (--float-spec, --ijmp-local).
 LIFTER_ARGS = []
 # Modules lifted without --merge-chunks (--merge-skip).
 MERGE_SKIP = set()
@@ -408,9 +408,15 @@ def main():
                     help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
                          "each function with no store, channel op, call or internal branch "
                          "and at least N single-precision float ops.")
+    ap.add_argument("--ijmp-local", action="store_true",
+                    help="Pass --ijmp-local to spu_lifter.py: a computed jump to an entry of "
+                         "its own C function that an ila loads is a goto, not a pass through "
+                         "the dispatcher.")
     args = ap.parse_args()
     if args.float_spec:
         LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
+    if args.ijmp_local:
+        LIFTER_ARGS.append("--ijmp-local")
     MERGE_SKIP.update(n.strip() for spec in args.merge_skip for n in spec.split(",") if n.strip())
     if args.insn_patches:
         for e in json.load(open(args.insn_patches)).get("patches", []):

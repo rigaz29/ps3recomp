@@ -116,6 +116,7 @@ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
  * SPU_PCHIST, SPU_NO_LS0_END, SPU_EXITTRACE, SPU_STEPTRACE, SPU_JOBDRAIN and
  * SPURS_PM_FLOW. */
 volatile int g_spu_direct = -1;
+volatile int g_spu_ijmp_local = -1;
 void spu_direct_init(void)
 {
     if (g_spu_direct >= 0) return;
@@ -130,6 +131,14 @@ void spu_direct_init(void)
         const char* d = getenv(diag[i]);
         if (d && *d && strcmp(d, "0")) { on = 0; why = diag[i]; }
     }
+    /* --ijmp-local's gotos (spu_context.h): off with the step diagnostics, not for
+     * want of musttail -- a goto needs none. */
+    { const char* j = getenv("SPU_IJMP_LOCAL");
+      const int ij = !on ? 0 : !j ? 1 : !strcmp(j, "shadow") ? 2 : (j[0] == '0' && !j[1]) ? 0 : 1;
+      if (on && ij != 1)
+          fprintf(stderr, "[spu] computed jumps to their own function: %s (SPU_IJMP_LOCAL)\n",
+                  ij ? "a goto, checked against the dispatcher" : "through the dispatcher");
+      g_spu_ijmp_local = ij; }
 #ifndef SPU_DIRECT_TAILCALLS
     on = 0; why = "no musttail in this compiler";
 #endif

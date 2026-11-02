@@ -1080,6 +1080,27 @@ void spu_direct_init(void);
     } while (0)
 #endif
 
+/* --ijmp-local (tools/spu_lifter.py): a computed jump -- `bi $rX` or a bi*z form, not
+ * a return -- whose target is an entry of the C function it is in (its start, or a
+ * chunk --merge-chunks put in it) that an `ila` of the image loads. The lifted code
+ * compares the target with those entries and, when this allows, goes there with a
+ * goto instead of through spu_indirect_branch and the drain loop. The tests are
+ * SPU_DIRECT's: not the run's first transfer, not a stack-reset entry, no interrupt
+ * pending with interrupts enabled, no diagnostic that watches each step
+ * (spu_direct_init). The SPU compiler's branch-free loops end `selb $rX, $head,
+ * $exit, $cond; bi $rX`, and every pass went through the dispatcher: God of War:
+ * Ascension's audio worker spent ~18% of its time there.
+ * SPU_IJMP_LOCAL=0: through the dispatcher as before. SPU_IJMP_LOCAL=shadow: each
+ * goto asks the dispatcher too and is taken only when the lookup gives the entry's
+ * own function (spu_ijmp_shadow, spu_channels.c, reports the rest). */
+extern volatile int g_spu_ijmp_local;   /* spu_drain.c: -1 unread, 0 off, 1 on, 2 shadow */
+int spu_ijmp_shadow(spu_context* ctx, uint32_t pc, void (*fn)(spu_context*));
+#define SPU_IJMP_LOCAL(ctx, PC, FN)                                           \
+    (__builtin_expect(g_spu_ijmp_local > 0, 1) && (ctx)->steps &&             \
+     !g_spu_stack_reset_hint[((PC) >> 2) & 1023u] &&                          \
+     !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)) &&     \
+     (__builtin_expect(g_spu_ijmp_local == 1, 1) || spu_ijmp_shadow((ctx), (PC), (FN))))
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful

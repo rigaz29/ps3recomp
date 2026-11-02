@@ -228,13 +228,15 @@ int rsx_fp_decompile_buffered_color_dyn_ex(
     char* out, u32 out_size, u32* out_constant_count);
 /* As above, and rsx_fp_decompile_color_ex, with tex_vol_mask naming the units
  * bound to a 3D texture: declared Texture3D on their own t-register and sampled
- * with three coordinates, as the cube units are TextureCube. */
+ * with three coordinates, as the cube units are TextureCube; and expand_masks
+ * (NULL: none) the lanes each unit's fetches sign-expand, as below. */
 int rsx_fp_decompile_buffered_color_dyn_vol_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
-    char* out, u32 out_size, u32* out_constant_count);
+    const u8* expand_masks, char* out, u32 out_size, u32* out_constant_count);
 int rsx_fp_decompile_color_vol_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                                   u32 tex_cube_mask, u32 tex_vol_mask,
-                                  const u8 gamma_masks[16], char* out, u32 out_size);
+                                  const u8 gamma_masks[16], const u8* expand_masks,
+                                  char* out, u32 out_size);
 /* Both: depth comparison per unit and post-filter gamma per unit. */
 /* Texture sign expansion (SET_TEXTURE_ADDRESS UNSIGNED_REMAP_BIASED):
  * expand_masks[u] is a post-remap RGBA lane mask of the lanes unit u

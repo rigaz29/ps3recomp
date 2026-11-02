@@ -436,6 +436,7 @@ typedef struct {
     u64 gamma;              /* texture gamma lanes, 4 bits per unit (PSO key) */
     u64 unnorm;             /* texel-coordinate units and their sizes (PSO key) */
     u64 shadow;             /* depth-compared units, dr_shadow_descs (PSO key) */
+    u64 expand;             /* sign-expanding units, a hash of their lane masks (PSO key) */
     u32 wpos;               /* rec_wpos_win of the draw, literal programs (PSO key) */
     u32 atest;              /* alpha test compiled in: CELL_GCM function, and for a
                              * literal program the reference above bit 16 (PSO key) */
@@ -5234,6 +5235,14 @@ static int tex_sep_on(void)
     return en;
 }
 
+/* RSX_TEX_EXPAND=0: programs decompiled without texture sign expansion. */
+static int tex_expand_on(void)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("RSX_TEX_EXPAND"); en = e ? (atoi(e) != 0) : 1; }
+    return en;
+}
+
 /* A unit bound to a volume the upload makes as one: uncompressed, deeper than
  * one slice. RSX_TEX3D=0: its first slice, in 2D, as before. */
 static int dr_unit_vol(const D3D12DrawRecord* dr, int u)
@@ -5416,6 +5425,22 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         cube_mask = ((dr_cube_mask(udr) | dr_vol_mask(udr) << 16) & (su | su << 16));
     }
     const u32 cube_units = cube_mask & 0xFFFFu, vol_units = cube_mask >> 16;
+    /* Texture sign expansion (SET_TEXTURE_ADDRESS UNSIGNED_REMAP_BIASED): the
+     * lanes each sampled unit re-centres to -1..1 (rsx_texture_expand_mask),
+     * compiled in and keyed on, as the other backends do. No program of God
+     * of War: Ascension's menu, opening cinematic or first level uses it.
+     * RSX_TEX_EXPAND=0 leaves them out, as before. */
+    u8 exp_masks[16] = {0};
+    u64 expand = 0;
+    if (udr && tex_expand_on()) {
+        const u32 su = (udr->fp_snap && udr->fp_addr == fp_addr) ? udr->fp_units : 0xFFFFu;
+        for (int u = 0; u < VP_TEX_UNITS; u++) {
+            if (!((su >> u) & 1u) || !udr->tex[u].set) continue;
+            exp_masks[u] = rsx_texture_expand_mask(udr->tex[u].fmt, udr->tex[u].ctrl1,
+                                                   udr->tex[u].filter, udr->tex[u].addr);
+            if (exp_masks[u]) expand = (expand ^ ((u64)exp_masks[u] << 8 | (u64)u)) * 1099511628211ull + 1u;
+        }
+    }
     /* Depth textures the RSX compares (shadow maps): the comparison is compiled
      * in (_rsx_shadowN) and keyed on, and with it the gamma decode of the
      * program's other units (the shadow entry point takes the masks rather
@@ -5460,6 +5485,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
+            s_d3d.vp_fp[i].expand == expand &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
             s_d3d.vp_fp[i].shadow == shadow && s_d3d.vp_fp[i].aa == aa &&
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
@@ -5560,13 +5586,25 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     u32 nk = 0;
     int n = (buffered && shadow)
         ? rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, prog_max, fp_ctrl,
-                                                    cube_units, vol_units, shd, gamma_masks, NULL,
+                                                    cube_units, vol_units, shd, gamma_masks,
+                                                    expand ? exp_masks : NULL,
                                                     hlsl, sizeof(hlsl), &nk)
         : buffered
         ? rsx_fp_decompile_buffered_color_dyn_vol_ex(prog, prog_max, fp_ctrl, cube_units, vol_units,
+                                                     expand ? exp_masks : NULL,
                                                      hlsl, sizeof(hlsl), &nk)
         : rsx_fp_decompile_color_vol_ex(prog, prog_max, fp_ctrl, cube_units, vol_units,
-                                        gamma ? gamma_masks : NULL, hlsl, sizeof(hlsl));
+                                        gamma ? gamma_masks : NULL, expand ? exp_masks : NULL,
+                                        hlsl, sizeof(hlsl));
+    if (expand) {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 8)) {
+            fprintf(stderr, "[EXPAND] fp=0x%X lanes", fp_addr);
+            for (int u = 0; u < VP_TEX_UNITS; u++)
+                if (exp_masks[u]) fprintf(stderr, " t%d=0x%02X", u, exp_masks[u]);
+            fprintf(stderr, "%c", 10);
+        }
+    }
     /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
      * before they reach an integer target. */
     if (n > 0 && !ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
@@ -6039,6 +6077,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].gamma     = gamma;
     s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm    = unnorm;
     s_d3d.vp_fp[s_d3d.vp_fp_n].shadow    = shadow;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].expand    = expand;
     s_d3d.vp_fp[s_d3d.vp_fp_n].wpos      = wpos_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].atest     = atest;
     s_d3d.vp_fp[s_d3d.vp_fp_n].last_use  = s_d3d.frame_count;

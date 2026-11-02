@@ -5689,14 +5689,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         } } }
 
     /* FP_PICK=<hex fp_addr>: write just that program, whatever order it compiles
-     * in. fp_dump.hlsl keeps only the first four, same trap as vp2_dump.hlsl. */
-    { static const char* fpk = (const char*)1; static u32 wantf = 0; static int done = 0;
+     * in. fp_dump.hlsl keeps only the first four, same trap as vp2_dump.hlsl.
+     * FP_PICK=u<hex>: the program with that key hash (the "ucode" in a RenderDoc
+     * capture's pipeline names), wherever the title put it. */
+    { static const char* fpk = (const char*)1; static u32 wantf = 0; static int done = 0, by_hash = 0;
       if (fpk == (const char*)1) { fpk = getenv("FP_PICK");
-                                   wantf = fpk ? (u32)strtoul(fpk, NULL, 16) : 0; }
-      if (wantf && !done && fp_addr == wantf) { done = 1;
+                                   by_hash = fpk && (fpk[0] == 'u' || fpk[0] == 'U');
+                                   wantf = fpk ? (u32)strtoul(fpk + by_hash, NULL, 16) : 0; }
+      if (wantf && !done && (by_hash ? uhash == wantf : fp_addr == wantf)) { done = 1;
           FILE* f = fopen("duck_fp.hlsl", "w");
           if (f) { fprintf(f, "/* fp_addr=0x%08X, %d instrs */%s", fp_addr, n, hlsl);
                    fclose(f); }
+          /* and its ucode as the guest has it (duck_fp.bin) */
+          { const u32 sz = rsx_fp_program_size(prog, prog_max);
+            FILE* fb = sz ? fopen("duck_fp.bin", "wb") : NULL;
+            if (fb) { fwrite(prog, 1, sz, fb); fclose(fb); } }
           fprintf(stderr, "[DUCKFP] wrote duck_fp.hlsl (fp=0x%08X, %d instrs)%c",
                   fp_addr, n, 10);
       } }

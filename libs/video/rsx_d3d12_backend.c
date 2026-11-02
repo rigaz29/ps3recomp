@@ -6579,6 +6579,31 @@ static u64 s_tex_bytes;                           /* held by the slots' resource
 static ID3D12Resource* s_tex_staging[1024];
 static int s_tex_staging_n;
 
+/* RSX_CENSUS: the level-0 texture decode by format (base format, swizzled,
+ * compressed): textures, texels and time since the last report. */
+static struct { u64 n, texels; double s; } s_tdp[256][2][2];
+static void tex_decode_note(const rsx_tex_layout* tl, u32 w, u32 h, double secs)
+{
+    if (!rsx_census_secs()) return;
+    const u32 f = tl->base_format & 0xFFu, sw = tl->swizzled ? 1u : 0u, cp = tl->compressed ? 1u : 0u;
+    s_tdp[f][sw][cp].n++;
+    s_tdp[f][sw][cp].texels += (u64)w * h;
+    s_tdp[f][sw][cp].s += secs;
+}
+static void tex_decode_print(void)
+{
+    fprintf(stderr, "[census] texture decode (format, swizzled, compressed: textures, Mtexels, ms):");
+    for (int f = 0; f < 256; f++)
+        for (int sw = 0; sw < 2; sw++)
+            for (int cp = 0; cp < 2; cp++)
+                if (s_tdp[f][sw][cp].n)
+                    fprintf(stderr, " %02X%s%s: %llu, %.2f, %.1f", f, sw ? " swz" : "", cp ? " dxt" : "",
+                            (unsigned long long)s_tdp[f][sw][cp].n, s_tdp[f][sw][cp].texels / 1e6,
+                            s_tdp[f][sw][cp].s * 1000.0);
+    fprintf(stderr, "%c", 10);
+    memset(s_tdp, 0, sizeof s_tdp);
+}
+
 /* Texture uploads that do not fit in the frame's part of the ring go to spill
  * chunks of TEX_RING_PART, made when a frame first needs them and kept for the
  * frames after it; one unused for TEX_SPILL_IDLE frames is released. They got
@@ -6634,7 +6659,10 @@ static void tex_spill_reset(u32 fi)
         TexSpill* c = &s_tex_spill[fi][i];
         if (!c->res) continue;
         c->used = 0;
-        if (s_d3d.frame_count - c->last > TEX_SPILL_IDLE) {
+        /* The first chunk stays: made again for the next burst, 32 MB of
+         * upload heap cost 35 ms on the frame clock thread (God of War:
+         * Ascension's first fight, the first of Megaera's effects). */
+        if (i > 0 && s_d3d.frame_count - c->last > TEX_SPILL_IDLE) {
             c->res->lpVtbl->Release(c->res);
             memset(c, 0, sizeof *c);
         }
@@ -7317,6 +7345,13 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 s_d3d.tex_ring_ptr = (u8*)rp;
             else { s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring); s_d3d.tex_ring = NULL; }
         }
+        /* Each frame index's first spill chunk with the ring, at the first
+         * texture (boot), not at the first burst that outgrows the ring. */
+        for (u32 _i = 0; _i < FRAME_COUNT && s_d3d.tex_ring; _i++) {
+            u64 _at = 0;
+            TexSpill* _c = tex_spill_take(_i, 0, &_at);
+            if (_c) _c->used = 0;
+        }
     }
     ID3D12Resource* up_res = NULL;
     u64 up_base = 0;
@@ -7400,7 +7435,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     { const double dc0 = perf_now();
       rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
                          rsx_texture_argb_is_rgba());
-      s_tex_decode_s += perf_now() - dc0; }
+      const double ddc = perf_now() - dc0;
+      s_tex_decode_s += ddc;
+      tex_decode_note(&tl, w, h, ddc); }
 
     /* The diagnostics below only apply to the linear 8-bit case (Bink video
      * planes); they used to sit inside that branch of the conversion. */
@@ -8628,6 +8665,7 @@ static void rsx_census_present(void)
     if (s_psoc_mode == 1)
         fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
                 (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);
+    tex_decode_print();
     fprintf(stderr, "[census] texture binds %llu, with a mip chain %llu; by format (binds / null: "
                     "no offset, format not taken, no slot):", s_cen_binds, s_cen_mips);
     for (int f = 0; f < 256; f++)

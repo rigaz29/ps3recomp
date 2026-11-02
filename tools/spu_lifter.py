@@ -240,6 +240,9 @@ _NO_RT_WRITE = {
 # --float-spec (SPULifter._float_spec). The single-precision ops with speculative forms:
 _SPEC_FLOAT_OPS = {"fa", "fs", "fm", "fma", "fms", "fnms"}
 _SPEC_FLOAT_CALL = re.compile(r"\bspu_(fa|fs|fm|fma|fms|fnms)\(([^()]*)\)")
+# --loop-locals: a register a lifted line writes -- assigned (=, a compound form, or a
+# part of it) or its address taken; group 2 is the register (_loop_locals).
+_LL_WRITE = re.compile(r"(&\s*)?ctx->gpr\[(\d+)\](?:\.\w+\[\d+\])?\s*((?:[-+*/%&|^]|<<|>>)?=(?!=))?")
 _SPEC_GPR = re.compile(r"ctx->gpr\[(\d+)\]")
 _SPEC_SET = re.compile(r"ctx->gpr\[(\d+)\] = ([^;{}]*);")
 _SPEC_NOP = re.compile(r"/\*(?:(?!\*/).)*\*/;")
@@ -623,6 +626,12 @@ class SPULifter:
         # the function being lifted, the image's ila values, and the sites done.
         self.ijmp_local = False
         self._ijmp_cands = ()
+        # --loop-locals: a single-block loop's registers in C locals (_loop_locals);
+        # the loops done.
+        self.loop_locals = False
+        self.loop_locals_n = 0
+        self.loop_locals_skip = set()   # loop heads left alone (a native routine takes them)
+        self.loop_locals_max = 0        # at most this many registers (0: any number)
         self._ila_cache = (None, frozenset())
         self.ijmp_sites = 0
 
@@ -680,18 +689,14 @@ class SPULifter:
             out.append(line.replace(goto, ""))
         return out, n
 
-    def _shufb_hoists(self, insns, start, end, labels):
-        """The loops of [start, end) whose shufb controls can be prepared once.
+    def _single_block_loops(self, insns, start, end, labels):
+        """The single-block loops of [start, end).
 
         A loop is a backward branch from b to a label t with the body [t, b] one
         block: no other label in (t, b], every branch to t from inside [t, b]
         (so the only way in from outside is falling into t, or t is the
         function's entry), and nothing in it that could change a register
-        behind the code's back (_HOIST_BARRIER). A shufb there whose control
-        register no instruction of the body writes gets it prepared right
-        before t. Returns ({t: [rc, ...]}, {shufb address: t})."""
-        if not self.shufb_hoist:
-            return {}, {}
+        behind the code's back (_HOIST_BARRIER). [(t, b, its instructions)]."""
         body = [i for i in insns if start <= i.addr < end]
         by_addr = {i.addr: i for i in body}
         sources = {}
@@ -699,7 +704,7 @@ class SPULifter:
             t = self._branch_target(i)
             if t is not None and start <= t < end:
                 sources.setdefault(t, []).append(i.addr)
-        preps, pre = {}, {}
+        out = []
         for t, srcs in sources.items():
             back = [a for a in srcs if a >= t]
             if not back:
@@ -712,6 +717,64 @@ class SPULifter:
             loop = [by_addr[a] for a in range(t, b + 4, 4) if a in by_addr]
             if any(i.mnemonic in _HOIST_BARRIER for i in loop):
                 continue
+            out.append((t, b, loop))
+        return out
+
+    def _loop_locals(self, func, heads, marks):
+        """--loop-locals: in each loop {t: b} its registers live in C locals.
+
+        The SPU code is built with -fno-strict-aliasing, so every LS store may
+        change ctx->gpr, and a loop wrote its registers to memory and read them
+        back around each one. Locals no store can reach stay in host registers
+        (or the compiler's own spills). They are loaded before t's label, after
+        its shufb preparations (an ijmp_ goto to t loads them again), and every
+        register the loop writes is stored back on the way out: after the branch
+        back, and in the pending-interrupt exit a merged chunk entry has at t.
+        A loop with any other way out keeps ctx->gpr, and so does one with more
+        than --loop-locals-max registers: the compiler spills those locals
+        anyway, and the copies in and out are all that is left."""
+        lines = func.body_lines
+        used = set()
+        for t in sorted(heads, reverse=True):
+            b = heads[t]
+            lab, chk, _ = marks.get(t, (None, None, None))
+            if lab is None or b not in marks:
+                continue
+            last = marks[b][2]
+            body = [k for k in range(lab + 1, last) if k != chk]
+            text = "\n".join(lines[k] for k in body)
+            if re.search(r"\breturn\b|SPU_DIRECT|SPU_RET|g_spu_trampoline_fn|spu_drain|ctx->pc\b|"
+                         r"goto (?!loc_%08X;)" % t, text):
+                continue
+            regs = sorted({int(x) for x in _SPEC_GPR.findall(text)})
+            if not regs or (self.loop_locals_max and len(regs) > self.loop_locals_max):
+                continue
+            # Only what the loop writes goes back (an assignment, compound or to
+            # a part, or its address taken); every register it names is loaded,
+            # so the interrupt exit at t can store a written one on the first pass.
+            written = {int(m.group(2)) for m in _LL_WRITE.finditer(text) if m.group(1) or m.group(3)}
+            for k in body:
+                lines[k] = _SPEC_GPR.sub(r"spu_l\1", lines[k])
+            back = " ".join(f"ctx->gpr[{r}] = spu_l{r};" for r in regs if r in written)
+            if back:
+                if chk is not None:
+                    lines[chk] = lines[chk].replace("{ ", "{ " + back + " ", 1)
+                lines.insert(last, "    " + back)
+            lines.insert(lab, "    " + " ".join(f"spu_l{r} = ctx->gpr[{r}];" for r in regs))
+            used.update(regs)
+            self.loop_locals_n += 1
+        if used:
+            lines[0:0] = [f"    u128 spu_l{r};" for r in sorted(used)]
+
+    def _shufb_hoists(self, insns, start, end, labels):
+        """The loops of [start, end) (_single_block_loops) whose shufb controls
+        can be prepared once: a shufb whose control register no instruction of
+        the body writes gets it prepared right before t. Returns
+        ({t: [rc, ...]}, {shufb address: t})."""
+        if not self.shufb_hoist:
+            return {}, {}
+        preps, pre = {}, {}
+        for t, b, loop in self._single_block_loops(insns, start, end, labels):
             written = {_dest_reg(i) for i in loop if i.mnemonic not in _NO_RT_WRITE}
             for i in loop:                     # --insn-patches: either form may run
                 if i.addr in self.insn_patches:
@@ -757,6 +820,20 @@ class SPULifter:
             self._ijmp_cands = tuple(sorted(a for a in {start} | merged_starts if a in ila))
         ijmp_labels = set(self._ijmp_cands)
         preps, self._shufb_pre = self._shufb_hoists(insns, start, end, internal | merged_starts)
+        # --loop-locals: the single-block loops that end in their one conditional
+        # branch back, with no other branch in them (_loop_locals).
+        # Not a head in --loop-locals-skip, nor one past --loop-locals-max
+        # registers (_loop_locals).
+        ll_heads = {}
+        if self.loop_locals and not self.trace:
+            for t, b, loop in self._single_block_loops(insns, start, end, internal | merged_starts):
+                if (loop and loop[-1].addr == b and loop[-1].mnemonic in _COND_BR and
+                        t not in self.loop_locals_skip and
+                        not any(self._branch_target(i) is not None or
+                                i.mnemonic in ("br", "bra", "bi", "iret", "stop", "stopd")
+                                for i in loop[:-1])):
+                    ll_heads[t] = b
+        marks = {}
         # Declared at the top: right before a loop head there can be a label, and
         # a declaration can't follow one (before C23).
         func.body_lines.extend(f"    spu_shufc spu_sc_{t:X}_{rc};"
@@ -771,9 +848,12 @@ class SPULifter:
                 func.body_lines.append(f"ijmp_{insn.addr:08X}: ;")
             for rc in preps.get(insn.addr, ()):
                 func.body_lines.append(f"    spu_sc_{insn.addr:X}_{rc} = spu_shufc_prep(ctx->gpr[{rc}]);")
+            lab_at = chk_at = None
             if insn.addr in internal or insn.addr in merged_starts:
+                lab_at = len(func.body_lines)
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             if insn.addr in merged_starts:
+                chk_at = len(func.body_lines)
                 func.body_lines.append(
                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
                     f"{{ {self._pset()}ctx->pc = {self._A(insn.addr)}; g_spu_trampoline_fn = "
@@ -788,6 +868,9 @@ class SPULifter:
                     rt_idx = insn.raw & 0x7F
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
             last_insn = insn
+            marks[insn.addr] = (lab_at, chk_at, len(func.body_lines))
+        if ll_heads:
+            self._loop_locals(func, ll_heads, marks)
 
         # Fall-through chaining: if the final instruction does NOT unconditionally
         # end the basic block (i.e. it's a normal op, a call brsl/bisl, or a
@@ -1552,6 +1635,15 @@ def main() -> None:
                         "register a loop never writes gets the control prepared once, "
                         "before the loop (spu_shufc_prep / spu_shufb_pre). "
                         "SPU_LIFT_NO_SHUFB_HOIST=1 does the same.")
+    p.add_argument("--loop-locals", action="store_true",
+                   help="A single-block loop's SPU registers in C locals, loaded before it and "
+                        "stored back on its way out: LS stores no longer force them out to "
+                        "ctx->gpr and back (-fno-strict-aliasing). Only loops with an LS store.")
+    p.add_argument("--loop-locals-skip", default="", metavar="ADDRS",
+                   help="Comma-separated loop heads (hex) --loop-locals leaves alone, e.g. "
+                        "loops a native routine takes.")
+    p.add_argument("--loop-locals-max", type=int, default=0, metavar="N",
+                   help="--loop-locals only for loops naming at most N registers (0: any).")
     p.add_argument("--ijmp-local", action="store_true",
                    help="A computed jump (bi $rX, not a return) to an entry of the C "
                         "function it is in -- its start or a merged chunk -- that an ila of "
@@ -1709,6 +1801,9 @@ def main() -> None:
     if args.no_shufb_hoist:
         lifter.shufb_hoist = False
     lifter.ijmp_local = args.ijmp_local
+    lifter.loop_locals = args.loop_locals
+    lifter.loop_locals_skip = {int(a, 16) for a in args.loop_locals_skip.split(",") if a.strip()}
+    lifter.loop_locals_max = args.loop_locals_max
     if args.insn_patches:
         lifter.insn_patches, lifter.insn_patches_optional = load_insn_patches(args.insn_patches)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
@@ -1778,6 +1873,9 @@ def main() -> None:
     if lifter.ijmp_local:
         print(f"  {lifter.ijmp_sites} computed jump(s) with an entry of their function "
               f"by a goto (--ijmp-local)")
+    if lifter.loop_locals:
+        print(f"  {lifter.loop_locals_n} single-block loop(s) with their registers in locals "
+              f"(--loop-locals)")
     print(f"  {len(lifter.call_targets)} call target(s)")
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())

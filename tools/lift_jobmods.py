@@ -412,9 +412,22 @@ def main():
                     help="Pass --ijmp-local to spu_lifter.py: a computed jump to an entry of "
                          "its own C function that an ila loads is a goto, not a pass through "
                          "the dispatcher.")
+    ap.add_argument("--loop-locals", action="store_true",
+                    help="Pass --loop-locals to spu_lifter.py: a single-block loop's registers "
+                         "in C locals.")
+    ap.add_argument("--loop-locals-skip", default="", metavar="ADDRS",
+                    help="Pass --loop-locals-skip to spu_lifter.py (loop heads, hex, comma-separated).")
+    ap.add_argument("--loop-locals-max", type=int, default=0, metavar="N",
+                    help="Pass --loop-locals-max to spu_lifter.py.")
     args = ap.parse_args()
     if args.float_spec:
         LIFTER_ARGS.extend(["--float-spec", str(args.float_spec)])
+    if args.loop_locals:
+        LIFTER_ARGS.append("--loop-locals")
+        if args.loop_locals_skip:
+            LIFTER_ARGS.extend(["--loop-locals-skip", args.loop_locals_skip])
+        if args.loop_locals_max:
+            LIFTER_ARGS.extend(["--loop-locals-max", str(args.loop_locals_max)])
     if args.ijmp_local:
         LIFTER_ARGS.append("--ijmp-local")
     MERGE_SKIP.update(n.strip() for spec in args.merge_skip for n in spec.split(",") if n.strip())

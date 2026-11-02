@@ -284,6 +284,26 @@ typedef struct {
  * post chain composites into a third) overwrites the frame being shown. */
 #define DISP_RT_TAG  0x40000000u
 #define Y16_RT_TAG   0x20000000u   /* the Y16_X16_FLOAT copy of a target */
+
+/* The key of a Y16_X16_FLOAT copy at the texture's own size: per unit and
+ * size, so the passes that read one target at different sizes each keep their
+ * copy (it is refreshed before every draw that reads it, y16_convert). Bit 28
+ * is never set in a guest offset. */
+static u32 y16_copy_key(int unit, u32 w, u32 h)
+{
+    return Y16_RT_TAG | 0x10000000u | ((u32)unit << 24) | ((w - 1u) << 12) | (h - 1u);
+}
+
+/* RSX_Y16_EXACT (default 1): a target read as Y16_X16_FLOAT goes through a
+ * copy the size of the texture the program reads, and the program's
+ * coordinates reach it unscaled. 0: the copy is the target's size and the
+ * coordinates are scaled by texture size / target size (before 2026-11-02). */
+static int y16_exact_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_Y16_EXACT"); on = e ? atoi(e) : 1; }
+    return on;
+}
 static int display_rt_on(void)
 {
     static int on = -1;
@@ -5134,6 +5154,10 @@ static u32 dr_coord_scales(const D3D12DrawRecord* dr, float sc[VP_TEX_UNITS][2])
         if (rt >= 0 && rt < MAX_OFF_RTS && s_d3d.off_rt[rt].res) {
             rw = s_d3d.off_rt[rt].w; rh = s_d3d.off_rt[rt].h;
         }
+        const int cv = dr->tex_cv[u];   /* read through its Y16_X16 copy: the copy's size */
+        if (cv >= 0 && cv < MAX_OFF_RTS && s_d3d.off_rt[cv].res) {
+            rw = s_d3d.off_rt[cv].w; rh = s_d3d.off_rt[cv].h;
+        }
         const int dz = dr->tex_dz[u];
         if (dz >= 0 && dz < MAX_OFF_DS && s_d3d.off_ds[dz].res) {
             rw = s_d3d.off_ds[dz].w; rh = s_d3d.off_ds[dz].h;
@@ -8007,7 +8031,13 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         if (slot < 0) {   /* evict an entry not used this frame */
             for (int i = 0; i < MAX_OFF_RTS; i++)
                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
-            if (slot < 0) return -1;
+            if (slot < 0) {
+                static int _n = 0;
+                if (PS3_LOG_FIRST(_n, 8))
+                    fprintf(stderr, "[D3D12] all %d render-target slots in use this frame;"
+                                    " 0x%08X %ux%u gets none%c", MAX_OFF_RTS, off, w, h, 10);
+                return -1;
+            }
             wait_for_gpu();   /* same hazard as above: the frame may still use it */
             rf_release(s_d3d.off_rt[slot].res);
             s_d3d.off_rt[slot].res = NULL;
@@ -10609,12 +10639,21 @@ static void rf_prepass(u32 from, u32 to)
                     /* An RGBA8 target read as Y16_X16_FLOAT: the bytes are two
                      * big-endian halves (God of War: Ascension's luminance
                      * chain). Sampled through a converted copy, refreshed
-                     * before each draw that reads it (y16_convert). */
+                     * before each draw that reads it (y16_convert), at the
+                     * texture's size (y16_exact_on). The chain's last pass
+                     * point-samples its 8x9 input on texel edges (u = 0.375);
+                     * scaled by 8/320 onto a target-sized copy, those fell a
+                     * hair short and took the texel to the left, columns 0
+                     * and 2 for the RSX's 1 and 3, and the exposure the PPU
+                     * takes from its result came out high. */
                     if ((dr->tex[_u].fmt & 0x9F) == 0x9F &&
                         s_d3d.off_rt[rt].dxgi == (u32)DXGI_FORMAT_R8G8B8A8_UNORM) {
                         s_d3d.off_rt[rt].used = 1;
-                        const int cv = off_rt_get(dr->tex[_u].raw | Y16_RT_TAG,
-                                                  s_d3d.off_rt[rt].w, s_d3d.off_rt[rt].h, 0x0Bu);
+                        const u32 tw = dr->tex[_u].w, th = dr->tex[_u].h;
+                        const int cv = (y16_exact_on() && tw && th && tw <= 4096u && th <= 4096u)
+                            ? off_rt_get(y16_copy_key(_u, tw, th), tw, th, 0x0Bu)
+                            : off_rt_get(dr->tex[_u].raw | Y16_RT_TAG,
+                                         s_d3d.off_rt[rt].w, s_d3d.off_rt[rt].h, 0x0Bu);
                         if (cv >= 0 && cv != rt) {
                             dr->tex_cv[_u] = cv;
                             srv_write(wslot, s_d3d.off_rt[cv].res, DXGI_FORMAT_R16G16B16A16_FLOAT,

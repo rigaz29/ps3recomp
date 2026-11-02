@@ -3192,6 +3192,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
+                    /* NV4097_NO_OPERATION, its words not incrementing into
+                     * other methods: nothing reads them (rsx_process_method
+                     * has no case for 0x0100, gcm_3d_method no check). God of
+                     * War: Ascension's first level carries ~500k a second.
+                     * GCM_NOP_FAST=0 hands them over word by word as before. */
+                    { static int nop_fast = -1;
+                      if (nop_fast < 0) { const char* e = getenv("GCM_NOP_FAST"); nop_fast = e ? atoi(e) : 1; }
+                      if (nop_fast && method == 0x0100u && (type != 0 || count == 1)) {
+                          s_fifo_getoff += 4 + count * 4;
+                          continue;
+                      } }
                     if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
                         s_fifo_getoff += 4 + count * 4;
                         continue;

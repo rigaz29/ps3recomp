@@ -28,6 +28,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_index_copy.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -13172,13 +13173,13 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
                             : (((u32)ip[(kk) * 4] << 24) | ((u32)ip[(kk) * 4 + 1] << 16) | \
                                ((u32)ip[(kk) * 4 + 2] << 8) | ip[(kk) * 4 + 3]))
     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
-    u32 lo = 0xFFFFFFFFu, hi = 0;
-    for (u32 k = 0; k < count; k++) {
-        const u32 ix = RAW_IX(first + k);
-        ib[k] = ix;
-        if (ix < lo) lo = ix;
-        if (ix > hi) hi = ix;
-    }
+    u32 lo, hi;
+    /* VTX_IX_SIMD=0: a word at a time, as before (rsx_index_copy.h). */
+    { static int simd = -1;
+      if (simd < 0) { const char* e = getenv("VTX_IX_SIMD"); simd = e ? atoi(e) : 1; }
+      const u8* src = ip + (u64)first * (sixteen ? 2u : 4u);
+      if (simd) rsx_index_copy_be(src, count, sixteen, ib, &lo, &hi);
+      else      rsx_index_copy_be_scalar(src, count, sixteen, ib, &lo, &hi); }
     VPRawSeg* pv = (cont && s_seg_n) ? &s_seg[s_seg_n - 1] : NULL;
     if (pv && pv->lo <= lo && hi <= pv->hi) {      /* the previous copy covers it */
         if (s_vs_on > 0) s_vs.raw_ext++;

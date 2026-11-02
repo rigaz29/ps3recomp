@@ -540,6 +540,26 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
+    /* The most frequent methods outside the vertex-program runs above go
+     * straight to their handlers, which sit at the end of the chain below,
+     * past ~150 tests none of which matches them (God of War: Ascension's
+     * first level, GCM_METHOD_HIST, a second: NO_OPERATION ~500k,
+     * DRAW_INDEX_ARRAY ~127k, SET_BEGIN_END ~88k, INLINE_ARRAY ~80k,
+     * INVALIDATE_VERTEX_CACHE_FILE ~70k, each scissor word ~33k). Nothing
+     * below handles 0x0100 or 0x1714; they end at the -1 at the bottom.
+     * RSX_METHOD_FAST=0 walks the chain for them as before. */
+    { static int fast = -1;
+      if (fast < 0) { const char* e = getenv("RSX_METHOD_FAST"); fast = e ? atoi(e) : 1; }
+      if (fast) switch (method) {
+      case 0x0100u: case 0x1714u:            return -1;
+      case NV4097_SET_BEGIN_END:             goto m_begin_end;
+      case 0x1818u:                          goto m_inline_array;
+      case NV4097_DRAW_INDEX_ARRAY:          goto m_draw_index_array;
+      case NV4097_SET_SCISSOR_HORIZONTAL:
+      case NV4097_SET_SCISSOR_VERTICAL:      goto m_scissor;
+      default: break;
+      } }
+
     /* NV4097_SET_CONTEXT_DMA_SEMAPHORE (0x01A4) picks where the semaphore
      * offset points. CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER (0xFEED0001) is
      * main memory by IO offset: Edge-style SPU geometry jobs release ring
@@ -921,6 +941,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 
 
     /* Draw */
+m_begin_end:
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
             state->primitive_type = data;
@@ -990,6 +1011,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         }
         return 0;
     }
+m_inline_array:
     if (method == 0x1818u) {   /* NV4097_INLINE_ARRAY: one word of vertex data */
         if (s_inline_words < RSX_INLINE_MAX / 4u) {
             u8* q = s_inline_buf + s_inline_words * 4u;
@@ -1052,6 +1074,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->index_array_dma = data;
         return 0;
     }
+m_draw_index_array:
     if (method == NV4097_DRAW_INDEX_ARRAY) {
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
@@ -1065,6 +1088,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     /* Scissor */
+m_scissor:
     if (method == NV4097_SET_SCISSOR_HORIZONTAL) {
         state->scissor_x = data & 0xFFFF;
         state->scissor_w = (data >> 16) & 0xFFFF;

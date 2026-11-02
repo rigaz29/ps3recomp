@@ -249,6 +249,9 @@ typedef struct {
     u16   tex_zok;      /* prepass: units whose offset a depth surface wrote
                          * last (or nothing seen yet), so may be read as depth */
     u32   blit_src, blit_sp, blit_dst, blit_dp, blit_w, blit_h;
+    /* A colour target in main memory (rec_mwb): its offset (0 = none), pitch,
+     * clip and SET_SURFACE_FORMAT, for the write-back at the batch's end. */
+    u32   mwb_off, mwb_pitch, mwb_w, mwb_h, mwb_fmt;
 } D3D12DrawRecord;
 /* An indexed run (upload_tris_vp_ix) may take the next batch; cleared with the records. */
 static int s_ix_run_valid;
@@ -3229,6 +3232,7 @@ static void present_to_backbuffer(u32 fi)
 
 static double s_rf_last_submit;   /* RF_WAITLOG: when the last batch was submitted */
 static void zq_submitted(u32 fi, u64 fence);   /* the ZPASS block, below */
+static void mwb_submitted(u32 fi, u64 fence);  /* main-memory surfaces, below it */
 static void move_to_next_frame(void)
 {
     s_rf_last_submit = perf_now();
@@ -3236,6 +3240,7 @@ static void move_to_next_frame(void)
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
     s_fence_last = current_fence;
     zq_submitted(s_d3d.frame_index, current_fence);
+    mwb_submitted(s_d3d.frame_index, current_fence);
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
@@ -7793,6 +7798,40 @@ static void rec_zeta(D3D12DrawRecord* dr)
     dr->no_color = st->color_target == 0 && dr->zeta_off != 0;
 }
 
+/* Colour surfaces in main memory, written back.
+ *
+ * A colour surface whose context DMA is the IO-mapped host buffer (0xFEED0001)
+ * is drawn into main memory, and that is where the CPU reads it. God of War:
+ * Ascension renders the scene's average luminance into a 1x1 A8R8G8B8 surface
+ * there, and the PPU takes the exposure from it (a half float in its first two
+ * bytes). The GPU's copy never reached guest memory, so the PPU read 0 and the
+ * first level's exposure stayed at its maximum (1.4, where RPCS3 had 0.52): the
+ * fog and the sky washed out to white. A draw or clear into such a surface is
+ * recorded here; at the batch's end the surface is copied to a readback buffer
+ * (mwb_record), and once the batch has run its pixels go to guest memory in the
+ * RSX's byte order (mwb_poll). RSX_MAIN_WB=0: off. */
+extern u32 rsx_color_dma[2];   /* SET_CONTEXT_DMA_COLOR_A/B as the stream set them (rsx_commands.c) */
+static int mwb_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_MAIN_WB"); v = !(e && atoi(e) == 0); }
+    return v;
+}
+static void rec_mwb(D3D12DrawRecord* dr)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    dr->mwb_off = 0;
+    /* One target, A or B; an MRT set in main memory is left as it was. */
+    if (!st || !mwb_on() || st->color_target == 0 || st->color_target >= 0x13) return;
+    const int sel = st->color_target == 2 ? 1 : 0;
+    if (rsx_color_dma[sel] != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER) return;
+    dr->mwb_off = st->surface_color_offset[sel];
+    dr->mwb_pitch = st->surface_color_pitch[sel];
+    dr->mwb_w = st->surface_clip_w;
+    dr->mwb_h = st->surface_clip_h;
+    dr->mwb_fmt = st->surface_format;
+}
+
 /* Which offscreen surface (if any) does the current RSX state render to?
  * Returns 0 for a display buffer (backbuffer), else the surface's RAW RSX
  * offset. RTs are keyed by raw offset -- a texture bound at the same raw
@@ -7824,13 +7863,14 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
     { static int _ro = -1; if (_ro < 0) _ro = getenv("RT_OFFDBG") ? 1 : 0;
       static u32 _seen[32]; static int _ns = 0;
       if (_ro) { u32 _k = st->surface_color_offset[0] ^ (st->color_target << 24)
-                        ^ (st->surface_clip_w << 8) ^ st->surface_format;
+                        ^ (st->surface_clip_w << 8) ^ st->surface_format ^ (rsx_color_dma[0] << 20);
         int _f = 0; for (int _i = 0; _i < _ns; _i++) if (_seen[_i] == _k) _f = 1;
         if (!_f && _ns < 32) { _seen[_ns++] = _k;
-        fprintf(stderr, "[RTOFF] fmt=0x%X tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d -> 0x%X\n",
+        fprintf(stderr, "[RTOFF] fmt=0x%X tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d dma=0x%X/0x%X -> 0x%X\n",
                 st->surface_format, st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
                 st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
-                cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); } } }
+                cellGcmOffsetIsDisplay(raw), rsx_color_dma[0], rsx_color_dma[1],
+                cellGcmOffsetIsDisplay(raw) ? 0 : raw); } } }
     if (cellGcmOffsetIsDisplay(raw)) {
         if (!display_rt_on()) return 0;
         if (out_w) *out_w = st->surface_clip_w;
@@ -8961,9 +9001,74 @@ static void d3d12_blit_observed(int src_display, u32 src_off, u32 sx, u32 sy, u3
  * drawn -- its scene without the post chain or the menu. Recorded as an op,
  * the replay copies the buffer to the backbuffer right there (the last flip of
  * the batch wins). FLIP_AT_OP=0: present the buffer at the batch's end. */
+/* GUEST_PEEK=<ea>:<bytes>[:<every>]: at every <every>th flip (default 30), log
+ * that many bytes of guest memory at <ea> (e.g. a render target the CPU reads).
+ * GUEST_POKE=<ea>:<hex bytes>: write those bytes there at every flip, a lever for
+ * testing what a CPU reader does with a value. Both are diagnostics. */
+static void guest_peek_poke(void)
+{
+    extern uint8_t* vm_base;
+    extern u32 gcm_io_offset_to_ea(u32 io);
+    static int init = 0, peek_n = 0, peek_every = 30, poke_n = 0, peek_io = 0, poke_io = 0;
+    static unsigned long peek_ea = 0, poke_ea = 0;
+    static u8 poke_b[32];
+    static u32 flips = 0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("GUEST_PEEK");
+        if (e) {
+            char* end = NULL;
+            peek_io = (e[0] == 'i' && e[1] == 'o' && e[2] == ':');
+            peek_ea = strtoul(e + (peek_io ? 3 : 0), &end, 16);
+            if (end && *end == ':') {
+                peek_n = (int)strtoul(end + 1, &end, 0);
+                if (end && *end == ':') peek_every = (int)strtoul(end + 1, NULL, 0);
+            }
+            if (peek_n > 64) peek_n = 64;
+            if (peek_every < 1) peek_every = 1;
+        }
+        e = getenv("GUEST_POKE");
+        if (e) {
+            char* end = NULL;
+            poke_io = (e[0] == 'i' && e[1] == 'o' && e[2] == ':');
+            poke_ea = strtoul(e + (poke_io ? 3 : 0), &end, 16);
+            if (end && *end == ':') {
+                const char* h = end + 1;
+                while (poke_n < (int)sizeof poke_b) {
+                    int hi = -1, lo = -1;
+                    char c0 = h[0], c1 = c0 ? h[1] : 0;
+                    hi = (c0 >= '0' && c0 <= '9') ? c0 - '0' : (c0 >= 'a' && c0 <= 'f') ? c0 - 'a' + 10 :
+                         (c0 >= 'A' && c0 <= 'F') ? c0 - 'A' + 10 : -1;
+                    lo = (c1 >= '0' && c1 <= '9') ? c1 - '0' : (c1 >= 'a' && c1 <= 'f') ? c1 - 'a' + 10 :
+                         (c1 >= 'A' && c1 <= 'F') ? c1 - 'A' + 10 : -1;
+                    if (hi < 0 || lo < 0) break;
+                    poke_b[poke_n++] = (u8)(hi * 16 + lo);
+                    h += 2;
+                }
+            }
+        }
+    }
+    if (!vm_base) return;
+    flips++;
+    if (peek_n > 0 && (flips % (u32)peek_every) == 0) {
+        const unsigned long ea = peek_io ? gcm_io_offset_to_ea((u32)peek_ea) : peek_ea;
+        if (ea) {
+            char line[64 * 3 + 1];
+            int k = 0;
+            for (int i = 0; i < peek_n; i++) k += snprintf(line + k, sizeof line - (size_t)k, "%02X ", vm_base[ea + (unsigned long)i]);
+            fprintf(stderr, "[GUEST_PEEK] flip %u %08lX: %s%c", flips, ea, line, 10);
+        }
+    }
+    if (poke_n > 0) {
+        const unsigned long ea = poke_io ? gcm_io_offset_to_ea((u32)poke_ea) : poke_ea;
+        if (ea) memcpy(vm_base + ea, poke_b, (size_t)poke_n);
+    }
+}
+
 static void d3d12_flip_observed(u32 buffer_id)
 {
     static int on = -1;
+    guest_peek_poke();
     if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
     extern u32 cellGcm_display_buffer_offset(u32 id);
     if (!on || !display_rt_on() || !s_d3d.initialized || s_d3d.draw_count >= MAX_DRAWS) return;
@@ -9783,6 +9888,172 @@ static void zq_read(void)
       } }
 }
 
+/* Colour surfaces in main memory (rec_mwb): at the batch's end each one its
+ * records drew is copied into this frame's readback buffer; when the batch's
+ * fence has passed, the pixels are written to guest memory. */
+#define MWB_MAX    8
+#define MWB_BYTES  (8u << 20)
+typedef struct { u32 off, pitch, w, h, fmt, row_pitch; u64 buf_off; } MwbEntry;
+static ID3D12Resource* s_mwb_rb[FRAME_COUNT];
+static MwbEntry s_mwb[FRAME_COUNT][MWB_MAX];
+static u32 s_mwb_n[FRAME_COUNT];
+static u64 s_mwb_used[FRAME_COUNT];    /* bytes of the readback buffer the copies fill */
+static u64 s_mwb_fence[FRAME_COUNT];   /* the batch's fence value, 0 = not submitted yet */
+
+/* The RSX's colour formats with 4 bytes a pixel (SET_SURFACE_FORMAT [4:0]):
+ * X8R8G8B8 (Z: X = 0, O: X = 0xFF), A8R8G8B8 and their B8G8R8 twins. */
+static int mwb_format_ok(u32 cf)
+{
+    return cf == 0x4 || cf == 0x5 || cf == 0x8 || cf == 0xE || cf == 0xF || cf == 0x10;
+}
+
+static void mwb_record(void)
+{
+    if (!mwb_on() || !s_d3d.device) return;
+    const u32 fi = s_rf.fi;
+    if (fi >= FRAME_COUNT) return;
+    if (s_mwb_n[fi]) {   /* this frame's last batch not delivered: keep it */
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[MWB] frame %u's write-back still pending; skipped%c", fi, 10);
+        return;
+    }
+    u32 n = 0;
+    for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[i];
+        if (!dr->mwb_off) continue;
+        u32 k = 0;
+        while (k < n && s_mwb[fi][k].off != dr->mwb_off) k++;
+        if (k == n) {
+            if (n == MWB_MAX) continue;
+            n++;
+        }
+        MwbEntry* e = &s_mwb[fi][k];
+        e->off = dr->mwb_off; e->pitch = dr->mwb_pitch; e->w = dr->mwb_w; e->h = dr->mwb_h; e->fmt = dr->mwb_fmt;
+    }
+    if (!n) return;
+    if (!s_mwb_rb[fi]) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd = {0};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = MWB_BYTES;
+        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_mwb_rb[fi]))) {
+            s_mwb_rb[fi] = NULL;
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 2)) fprintf(stderr, "[MWB] readback buffer failed%c", 10);
+            return;
+        }
+    }
+    u64 pos = 0;
+    u32 kept = 0;
+    for (u32 k = 0; k < n; k++) {
+        MwbEntry e = s_mwb[fi][k];
+        const u32 cf = e.fmt & 0x1Fu;
+        const int slot = off_rt_find(e.off);
+        u32 ax = 1, ay = 1;
+        rsx_aa_grid(e.fmt, &ax, &ay);
+        const char* why = NULL;
+        if (slot < 0) why = "no target";
+        else if (!mwb_format_ok(cf) || s_d3d.off_rt[slot].dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) why = "format";
+        else if (ax * ay != 1) why = "antialiased";
+        else if (!e.w || !e.h) why = "empty clip";
+        if (why) {
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 8))
+                fprintf(stderr, "[MWB] main-memory surface 0x%X %ux%u format 0x%X not written back (%s)%c",
+                        e.off, e.w, e.h, e.fmt, why, 10);
+            continue;
+        }
+        OffRT* r = &s_d3d.off_rt[slot];
+        if (e.w > r->w) e.w = r->w;
+        if (e.h > r->h) e.h = r->h;
+        e.row_pitch = (e.w * 4u + 255u) & ~255u;
+        pos = (pos + 511u) & ~(u64)511u;
+        if (pos + (u64)e.row_pitch * e.h > MWB_BYTES) {
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 4))
+                fprintf(stderr, "[MWB] main-memory surface 0x%X %ux%u does not fit the readback buffer%c", e.off, e.w, e.h, 10);
+            continue;
+        }
+        e.buf_off = pos;
+        const D3D12_RESOURCE_STATES before = r->st;
+        off_rt_transition(slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+        dst.pResource = s_mwb_rb[fi];
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = pos;
+        dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        dst.PlacedFootprint.Footprint.Width = e.w;
+        dst.PlacedFootprint.Footprint.Height = e.h;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = e.row_pitch;
+        src.pResource = r->res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        D3D12_BOX box = { 0, 0, 0, e.w, e.h, 1 };
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, &box);
+        off_rt_transition(slot, before);
+        pos += (u64)e.row_pitch * e.h;
+        s_mwb[fi][kept++] = e;
+    }
+    s_mwb_n[fi] = kept;
+    s_mwb_used[fi] = pos;
+    s_mwb_fence[fi] = 0;
+}
+
+static void mwb_submitted(u32 fi, u64 fence)
+{
+    if (fi < FRAME_COUNT && s_mwb_n[fi]) s_mwb_fence[fi] = fence;
+}
+
+/* The pixels of a batch that has run, into guest memory: the RSX keeps an
+ * A8R8G8B8 pixel as the bytes A R G B (A8B8G8R8: A B G R), and the target
+ * holds the shader's x y z w as R G B A. */
+static void mwb_deliver(u32 fi)
+{
+    extern uint8_t* vm_base;
+    extern u32 gcm_io_offset_to_ea(u32 io);
+    void* p = NULL;
+    D3D12_RANGE rr = { 0, (SIZE_T)s_mwb_used[fi] };
+    if (vm_base && s_mwb_rb[fi] && SUCCEEDED(s_mwb_rb[fi]->lpVtbl->Map(s_mwb_rb[fi], 0, &rr, &p)) && p) {
+        for (u32 k = 0; k < s_mwb_n[fi]; k++) {
+            const MwbEntry* e = &s_mwb[fi][k];
+            const u32 ea = gcm_io_offset_to_ea(e->off);
+            if (!ea) continue;
+            const u32 cf = e->fmt & 0x1Fu;
+            const u32 pitch = e->pitch >= e->w * 4u ? e->pitch : e->w * 4u;
+            for (u32 y = 0; y < e->h; y++) {
+                const u8* s = (const u8*)p + e->buf_off + (u64)y * e->row_pitch;
+                u8* d = vm_base + ea + (u64)y * pitch;
+                for (u32 x = 0; x < e->w; x++, s += 4, d += 4) {
+                    const u8 R = s[0], G = s[1], B = s[2], A = s[3];
+                    const u8 X = (cf == 0x4 || cf == 0xE) ? 0x00 : (cf == 0x5 || cf == 0xF) ? 0xFF : A;
+                    if (cf >= 0xE) { d[0] = X; d[1] = B; d[2] = G; d[3] = R; }
+                    else           { d[0] = X; d[1] = R; d[2] = G; d[3] = B; }
+                }
+            }
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 3))
+                fprintf(stderr, "[MWB] main-memory surface 0x%X (0x%08X) %ux%u format 0x%X written back: %02X %02X %02X %02X%c",
+                        e->off, ea, e->w, e->h, e->fmt, vm_base[ea], vm_base[ea + 1], vm_base[ea + 2], vm_base[ea + 3], 10);
+        }
+        D3D12_RANGE wr = { 0, 0 };
+        s_mwb_rb[fi]->lpVtbl->Unmap(s_mwb_rb[fi], 0, &wr);
+    }
+    s_mwb_n[fi] = 0;
+    s_mwb_fence[fi] = 0;
+}
+
+static void mwb_poll(void)
+{
+    if (!s_d3d.fence) return;
+    const u64 done = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++)
+        if (s_mwb_n[fi] && s_mwb_fence[fi] && done >= s_mwb_fence[fi])
+            mwb_deliver(fi);
+}
+
 static int s_rf_open_ahead;   /* RF_WAITLOG: rf_open called by record-ahead */
 static void rf_open(void)
 {
@@ -9818,6 +10089,7 @@ static void rf_open(void)
                     (unsigned long long)s_fence_last, (perf_now() - t0) * 1000.0, s_d3d.draw_count, 10); } }
     gts_read();
     zq_read();
+    mwb_poll();
     rf_release_dead();   /* the batch that last referenced them has run */
     vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
@@ -11196,6 +11468,7 @@ static void render_frame(void)
     rf_vp_draws(s_rf.done, cap_stop(s_d3d.draw_count), 0);
     gps_end(s_d3d.draw_count);
     rf_vp_end();
+    mwb_record();
     gts_mark(2);
     s_rf.open = 0;
     u32 fi = s_rf.fi;
@@ -11873,7 +12146,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             memset(dr, 0, sizeof(*dr));
             dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
             dr->rt_off = rt; memcpy(dr->rt_mrt, mrt, sizeof(mrt)); dr->surf_a = rec_surface_a();
-            rec_zeta(dr);
+            rec_zeta(dr); rec_mwb(dr);
             dr->rt_w = rt_w; dr->rt_h = rt_h;
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
             memcpy(dr->cc, cc, sizeof(cc));
@@ -13355,7 +13628,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     if (!f && ns<32) { seen[ns++]=k;
                         fprintf(stderr, "[BLEND] enable=%d key=0x%X%c",
                                 dr->blend, dr->blend_key, 10); } }
-                dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); dr->surf_a = rec_surface_a();
+                dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); rec_mwb(dr); dr->surf_a = rec_surface_a();
                 dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
                 if (s_d3d.current_rsx_state) {
                     dr->vp_x = s_d3d.current_rsx_state->viewport_x;
@@ -13472,7 +13745,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->is_clear = 0; rec_not_copy(dr);
             dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
             dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
-            dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); dr->surf_a = rec_surface_a();
+            dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); rec_mwb(dr); dr->surf_a = rec_surface_a();
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
             if (s_d3d.current_rsx_state) {
                 dr->vp_x = s_d3d.current_rsx_state->viewport_x;
@@ -13676,7 +13949,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->is_clear = 0; rec_not_copy(dr);
         dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
         dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
-        dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); dr->surf_a = rec_surface_a();
+        dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt); rec_zeta(dr); rec_mwb(dr); dr->surf_a = rec_surface_a();
         dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
         if (s_d3d.current_rsx_state) {
             dr->vp_x = s_d3d.current_rsx_state->viewport_x;
@@ -14149,7 +14422,7 @@ static int rf_ahead_on(void)
 #define RF_AHEAD_MIN 16
 void rsx_d3d12_backend_record_ahead(void)
 {
-    if (s_d3d.initialized) zq_poll();   /* ZPASS counts of a batch the GPU has finished */
+    if (s_d3d.initialized) { zq_poll(); mwb_poll(); }   /* ZPASS counts and main-memory surfaces of a batch the GPU has finished */
     if (!s_d3d.initialized || !rf_ahead_on()) return;
     const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
     if (n < 2) return;

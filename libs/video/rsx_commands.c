@@ -166,6 +166,12 @@ void rsx_state_init(rsx_state* state)
  * Method processing
  * -----------------------------------------------------------------------*/
 
+/* Colour targets A and B's context DMA handles (SET_CONTEXT_DMA_COLOR_A/B):
+ * rsx_state keys surfaces by offset, and the D3D12 backend writes a surface in
+ * main memory back to it (rsx_d3d12_backend.c, "Colour surfaces in main
+ * memory"). */
+u32 rsx_color_dma[2];
+
 static int process_surface_method(rsx_state* state, u32 method, u32 data)
 {
     switch (method) {
@@ -600,6 +606,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }
+    if (method == NV4097_SET_CONTEXT_DMA_COLOR_A) rsx_color_dma[0] = data;
+    if (method == NV4097_SET_CONTEXT_DMA_COLOR_B) rsx_color_dma[1] = data;
     if ((method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);

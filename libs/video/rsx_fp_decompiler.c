@@ -1997,3 +1997,20 @@ int rsx_fp_decompile_buffered_color_dyn_ex(
     return rsx_fp_decompile_internal2(ucode, max_bytes, ctrl, tex_cube_mask, 0,
         1, NULL, NULL, NULL, out, out_size, out_constant_count, 1);
 }
+
+int rsx_fp_decompile_buffered_color_dyn_vol_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal2(ucode, max_bytes, ctrl, tex_cube_mask, tex_vol_mask,
+        1, NULL, NULL, NULL, out, out_size, out_constant_count, 1);
+}
+
+int rsx_fp_decompile_color_vol_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                                  u32 tex_cube_mask, u32 tex_vol_mask,
+                                  const u8 gamma_masks[16], char* out, u32 out_size)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, tex_cube_mask, tex_vol_mask, 0, NULL, gamma_masks, NULL,
+        out, out_size, NULL);
+}

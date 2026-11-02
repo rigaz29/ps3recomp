@@ -1255,6 +1255,324 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
     return s_dbt.dev2->lpVtbl->CreatePipelineState(s_dbt.dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest pipelines kept between sessions (D3D12_PSO_CACHE)
+ *
+ * A guest pipeline is built when a draw first needs it, and with the async
+ * workers the draws that need it are skipped until it is built. God of War:
+ * Ascension's first fight built 409 of them, ~1.15 ms each, in bursts of 10-30
+ * when something appeared for the first time, and skipped up to 1,562 of a
+ * frame's 3,678 draws; every session built them all again. Now each pipeline
+ * built is appended to <shader cache>.pso: its key (a hash of its pixel
+ * shader's HLSL, its vertex shader and the rest of its description), that
+ * description, and both shaders' bytecode. The next session builds them all on
+ * a thread of its own from the title's first pipeline on, long before a
+ * fight, and a draw finds its pipeline by the key, built. The description is
+ * written field by field, so struct padding never reaches the key.
+ * D3D12_PSO_CACHE=0: off. The file follows graphics.shader_cache.
+ * -----------------------------------------------------------------------*/
+#define PSOC_VERSION   1u
+#define PSOC_SLOTS     8192u             /* a power of two */
+#define PSOC_STATE_MAX 2048u
+static const char s_psoc_magic[8] = { 'G', 'W', 'P', 'S', 'O', 'C', '0', '1' };
+static struct { u64 key; ID3D12PipelineState* pso; } s_psoc[PSOC_SLOTS];
+static u32 s_psoc_n;
+static SRWLOCK s_psoc_lock = SRWLOCK_INIT;
+static FILE* s_psoc_out;
+static int s_psoc_mode = -1;             /* -1 not started, 0 off, 1 on */
+static volatile LONG s_psoc_hits, s_psoc_added, s_psoc_built, s_psoc_failed;
+typedef struct { u64 key; u32 stn, vsn, psn; u8* st; u8* vs; u8* ps; } PsocRec;
+static PsocRec* s_psoc_recs;
+static u32 s_psoc_nrecs;
+
+static u64 psoc_fnv(u64 h, const void* p, size_t n)
+{
+    const u8* b = (const u8*)p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+static void psoc_u32(u8* b, u32* n, u32 v)
+{
+    if (*n + 4u <= PSOC_STATE_MAX) memcpy(b + *n, &v, 4);
+    *n += 4u;
+}
+static u32 psoc_f32(float f) { u32 v; memcpy(&v, &f, 4); return v; }
+
+/* The description of a guest pipeline but its shaders and root signature, as
+ * bytes; 0 for one the cache does not keep. */
+static u32 psoc_state_bytes(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, int dbt, u8* b)
+{
+    u32 n = 0;
+    if (pd->pRootSignature != s_d3d.vp_root_sig || pd->InputLayout.NumElements > 16 ||
+        pd->StreamOutput.NumEntries || pd->CachedPSO.CachedBlobSizeInBytes)
+        return 0;
+    psoc_u32(b, &n, PSOC_VERSION); psoc_u32(b, &n, (u32)dbt);
+    const D3D12_BLEND_DESC* bl = &pd->BlendState;
+    psoc_u32(b, &n, (u32)bl->AlphaToCoverageEnable); psoc_u32(b, &n, (u32)bl->IndependentBlendEnable);
+    for (int r = 0; r < 8; r++) {
+        const D3D12_RENDER_TARGET_BLEND_DESC* t = &bl->RenderTarget[r];
+        psoc_u32(b, &n, (u32)t->BlendEnable); psoc_u32(b, &n, (u32)t->LogicOpEnable);
+        psoc_u32(b, &n, (u32)t->SrcBlend); psoc_u32(b, &n, (u32)t->DestBlend); psoc_u32(b, &n, (u32)t->BlendOp);
+        psoc_u32(b, &n, (u32)t->SrcBlendAlpha); psoc_u32(b, &n, (u32)t->DestBlendAlpha);
+        psoc_u32(b, &n, (u32)t->BlendOpAlpha); psoc_u32(b, &n, (u32)t->LogicOp);
+        psoc_u32(b, &n, (u32)t->RenderTargetWriteMask);
+    }
+    psoc_u32(b, &n, pd->SampleMask);
+    const D3D12_RASTERIZER_DESC* ra = &pd->RasterizerState;
+    psoc_u32(b, &n, (u32)ra->FillMode); psoc_u32(b, &n, (u32)ra->CullMode);
+    psoc_u32(b, &n, (u32)ra->FrontCounterClockwise); psoc_u32(b, &n, (u32)ra->DepthBias);
+    psoc_u32(b, &n, psoc_f32(ra->DepthBiasClamp)); psoc_u32(b, &n, psoc_f32(ra->SlopeScaledDepthBias));
+    psoc_u32(b, &n, (u32)ra->DepthClipEnable); psoc_u32(b, &n, (u32)ra->MultisampleEnable);
+    psoc_u32(b, &n, (u32)ra->AntialiasedLineEnable); psoc_u32(b, &n, ra->ForcedSampleCount);
+    psoc_u32(b, &n, (u32)ra->ConservativeRaster);
+    const D3D12_DEPTH_STENCIL_DESC* ds = &pd->DepthStencilState;
+    psoc_u32(b, &n, (u32)ds->DepthEnable); psoc_u32(b, &n, (u32)ds->DepthWriteMask);
+    psoc_u32(b, &n, (u32)ds->DepthFunc); psoc_u32(b, &n, (u32)ds->StencilEnable);
+    psoc_u32(b, &n, ds->StencilReadMask); psoc_u32(b, &n, ds->StencilWriteMask);
+    const D3D12_DEPTH_STENCILOP_DESC* f[2] = { &ds->FrontFace, &ds->BackFace };
+    for (int i = 0; i < 2; i++) {
+        psoc_u32(b, &n, (u32)f[i]->StencilFailOp); psoc_u32(b, &n, (u32)f[i]->StencilDepthFailOp);
+        psoc_u32(b, &n, (u32)f[i]->StencilPassOp); psoc_u32(b, &n, (u32)f[i]->StencilFunc);
+    }
+    psoc_u32(b, &n, pd->InputLayout.NumElements);
+    for (u32 i = 0; i < pd->InputLayout.NumElements; i++) {
+        const D3D12_INPUT_ELEMENT_DESC* e = &pd->InputLayout.pInputElementDescs[i];
+        char name[16];
+        if (!e->SemanticName || strlen(e->SemanticName) >= sizeof name) return 0;
+        memset(name, 0, sizeof name);
+        strcpy(name, e->SemanticName);
+        for (int k = 0; k < 16; k += 4) { u32 w; memcpy(&w, name + k, 4); psoc_u32(b, &n, w); }
+        psoc_u32(b, &n, e->SemanticIndex); psoc_u32(b, &n, (u32)e->Format); psoc_u32(b, &n, e->InputSlot);
+        psoc_u32(b, &n, e->AlignedByteOffset); psoc_u32(b, &n, (u32)e->InputSlotClass);
+        psoc_u32(b, &n, e->InstanceDataStepRate);
+    }
+    psoc_u32(b, &n, (u32)pd->IBStripCutValue); psoc_u32(b, &n, (u32)pd->PrimitiveTopologyType);
+    psoc_u32(b, &n, pd->NumRenderTargets);
+    for (int r = 0; r < 8; r++) psoc_u32(b, &n, (u32)pd->RTVFormats[r]);
+    psoc_u32(b, &n, (u32)pd->DSVFormat);
+    psoc_u32(b, &n, pd->SampleDesc.Count); psoc_u32(b, &n, pd->SampleDesc.Quality);
+    psoc_u32(b, &n, pd->NodeMask); psoc_u32(b, &n, (u32)pd->Flags);
+    return n <= PSOC_STATE_MAX ? n : 0;
+}
+
+/* psoc_state_bytes read back into pd; il holds its input layout and names
+ * (16 bytes each, at least 16 elements). The dbt flag in *dbt. */
+static int psoc_state_read(const u8* b, u32 n, D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+                           D3D12_INPUT_ELEMENT_DESC* il, char (*names)[16], int* dbt)
+{
+    u32 o = 0;
+#define PSOC_RD() (o + 4u <= n ? (o += 4u, *(const u32*)(b + o - 4u)) : (o = n + 1u, 0u))
+    memset(pd, 0, sizeof *pd);
+    if (PSOC_RD() != PSOC_VERSION) return 0;
+    *dbt = (int)PSOC_RD();
+    D3D12_BLEND_DESC* bl = &pd->BlendState;
+    bl->AlphaToCoverageEnable = (BOOL)PSOC_RD(); bl->IndependentBlendEnable = (BOOL)PSOC_RD();
+    for (int r = 0; r < 8; r++) {
+        D3D12_RENDER_TARGET_BLEND_DESC* t = &bl->RenderTarget[r];
+        t->BlendEnable = (BOOL)PSOC_RD(); t->LogicOpEnable = (BOOL)PSOC_RD();
+        t->SrcBlend = (D3D12_BLEND)PSOC_RD(); t->DestBlend = (D3D12_BLEND)PSOC_RD();
+        t->BlendOp = (D3D12_BLEND_OP)PSOC_RD(); t->SrcBlendAlpha = (D3D12_BLEND)PSOC_RD();
+        t->DestBlendAlpha = (D3D12_BLEND)PSOC_RD(); t->BlendOpAlpha = (D3D12_BLEND_OP)PSOC_RD();
+        t->LogicOp = (D3D12_LOGIC_OP)PSOC_RD(); t->RenderTargetWriteMask = (UINT8)PSOC_RD();
+    }
+    pd->SampleMask = PSOC_RD();
+    D3D12_RASTERIZER_DESC* ra = &pd->RasterizerState;
+    ra->FillMode = (D3D12_FILL_MODE)PSOC_RD(); ra->CullMode = (D3D12_CULL_MODE)PSOC_RD();
+    ra->FrontCounterClockwise = (BOOL)PSOC_RD(); ra->DepthBias = (INT)PSOC_RD();
+    { u32 v = PSOC_RD(); memcpy(&ra->DepthBiasClamp, &v, 4); }
+    { u32 v = PSOC_RD(); memcpy(&ra->SlopeScaledDepthBias, &v, 4); }
+    ra->DepthClipEnable = (BOOL)PSOC_RD(); ra->MultisampleEnable = (BOOL)PSOC_RD();
+    ra->AntialiasedLineEnable = (BOOL)PSOC_RD(); ra->ForcedSampleCount = PSOC_RD();
+    ra->ConservativeRaster = (D3D12_CONSERVATIVE_RASTERIZATION_MODE)PSOC_RD();
+    D3D12_DEPTH_STENCIL_DESC* ds = &pd->DepthStencilState;
+    ds->DepthEnable = (BOOL)PSOC_RD(); ds->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)PSOC_RD();
+    ds->DepthFunc = (D3D12_COMPARISON_FUNC)PSOC_RD(); ds->StencilEnable = (BOOL)PSOC_RD();
+    ds->StencilReadMask = (UINT8)PSOC_RD(); ds->StencilWriteMask = (UINT8)PSOC_RD();
+    D3D12_DEPTH_STENCILOP_DESC* f[2] = { &ds->FrontFace, &ds->BackFace };
+    for (int i = 0; i < 2; i++) {
+        f[i]->StencilFailOp = (D3D12_STENCIL_OP)PSOC_RD(); f[i]->StencilDepthFailOp = (D3D12_STENCIL_OP)PSOC_RD();
+        f[i]->StencilPassOp = (D3D12_STENCIL_OP)PSOC_RD(); f[i]->StencilFunc = (D3D12_COMPARISON_FUNC)PSOC_RD();
+    }
+    const u32 ne = PSOC_RD();
+    if (ne > 16) return 0;
+    for (u32 i = 0; i < ne; i++) {
+        for (int k = 0; k < 16; k += 4) { u32 w = PSOC_RD(); memcpy(names[i] + k, &w, 4); }
+        names[i][15] = 0;
+        il[i].SemanticName = names[i];
+        il[i].SemanticIndex = PSOC_RD(); il[i].Format = (DXGI_FORMAT)PSOC_RD(); il[i].InputSlot = PSOC_RD();
+        il[i].AlignedByteOffset = PSOC_RD(); il[i].InputSlotClass = (D3D12_INPUT_CLASSIFICATION)PSOC_RD();
+        il[i].InstanceDataStepRate = PSOC_RD();
+    }
+    pd->InputLayout.NumElements = ne;
+    pd->InputLayout.pInputElementDescs = ne ? il : NULL;
+    pd->IBStripCutValue = (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)PSOC_RD();
+    pd->PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)PSOC_RD();
+    pd->NumRenderTargets = PSOC_RD();
+    for (int r = 0; r < 8; r++) pd->RTVFormats[r] = (DXGI_FORMAT)PSOC_RD();
+    pd->DSVFormat = (DXGI_FORMAT)PSOC_RD();
+    pd->SampleDesc.Count = PSOC_RD(); pd->SampleDesc.Quality = PSOC_RD();
+    pd->NodeMask = PSOC_RD(); pd->Flags = (D3D12_PIPELINE_STATE_FLAGS)PSOC_RD();
+#undef PSOC_RD
+    pd->pRootSignature = s_d3d.vp_root_sig;
+    return o == n;
+}
+
+static u64 psoc_key(const char* hlsl, size_t hn, const void* vs, size_t vn, const u8* st, u32 stn)
+{
+    u64 h = psoc_fnv(1469598103934665603ull, hlsl, hn);
+    h = psoc_fnv(h, vs, vn);
+    return psoc_fnv(h, st, stn);
+}
+
+/* The slot of key, or of the empty place it would go; s_psoc_lock held. */
+static u32 psoc_slot(u64 key)
+{
+    u32 i = (u32)(key ^ (key >> 29)) & (PSOC_SLOTS - 1u);
+    while (s_psoc[i].key && s_psoc[i].key != key) i = (i + 1u) & (PSOC_SLOTS - 1u);
+    return i;
+}
+
+/* The built pipeline of key, with a reference for the caller; NULL when none
+ * is built (yet). *known: the key is in the file or was added this session. */
+static ID3D12PipelineState* psoc_find(u64 key, int* known)
+{
+    ID3D12PipelineState* p = NULL;
+    AcquireSRWLockShared(&s_psoc_lock);
+    const u32 i = psoc_slot(key);
+    *known = s_psoc[i].key == key;
+    if (*known && s_psoc[i].pso) { p = s_psoc[i].pso; p->lpVtbl->AddRef(p); }
+    ReleaseSRWLockShared(&s_psoc_lock);
+    if (p) InterlockedIncrement(&s_psoc_hits);
+    return p;
+}
+
+/* A pipeline built for key: kept (one reference), and appended to the file
+ * unless the file already has it. */
+static void psoc_add(u64 key, ID3D12PipelineState* pso, const u8* st, u32 stn,
+                     const void* vs, u32 vsn, const void* ps, u32 psn)
+{
+    if (s_psoc_mode != 1 || !pso || !key) return;
+    AcquireSRWLockExclusive(&s_psoc_lock);
+    const u32 i = psoc_slot(key);
+    if (s_psoc[i].key != key) {
+        if (s_psoc_n + 1u < PSOC_SLOTS * 3u / 4u) {
+            s_psoc[i].key = key; s_psoc_n++;
+            pso->lpVtbl->AddRef(pso); s_psoc[i].pso = pso;
+            if (s_psoc_out && fwrite(&key, 8, 1, s_psoc_out) == 1 && fwrite(&stn, 4, 1, s_psoc_out) == 1 &&
+                fwrite(st, 1, stn, s_psoc_out) == stn && fwrite(&vsn, 4, 1, s_psoc_out) == 1 &&
+                fwrite(vs, 1, vsn, s_psoc_out) == vsn && fwrite(&psn, 4, 1, s_psoc_out) == 1 &&
+                fwrite(ps, 1, psn, s_psoc_out) == psn)
+                fflush(s_psoc_out);
+            InterlockedIncrement(&s_psoc_added);
+        }
+    } else if (!s_psoc[i].pso) {
+        pso->lpVtbl->AddRef(pso); s_psoc[i].pso = pso;
+    }
+    ReleaseSRWLockExclusive(&s_psoc_lock);
+}
+
+/* The thread that builds the file's pipelines. */
+static DWORD WINAPI psoc_thread(LPVOID arg)
+{
+    (void)arg;
+    ps3_thread_name("pipeline cache");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    const double t0 = perf_now();
+    static D3D12_INPUT_ELEMENT_DESC il[16];
+    static char names[16][16];
+    for (u32 r = 0; r < s_psoc_nrecs; r++) {
+        PsocRec* rec = &s_psoc_recs[r];
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+        int dbt = 0, known = 0;
+        ID3D12PipelineState* have = psoc_find(rec->key, &known);
+        if (have) { have->lpVtbl->Release(have); goto next; }   /* a draw's build got there first */
+        if (!psoc_state_read(rec->st, rec->stn, &pd, il, names, &dbt)) { InterlockedIncrement(&s_psoc_failed); goto next; }
+        pd.VS.pShaderBytecode = rec->vs; pd.VS.BytecodeLength = rec->vsn;
+        pd.PS.pShaderBytecode = rec->ps; pd.PS.BytecodeLength = rec->psn;
+        ID3D12PipelineState* pso = NULL;
+        if (SUCCEEDED(guest_pso_create(&pd, dbt, &pso)) && pso) {
+            AcquireSRWLockExclusive(&s_psoc_lock);
+            const u32 i = psoc_slot(rec->key);
+            if (s_psoc[i].key == rec->key && !s_psoc[i].pso) { s_psoc[i].pso = pso; pso = NULL; }
+            ReleaseSRWLockExclusive(&s_psoc_lock);
+            if (pso) pso->lpVtbl->Release(pso);
+            InterlockedIncrement(&s_psoc_built);
+        } else {
+            InterlockedIncrement(&s_psoc_failed);
+        }
+    next:
+        free(rec->st); rec->st = rec->vs = rec->ps = NULL;
+    }
+    fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms (%ld failed)%c",
+            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, (long)s_psoc_failed, 10);
+    free(s_psoc_recs); s_psoc_recs = NULL;
+    return 0;
+}
+
+/* On the drain thread, at the title's first guest pipeline: read the file,
+ * build its pipelines on a thread, and open it to append the new ones. */
+static void psoc_start(void)
+{
+    if (s_psoc_mode >= 0) return;
+    s_psoc_mode = 0;
+    const char* e = getenv("D3D12_PSO_CACHE");
+    if ((e && !atoi(e)) || !s_shc_on || !s_d3d.vp_root_sig) return;
+    const char* sc = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
+    if (!sc || !*sc) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s.pso", sc);
+    dbt_ready();   /* a depth-bounds pipeline needs it, and it is made on this thread */
+    u32 cap = 0;
+    FILE* f = fopen(path, "rb");
+    int good = 0;
+    if (f) {
+        char magic[8];
+        if (fread(magic, 1, 8, f) == 8 && !memcmp(magic, s_psoc_magic, 8)) {
+            good = 1;
+            for (;;) {
+                PsocRec rec; memset(&rec, 0, sizeof rec);
+                if (fread(&rec.key, 8, 1, f) != 1) break;
+                if (fread(&rec.stn, 4, 1, f) != 1 || !rec.stn || rec.stn > PSOC_STATE_MAX) { good = 0; break; }
+                u8 st[PSOC_STATE_MAX];
+                if (fread(st, 1, rec.stn, f) != rec.stn) { good = 0; break; }
+                u32 vsn, psn;
+                if (fread(&vsn, 4, 1, f) != 1 || !vsn || vsn > (4u << 20)) { good = 0; break; }
+                u8* vs = (u8*)malloc(vsn);
+                if (!vs || fread(vs, 1, vsn, f) != vsn) { free(vs); good = 0; break; }
+                if (fread(&psn, 4, 1, f) != 1 || !psn || psn > (4u << 20)) { free(vs); good = 0; break; }
+                u8* all = (u8*)malloc((size_t)rec.stn + vsn + psn);
+                if (!all || fread(all + rec.stn + vsn, 1, psn, f) != psn) { free(all); free(vs); good = 0; break; }
+                memcpy(all, st, rec.stn);
+                memcpy(all + rec.stn, vs, vsn);
+                free(vs);
+                rec.st = all; rec.vs = all + rec.stn; rec.ps = all + rec.stn + vsn;
+                rec.vsn = vsn; rec.psn = psn;
+                if (s_psoc_nrecs == cap) {
+                    cap = cap ? cap * 2u : 256u;
+                    PsocRec* g = (PsocRec*)realloc(s_psoc_recs, cap * sizeof *g);
+                    if (!g) { free(all); break; }
+                    s_psoc_recs = g;
+                }
+                const u32 i = psoc_slot(rec.key);
+                if (s_psoc[i].key == rec.key || s_psoc_n + 1u >= PSOC_SLOTS * 3u / 4u) { free(all); continue; }
+                s_psoc[i].key = rec.key; s_psoc_n++;
+                s_psoc_recs[s_psoc_nrecs++] = rec;
+            }
+        }
+        fclose(f);
+    }
+    /* A file this build cannot read (another version, cut short) starts over. */
+    s_psoc_out = fopen(path, good ? "ab" : "wb");
+    if (s_psoc_out && !good) { fwrite(s_psoc_magic, 1, 8, s_psoc_out); fflush(s_psoc_out); }
+    s_psoc_mode = 1;
+    fprintf(stderr, "[d3d12] pipeline cache %s: %u pipelines to build%s%c", path, s_psoc_nrecs,
+            good ? "" : " (a new file)", 10);
+    if (s_psoc_nrecs) {
+        HANDLE t = CreateThread(NULL, 0, psoc_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+}
+
 static void sj_build(ShaderJob* j)
 {
     ID3DBlob* err = NULL;
@@ -1269,6 +1587,14 @@ static void sj_build(ShaderJob* j)
     const double t0 = perf_now();
     j->hr = guest_pso_create(&j->pd, j->dbt, &j->pso);
     const double dt = perf_now() - t0;
+    if (SUCCEEDED(j->hr) && j->pso && s_psoc_mode == 1) {
+        u8 st[PSOC_STATE_MAX];
+        const u32 stn = psoc_state_bytes(&j->pd, j->dbt, st);
+        if (stn)
+            psoc_add(psoc_key(j->src, j->len, j->pd.VS.pShaderBytecode, j->pd.VS.BytecodeLength, st, stn),
+                     j->pso, st, stn, j->pd.VS.pShaderBytecode, (u32)j->pd.VS.BytecodeLength,
+                     j->pd.PS.pShaderBytecode, (u32)j->pd.PS.BytecodeLength);
+    }
     if (FAILED(j->hr)) {
         /* The driver refused it: what it was given. */
         const char* cb = strstr(j->src, "fp_constants[");
@@ -6044,13 +6370,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     ID3D12PipelineState* pso = NULL;
     ShaderJob* job = NULL;
-    if (async) {
+    /* D3D12_PSO_CACHE: built at the start from an earlier session's file. */
+    psoc_start();
+    u8 pst[PSOC_STATE_MAX];
+    u32 pstn = 0;
+    u64 psokey = 0;
+    if (s_psoc_mode == 1 && (pstn = psoc_state_bytes(&pd, (int)(ext & 1u), pst)) != 0) {
+        int known = 0;
+        psokey = psoc_key(hlsl, strlen(hlsl), pd.VS.pShaderBytecode, pd.VS.BytecodeLength, pst, pstn);
+        pso = psoc_find(psokey, &known);
+    }
+    if (pso) {
+        if (pb) pb->lpVtbl->Release(pb);
+    } else if (async) {
         job = sj_submit(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", vsb, &pd, (int)(ext & 1u));
         if (!job) return NULL;
     } else {
         { const double t0 = perf_now();
           hr = guest_pso_create(&pd, (int)(ext & 1u), &pso);
           s_shc_stat_pso++; s_shc_stat_pso_s += perf_now() - t0; }
+        if (SUCCEEDED(hr) && pso && pstn)
+            psoc_add(psokey, pso, pst, pstn, pd.VS.pShaderBytecode, (u32)pd.VS.BytecodeLength,
+                     pb->lpVtbl->GetBufferPointer(pb), (u32)pb->lpVtbl->GetBufferSize(pb));
         pb->lpVtbl->Release(pb);
         if (FAILED(hr)) {
             static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
@@ -8284,6 +8625,9 @@ static void rsx_census_present(void)
                     "80-100:%llu 100-150:%llu 150-250:%llu 250-500:%llu 500-1000:%llu >1000:%llu, max %.0f\n",
             s_cen_hist[0], s_cen_hist[1], s_cen_hist[2], s_cen_hist[3], s_cen_hist[4], s_cen_hist[5],
             s_cen_hist[6], s_cen_hist[7], s_cen_hist[8], s_cen_hist[9], s_cen_max_ms);
+    if (s_psoc_mode == 1)
+        fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
+                (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);
     fprintf(stderr, "[census] texture binds %llu, with a mip chain %llu; by format (binds / null: "
                     "no offset, format not taken, no slot):", s_cen_binds, s_cen_mips);
     for (int f = 0; f < 256; f++)
@@ -9117,12 +9461,42 @@ static void guest_peek_poke(void)
     }
 }
 
+/* FLIP_OP_DBG=1: what each flip op did (flip_op_note), and every present whose batch did not
+ * carry exactly one, with its time since the process started (flip_op_present_note). */
+static int flip_op_dbg(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("FLIP_OP_DBG"); on = e ? atoi(e) : 0; }
+    return on;
+}
+static double flip_op_secs(void)
+{
+    static double t0 = -1.0;
+    if (t0 < 0.0) {
+        FILETIME cr, ex, kt, ut, nf;
+        ULARGE_INTEGER a, b;
+        GetProcessTimes(GetCurrentProcess(), &cr, &ex, &kt, &ut);
+        GetSystemTimePreciseAsFileTime(&nf);
+        a.LowPart = cr.dwLowDateTime; a.HighPart = cr.dwHighDateTime;
+        b.LowPart = nf.dwLowDateTime; b.HighPart = nf.dwHighDateTime;
+        t0 = perf_now() - (double)(b.QuadPart - a.QuadPart) / 1e7;
+    }
+    return perf_now() - t0;
+}
+static unsigned s_fo_batch, s_fo_dropped, s_fo_failed;
+
 static void d3d12_flip_observed(u32 buffer_id)
 {
     static int on = -1;
     guest_peek_poke();
     if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
     extern u32 cellGcm_display_buffer_offset(u32 id);
+    if (on && display_rt_on() && s_d3d.initialized && s_d3d.draw_count >= MAX_DRAWS) {
+        s_fo_dropped++;
+        if (flip_op_dbg())
+            fprintf(stderr, "[flip-op] %.2f s: buffer %u dropped, the batch is full (%u records)%c",
+                    flip_op_secs(), buffer_id, s_d3d.draw_count, 10);
+    }
     if (!on || !display_rt_on() || !s_d3d.initialized || s_d3d.draw_count >= MAX_DRAWS) return;
     const u32 o = cellGcm_display_buffer_offset(buffer_id);
     if (o == 0xFFFFFFFFu) return;
@@ -11023,7 +11397,17 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 if (dr->snap_ea) { blit_snap_take(dr, fi); continue; }
                 if (dr->is_blit) { blit_rt_copy(dr); force_rebind = 1; continue; }
                 if (dr->flip_key) {
-                    composite_copy(fi, off_rt_find(dr->flip_key), dr->flip_key);
+                    const int fslot = off_rt_find(dr->flip_key);
+                    s_fo_batch++;
+                    if (fslot < 0 || s_d3d.off_rt[fslot].dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
+                        s_fo_failed++;
+                        if (flip_op_dbg())
+                            fprintf(stderr, "[flip-op] %.2f s: op %u key 0x%08X not copied: %s %d%c",
+                                    flip_op_secs(), d, dr->flip_key,
+                                    fslot < 0 ? "no target, slot" : "its target's format is dxgi",
+                                    fslot < 0 ? fslot : (int)s_d3d.off_rt[fslot].dxgi, 10);
+                    }
+                    composite_copy(fi, fslot, dr->flip_key);
                     s_flip_shown = 1;
                     force_rebind = 1;
                     continue;
@@ -11835,6 +12219,10 @@ skip_dump_consider: ;
         }
     }
 
+    if (s_present_this_frame && flip_op_dbg() && (s_fo_batch != 1 || s_fo_dropped || s_fo_failed))
+        fprintf(stderr, "[flip-op] %.2f s: present with %u flip ops (%u dropped, %u not copied), %u records%c",
+                flip_op_secs(), s_fo_batch, s_fo_dropped, s_fo_failed, s_d3d.draw_count, 10);
+    if (s_present_this_frame) s_fo_batch = s_fo_dropped = s_fo_failed = 0;
     if (s_present_this_frame) present_to_backbuffer(fi);
     if (shot && !d3d12_shot_game()) shot_copy_bb(fi);
 

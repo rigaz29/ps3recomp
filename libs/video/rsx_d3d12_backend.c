@@ -5046,6 +5046,10 @@ static int rsx_aniso_setting(void)
     return v;
 }
 
+/* RSX_CENSUS: the samplers made, by filter: [0] point or linear, [1] anisotropic
+ * at the title's level, [2] anisotropic raised to graphics.anisotropy. */
+static volatile long s_samp_made[3];
+
 static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
 {
     const u32 addr = k[0], filter = k[1], ctrl0 = k[2], border = k[3];
@@ -5055,7 +5059,9 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
     const int mag_lin = magf == 2 || magf == 4;
     static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
     u32 level = aniso[(ctrl0 >> 4) & 7u];
+    const u32 own = level;
     if (min_lin && mag_lin && level < (u32)rsx_aniso_setting()) level = (u32)rsx_aniso_setting();
+    s_samp_made[!(level > 1 && min_lin && mag_lin) ? 0 : level > own ? 2 : 1]++;
     memset(s, 0, sizeof *s);
     if (level > 1 && min_lin && mag_lin) {
         s->Filter = D3D12_FILTER_ANISOTROPIC;
@@ -8666,6 +8672,9 @@ static void rsx_census_present(void)
         fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
                 (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);
     tex_decode_print();
+    fprintf(stderr, "[census] samplers made: %ld point or linear, %ld anisotropic at the title's level, "
+                    "%ld raised to graphics.anisotropy (%d; 0 = the title's)%c",
+            s_samp_made[0], s_samp_made[1], s_samp_made[2], rsx_aniso_setting(), 10);
     fprintf(stderr, "[census] texture binds %llu, with a mip chain %llu; by format (binds / null: "
                     "no offset, format not taken, no slot):", s_cen_binds, s_cen_mips);
     for (int f = 0; f < 256; f++)

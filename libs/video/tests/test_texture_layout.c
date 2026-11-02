@@ -597,6 +597,46 @@ static void test_decode_swizzled_sizes(void)
         }
 }
 
+/* The 4x4-tile path (decode_swizzled_tiles) gives what the Morton formula
+ * says, for one-byte B8 and four-byte A8R8G8B8 / D8R8G8B8, square and not,
+ * from 1 texel to 1024 a side, either channel order, random bytes. Sizes not
+ * a multiple of 4 go texel by texel and are checked the same way. */
+static u32 s_rnd = 0x12345678u;
+static u32 rnd32(void) { s_rnd = s_rnd * 1664525u + 1013904223u; return s_rnd; }
+static void test_decode_swizzled_tiles(void)
+{
+    static u8 src[1024 * 1024 * 4], dst[1024 * 1024 * 4];
+    static const u32 fmts[3] = { FMT_B8, FMT_A8R8G8B8, 0x9Eu };
+    static const u32 sizes[][2] = { {1, 1}, {2, 2}, {4, 4}, {8, 8}, {4, 64}, {64, 4}, {8, 4}, {16, 256},
+                                    {256, 16}, {128, 128}, {512, 64}, {1024, 1024}, {2, 8}, {8, 2} };
+    for (u32 fi = 0; fi < 3; fi++)
+        for (u32 si = 0; si < sizeof sizes / sizeof sizes[0]; si++)
+            for (int argb = 0; argb < 2; argb++) {
+                const u32 w = sizes[si][0], h = sizes[si][1];
+                rsx_tex_layout L;
+                rsx_texture_layout(fmts[fi], w, h, &L);
+                CHECK(L.swizzled);
+                const u32 bpp = L.bytes_per_texel, l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
+                for (u32 i = 0; i < (1u << (l2w + l2h)) * bpp; i++) src[i] = (u8)(rnd32() >> 24);
+                memset(dst, 0xA5, (size_t)w * h * bpp);
+                rsx_texture_decode(dst, w * bpp, src, w, h, &L, argb);
+                u32 bad = 0;
+                for (u32 y = 0; y < h; y++)
+                    for (u32 x = 0; x < w; x++) {
+                        const u8* s = src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * bpp;
+                        const u8* d = dst + ((size_t)y * w + x) * bpp;
+                        u8 want[4];
+                        if (bpp == 1) want[0] = s[0];
+                        else if (argb) { want[0] = s[0]; want[1] = s[1]; want[2] = s[2]; want[3] = s[3]; }
+                        else { want[0] = s[1]; want[1] = s[2]; want[2] = s[3]; want[3] = s[0]; }
+                        if (bpp == 4 && fmts[fi] == 0x9Eu) want[3] = 255;
+                        if (memcmp(d, want, bpp)) bad++;
+                    }
+                if (bad) printf("  fmt %02X %ux%u argb %d: %u texels wrong\n", fmts[fi], w, h, argb, bad);
+                CHECK_EQ(bad, 0);
+            }
+}
+
 /* Compressed payload is copied verbatim -- BC1/2/3 are bit-identical to
  * DXT1/23/45 -- with only the row stride changing. */
 static void test_decode_compressed_is_verbatim(void)
@@ -862,6 +902,7 @@ int main(void)
     test_decode_swizzled();
     test_decode_g8b8_swizzled();
     test_decode_swizzled_sizes();
+    test_decode_swizzled_tiles();
     test_decode_compressed_is_verbatim();
     test_decode_rejects_nonsense();
     test_remap_identity();

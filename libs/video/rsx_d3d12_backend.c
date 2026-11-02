@@ -8231,18 +8231,39 @@ static void rsx_census_present(void)
       if (dpre < 0.0) dpre = s_perf_pre;   /* PERF reset its sums in between */
       if (drf < 0.0) drf = s_perf_rf;
       pre_prev = s_perf_pre; rf_prev = s_perf_rf;
-      if (s_cen_last_present > 0.0 && (now - s_cen_last_present) * 1000.0 >= 150.0) {
+      /* RSX_HITCH_MS=<ms>: a line for every present at least that long after the one
+       * before (150 without it), and with it set also for every present that skipped a
+       * draw or queued a build, each with its time since the process started and the
+       * frame's draws: stutter and its causes, frame by frame. */
+      static double hitch_ms = -1.0, t_proc0;
+      static int hitch_every;
+      if (hitch_ms < 0.0) {
+          const char* e = getenv("RSX_HITCH_MS");
+          hitch_ms = e ? atof(e) : 150.0;
+          hitch_every = e != NULL;
+          FILETIME cr, ex, kt, ut, nf;
+          ULARGE_INTEGER a, b;
+          GetProcessTimes(GetCurrentProcess(), &cr, &ex, &kt, &ut);
+          GetSystemTimePreciseAsFileTime(&nf);
+          a.LowPart = cr.dwLowDateTime; a.HighPart = cr.dwHighDateTime;
+          b.LowPart = nf.dwLowDateTime; b.HighPart = nf.dwHighDateTime;
+          t_proc0 = now - (double)(b.QuadPart - a.QuadPart) / 1e7;
+      }
+      const double gap_ms = (now - s_cen_last_present) * 1000.0;
+      if (s_cen_last_present > 0.0 &&
+          (gap_ms >= hitch_ms || (hitch_every && (s_hl_skipped || s_hl_jobs)))) {
           DXGI_QUERY_VIDEO_MEMORY_INFO vm;
           memset(&vm, 0, sizeof vm);
           if (s_adapter3)
               s_adapter3->lpVtbl->QueryVideoMemoryInfo(s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm);
-          fprintf(stderr, "[hitch] %.0f ms: textures uploaded %u (%.1f ms: create %.1f, evict %.1f, decode %.1f), "
+          fprintf(stderr, "[hitch] %.0f ms at %.2f s, %u draws: "
+                          "textures uploaded %u (%.1f ms: create %.1f, evict %.1f, decode %.1f), "
                           "shader waits %.1f ms, draws skipped %u, builds queued %u, GPU wait %.1f ms, prepass %.1f ms, "
                           "render_frame %.1f ms; pipelines made here %u (%.1f ms), upload buffers %u (%.1f ms), "
                           "targets made %u (%.1f ms), heaps made %u (%.1f ms), all GPU waits %u (%.1f ms), "
                           "VRAM %llu of %llu MB; the frame before on the GPU %.1f ms (copies %.1f, draws %.1f, "
                           "the rest %.1f)\n",
-                  (now - s_cen_last_present) * 1000.0, s_hl_tex_n, s_hl_tex_s * 1000.0,
+                  gap_ms, now - t_proc0, s_dbg_last_draws, s_hl_tex_n, s_hl_tex_s * 1000.0,
                   dcr * 1000.0, dev * 1000.0, ddc * 1000.0, s_hl_sjwait_s * 1000.0,
                   s_hl_skipped, s_hl_jobs, s_hl_gpuwait_s * 1000.0, dpre * 1000.0, drf * 1000.0,
                   s_hl_miss_n, s_hl_miss_s * 1000.0, s_hl_upbuf_n, s_hl_upbuf_s * 1000.0,

@@ -3429,20 +3429,20 @@ static void spu_indirect_branch_full(spu_context* ctx)
               const uint32_t sp = ((uint32_t)k[0x1C4] << 24) | ((uint32_t)k[0x1C5] << 16) | ((uint32_t)k[0x1C6] << 8) | k[0x1C7];
               const uint32_t sn = ((uint32_t)k[0x1C8] << 24) | ((uint32_t)k[0x1C9] << 16) | ((uint32_t)k[0x1CA] << 8) | k[0x1CB];
               const uint32_t cur = ((uint32_t)k[0x1DC] << 24) | ((uint32_t)k[0x1DD] << 16) | ((uint32_t)k[0x1DE] << 8) | k[0x1DF];
-              const uint64_t r = (sp && g_spurs_kernel_poll) ? g_spurs_kernel_poll(sp, sn, cur) : 0;
-              ctx->gpr[3] = spu_make_preferred_u32((uint32_t)(r >> 32));
-              ctx->gpr[3]._u32[1] = (uint32_t)r; }
-            /* The kernel's selection copies the instance's first line into the
-             * context's tempArea (LS 0x100) on every call, not only at module
-             * entry, and jobs that ran since may have overwritten it. */
-            { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
-                                  ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
+              uint64_t r = (sp && g_spurs_kernel_poll) ? g_spurs_kernel_poll(sp, sn, cur) : 0;
+              /* The kernel's selection copies the instance's first line into the
+               * context's tempArea (LS 0x100) on every call, not only at module
+               * entry, and jobs that ran since may have overwritten it. A job
+               * capture records the answer and the line; a replay, which has no
+               * kernel, is served both from the record. */
               if (sp) {
                   if (SPU_JOBCAP_ANY())
-                      spu_jobcap_kernel_line(ctx, sp);   /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY */
+                      r = spu_jobcap_kernel_poll(ctx, sp, r);   /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY */
                   else
                       memcpy(ctx->ls + 0x100, vm_base + sp, 0x80);
-              } }
+              }
+              ctx->gpr[3] = spu_make_preferred_u32((uint32_t)(r >> 32));
+              ctx->gpr[3]._u32[1] = (uint32_t)r; }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

@@ -21,7 +21,8 @@
  * returns. The file holds the context and local store at the
  * start, then in order every DMA GET and PUT with their bytes, every atomic
  * with its line and status, every channel read and count, every outbound
- * mailbox write; then the registers and local store at the end. A job that
+ * mailbox write, every kernel poll's answer with the line its selection copies
+ * to LS 0x100; then the registers and local store at the end. A job that
  * stops or halts is not kept: what follows depends on more than the record
  * holds. Interrupts are kept (see spu_jobcap_abandon).
  *
@@ -36,6 +37,7 @@
  * Replay, SPU_JOB_REPLAY=<dir> (the port starts it instead of the game):
  *   SPU_JOB_REPLAY_REPS=10        runs per job (default 10)
  *   SPU_JOB_REPLAY_ONLY=_w15_     only files whose name contains this
+ *   SPU_JOB_REPLAY_TRACE=1        every request a run makes of its record, on stderr
  * Each job runs from its saved context with every input served from the
  * record, in order, and every output compared with it: PUT bytes, outbound
  * mailbox words, and at the end the local store and the registers. A request
@@ -87,7 +89,7 @@ static const char* const jc_names[] = { "?", "GET", "PUT", "SDCRZ", "atomic", "r
 typedef struct { uint32_t type, a, b, c, len; } jc_ev;
 
 typedef struct {
-    char     magic[8];          /* "SPUJCAP1" */
+    char     magic[8];          /* "SPUJCAP2" (2: a kernel poll's answer after its line) */
     uint32_t ctx_size;          /* sizeof(spu_context) of the build that wrote it */
     uint32_t wid, link, entry;
     uint32_t n_ev, ev_len;
@@ -95,7 +97,7 @@ typedef struct {
     uint32_t reserved[5];
 } jc_hdr;
 
-#define JC_MAGIC "SPUJCAP1"
+#define JC_MAGIC "SPUJCAP2"
 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 
@@ -427,19 +429,34 @@ void spu_jobcap_drain_done(spu_context* ctx, uint32_t return_pc)
 /* ------------------------------------------------------------------- replay */
 
 
+/* Requests a run may make off its record before it is stopped: past the first
+ * the run is not the game's any more, and an interrupt handler served nothing
+ * can be taken again at once, deeper each time, until the stack is gone. */
+#define JC_GIVE_UP 64u
+
+static int s_rep_trace = -1;
+
 static const jc_ev* rep_next(jc_rep* r, uint32_t type, uint32_t a, uint32_t b, uint32_t c, uint32_t len, const uint8_t** data)
 {
+    if (s_rep_trace < 0) s_rep_trace = getenv("SPU_JOB_REPLAY_TRACE") ? 1 : 0;
+    if (s_rep_trace && r->diverged < 64)
+        fprintf(stderr, "[replay-ev] %u %s a=0x%X b=0x%X c=0x%X len=%u pc=0x%05X%s\n", r->idx, jc_names[type],
+                a, b, c, len, r->ctx ? r->ctx->pc & SPU_LS_MASK : 0, r->diverged ? " (off the record)" : "");
     if (r->pos + sizeof(jc_ev) > r->len) {
         if (!r->diverged++)
             snprintf(r->first, sizeof r->first, "event %u: %s past the end of the record", r->idx, jc_names[type]);
+        if (r->diverged > JC_GIVE_UP) longjmp(r->jb, 3);
         return NULL;
     }
     static SPU_THREAD_LOCAL jc_ev e;
     memcpy(&e, r->ev + r->pos, sizeof e);
-    if (e.type != type || e.a != a || e.b != b || (type != JC_ATOMIC && e.c != c) || (len && e.len != len)) {
+    /* An atomic's c and a channel count's c are what the record answers. */
+    if (e.type != type || e.a != a || e.b != b || (type != JC_ATOMIC && type != JC_RCHCNT && e.c != c) ||
+        (len && e.len != len)) {
         if (!r->diverged++)
             snprintf(r->first, sizeof r->first, "event %u: %s a=0x%X b=0x%X c=0x%X len=%u, the record has %s a=0x%X b=0x%X c=0x%X len=%u",
                      r->idx, jc_names[type], a, b, c, len, jc_names[e.type < 9 ? e.type : 0], e.a, e.b, e.c, e.len);
+        if (r->diverged > JC_GIVE_UP) longjmp(r->jb, 3);
         return NULL;
     }
     *data = r->ev + r->pos + sizeof e;
@@ -449,19 +466,29 @@ static const jc_ev* rep_next(jc_rep* r, uint32_t type, uint32_t a, uint32_t b, u
 }
 
 extern uint8_t* vm_base;
-void spu_jobcap_kernel_line(spu_context* ctx, uint32_t ea)
+/* The record holds the line, then the answer (8 bytes, host order). Without
+ * the answer a replay had none (no kernel): 0, "workload 0", and the job
+ * manager went another way than in the game. */
+uint64_t spu_jobcap_kernel_poll(spu_context* ctx, uint32_t ea, uint64_t answer)
 {
     if (t_spu_jobcap == 2) {
         jc_rep* r = t_rep;
         const uint8_t* d;
-        if (r && rep_next(r, JC_KLINE, 0x100, ea, 0, 0x80, &d))
+        if (r && rep_next(r, JC_KLINE, 0x100, ea, 0, 0x88, &d)) {
             memcpy(ctx->ls + 0x100, d, 0x80);
-        return;
+            memcpy(&answer, d + 0x80, 8);
+        }
+        return answer;
     }
     memcpy(ctx->ls + 0x100, vm_base + ea, 0x80);
     jc_cap* c = t_cap;
-    if (t_spu_jobcap == 1 && c && c->ctx == ctx)
-        cap_put(c, JC_KLINE, 0x100, ea, 0, ctx->ls + 0x100, 0x80);
+    if (t_spu_jobcap == 1 && c && c->ctx == ctx) {
+        uint8_t rec[0x88];
+        memcpy(rec, ctx->ls + 0x100, 0x80);
+        memcpy(rec + 0x80, &answer, 8);
+        cap_put(c, JC_KLINE, 0x100, ea, 0, rec, 0x88);
+    }
+    return answer;
 }
 
 void spu_jobcap_restart(spu_context* ctx)
@@ -562,9 +589,13 @@ void spu_jobcap_atomic_done(spu_context* ctx, uint32_t cmd)
 
 int spu_jobcap_rdch(spu_context* ctx, uint32_t channel, u128* value)
 {
-    (void)ctx;
     jc_rep* r = t_rep;
     if (t_spu_jobcap != 2 || !r) return 0;
+    /* The value comes from the record, but the read's own effect on the MFC
+     * is kept: reading the list stall status clears it (mfc_channel_read).
+     * Left set, the replay's stall-and-notify event came back after the
+     * handler's acknowledge, where the game's had gone. */
+    if (channel == MFC_RdListStallStat) ctx->list_stall_stat = 0;
     const uint8_t* d;
     if (!rep_next(r, JC_RDCH, channel, 0, 0, sizeof(u128), &d)) { memset(value, 0, sizeof *value); return 1; }
     memcpy(value, d, sizeof *value);
@@ -611,6 +642,11 @@ int spu_jobcap_wrch_out(spu_context* ctx, uint32_t channel, uint32_t value)
 }
 
 typedef struct { char name[64]; uint32_t wid, entry, n_ev; double best, med; int ok; } jc_row;
+
+static int cmp_name(const void* a, const void* b)
+{
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
 
 static int cmp_d(const void* a, const void* b)
 {
@@ -691,6 +727,7 @@ static int replay_one(const char* dir, const char* name, int reps, jc_row* row)
             const int jr = setjmp(r->jb);
             if (jr == 1) { how = 1; break; }
             if (jr == 2 && ++restarts > 64) break;
+            if (jr == 3) break;   /* gone off its record and not coming back (rep_next) */
             spu_jmp_no_unwind(r->jb);
             g_spu_trampoline_fn = 0;
             spu_indirect_branch(ctx);
@@ -780,7 +817,7 @@ int spu_job_replay_main(const char* dir)
     }
     if (dp) closedir(dp);
 #endif
-    qsort(names, nn, sizeof *names, (int (*)(const void*, const void*))strcmp);
+    qsort(names, nn, sizeof *names, cmp_name);
     fprintf(stderr, "[replay] %zu captures in %s, %d runs each\n", nn, dir, reps);
     for (size_t i = 0; i < nn; i++) {
         if (only && !strstr(names[i], only)) continue;

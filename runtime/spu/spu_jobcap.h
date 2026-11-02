@@ -84,9 +84,10 @@ void spu_jobcap_rdch_done(spu_context* ctx, uint32_t channel, u128 value);
 int spu_jobcap_rchcnt(spu_context* ctx, uint32_t channel, uint32_t* count);
 void spu_jobcap_rchcnt_done(spu_context* ctx, uint32_t channel, uint32_t count);
 int spu_jobcap_wrch_out(spu_context* ctx, uint32_t channel, uint32_t value);
-/* The kernel's workload selection copies the SPURS instance's first line
- * from guest memory into LS 0x100 (no DMA): recorded, and served in a replay. */
-void spu_jobcap_kernel_line(spu_context* ctx, uint32_t ea);
+/* The kernel poll (cellSpursModulePoll): its answer, and the SPURS instance's
+ * first line its workload selection copies from guest memory into LS 0x100
+ * (no DMA). Recorded, and served in a replay; returns the answer to use. */
+uint64_t spu_jobcap_kernel_poll(spu_context* ctx, uint32_t ea, uint64_t answer);
 /* spu_restart_dispatch during a replay: jump back to the replay, which
  * dispatches on at ctx->pc as the execution driver would. */
 void spu_jobcap_restart(spu_context* ctx);

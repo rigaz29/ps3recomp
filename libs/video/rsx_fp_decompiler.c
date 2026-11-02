@@ -193,6 +193,13 @@ static int rsx_fp_precision_on(void)
     if (v < 0) { const char* e = getenv("RSX_FP_PRECISION"); v = e ? (atoi(e) != 0) : 1; }
     return v;
 }
+/* RSX_FP_SRC_PREC=0: SRC1 [21:19] ignored, every first source read as is. */
+static int rsx_fp_src_prec_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_SRC_PREC"); v = e ? (atoi(e) != 0) : 1; }
+    return v;
+}
 static const char* rsx_fp_precision_clamp(u32 w0)
 {
     if (!rsx_fp_precision_on()) return "";
@@ -894,6 +901,31 @@ static int rsx_fp_decompile_internal2(
         emit_src(
             &s0, input_src, persp, k, has_k, buffered, constant_slot,
             a, sizeof(a));
+        /* SRC1 [21:19]: the first source's precision as it is read, after
+         * its abs and negate. 4 clamps it to [0, 1]: God of War: Ascension
+         * lights its menu's cloth and rocks with MUL h, r3.w, c where r3.w =
+         * N.L carries 4, and read as is, a negative N.L darkened them in black
+         * patches RPCS3 does not have (its translation clamps exactly these
+         * sources). 3 clamps it to [-1, 1]: the opening cinematic's LG2s of
+         * |h1.z| (RPCS3: log2(clamp(abs(h1.z), -1, 1))). 5 marks some NRMs,
+         * left as they are (as RPCS3 does); no other value is seen in this
+         * title, and one would be read as is and reported.
+         * RSX_FP_SRC_PREC=0 reads every first source as is. */
+        if (!is_branch) {
+            const u32 src_prec = (w2 >> 19) & 7u;
+            if ((src_prec == 4u || src_prec == 3u) && rsx_fp_src_prec_on()) {
+                char t[sizeof a];
+                const int len = src_prec == 4u ? snprintf(t, sizeof t, "saturate(%s)", a)
+                                               : snprintf(t, sizeof t, "clamp(%s, -1.0, 1.0)", a);
+                if (len < 0 || (size_t)len >= sizeof t) return -1;
+                memcpy(a, t, (size_t)len + 1);
+            } else if (src_prec != 0u && src_prec != 5u) {
+                static u32 reported;
+                if (PS3_LOG_FIRST(reported, 16))
+                    fprintf(stderr, "[RSX fp] first-source precision %u on opcode 0x%02X: read as is\n",
+                            src_prec, opcode);
+            }
+        }
         emit_src(
             &s1, input_src, persp, k, has_k, buffered, constant_slot,
             b, sizeof(b));

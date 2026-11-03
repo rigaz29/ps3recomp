@@ -1245,17 +1245,64 @@ static __attribute__((noinline, cold, unused)) u128 spu__x8_rz_check(u128 got, i
 #else
 #define SPU__X8_VCALL
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+/* The redo four lanes at once, in double precision. It serves only the RZ forms, which run with
+ * the host's rounding toward zero (MXCSR), and in that mode it is exact:
+ *  - an SPU single (every biased exponent 1-255 a normal number, 0 a zero) is exact as a double;
+ *  - a product of two 24-bit significands is exact in double, and well inside its range
+ *    (2^-252 to 2^258: no double denormal, no overflow);
+ *  - a double sum or fused sum is truncated once at 53 bits; truncating that at 24 bits gives the
+ *    exact result truncated at 24, since every 24-bit value is also a 53-bit one;
+ *  - back to a single: the top 23 fraction bits (truncation); above biased 255 the SPU's
+ *    saturation (sign | 0x7FFFFFFF); below biased 1, or zero, +0.
+ * In any other rounding mode it takes the lane-by-lane forms. tests/test_spu_float_redo.c checks
+ * them against spu__fa_any / spu__fm_any / spu__fma_any. */
+SPU__X8_INLINE __m256d spu__x8_redo_d(__m128i x) {
+    const __m256i u = _mm256_cvtepu32_epi64(x);
+    const __m256i be = _mm256_and_si256(_mm256_srli_epi64(u, 23), _mm256_set1_epi64x(0xFF));
+    const __m256i d = _mm256_or_si256(
+        _mm256_or_si256(_mm256_slli_epi64(_mm256_and_si256(u, _mm256_set1_epi64x(0x80000000)), 32),
+                        _mm256_slli_epi64(_mm256_add_epi64(be, _mm256_set1_epi64x(1023 - 127)), 52)),
+        _mm256_slli_epi64(_mm256_and_si256(u, _mm256_set1_epi64x(0x7FFFFF)), 29));
+    return _mm256_castsi256_pd(_mm256_andnot_si256(_mm256_cmpeq_epi64(be, _mm256_setzero_si256()), d));
+}
+SPU__X8_INLINE __m128i spu__x8_redo_s(__m256d v) {
+    const __m256i u = _mm256_castpd_si256(v);
+    const __m256i biased = _mm256_sub_epi64(_mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF)),
+                                            _mm256_set1_epi64x(1023 - 127));
+    const __m256i sign = _mm256_and_si256(_mm256_srli_epi64(u, 32), _mm256_set1_epi64x(0x80000000));
+    __m256i r = _mm256_or_si256(sign, _mm256_or_si256(_mm256_slli_epi64(biased, 23),
+                                _mm256_and_si256(_mm256_srli_epi64(u, 29), _mm256_set1_epi64x(0x7FFFFF))));
+    r = _mm256_blendv_epi8(r, _mm256_or_si256(sign, _mm256_set1_epi64x(0x7FFFFFFF)),
+                           _mm256_cmpgt_epi64(biased, _mm256_set1_epi64x(255)));
+    r = _mm256_andnot_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(1), biased), r);
+    return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(r, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)));
+}
+#define SPU__X8_REDO_RZ() ((_mm_getcsr() & 0x6000u) == 0x6000u)
+#else
+#define SPU__X8_REDO_RZ() 0
+#endif
 SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fa_redo(__m128i x, __m128i y) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if (SPU__X8_REDO_RZ()) return spu__x8_redo_s(_mm256_add_pd(spu__x8_redo_d(x), spu__x8_redo_d(y)));
+#endif
     const u128 a = spu__x8_st(x), b = spu__x8_st(y); u128 r;
     for (int i = 0; i < 4; i++) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i]);
     return spu__x8_ld(r);
 }
 SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fm_redo(__m128i x, __m128i y) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if (SPU__X8_REDO_RZ()) return spu__x8_redo_s(_mm256_mul_pd(spu__x8_redo_d(x), spu__x8_redo_d(y)));
+#endif
     const u128 a = spu__x8_st(x), b = spu__x8_st(y); u128 r;
     for (int i = 0; i < 4; i++) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
     return spu__x8_ld(r);
 }
 SPU__X8_SLOW __m128i SPU__X8_VCALL spu__x8_fma_redo(__m128i x, __m128i y, __m128i z) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if (SPU__X8_REDO_RZ())
+        return spu__x8_redo_s(_mm256_fmadd_pd(spu__x8_redo_d(x), spu__x8_redo_d(y), spu__x8_redo_d(z)));
+#endif
     const u128 a = spu__x8_st(x), b = spu__x8_st(y), c = spu__x8_st(z); u128 r;
     for (int i = 0; i < 4; i++) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], 0, 0);
     return spu__x8_ld(r);

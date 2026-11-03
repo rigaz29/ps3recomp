@@ -2462,11 +2462,34 @@ static int spurs_select_rr(void)
  * Returns 0 when it may not take the SPU at all. God of War: Ascension's
  * first level: CollisL 1, audio 1 (SPU 5 only), Batch 2, the EDGE lists 3
  * (SPUs 0-3 only), RenJobSet 8, RenderJobs 10-12, General6 11-13. */
+/* SPURS_RESERVE=<wid>:<spu>: that SPU runs that workload only; no other workload may
+ * claim it. For a workload with a deadline that the title pins to one SPU: God of War:
+ * Ascension's audio (7) runs on SPU 5 only, and in a fight its kicks waited up to ~10 ms
+ * for SPU 5 while other workloads' jobs held it -- a job is not interrupted, only a run
+ * between jobs. The other workloads keep the other SPUs. */
+static int spurs_reserved_away(u32 wid, u32 sn)
+{
+    static int parsed;
+    static u32 res_wid = 0xFFFFFFFFu, res_sn = 0xFFFFFFFFu;
+    if (!parsed) {
+        parsed = 1;
+        const char* e = getenv("SPURS_RESERVE");
+        unsigned w, n;
+        if (e && sscanf(e, "%u:%u", &w, &n) == 2 && w < SPURS_MAX_WID && n < 8) {
+            res_wid = w; res_sn = n;
+            fprintf(stderr, "[spurs] SPURS_RESERVE: SPU %u runs workload %u only\n", n, w);
+        }
+    }
+    return sn == res_sn && wid != res_wid;
+}
+
 static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, u32 enabled, u32 contention,
                        u32 last_wid, int* asked)
 {
     const u32 ea = si->ea;
     *asked = 0;
+    if (spurs_reserved_away(wid, sn))
+        return 0;
     if (!(enabled & (0x80000000u >> wid)) || vm_read8(ea + wkl_state_off(wid)) != 2 ||
         !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
         return 0;

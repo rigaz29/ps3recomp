@@ -1622,6 +1622,10 @@ static void sj_build(ShaderJob* j)
 static DWORD WINAPI sj_worker(LPVOID arg)
 {
     ps3_thread_name("shader build %d", (int)(intptr_t)arg);
+    /* Below the game's threads, as the pipeline cache's builder: on a six-core laptop the
+     * game's threads fill the cores, and builds at their priority (a new area's first
+     * minute: ~0.7 of a core) cost it ~10% of its frames and left the audio blocks late. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         AcquireSRWLockExclusive(&s_sj_lock);
         while (!s_sj_head && !s_sj_quit)
@@ -3179,14 +3183,20 @@ static int ovs_group(HANDLE h)
     return 0;
 }
 
+/* The PPU, SPU and RSX threads, found by a snapshot of the system's threads every
+ * OVS_FIND ticks: on a desktop with a browser open that snapshot holds thousands of
+ * threads, and taken every half second it cost ~16% of a core. Their handles stay open
+ * and each half second reads their times; the process total is GetProcessTimes. */
+#define OVS_FIND 10
 static DWORD WINAPI ovs_sampler(LPVOID arg)
 {
     (void)arg;
-    enum { MAXT = 512 };
-    static DWORD th_tid[MAXT], nx_tid[MAXT];
-    static ULONGLONG th_cpu[MAXT], nx_cpu[MAXT];
-    static signed char th_grp[MAXT], nx_grp[MAXT];
-    int n = 0;
+    enum { MAXT = 128 };
+    static DWORD th_tid[MAXT];
+    static HANDLE th_h[MAXT];
+    static ULONGLONG th_cpu[MAXT];
+    static signed char th_grp[MAXT];
+    int n = 0, tick = 0;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     const double ncpu = si.dwNumberOfProcessors ? (double)si.dwNumberOfProcessors : 1.0;
@@ -3194,35 +3204,48 @@ static DWORD WINAPI ovs_sampler(LPVOID arg)
     FILETIME c, e, k, u;
     GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
     ULONGLONG proc0 = ovs_ft64(k) + ovs_ft64(u), wall0 = GetTickCount64();
-    for (;;) {
+    for (;; tick++) {
         Sleep(500);
         ULONGLONG d[4] = { 0, 0, 0, 0 };
-        int m = 0;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) continue;
-        THREADENTRY32 te;
-        te.dwSize = sizeof te;
-        for (BOOL ok = Thread32First(snap, &te); ok && m < MAXT; ok = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid) continue;
-            HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
-            if (!h) continue;
-            if (GetThreadTimes(h, &c, &e, &k, &u)) {
+        /* the threads already known: their time since the last tick; one gone is dropped */
+        for (int j = 0; j < n; ) {
+            if (GetThreadTimes(th_h[j], &c, &e, &k, &u) &&
+                WaitForSingleObject(th_h[j], 0) == WAIT_TIMEOUT) {
                 const ULONGLONG t = ovs_ft64(k) + ovs_ft64(u);
-                int j = 0;
-                while (j < n && th_tid[j] != te.th32ThreadID) j++;
-                nx_tid[m] = te.th32ThreadID;
-                nx_cpu[m] = t;
-                nx_grp[m] = (signed char)(j < n ? th_grp[j] : ovs_group(h));   /* a name is read once */
-                d[nx_grp[m]] += j < n ? t - th_cpu[j] : 0;
-                m++;
+                d[th_grp[j]] += t - th_cpu[j];
+                th_cpu[j] = t;
+                j++;
+            } else {
+                CloseHandle(th_h[j]);
+                n--;
+                th_tid[j] = th_tid[n]; th_h[j] = th_h[n]; th_cpu[j] = th_cpu[n]; th_grp[j] = th_grp[n];
             }
-            CloseHandle(h);
         }
-        CloseHandle(snap);
-        memcpy(th_tid, nx_tid, sizeof nx_tid[0] * (size_t)m);
-        memcpy(th_cpu, nx_cpu, sizeof nx_cpu[0] * (size_t)m);
-        memcpy(th_grp, nx_grp, sizeof nx_grp[0] * (size_t)m);
-        n = m;
+        /* new ones, now and then: kept if their name says PPU main, SPU or RSX */
+        if (tick % OVS_FIND == 0) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te;
+                te.dwSize = sizeof te;
+                for (BOOL ok = Thread32First(snap, &te); ok && n < MAXT; ok = Thread32Next(snap, &te)) {
+                    if (te.th32OwnerProcessID != pid) continue;
+                    int j = 0;
+                    while (j < n && th_tid[j] != te.th32ThreadID) j++;
+                    if (j < n) continue;
+                    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, te.th32ThreadID);
+                    if (!h) continue;
+                    const int g = ovs_group(h);
+                    if (g && GetThreadTimes(h, &c, &e, &k, &u)) {
+                        th_tid[n] = te.th32ThreadID; th_h[n] = h; th_grp[n] = (signed char)g;
+                        th_cpu[n] = ovs_ft64(k) + ovs_ft64(u);   /* counted from the next tick */
+                        n++;
+                    } else {
+                        CloseHandle(h);
+                    }
+                }
+                CloseHandle(snap);
+            }
+        }
         GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
         const ULONGLONG proc = ovs_ft64(k) + ovs_ft64(u), wall = GetTickCount64();
         const double win = (double)(wall - wall0) * 1e4;   /* 100 ns units */

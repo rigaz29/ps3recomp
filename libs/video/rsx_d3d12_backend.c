@@ -38,6 +38,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency.
  * initguid.h only turns DEFINE_GUID into a definition for headers included
@@ -3111,8 +3112,11 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
  * and each item is one quad of it, white on a dark box.
  * -----------------------------------------------------------------------*/
 #define OV_W   640
-#define OV_H   96
-#define OV_ROW 48   /* one item a row: the frame rate, then the message */
+#define OV_ROWS_H 96   /* the two text rows: the frame rate (unused with the panel), the message */
+#define OV_ROW 48      /* one item a row */
+#define OVS_W  320     /* the stats panel's region, below the rows */
+#define OVS_H  416
+#define OV_H   (OV_ROWS_H + OVS_H)
 
 static const char* volatile s_toast_msg;   /* a string literal, or NULL */
 static volatile ULONGLONG   s_toast_until;
@@ -3136,6 +3140,131 @@ static int d3d12_show_fps(void)
     return v;
 }
 
+/* The stats panel (display.show_fps = overlay), top left: the frame rate, the
+ * frame time, how busy the CPU, the GPU and the guest's processors are, and a
+ * graph of the last frames' times with a line at 30 frames a second.
+ * - CPU: the process, of all the machine's logical processors.
+ * - PPU, SPU, RSX: the host threads the runtime names "ppu main"; "spurs ..."
+ *   and "spu ..." (six of them make 100%, as the PS3's six SPUs); "frame
+ *   clock" (the FIFO walk, the recording and the present). A thread of its own
+ *   samples their CPU times every half second.
+ * - GPU: the frames' GPU time (their timestamps) over their wall time.
+ * Text and graph are drawn by GDI a tenth of a second at most, so the
+ * presenting thread spends about 2 ms a second on it. */
+#define OVS_HIST 96
+static float s_ovs_ft[OVS_HIST];        /* the last presents' frame times, ms, a ring */
+static int s_ovs_ft_i;                  /* its next slot */
+static volatile LONG s_ovs_pct[4];      /* CPU, PPU, SPU, RSX: percent x10, from the sampler */
+static double s_ovs_fps, s_ovs_ms, s_ovs_gpu;   /* the presenting thread's, every half second */
+static double s_ovs_gpu_ms;             /* the GPU time of the frames read since */
+static int ovs_on(void) { return d3d12_show_fps() == 2; }
+
+static ULONGLONG ovs_ft64(FILETIME f) { return ((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime; }
+
+/* Which part a thread's name says it does: 1 PPU, 2 SPU, 3 RSX, 0 the rest. */
+static int ovs_group(HANDLE h)
+{
+    typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR*);
+    static get_desc_fn get_desc = (get_desc_fn)(void*)1;
+    if (get_desc == (get_desc_fn)(void*)1)
+        get_desc = (get_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    PWSTR w = NULL;
+    char n[24] = { 0 };
+    if (get_desc && SUCCEEDED(get_desc(h, &w)) && w)
+        for (int i = 0; w[i] && i < 23; i++) n[i] = (char)(w[i] < 128 ? w[i] : '?');
+    if (w) LocalFree(w);
+    if (!strcmp(n, "ppu main")) return 1;
+    if (!strncmp(n, "spurs", 5) || !strncmp(n, "spu ", 4)) return 2;
+    if (!strcmp(n, "frame clock")) return 3;
+    return 0;
+}
+
+static DWORD WINAPI ovs_sampler(LPVOID arg)
+{
+    (void)arg;
+    enum { MAXT = 512 };
+    static DWORD th_tid[MAXT], nx_tid[MAXT];
+    static ULONGLONG th_cpu[MAXT], nx_cpu[MAXT];
+    static signed char th_grp[MAXT], nx_grp[MAXT];
+    int n = 0;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const double ncpu = si.dwNumberOfProcessors ? (double)si.dwNumberOfProcessors : 1.0;
+    const DWORD pid = GetCurrentProcessId();
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    ULONGLONG proc0 = ovs_ft64(k) + ovs_ft64(u), wall0 = GetTickCount64();
+    for (;;) {
+        Sleep(500);
+        ULONGLONG d[4] = { 0, 0, 0, 0 };
+        int m = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        for (BOOL ok = Thread32First(snap, &te); ok && m < MAXT; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid) continue;
+            HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            if (GetThreadTimes(h, &c, &e, &k, &u)) {
+                const ULONGLONG t = ovs_ft64(k) + ovs_ft64(u);
+                int j = 0;
+                while (j < n && th_tid[j] != te.th32ThreadID) j++;
+                nx_tid[m] = te.th32ThreadID;
+                nx_cpu[m] = t;
+                nx_grp[m] = (signed char)(j < n ? th_grp[j] : ovs_group(h));   /* a name is read once */
+                d[nx_grp[m]] += j < n ? t - th_cpu[j] : 0;
+                m++;
+            }
+            CloseHandle(h);
+        }
+        CloseHandle(snap);
+        memcpy(th_tid, nx_tid, sizeof nx_tid[0] * (size_t)m);
+        memcpy(th_cpu, nx_cpu, sizeof nx_cpu[0] * (size_t)m);
+        memcpy(th_grp, nx_grp, sizeof nx_grp[0] * (size_t)m);
+        n = m;
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+        const ULONGLONG proc = ovs_ft64(k) + ovs_ft64(u), wall = GetTickCount64();
+        const double win = (double)(wall - wall0) * 1e4;   /* 100 ns units */
+        if (win > 0) {
+            const double pct[4] = { (double)(proc - proc0) * 100.0 / (win * ncpu), (double)d[1] * 100.0 / win,
+                                    (double)d[2] * 100.0 / (win * 6.0), (double)d[3] * 100.0 / win };
+            for (int i = 0; i < 4; i++)
+                InterlockedExchange(&s_ovs_pct[i], (LONG)((pct[i] < 0 ? 0 : pct[i] > 100 ? 100 : pct[i]) * 10.0 + 0.5));
+        }
+        proc0 = proc;
+        wall0 = wall;
+    }
+    return 0;
+}
+
+/* A present: its frame time into the graph, and every half second the frame
+ * rate, the mean frame time and the GPU's share. */
+static void ovs_present(void)
+{
+    static double t_last, t_win;
+    static int frames;
+    const double now = perf_now();
+    if (t_last > 0.0) {
+        s_ovs_ft[s_ovs_ft_i] = (float)((now - t_last) * 1000.0);
+        s_ovs_ft_i = (s_ovs_ft_i + 1) % OVS_HIST;
+        frames++;
+    } else {
+        t_win = now;
+    }
+    t_last = now;
+    const double win_ms = (now - t_win) * 1000.0;
+    if (win_ms >= 500.0 && frames) {
+        s_ovs_fps = frames * 1000.0 / win_ms;
+        s_ovs_ms = win_ms / frames;
+        s_ovs_gpu = s_ovs_gpu_ms * 100.0 / win_ms;
+        if (s_ovs_gpu > 100.0) s_ovs_gpu = 100.0;
+        s_ovs_gpu_ms = 0.0;
+        frames = 0;
+        t_win = now;
+    }
+}
+
 /* The two items into a premultiplied RGBA image, OV_W wide, OV_H tall, at
  * dst: white text with the font's antialiasing over a box of 55% black. The
  * widths drawn come back in w[]. */
@@ -3150,7 +3279,7 @@ static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
         bi.bmiHeader.biWidth = OV_W;
-        bi.bmiHeader.biHeight = -OV_H;   /* top-down */
+        bi.bmiHeader.biHeight = -OV_ROWS_H;   /* top-down */
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         dc = CreateCompatibleDC(NULL);
@@ -3168,7 +3297,7 @@ static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px
         SelectObject(dc, font);
         font_size = font_px;
     }
-    memset(bits, 0, (size_t)OV_W * OV_H * 4);
+    memset(bits, 0, (size_t)OV_W * OV_ROWS_H * 4);
     const int pad = (int)font_px / 2;
     for (int r = 0; r < 2; r++) {
         w[r] = 0;
@@ -3180,7 +3309,7 @@ static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px
         TextOutA(dc, pad, r * OV_ROW + (OV_ROW - sz.cy) / 2, item[r], len);
     }
     GdiFlush();
-    for (u32 y = 0; y < OV_H; y++) {
+    for (u32 y = 0; y < OV_ROWS_H; y++) {
         const u32 r = y / OV_ROW;
         for (u32 x = 0; x < OV_W; x++) {
             unsigned char* o = dst + ((size_t)y * OV_W + x) * 4;
@@ -3195,24 +3324,160 @@ static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px
     }
 }
 
+/* The stats panel into premultiplied RGBA at dst (rows OV_W * 4 apart), at
+ * most OVS_W x OVS_H; its size comes back in *pw, *ph. GDI draws the text and
+ * the graph white, for their coverage; each is then coloured by the box it is
+ * in, over a rounded box of 80% near-black. */
+typedef struct { int x0, y0, x1, y1; u32 rgb; } OvsBox;
+static void ov_render_panel(unsigned char* dst, u32 font_px, u32* pw, u32* ph)
+{
+    static HDC dc;
+    static u32* bits;
+    static HFONT f_lab, f_val;
+    static u32 f_size;
+    *pw = *ph = 0;
+    if (!dc) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = OVS_W;
+        bi.bmiHeader.biHeight = -OVS_H;   /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        dc = CreateCompatibleDC(NULL);
+        HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0) : NULL;
+        if (!bmp || !bits) { if (dc) DeleteDC(dc); dc = NULL; return; }
+        SelectObject(dc, bmp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+    if (f_size != font_px) {
+        if (f_lab) DeleteObject(f_lab);
+        if (f_val) DeleteObject(f_val);
+        f_lab = CreateFontA(-(int)(font_px * 9 / 10), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                            DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        f_val = CreateFontA(-(int)font_px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                            FIXED_PITCH | FF_MODERN, "Consolas");
+        f_size = font_px;
+    }
+    static const char* const lab[7] = { "FPS", "MS", "CPU", "GPU", "PPU", "SPU", "RSX" };
+    static const u32 col[7] = { 0x4ADE80, 0xFBBF24, 0x22D3EE, 0xF87171, 0x60A5FA, 0xA78BFA, 0xF472B6 };
+    char val[7][16];
+    snprintf(val[0], sizeof val[0], "%.1f", s_ovs_fps);
+    snprintf(val[1], sizeof val[1], "%.1f", s_ovs_ms);
+    snprintf(val[2], sizeof val[2], "%ld%%", (long)((s_ovs_pct[0] + 5) / 10));
+    snprintf(val[3], sizeof val[3], "%.0f%%", s_ovs_gpu);
+    snprintf(val[4], sizeof val[4], "%ld%%", (long)((s_ovs_pct[1] + 5) / 10));
+    snprintf(val[5], sizeof val[5], "%ld%%", (long)((s_ovs_pct[2] + 5) / 10));
+    snprintf(val[6], sizeof val[6], "%ld%%", (long)((s_ovs_pct[3] + 5) / 10));
+
+    memset(bits, 0, (size_t)OVS_W * OVS_H * 4);
+    const int pad = (int)font_px * 2 / 3, rh = (int)font_px * 4 / 3, gh = (int)font_px * 2;
+    SIZE sl, sv, s1;
+    SelectObject(dc, f_lab);
+    GetTextExtentPoint32A(dc, "RSX", 3, &sl);
+    SelectObject(dc, f_val);
+    GetTextExtentPoint32A(dc, "100.0", 5, &sv);
+    int W = pad + sl.cx + (int)font_px + sv.cx + pad;
+    int H = pad + 7 * rh + pad / 2 + gh + pad;
+    if (W > OVS_W) W = OVS_W;
+    if (H > OVS_H) H = OVS_H;
+    OvsBox box[16];
+    int nb = 0;
+    for (int r = 0; r < 7; r++) {
+        const int y = pad + r * rh;
+        SelectObject(dc, f_lab);
+        GetTextExtentPoint32A(dc, lab[r], (int)strlen(lab[r]), &s1);
+        TextOutA(dc, pad, y + (rh - s1.cy) / 2, lab[r], (int)strlen(lab[r]));
+        box[nb].x0 = pad; box[nb].y0 = y; box[nb].x1 = pad + s1.cx + 1; box[nb].y1 = y + rh; box[nb].rgb = col[r]; nb++;
+        SelectObject(dc, f_val);
+        GetTextExtentPoint32A(dc, val[r], (int)strlen(val[r]), &s1);
+        TextOutA(dc, W - pad - s1.cx, y + (rh - s1.cy) / 2, val[r], (int)strlen(val[r]));
+    }
+    /* The graph: the last OVS_HIST frame times, 0 to 66.7 ms (15 frames a
+     * second) bottom to top, oldest left. */
+    const int gx0 = pad, gx1 = W - pad, gy0 = pad + 7 * rh + pad / 2, gy1 = gy0 + gh;
+    POINT pts[OVS_HIST];
+    for (int i = 0; i < OVS_HIST; i++) {
+        float ft = s_ovs_ft[(s_ovs_ft_i + i) % OVS_HIST] / 66.7f;
+        if (ft > 1.0f) ft = 1.0f;
+        if (ft < 0.0f) ft = 0.0f;
+        pts[i].x = gx0 + (gx1 - gx0) * i / (OVS_HIST - 1);
+        pts[i].y = gy1 - (int)(ft * (float)(gy1 - gy0));
+    }
+    HPEN pen = CreatePen(PS_SOLID, font_px >= 18 ? 2 : 1, RGB(255, 255, 255));
+    HGDIOBJ old = SelectObject(dc, pen);
+    Polyline(dc, pts, OVS_HIST);
+    SelectObject(dc, old);
+    DeleteObject(pen);
+    box[nb].x0 = gx0 - 2; box[nb].y0 = gy0 - 2; box[nb].x1 = gx1 + 2; box[nb].y1 = gy1 + 2; box[nb].rgb = 0x4ADE80; nb++;
+    const int ref_y = gy1 - (int)(0.5f * (float)(gy1 - gy0));   /* 33.3 ms: 30 frames a second */
+    GdiFlush();
+
+    const float rad = (float)font_px * 0.5f, bg_a = 0.80f;
+    const float bg_c[3] = { 12.0f / 255.0f, 14.0f / 255.0f, 20.0f / 255.0f };
+    for (int y = 0; y < H; y++) {
+        unsigned char* o = dst + (size_t)y * OV_W * 4;
+        for (int x = 0; x < W; x++, o += 4) {
+            /* the rounded box's coverage at the pixel's centre */
+            const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            const float cx = px < rad ? rad : (px > (float)W - rad ? (float)W - rad : px);
+            const float cy = py < rad ? rad : (py > (float)H - rad ? (float)H - rad : py);
+            float a = rad + 0.5f - sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
+            a = (a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a) * bg_a;
+            const u32 p = bits[(size_t)y * OVS_W + (size_t)x];
+            u32 cv = p & 0xFF;
+            if (((p >> 8) & 0xFF) > cv) cv = (p >> 8) & 0xFF;
+            if (((p >> 16) & 0xFF) > cv) cv = (p >> 16) & 0xFF;
+            float cov = (float)cv / 255.0f;
+            u32 rgb = 0xF5F5F5;
+            for (int b = 0; b < nb; b++)
+                if (x >= box[b].x0 && x < box[b].x1 && y >= box[b].y0 && y < box[b].y1) { rgb = box[b].rgb; break; }
+            if (y == ref_y && x >= gx0 && x < gx1 && cov < 0.30f) { cov = 0.30f; rgb = 0xF5F5F5; }
+            const float t[3] = { (float)((rgb >> 16) & 0xFF) / 255.0f, (float)((rgb >> 8) & 0xFF) / 255.0f,
+                                 (float)(rgb & 0xFF) / 255.0f };
+            for (int ch = 0; ch < 3; ch++)
+                o[ch] = (unsigned char)((t[ch] * cov + bg_c[ch] * a * (1.0f - cov)) * 255.0f + 0.5f);
+            o[3] = (unsigned char)((cov + a * (1.0f - cov)) * 255.0f + 0.5f);
+        }
+    }
+    *pw = (u32)W;
+    *ph = (u32)H;
+}
+
 /* The overlay's items over the back buffer at rtv, after the scaling pass. */
 static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     if (!s_d3d.ov_pso) return;
     const char* msg = (const char*)s_toast_msg;
     if (msg && GetTickCount64() > s_toast_until) msg = NULL;
-    const char* item[2] = { d3d12_show_fps() == 2 && s_ov_fps[0] ? s_ov_fps : NULL, msg };
-    if (!item[0] && !item[1]) return;
+    const int panel = ovs_on();
+    const char* item[2] = { NULL, msg };   /* the frame rate is the panel's */
+    if (!panel && !item[1]) return;
 
-    /* Text the window's height can read: 1/40 of it, 14 to 40 pixels. */
+    /* Text the window's height can read: the message 1/40 of it (14 to 40
+     * pixels), the panel 1/60 (12 to 28). */
     u32 font_px = s_d3d.bb_h / 40;
     if (font_px < 14) font_px = 14;
     if (font_px > 40) font_px = 40;
+    u32 pfont = s_d3d.bb_h / 60;
+    if (pfont < 12) pfont = 12;
+    if (pfont > 28) pfont = 28;
     static char shown[2][64];
-    static u32 shown_px, w[2];
+    static u32 shown_px, w[2], pw, ph;
+    static ULONGLONG panel_at;
+    const ULONGLONG now = GetTickCount64();
+    const int panel_due = panel && now - panel_at >= 100;   /* the panel ten times a second */
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    if (font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") || strcmp(shown[1], item[1] ? item[1] : "")) {
+    if (panel_due || font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") ||
+        strcmp(shown[1], item[1] ? item[1] : "")) {
         ov_render(s_d3d.ov_up_ptr[fi], item, font_px, w);
+        if (panel) {
+            ov_render_panel(s_d3d.ov_up_ptr[fi] + (size_t)OV_ROWS_H * OV_W * 4, pfont, &pw, &ph);
+            panel_at = now;
+        }
         snprintf(shown[0], sizeof shown[0], "%s", item[0] ? item[0] : "");
         snprintf(shown[1], sizeof shown[1], "%s", item[1] ? item[1] : "");
         shown_px = font_px;
@@ -3244,15 +3509,25 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     cl->lpVtbl->SetPipelineState(cl, s_d3d.ov_pso);
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    const float bw = (float)s_d3d.bb_w, bh = (float)s_d3d.bb_h, m = (float)font_px * 0.5f;
+    const float bw = (float)s_d3d.bb_w, bh = (float)s_d3d.bb_h;
     for (int r = 0; r < 2; r++) {
         if (!item[r] || !w[r]) continue;
-        /* the frame rate in the top left corner, a message centred near the top */
-        const float x = r ? (bw - (float)w[r]) * 0.5f : m, y = r ? bh * 0.08f : m;
+        /* a message centred near the top */
+        const float x = (bw - (float)w[r]) * 0.5f, y = bh * 0.08f;
         const float c[16] = {
             x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
             (x + (float)w[r]) / bw * 2.0f - 1.0f, 1.0f - (y + (float)OV_ROW) / bh * 2.0f,
             0.0f, (float)(r * OV_ROW) / (float)OV_H, (float)w[r] / (float)OV_W, (float)((r + 1) * OV_ROW) / (float)OV_H };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+    }
+    if (panel && pw && ph) {
+        /* the panel in the top left corner, a texel to a pixel */
+        const float x = (float)pfont, y = (float)pfont;
+        const float c[16] = {
+            x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
+            (x + (float)pw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)ph) / bh * 2.0f,
+            0.0f, (float)OV_ROWS_H / (float)OV_H, (float)pw / (float)OV_W, (float)(OV_ROWS_H + ph) / (float)OV_H };
         cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
         cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
     }
@@ -3323,6 +3598,17 @@ static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
     if (vsb) vsb->lpVtbl->Release(vsb);
     if (psb) psb->lpVtbl->Release(psb);
     if (FAILED(hr)) { printf("[D3D12] overlay unavailable (0x%08lX)\n", hr); s_d3d.ov_pso = NULL; }
+    if (s_d3d.ov_pso && ovs_on()) {
+        HANDLE t = CreateThread(NULL, 0, ovs_sampler, NULL, 0, NULL);
+        if (t) {
+            typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+            const set_desc_fn set_desc = (set_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                                            "SetThreadDescription");
+            if (set_desc) set_desc(t, L"overlay stats");
+            SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(t);
+        }
+    }
 }
 
 /* SMAA 1x (graphics.antialiasing = smaa; rsx_smaa.c): its targets, the
@@ -10093,7 +10379,7 @@ static int gts_on(void)
     static int v = -1;
     if (v >= 0) return v;
     v = 0;
-    if (!rsx_census_secs() || !s_d3d.device || !s_d3d.cmd_queue) return v;
+    if (!(rsx_census_secs() || ovs_on()) || !s_d3d.device || !s_d3d.cmd_queue) return v;
     D3D12_QUERY_HEAP_DESC qd;
     memset(&qd, 0, sizeof qd);
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -10108,7 +10394,7 @@ static int gts_on(void)
             D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_gts_rb)) &&
         SUCCEEDED(s_d3d.cmd_queue->lpVtbl->GetTimestampFrequency(s_d3d.cmd_queue, &s_gts_freq)) && s_gts_freq)
         v = 1;
-    if (v) {
+    if (v && rsx_census_secs()) {
         qd.Count = GPS_MAX * FRAME_COUNT;
         bd.Width = 8ull * GPS_MAX * FRAME_COUNT;
         if (FAILED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_gps_heap)) ||
@@ -10192,6 +10478,7 @@ static void gts_read(void)
     s_hl_gpu_ms[1] = (double)(t[2] - t[1]) * k;
     s_hl_gpu_ms[2] = (double)(t[3] - t[2]) * k;
     s_hl_gpu_ms[3] = (double)(t[3] - t[0]) * k;
+    if (ovs_on()) s_ovs_gpu_ms += s_hl_gpu_ms[3];
     if (s_hl_gpu_ms[1] < 50.0 || s_gps_rd_slot < 0) return;
     const int fi = s_gps_rd_slot, n = s_gps_rd_n;
     D3D12_RANGE pr = { (SIZE_T)8 * GPS_MAX * fi, (SIZE_T)8 * GPS_MAX * fi + (SIZE_T)8 * n };
@@ -12557,6 +12844,7 @@ skip_dump_consider: ;
     if (s_present_this_frame) bb_resize();
 
     s_d3d.frame_count++;
+    if (s_present_this_frame && ovs_on()) ovs_present();
 
     /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
      * draw count of the last frame, and the backbuffer size. */

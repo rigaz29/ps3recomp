@@ -273,9 +273,16 @@ typedef struct {
     u32                   dxgi;        /* DXGI_FORMAT of the resource */
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
+    u64                   last;        /* frame_count it was last bound or sampled */
 } OffRT;
-#define MAX_OFF_RTS  32  /* demosaic double-buffers its 6-surface pass chain; God of
-                          * War: Ascension has a dozen, plus its display buffers */
+/* demosaic double-buffers its 6-surface pass chain. God of War: Ascension
+ * holds 29 targets by the gate after its first fight when started from that
+ * checkpoint (its post chain, three display buffers, a Y16 copy for each unit
+ * and size that reads one), and a longer session holds what the scenes before
+ * made too. A full table evicts: the target loses what it held, and the
+ * eviction waits for the GPU. With 28 slots its display buffers evicted each
+ * other every frame for ~25 s there. RSX_RT_SLOTS=<n> uses fewer slots. */
+#define MAX_OFF_RTS  64
 
 /* RSX_DISPLAY_RT=1: each display buffer is an offscreen target of its own,
  * keyed DISP_RT_TAG | offset, and the present copies the one the guest flipped
@@ -341,12 +348,12 @@ typedef struct {
 /* Room to spare: God of War: Ascension's first level keeps six in use (the
  * scene's, a 1408x1408 one, the half-size passes'). */
 #define MAX_OFF_DS   12
-#define DS_SRV_BASE  37  /* SRV heap slots 37..48 hold depth + stencil SRVs (2 per OffDS) */
-#define RT_SRV_BASE  5   /* SRV heap slots 5..36 hold offscreen-RT SRVs */
+#define RT_SRV_BASE  5   /* SRV heap slots 5.. hold the offscreen-RT SRVs, one per slot */
+#define DS_SRV_BASE  (RT_SRV_BASE + MAX_OFF_RTS)   /* then depth + stencil SRVs, 2 per OffDS */
 /* Per-draw SRV windows: each VP draw gets VP_TEX_UNITS consecutive
  * descriptors (t0-t15) so multi-unit fragment programs see all their
  * textures. */
-#define DRAW_SRV_BASE 64
+#define DRAW_SRV_BASE ((DS_SRV_BASE + 2 * MAX_OFF_DS + 31) & ~31)
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
 
 /* VP texture slot: a guest texture held for the VP draws, uploaded again when
@@ -8322,11 +8329,29 @@ static DXGI_FORMAT rsx_surface_dxgi(u32 fmt)
     }
 }
 
+/* RSX_RT_SLOTS=<n>: use n of the MAX_OFF_RTS slots (8 at least), to see what a
+ * full table does. The table's traffic, for RSX_CENSUS. */
+static unsigned long long s_ort_made, s_ort_remade, s_ort_evicted, s_ort_refused;
+static int ort_cap(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("RSX_RT_SLOTS");
+        v = e ? atoi(e) : MAX_OFF_RTS;
+        if (v < 8) v = 8;
+        if (v > MAX_OFF_RTS) v = MAX_OFF_RTS;
+    }
+    return v;
+}
+
 static int off_rt_find(u32 off)
 {
     if (!off) return -1;
     for (int i = 0; i < MAX_OFF_RTS; i++)
-        if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].off == off) return i;
+        if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].off == off) {
+            s_d3d.off_rt[i].last = s_d3d.frame_count;   /* sampled: recent for eviction */
+            return i;
+        }
     return -1;
 }
 
@@ -8388,7 +8413,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     int slot = off_rt_find(off);
     if (slot >= 0) {
         OffRT* r = &s_d3d.off_rt[slot];
-        if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt) { r->used = 1; return slot; }
+        if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt) { r->used = 1; r->last = s_d3d.frame_count; return slot; }
         /* RT_REUSE (default 1): a re-bind of the same format no larger than
          * the surface keeps it -- the pass draws into its top-left corner
          * through its viewport -- and a larger one grows it. God of War:
@@ -8398,7 +8423,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         { static int reuse = -1;
           if (reuse < 0) { const char* e = getenv("RT_REUSE"); reuse = e ? atoi(e) : 1; }
           if (reuse && r->dxgi == (u32)want_fmt) {
-              if (r->w >= w && r->h >= h) { r->used = 1; return slot; }
+              if (r->w >= w && r->h >= h) { r->used = 1; r->last = s_d3d.frame_count; return slot; }
               if (r->w > w) w = r->w;
               if (r->h > h) h = r->h;
           } }
@@ -8407,21 +8432,42 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
          * and every draw recorded against it silently lands nowhere while the
          * replacement reads back empty. Let the GPU finish first. Recreations are
          * rare (a surface changing size), so the stall costs nothing. */
+        s_ort_remade++;
         wait_for_gpu();
         rf_release(r->res); r->res = NULL;   /* dims/format changed */
         if (r->up) { rf_release(r->up); r->up = NULL; }
     } else {
-        for (int i = 0; i < MAX_OFF_RTS; i++)
+        const int cap = ort_cap();
+        for (int i = 0; i < cap; i++)
             if (!s_d3d.off_rt[i].res) { slot = i; break; }
-        if (slot < 0) {   /* evict an entry not used this frame */
-            for (int i = 0; i < MAX_OFF_RTS; i++)
-                if (!s_d3d.off_rt[i].used) { slot = i; break; }
+        if (slot < 0) {
+            /* Evict the entry bound or sampled longest ago among those not
+             * bound this frame. The first one not yet bound this frame was
+             * usually one the frame binds later: early in a frame that is
+             * every slot, so a full table evicted the frame's own targets.
+             * RSX_RT_EVICT=first: that old choice, to compare. */
+            static int first = -1;
+            if (first < 0) { const char* e = getenv("RSX_RT_EVICT"); first = (e && strcmp(e, "first") == 0) ? 1 : 0; }
+            for (int i = 0; i < cap; i++) {
+                if (s_d3d.off_rt[i].used) continue;
+                if (first) { slot = i; break; }
+                if (slot < 0 || s_d3d.off_rt[i].last < s_d3d.off_rt[slot].last) slot = i;
+            }
             if (slot < 0) {
+                s_ort_refused++;
                 static int _n = 0;
                 if (PS3_LOG_FIRST(_n, 8))
                     fprintf(stderr, "[D3D12] all %d render-target slots in use this frame;"
-                                    " 0x%08X %ux%u gets none%c", MAX_OFF_RTS, off, w, h, 10);
+                                    " 0x%08X %ux%u gets none%c", cap, off, w, h, 10);
                 return -1;
+            }
+            s_ort_evicted++;
+            if (s_ort_evicted <= 24 || (s_ort_evicted & 255u) == 0) {
+                const OffRT* e = &s_d3d.off_rt[slot];
+                fprintf(stderr, "[D3D12] render-target table full (%d slots): 0x%08X %ux%u, last used at frame %llu,"
+                                " evicted for 0x%08X %ux%u at frame %llu (eviction %llu)%c",
+                        cap, e->off, e->w, e->h, (unsigned long long)e->last, off, w, h,
+                        (unsigned long long)s_d3d.frame_count, s_ort_evicted, 10);
             }
             wait_for_gpu();   /* same hazard as above: the frame may still use it */
             rf_release(s_d3d.off_rt[slot].res);
@@ -8451,6 +8497,8 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
+    r->last = s_d3d.frame_count;
+    s_ort_made++;
     rdoc_name((ID3D12Object*)r->res, "rt 0x%08X %ux%u rsxfmt %02X", off, w, h, rsx_fmt);
 
     /* Populate the new RT from guest memory: titles CPU-initialise their
@@ -8672,6 +8720,11 @@ static void rsx_census_present(void)
         fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
                 (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);
     tex_decode_print();
+    { int held = 0;
+      for (int i = 0; i < MAX_OFF_RTS; i++) held += s_d3d.off_rt[i].res != NULL;
+      fprintf(stderr, "[census] render targets: %d held of %d slots; %llu made, %llu remade at a new size or"
+                      " format, %llu evicted, %llu refused%c", held, ort_cap(), s_ort_made, s_ort_remade,
+              s_ort_evicted, s_ort_refused, 10); }
     fprintf(stderr, "[census] samplers made: %ld point or linear, %ld anisotropic at the title's level, "
                     "%ld raised to graphics.anisotropy (%d; 0 = the title's)%c",
             s_samp_made[0], s_samp_made[1], s_samp_made[2], rsx_aniso_setting(), 10);

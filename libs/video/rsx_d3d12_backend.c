@@ -1479,6 +1479,12 @@ static void psoc_add(u64 key, ID3D12PipelineState* pso, const u8* st, u32 stn,
     ReleaseSRWLockExclusive(&s_psoc_lock);
 }
 
+/* The shader build indicator's sources (ovi_*, with the overlay): guest shader jobs
+ * queued or being built, and the pipeline cache's build at the start (done of total;
+ * total 0 when it is not running). */
+static volatile LONG s_sj_inflight;
+static volatile LONG s_psoc_done, s_psoc_total;
+
 /* The thread that builds the file's pipelines. */
 static DWORD WINAPI psoc_thread(LPVOID arg)
 {
@@ -1488,7 +1494,10 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
     const double t0 = perf_now();
     static D3D12_INPUT_ELEMENT_DESC il[16];
     static char names[16][16];
+    InterlockedExchange(&s_psoc_done, 0);
+    InterlockedExchange(&s_psoc_total, (LONG)s_psoc_nrecs);
     for (u32 r = 0; r < s_psoc_nrecs; r++) {
+        InterlockedExchange(&s_psoc_done, (LONG)r);
         PsocRec* rec = &s_psoc_recs[r];
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
         int dbt = 0, known = 0;
@@ -1511,6 +1520,7 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
     next:
         free(rec->st); rec->st = rec->vs = rec->ps = NULL;
     }
+    InterlockedExchange(&s_psoc_total, 0);
     fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms (%ld failed)%c",
             (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, (long)s_psoc_failed, 10);
     free(s_psoc_recs); s_psoc_recs = NULL;
@@ -1640,6 +1650,7 @@ static DWORD WINAPI sj_worker(LPVOID arg)
         j->done = 1;
         WakeAllConditionVariable(&s_sj_done);
         ReleaseSRWLockExclusive(&s_sj_lock);
+        InterlockedDecrement(&s_sj_inflight);
         sj_release(j);
     }
 }
@@ -1689,6 +1700,7 @@ static ShaderJob* sj_submit(const char* src, size_t len, const char* name, const
     AcquireSRWLockExclusive(&s_sj_lock);
     if (s_sj_tail) s_sj_tail->next = j; else s_sj_head = j;
     s_sj_tail = j;
+    InterlockedIncrement(&s_sj_inflight);   /* before a worker can take it */
     WakeConditionVariable(&s_sj_work);
     ReleaseSRWLockExclusive(&s_sj_lock);
     s_sj_stat_jobs++;
@@ -3120,7 +3132,8 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
 #define OV_ROW 48      /* one item a row */
 #define OVS_W  320     /* the stats panel's region, below the rows */
 #define OVS_H  416
-#define OV_H   (OV_ROWS_H + OVS_H)
+#define OVI_H  96      /* the shader build indicator's band, below the panel's region */
+#define OV_H   (OV_ROWS_H + OVS_H + OVI_H)
 
 static const char* volatile s_toast_msg;   /* a string literal, or NULL */
 static volatile ULONGLONG   s_toast_until;
@@ -3471,6 +3484,115 @@ static void ov_render_panel(unsigned char* dst, u32 font_px, u32* pw, u32* ph)
 }
 
 /* The overlay's items over the back buffer at rtv, after the scaling pass. */
+/* display.shader_hint (on by default): the shader build indicator. Read once. */
+static int ovi_on(void)
+{
+    static int v = -1;
+    if (v < 0) v = ps3_settings_bool("display", "shader_hint", "D3D12_SHADER_HINT", 1);
+    return v;
+}
+
+static float ovi_clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+/* The indicator into premultiplied RGBA at dst (rows OV_W * 4 apart), at most OV_W x
+ * OVI_H; its size comes back in *pw, *ph. A rounded box of 85% near-black; in it a ring
+ * -- frac < 0: an arc that turns (phase, turns), its tail fading; else the arc from the
+ * top to frac of the way round -- and the text. The ring is computed per pixel with a
+ * pixel of antialiasing; GDI draws the text, for its coverage. */
+static void ovi_render(unsigned char* dst, u32 font_px, const char* text, float frac, float phase,
+                       u32* pw, u32* ph)
+{
+    static HDC dc;
+    static u32* bits;
+    static HFONT font;
+    static u32 font_size;
+    static char drawn[64];
+    static int tw;
+    if (!dc) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = OV_W;
+        bi.bmiHeader.biHeight = -OVI_H;   /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        dc = CreateCompatibleDC(NULL);
+        HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0) : NULL;
+        if (!bmp || !bits) { *pw = *ph = 0; return; }
+        SelectObject(dc, bmp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+    const int pad = (int)(font_px * 6 / 10), ring = (int)(font_px * 5 / 4), gap = (int)(font_px / 2);
+    const int bh = ring + 2 * pad;
+    if (font_size != font_px || strcmp(drawn, text)) {
+        if (font_size != font_px) {
+            if (font) DeleteObject(font);
+            font = CreateFontA(-(int)font_px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                               DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+            SelectObject(dc, font);
+            font_size = font_px;
+        }
+        memset(bits, 0, (size_t)OV_W * OVI_H * 4);
+        SIZE sz;
+        const int len = (int)strlen(text);
+        GetTextExtentPoint32A(dc, text, len, &sz);
+        tw = sz.cx;
+        TextOutA(dc, pad + ring + gap, (bh - sz.cy) / 2, text, len);
+        GdiFlush();
+        snprintf(drawn, sizeof drawn, "%s", text);
+    }
+    int bw = pad + ring + gap + tw + pad;
+    if (bw > OV_W) bw = OV_W;
+    if (bh > OVI_H) { *pw = *ph = 0; return; }
+    const float rad = (float)bh * 0.3f;                       /* the box's corners */
+    const float cx = (float)pad + (float)ring * 0.5f, cy = (float)bh * 0.5f;
+    const float r_out = (float)ring * 0.5f - 0.5f, r_in = r_out - (float)ring * 0.16f;
+    for (int y = 0; y < bh; y++) {
+        for (int x = 0; x < OV_W; x++) {
+            unsigned char* o = dst + ((size_t)y * OV_W + x) * 4;
+            if (x >= bw) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
+            /* the box, its corners rounded */
+            const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            const float qx = px < rad ? rad - px : px > (float)bw - rad ? px - ((float)bw - rad) : 0.0f;
+            const float qy = py < rad ? rad - py : py > (float)bh - rad ? py - ((float)bh - rad) : 0.0f;
+            const float box = ovi_clamp01(rad - sqrtf(qx * qx + qy * qy) + 0.5f);
+            float a = 0.85f * box, r = 12.0f / 255.0f * a, g = 14.0f / 255.0f * a, b = 20.0f / 255.0f * a;
+            /* the text, white */
+            const u32 p = bits[(size_t)y * OV_W + x];
+            u32 cov = p & 0xFF;
+            if (((p >> 8) & 0xFF) > cov) cov = (p >> 8) & 0xFF;
+            if (((p >> 16) & 0xFF) > cov) cov = (p >> 16) & 0xFF;
+            const float t = (float)cov / 255.0f * box;
+            r = t + r * (1.0f - t); g = t + g * (1.0f - t); b = t + b * (1.0f - t); a = t + a * (1.0f - t);
+            /* the ring: a faint track, the arc over it */
+            const float dx = px - cx, dy = py - cy, d = sqrtf(dx * dx + dy * dy);
+            const float band = ovi_clamp01(fminf(d - r_in, r_out - d) + 0.5f);
+            if (band > 0.0f) {
+                float turn = atan2f(dx, -dy) / 6.2831853f;     /* 0 at the top, clockwise */
+                if (turn < 0.0f) turn += 1.0f;
+                float arc;
+                if (frac < 0.0f) {
+                    float behind = phase - turn;                /* how far behind the head */
+                    behind -= floorf(behind);
+                    arc = behind < 0.75f ? powf(1.0f - behind / 0.75f, 1.5f) : 0.0f;
+                } else {
+                    arc = turn <= frac ? 1.0f : 0.0f;
+                }
+                const float c = band * (0.18f + 0.82f * arc);
+                r = c + r * (1.0f - c); g = c + g * (1.0f - c); b = c + b * (1.0f - c); a = c + a * (1.0f - c);
+            }
+            o[0] = (unsigned char)(r * 255.0f + 0.5f);
+            o[1] = (unsigned char)(g * 255.0f + 0.5f);
+            o[2] = (unsigned char)(b * 255.0f + 0.5f);
+            o[3] = (unsigned char)(a * 255.0f + 0.5f);
+        }
+    }
+    *pw = (u32)bw;
+    *ph = (u32)bh;
+}
+
 static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     if (!s_d3d.ov_pso) return;
@@ -3478,7 +3600,28 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     if (msg && GetTickCount64() > s_toast_until) msg = NULL;
     const int panel = ovs_on();
     const char* item[2] = { NULL, msg };   /* the frame rate is the panel's */
-    if (!panel && !item[1]) return;
+    /* The shader build indicator: while jobs are in flight or the pipeline cache is
+     * building, and 0.6 s after, so a short burst does not flicker. */
+    static ULONGLONG ovi_until;
+    static char ovi_text[64];
+    static float ovi_frac = -1.0f;
+    {
+        const LONG jobs = InterlockedCompareExchange(&s_sj_inflight, 0, 0);
+        const LONG ptot = InterlockedCompareExchange(&s_psoc_total, 0, 0);
+        if (ovi_on() && (jobs > 0 || ptot > 0)) {
+            ovi_until = GetTickCount64() + 600;
+            if (ptot > 0) {
+                const LONG pdone = InterlockedCompareExchange(&s_psoc_done, 0, 0);
+                snprintf(ovi_text, sizeof ovi_text, "Building pipelines %ld / %ld", (long)pdone, (long)ptot);
+                ovi_frac = (float)pdone / (float)ptot;
+            } else {
+                snprintf(ovi_text, sizeof ovi_text, "Compiling shaders");
+                ovi_frac = -1.0f;
+            }
+        }
+    }
+    const int ind = ovi_on() && GetTickCount64() < ovi_until && ovi_text[0];
+    if (!panel && !item[1] && !ind) return;
 
     /* Text the window's height can read: the message 1/40 of it (14 to 40
      * pixels), the panel 1/60 (12 to 28). */
@@ -3494,8 +3637,14 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     const ULONGLONG now = GetTickCount64();
     const int panel_due = panel && now - panel_at >= 100;   /* the panel ten times a second */
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    static u32 iw, ih;
+    if (ind)   /* its band every frame it shows: the ring turns */
+        ovi_render(s_d3d.ov_up_ptr[fi] + (size_t)(OV_ROWS_H + OVS_H) * OV_W * 4, pfont, ovi_text, ovi_frac,
+                   (float)(now % 100000u) / 1000.0f * 1.25f, &iw, &ih);
+    int whole = 0;
     if (panel_due || font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") ||
         strcmp(shown[1], item[1] ? item[1] : "")) {
+        whole = 1;
         ov_render(s_d3d.ov_up_ptr[fi], item, font_px, w);
         if (panel) {
             ov_render_panel(s_d3d.ov_up_ptr[fi] + (size_t)OV_ROWS_H * OV_W * 4, pfont, &pw, &ph);
@@ -3521,6 +3670,26 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         s_d3d.ov_tex_ready = 1;
     }
+    if (ind && !whole && ih) {
+        /* only the indicator's band */
+        pp_barrier(s_d3d.ov_tex, s_d3d.ov_tex_ready ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                                    : D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+        dl.pResource = s_d3d.ov_tex;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        sl.pResource = s_d3d.ov_up[fi];
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sl.PlacedFootprint.Footprint.Width = OV_W;
+        sl.PlacedFootprint.Footprint.Height = OV_H;
+        sl.PlacedFootprint.Footprint.Depth = 1;
+        sl.PlacedFootprint.Footprint.RowPitch = OV_W * 4;
+        const D3D12_BOX band = { 0, OV_ROWS_H + OVS_H, 0, OV_W, OV_ROWS_H + OVS_H + OVI_H, 1 };
+        cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, OV_ROWS_H + OVS_H, 0, &sl, &band);
+        pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        s_d3d.ov_tex_ready = 1;
+    }
 
     D3D12_GPU_DESCRIPTOR_HANDLE srv;
     s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &srv);
@@ -3541,6 +3710,17 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
             x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
             (x + (float)w[r]) / bw * 2.0f - 1.0f, 1.0f - (y + (float)OV_ROW) / bh * 2.0f,
             0.0f, (float)(r * OV_ROW) / (float)OV_H, (float)w[r] / (float)OV_W, (float)((r + 1) * OV_ROW) / (float)OV_H };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+    }
+    if (ind && iw && ih) {
+        /* the indicator in the bottom left corner, a texel to a pixel */
+        const float x = (float)pfont, y = bh - (float)pfont - (float)ih;
+        const float y0 = (float)(OV_ROWS_H + OVS_H);
+        const float c[16] = {
+            x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
+            (x + (float)iw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)ih) / bh * 2.0f,
+            0.0f, y0 / (float)OV_H, (float)iw / (float)OV_W, (y0 + (float)ih) / (float)OV_H };
         cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
         cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
     }

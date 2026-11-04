@@ -46,6 +46,10 @@
  * (a sign apart), within 1, 16 or 256 ulps, or other. It prints the time per job
  * (fastest run, and the median) and each workload's totals, and writes
  * replay.csv next to the captures.
+ *   SPU_JOB_REPLAY_CMP=state      at the end, only the local-store ranges of
+ *   SPU_JOB_REPLAY_STATE=lo-hi,.. (hex, hi exclusive) and r0, r1, r3, r80-r127:
+ *                                 for a job done another way than its lifted
+ *                                 code (its scratch and stack need not match)
  */
 #include "spu_jobcap.h"
 #include "spu_context.h"
@@ -672,6 +676,45 @@ static uint8_t* read_file(const char* path, size_t* len)
     return b;
 }
 
+/* SPU_JOB_REPLAY_CMP=state: at a run's end only the local-store ranges of
+ * SPU_JOB_REPLAY_STATE ("lo-hi,lo-hi,...", hex, hi exclusive) and the registers
+ * a caller keeps (r0, r1, r3, r80-r127) are compared; the requests, the PUT
+ * bytes and the mailbox words as always. For a job done another way than its
+ * lifted code, whose scratch, stack and scratch registers need not match. */
+static int s_cmp_state = -1;
+static uint32_t s_state_lo[32], s_state_hi[32];
+static int s_state_n;
+
+static void rep_cmp_init(void)
+{
+    if (s_cmp_state >= 0) return;
+    const char* m = getenv("SPU_JOB_REPLAY_CMP");
+    s_cmp_state = m && !strcmp(m, "state");
+    if (!s_cmp_state) return;
+    const char* p = getenv("SPU_JOB_REPLAY_STATE");
+    while (p && *p && s_state_n < 32) {
+        char* e;
+        const unsigned long lo = strtoul(p, &e, 16);
+        if (*e != '-') break;
+        const unsigned long hi = strtoul(e + 1, &e, 16);
+        if (lo < hi && hi <= SPU_LS_SIZE) {
+            s_state_lo[s_state_n] = (uint32_t)lo;
+            s_state_hi[s_state_n] = (uint32_t)hi;
+            s_state_n++;
+        }
+        if (*e != ',') break;
+        p = e + 1;
+    }
+    fprintf(stderr, "[replay] compare mode: state (%d local-store ranges, registers r0 r1 r3 r80-r127)\n", s_state_n);
+}
+
+static int rep_in_state(uint32_t o)
+{
+    for (int k = 0; k < s_state_n; k++)
+        if (o >= s_state_lo[k] && o < s_state_hi[k]) return 1;
+    return 0;
+}
+
 static int replay_one(const char* dir, const char* name, int reps, jc_row* row)
 {
     char path[640];
@@ -753,12 +796,21 @@ static int replay_one(const char* dir, const char* name, int reps, jc_row* row)
         t[i] = (double)(t1 - t0);
         if (r->idx != h.n_ev && !r->diverged++)
             snprintf(r->first, sizeof r->first, "%u of %u recorded events used", r->idx, h.n_ev);
-        const int ls_same = !memcmp(ctx->ls, end_ls, SPU_LS_SIZE);
-        const int gpr_same = !memcmp(ctx->gpr, end_gpr, sizeof ctx->gpr);
+        int ls_same, gpr_same;
+        if (s_cmp_state) {
+            ls_same = 1;
+            for (int k = 0; k < s_state_n && ls_same; k++)
+                ls_same = !memcmp(ctx->ls + s_state_lo[k], end_ls + s_state_lo[k], s_state_hi[k] - s_state_lo[k]);
+            gpr_same = !memcmp(&ctx->gpr[0], end_gpr, 2 * 16) && !memcmp(&ctx->gpr[3], end_gpr + 3 * 16, 16) &&
+                       !memcmp(&ctx->gpr[80], end_gpr + 80 * 16, 48 * 16);
+        } else {
+            ls_same = !memcmp(ctx->ls, end_ls, SPU_LS_SIZE);
+            gpr_same = !memcmp(ctx->gpr, end_gpr, sizeof ctx->gpr);
+        }
         if (r->diverged || r->put_bytes_differ || r->out_differ || !ls_same || !gpr_same) {
             uint32_t first = 0, last = 0, nd = 0;
             for (uint32_t o = 0; o < SPU_LS_SIZE; o++)
-                if (ctx->ls[o] != end_ls[o]) { if (!nd++) first = o; last = o; }
+                if (ctx->ls[o] != end_ls[o] && (!s_cmp_state || rep_in_state(o))) { if (!nd++) first = o; last = o; }
             if (ok)
                 fprintf(stderr, "[replay] %s run %d differs: %s%s%u PUT/atomic bytes (words: %u zero, %u/%u/%u within 1/16/256 ulps, %u other; max %u ulps), "
                         "%u mailbox words, local store: %u bytes differ (0x%05X..0x%05X), registers %s\n",
@@ -796,6 +848,7 @@ int spu_job_replay_main(const char* dir)
     const char* rp = getenv("SPU_JOB_REPLAY_REPS");
     const int reps = rp && atoi(rp) > 0 ? atoi(rp) : 10;
     const char* only = getenv("SPU_JOB_REPLAY_ONLY");
+    rep_cmp_init();
     size_t nrows = 0, caprows = 256;
     jc_row* rows = (jc_row*)calloc(caprows, sizeof *rows);
     char** names = NULL;

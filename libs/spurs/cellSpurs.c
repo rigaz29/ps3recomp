@@ -60,6 +60,8 @@ typedef struct {
     u32         maxContention;
     u32         readyCount;
     int         started;       /* its SPU program has been dispatched        */
+    char        name[32];      /* the attribute's instance name, if it had one */
+    int         lent;          /* SPURS_LEND: may take the reserved SPU too   */
 } SpursWorkload;
 
 typedef struct {
@@ -1760,6 +1762,8 @@ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
  * Workload
  * =====================================================================*/
 
+static void spurs_lend_mark(u32 wid);   /* SPURS_LEND, with the reserve below */
+
 s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
                          const void* pm, u32 sizePm, u64 data,
                          const u8* priority, u32 minContention,
@@ -1795,6 +1799,9 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             s_workloads[i].minContention = minContention;
             s_workloads[i].maxContention = maxContention;
             s_workloads[i].readyCount = 0;
+            s_workloads[i].name[0] = 0;      /* the attribute path names it after this */
+            s_workloads[i].lent = 0;
+            spurs_lend_mark(i);
 
             if (priority_h)
                 memcpy(s_workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
@@ -1951,10 +1958,24 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
     }
 
     /* Forward the BE-decoded values (priority as guest EA of the 8-byte table). */
-    return cellSpursAddWorkload(spurs, wid, (const void*)(uintptr_t)pm_ea,
-                               pm_sz, data,
-                               (const u8*)(uintptr_t)(attr_ea + WKATTR_PRIORITY),
-                               minc, maxc);
+    const s32 rc = cellSpursAddWorkload(spurs, wid, (const void*)(uintptr_t)pm_ea,
+                                        pm_sz, data,
+                                        (const u8*)(uintptr_t)(attr_ea + WKATTR_PRIORITY),
+                                        minc, maxc);
+    /* The instance name, which SPURS_LEND can name a workload by. */
+    if (rc == CELL_OK && nmins && wid) {
+        const u32 w = vm_read32((u32)(uintptr_t)wid);
+        if (w < SPURS_MAX_WID) {
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            if (s_workloads[w].in_use) {
+                strncpy(s_workloads[w].name, (const char*)(vm_base + nmins), sizeof s_workloads[w].name - 1);
+                s_workloads[w].name[sizeof s_workloads[w].name - 1] = 0;
+                spurs_lend_mark(w);
+            }
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        }
+    }
+    return rc;
 }
 
 /* cellSpursGetWorkloadFlag(spurs, CellSpursWorkloadFlag** flag): the flag the
@@ -2466,21 +2487,69 @@ static int spurs_select_rr(void)
  * claim it. For a workload with a deadline that the title pins to one SPU: God of War:
  * Ascension's audio (7) runs on SPU 5 only, and in a fight its kicks waited up to ~10 ms
  * for SPU 5 while other workloads' jobs held it -- a job is not interrupted, only a run
- * between jobs. The other workloads keep the other SPUs. */
+ * between jobs. The other workloads keep the other SPUs.
+ *
+ * SPURS_LEND=<workload>[,<workload>...]: with a reserve, these workloads may take the reserved
+ * SPU too -- only where the title's own priority table gives them one there, and never as strong
+ * as the reserved workload, so a kick of that one waits at most for one of their jobs: the Wws
+ * job manager polls the kernel between jobs and yields to a stronger workload. A workload is
+ * named by its attribute's instance name ("RenJobSet" of Wws_Job/RenJobSet) or by its id. Meant
+ * for workloads whose jobs are short. God of War: Ascension at the gate: audio's SPU 5 was 56%
+ * idle; RenJobSet, Batch and three small lists (jobs ~0.06-0.3 ms, p99 under 1 ms) may use it,
+ * audio's kicks as before. General6 (jobs 1-4 ms) lent too fills it, as no reserve does, but
+ * audio's kicks then wait ~1.3 ms on average and 12-25 ms at most (2026-11-04). */
+static u32 s_res_wid = 0xFFFFFFFFu, s_res_sn = 0xFFFFFFFFu, s_lend_wids;
+static char s_lend_names[16][32];
+static int s_lend_n;
+static void spurs_reserve_parse(void)
+{
+    static volatile LONG state;          /* 0 not yet, 1 parsing, 2 done */
+    if (state == 2) return;
+    if (InterlockedCompareExchange(&state, 1, 0) != 0) {
+        while (state != 2) YieldProcessor();
+        return;
+    }
+    const char* e = getenv("SPURS_RESERVE");
+    unsigned w, n;
+    if (e && sscanf(e, "%u:%u", &w, &n) == 2 && w < SPURS_MAX_WID && n < 8) {
+        s_res_wid = w; s_res_sn = n;
+        fprintf(stderr, "[spurs] SPURS_RESERVE: SPU %u runs workload %u only\n", n, w);
+    }
+    for (const char* l = getenv("SPURS_LEND"); l && *l && s_res_sn != 0xFFFFFFFFu; ) {
+        const char* c = strchr(l, ',');
+        const size_t len = c ? (size_t)(c - l) : strlen(l);
+        if (len && len < sizeof s_lend_names[0]) {
+            char tok[sizeof s_lend_names[0]];
+            memcpy(tok, l, len);
+            tok[len] = 0;
+            char* end;
+            const unsigned long v = strtoul(tok, &end, 10);
+            if (!*end && v < SPURS_MAX_WID) s_lend_wids |= 1u << v;
+            else if (*end && s_lend_n < 16) memcpy(s_lend_names[s_lend_n++], tok, len + 1);
+            fprintf(stderr, "[spurs] SPURS_LEND: %s may also take SPU %u\n", tok, s_res_sn);
+        }
+        l = c ? c + 1 : l + len;
+    }
+    InterlockedExchange(&state, 2);
+}
+/* Whether a workload, just added or just named, may take the reserved SPU too. Called with the
+ * workload registry lock held. */
+static void spurs_lend_mark(u32 wid)
+{
+    spurs_reserve_parse();
+    if (wid >= SPURS_MAX_WID) return;
+    int lent = (s_lend_wids >> wid) & 1u;
+    for (int i = 0; !lent && i < s_lend_n; i++)
+        lent = s_workloads[wid].name[0] && !strcmp(s_workloads[wid].name, s_lend_names[i]);
+    if (lent && !s_workloads[wid].lent)
+        fprintf(stderr, "[spurs] SPURS_LEND: workload %u (%s) may take SPU %u\n", wid,
+                s_workloads[wid].name[0] ? s_workloads[wid].name : "-", s_res_sn);
+    s_workloads[wid].lent = lent;
+}
 static int spurs_reserved_away(u32 wid, u32 sn)
 {
-    static int parsed;
-    static u32 res_wid = 0xFFFFFFFFu, res_sn = 0xFFFFFFFFu;
-    if (!parsed) {
-        parsed = 1;
-        const char* e = getenv("SPURS_RESERVE");
-        unsigned w, n;
-        if (e && sscanf(e, "%u:%u", &w, &n) == 2 && w < SPURS_MAX_WID && n < 8) {
-            res_wid = w; res_sn = n;
-            fprintf(stderr, "[spurs] SPURS_RESERVE: SPU %u runs workload %u only\n", n, w);
-        }
-    }
-    return sn == res_sn && wid != res_wid;
+    spurs_reserve_parse();
+    return sn == s_res_sn && wid != s_res_wid && !s_workloads[wid].lent;
 }
 
 static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, u32 enabled, u32 contention,
@@ -2493,9 +2562,14 @@ static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, u32 enabled,
     if (!(enabled & (0x80000000u >> wid)) || vm_read8(ea + wkl_state_off(wid)) != 2 ||
         !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
         return 0;
-    const u32 prio = vm_read8(ea + wkl_info_off(wid) + 0x18 + sn) & 0x0Fu;
+    u32 prio = vm_read8(ea + wkl_info_off(wid) + 0x18 + sn) & 0x0Fu;
     if (!prio)
         return 0;
+    if (sn == s_res_sn && wid != s_res_wid) {
+        /* lent (spurs_reserved_away let it through): never as strong as the reserved one */
+        const u32 rp = vm_read8(ea + wkl_info_off(s_res_wid) + 0x18 + sn) & 0x0Fu;
+        if (rp && prio <= rp) prio = rp < 15 ? rp + 1 : 15;
+    }
     const u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
     if (contention >= maxcont || !spurs_resolve_pm(wid))
         return 0;

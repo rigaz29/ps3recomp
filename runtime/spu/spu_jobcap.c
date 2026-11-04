@@ -186,14 +186,18 @@ static void jc_time_report(uint64_t now)
         int64_t h[16], acc = 0;
         for (int k = 0; k < 16; k++) h[k] = __atomic_exchange_n(&s_time_hist[w][k], 0, __ATOMIC_SEQ_CST);
         if (!n) continue;
-        int p50 = 15, p90 = 15;
+        /* the tail too: a job is not interrupted, so the longest ones bound how long another
+         * workload's kick waits for this one's SPU */
+        int p50 = 15, p90 = 15, p99 = 15, top = 0;
         for (int k = 0; k < 16; k++) {
             acc += h[k];
+            if (h[k]) top = k;
             if (p50 == 15 && acc * 2 >= n) p50 = k;
-            if (p90 == 15 && acc * 10 >= n * 9) { p90 = k; break; }
+            if (p90 == 15 && acc * 10 >= n * 9) p90 = k;
+            if (p99 == 15 && acc * 100 >= n * 99) p99 = k;
         }
-        fprintf(stderr, "[jobtime]   w%-2d %8.0f jobs/s  %8.1f us/job  median < %u us  p90 < %u us\n",
-                w, n / win, (double)sum / (double)n, 1u << p50, 1u << p90);
+        fprintf(stderr, "[jobtime]   w%-2d %8.0f jobs/s  %8.1f us/job  median < %u us  p90 < %u us  p99 < %u us  max < %u us\n",
+                w, n / win, (double)sum / (double)n, 1u << p50, 1u << p90, 1u << p99, 1u << top);
 #ifdef PS3_SPU_JOBCAP
         { int64_t s[SPU_JS_N]; const double q = 1.0 / (double)n;
           for (int j = 0; j < SPU_JS_N; j++) s[j] = __atomic_exchange_n(&s_js[w][j], 0, __ATOMIC_SEQ_CST);

@@ -278,6 +278,12 @@ typedef struct spu_context {
     uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
     int      resv_valid;
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
+    /* The 8 KB local-store pages that hold, or held, a resident code span (resident_code below;
+     * bit n is LS 0x2000 * n): a span's pages are added when it becomes resident and stay when
+     * it goes, and spu_resident_pages_rebuild sets it exactly where a context is copied in
+     * whole. A GET into none of them leaves every span as it is. It fills the padding before
+     * dbg_getllar: a capture holds the whole context, and a replay takes only its own size. */
+    uint32_t resident_pages;
     uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 
@@ -900,6 +906,9 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
+/* ctx->resident_pages from ctx->resident_code (spu_channels.c): after a slot changes, or a
+ * context is copied in whole. */
+void spu_resident_pages_rebuild(spu_context* ctx);
 
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */

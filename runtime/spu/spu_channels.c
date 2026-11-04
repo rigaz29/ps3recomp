@@ -623,8 +623,9 @@ extern uint8_t* vm_base;
  * and the polling module's workload. NULL, the intercept answers workload 0. */
 uint64_t (*g_spurs_kernel_poll)(uint32_t ea, uint32_t spu_num, uint32_t cur_wid) = NULL;
 
-/* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
- * the delta across one policy run to find the run that performed a claim. */
+/* PUTLLC attempts (all SPUs) while the sync watch is armed (spu_mfc_atomic). The PM flow trace
+ * (spurs_policy.c) reads the delta across one policy run to find the run that performed a
+ * claim. */
 volatile unsigned g_spu_putllc_count = 0;
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
@@ -1022,10 +1023,16 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        /* The PM flow trace's counters (spurs_policy.c), counted only while its sync watch is
+         * armed. Counted on every PUTLLC of every SPU, they kept writing the cache line that
+         * holds g_spu_put_hook, g_spu_get_observer and g_spurs_kernel_poll, which every DMA and
+         * kernel poll reads: each of those reads missed. */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
-          if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+          if (b) {
+              g_spu_putllc_count++;
+              if ((ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++;
+          } }
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
@@ -1191,9 +1198,51 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* One switch for the channel functions' own diagnostics (SPU_CHHIST, SPU_POLLTRACE,
+ * SPU_WHOPOLLS and the SPU_LSDUMP inside it), as spu_dma_diag is for the DMA path: 0 while none
+ * is set. SPU_CHAN_DIAG=1 runs them all. */
+static int spu_chan_diag(void)
+{
+    static SPU_DIAG_LINE struct { int v; char pad[60]; } s_line = { -1, { 0 } };
+    int v = s_line.v;
+    if (v < 0) {
+        v = getenv("SPU_CHAN_DIAG") || getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
+            getenv("SPU_WHOPOLLS") || getenv("SPU_LSDUMP");
+        s_line.v = v;
+    }
+    return v;
+}
+
+#if defined(_MSC_VER)
+#define SPU_CH_NOINLINE __declspec(noinline)
+#else
+#define SPU_CH_NOINLINE __attribute__((noinline))
+#endif
+
+static SPU_CH_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+
+/* The MFC address, size, tag and tag-mask channels, five of the six channel writes of a DMA,
+ * are each a store into the context (the one spu_wrch_full makes). With no channel diagnostic
+ * on they are made here, without that function's frame. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     SPU_JS_ADD(SPU_JS_WRCH, 1);
+    if (channel >= MFC_LSA && channel <= MFC_WrTagMask && channel != MFC_Cmd && !spu_chan_diag()) {
+        const uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:   ctx->mfc_lsa = v;        return;
+        case MFC_EAH:   ctx->mfc_eah = v;        return;
+        case MFC_EAL:   ctx->mfc_eal = v;        return;
+        case MFC_Size:  ctx->mfc_size = v;       return;
+        case MFC_TagID: ctx->mfc_tag = v & 0x1F; return;
+        default:        ctx->mfc_tag_mask = v;   return;   /* MFC_WrTagMask */
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+
+static SPU_CH_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
+{
     /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY: an outbound mailbox word is a job's
      * output; a replay compares it with the record and drops it. */
     if (SPU_JOBCAP_ANY() &&
@@ -1204,7 +1253,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
      * mix distinguishes those. */
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+    if (spu_chan_diag()) { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long w[128]; static unsigned long long n;
           w[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
@@ -1213,6 +1262,18 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
+        /* The address, size, tag and tag-mask channels only store into the context (as
+         * mfc_channel_write does): no engine lookup for them. It was looked up for each, six
+         * times or more a DMA. */
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;          return;
+        case MFC_EAH:       ctx->mfc_eah = v;          return;
+        case MFC_EAL:       ctx->mfc_eal = v;          return;
+        case MFC_Size:      ctx->mfc_size = v;         return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
+        default:            break;
+        }
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
@@ -1449,14 +1510,28 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_CH_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+
+/* The MFC read channels and SPU_RdMachStat, with no channel diagnostic on: the stop check and
+ * the field, read as spu_rdch_full reads it, without that function's frame. */
 #ifdef PS3_SPU_JOBCAP
 static u128 spu_rdch_body(spu_context* ctx, uint32_t channel)
 #else
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 #endif
 {
+    if ((channel_is_mfc(channel) || channel == SPU_RdMachStat) && !spu_chan_diag()) {
+        spu_honour_stop_request(ctx);
+        return spu_make_preferred_u32(channel == SPU_RdMachStat ? (uint32_t)(ctx->int_enable & 1u)
+                                                                : mfc_channel_read(ctx, channel));
+    }
+    return spu_rdch_full(ctx, channel);
+}
+
+static SPU_CH_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
+{
     spu_honour_stop_request(ctx);
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+    if (spu_chan_diag()) { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
@@ -1474,7 +1549,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 
     uint32_t v = 0;
 
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    if (spu_chan_diag()) { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_c[10] = {0}; static uint64_t s_tot = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdSigNotify1)?1:(channel==SPU_RdSigNotify2)?2:
                 (channel==SPU_RdDec)?3:(channel==SPU_RdEventStat)?4:(channel==SPU_RdEventMask)?5:
@@ -1487,7 +1562,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        v = mfc_channel_read(ctx, channel);
         return spu_make_preferred_u32(v);
     }
 
@@ -1580,7 +1655,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * SPU or two. The freeze under investigation is the PPU-side spin in
      * func_000D2298 waiting for spu4 to advance a counter at 0x002DF008, so
      * which SPU is parked, and on what, is the whole question. */
-    { static int s_w = -1;
+    if (spu_chan_diag()) { static int s_w = -1;
       if (s_w < 0) { const char* e = getenv("SPU_WHOPOLLS");
         s_w = e ? (atoi(e) > 0 ? atoi(e) : 4000000) : 0; }
       if (s_w) { static unsigned long long c[8][40]; static unsigned long long n;
@@ -1684,7 +1759,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * appear: park_on_empty_inmbox halts from inside THIS function, so a
      * worker that polls rchcnt and parks produced a completely empty channel
      * histogram and read as 'never touches a channel'. */
-    { static int s_c = -1;
+    if (spu_chan_diag()) { static int s_c = -1;
       if (s_c < 0) { const char* e = getenv("SPU_CHHIST");
         s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long c[128]; static unsigned long long n;
@@ -1694,7 +1769,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
               for (int i = 0; i < 128; i++) if (c[i])
                   fprintf(stderr, "   rchcnt ch%-3d %llu%c", i, c[i], 10);
               fflush(stderr); } } }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    if (spu_chan_diag()) { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_cnt[8] = {0}; static uint64_t s_total = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdEventStat)?1:(channel==SPU_RdSigNotify1)?2:
                 (channel==SPU_RdSigNotify2)?3:(channel==MFC_RdTagStat)?4:(channel==SPU_WrOutMbox)?5:
@@ -2373,6 +2448,46 @@ static void spu_pic_sigs_add(int src)
         }
     }
 }
+
+/* The bits of the 8 KB local-store pages that [lsa, lsa + size) touches (resident_pages).
+ * Nothing at or past the end of the local store: no transfer reaches there. */
+static inline uint32_t spu_ls_pages(uint32_t lsa, uint32_t size)
+{
+    if (!size || lsa >= SPU_LS_SIZE) return 0;
+    const uint64_t end = (uint64_t)lsa + size;
+    const uint32_t first = lsa >> 13;
+    const uint32_t last = end > SPU_LS_SIZE ? 31u : (uint32_t)((end - 1u) >> 13);
+    const uint32_t upto = last >= 31u ? 0xFFFFFFFFu : ((1u << (last + 1u)) - 1u);
+    return upto & ~((1u << first) - 1u);
+}
+
+/* The pages a span covers for spu_overlay_note_get's overlap test (lsa < base + size &&
+ * lsa + n > base): every GET the test can match touches one of them. A span of size 0 matches
+ * a GET across its base, so its base's page counts. */
+static inline uint32_t spu_span_pages(uint32_t base, uint32_t size)
+{
+    if (size) return spu_ls_pages(base, size);
+    return base < SPU_LS_SIZE ? 1u << (base >> 13) : 0u;
+}
+
+/* resident_pages is a superset: a span's pages are added when it becomes resident, and stay
+ * when it goes (a GET there then reads the slots, as every GET did). Rebuilding it at every
+ * change cost about what the skipped loops saved; it is rebuilt exactly only where a context
+ * is copied in whole. */
+static inline void spu_resident_pages_add(spu_context* ctx, uint32_t base, uint32_t size)
+{
+    ctx->resident_pages |= spu_span_pages(base, size);
+}
+
+void spu_resident_pages_rebuild(spu_context* ctx)
+{
+    uint32_t m = 0;
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+        if (ctx->resident_code[slot].image_id)
+            m |= spu_span_pages(ctx->resident_code[slot].lsa, ctx->resident_code[slot].size);
+    ctx->resident_pages = m;
+}
+
 static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa)
 {
     if ((lsa & 3) || lsa > SPU_LS_SIZE - 16) return NULL;
@@ -2431,6 +2546,7 @@ static spu_lifted_fn spu_pic_adopt(spu_context* ctx, uint32_t lsa)
         ctx->resident_code[free_slot].source_index = (int)s_pic_sig[h].src;
         ctx->resident_code[free_slot].pic = 1;
         ctx->resident_code[free_slot].pic_delta = place - o->load_lsa;
+        spu_resident_pages_add(ctx, place, extent);
         { static int on = -1; static long n;
           if (on < 0) on = getenv("SPU_PIC_ADOPTLOG") ? 1 : 0;
           if (on && (++n <= 64 || (n & 4095) == 0))
@@ -2693,6 +2809,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     SPU_JS_ADD(SPU_JS_NOTE_GET, 1);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
+    /* Only a GET into a page that holds a resident span can end or change one
+     * (resident_pages); for the others, most of a job's GETs, the slots are not read. */
+    if (ctx->resident_pages & spu_ls_pages(lsa, size))
     for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
@@ -2724,12 +2843,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     /* A source matches by EA, or (512 bytes or more) by its 16-byte signature:
      * with the EA in neither set and the head in no signature, none can. */
     const int big = size >= 512;
-    uint64_t head[2] = { 0, 0 };
-    if (big) memcpy(head, ls, 16);
-    if (!spu_ovl_ea_known(ea) && (!big || !spu_ovl_sig_known(head[0]))) return;
+    uint64_t head0 = 0, head1 = 0;   /* not an array: the frame then needs no stack cookie */
+    if (big) { memcpy(&head0, ls, 8); memcpy(&head1, ls + 8, 8); }
+    if (!spu_ovl_ea_known(ea) && (!big || !spu_ovl_sig_known(head0))) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (big && o->sig64[0] == head[0] && o->sig64[1] == head[1])
+        int hit = o->has_sig ? (big && o->sig64[0] == head0 && o->sig64[1] == head1)
                              : (o->src_ea == ea);
         if (hit) {
             if (o->span) {
@@ -2759,6 +2878,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_index = i;
                     ctx->resident_code[slot].pic = o->pic;
                     ctx->resident_code[slot].pic_delta = lsa - o->load_lsa;
+                    spu_resident_pages_add(ctx, lsa, o->span);
                     SPU_JS_ADD(SPU_JS_RES_NEW, 1);
                     spu_dcache_span_changed(ctx, lsa, o->span);
                     return;
@@ -3206,6 +3326,147 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+/* A runtime-generated stub run again: the WWS job manager's register save and restore at
+ * 0x3FEC0, written and called at every interrupt, about four calls an EDGE job. With no lifted
+ * function there, each call took the fast path's lookup (a cached miss, then spu_pic_adopt's
+ * signature probe), the full path's special cases, the lookup and spu_pic_adopt again, and only
+ * then spu_smc_microstep: 44% of all full-path branches in the game.
+ *
+ * The full path remembers here, per thread, the last two stubs it ran through the micro-step
+ * and what its way there rested on: the context, the pc, the stub's bytes, the image, the policy
+ * mode, the resident overlay and task, the dispatch generation of the stub's page, and the
+ * counts of registered functions and piece signatures (the lookup's inputs). While all of them
+ * are the same, the full path would decide the same and run the same bytes from the same state,
+ * so the fast path runs the micro-step itself. Only a straight run of quadword loads and stores
+ * ending in bi or bisl is remembered: it cannot go another way, and the micro-step runs it to
+ * the end. The lookup it skips would only have set ctx->pic_base, which the next dispatch sets
+ * again before any position-independent code reads it. */
+#define SPU_SMC_MEMO_MAX 512u
+typedef struct {
+    const spu_context* ctx;
+    uint32_t pc, len;
+    int image_id, policy_mode, resident_ovl, resident_task;
+    uint32_t page_gen, rgen, pic_n;
+    uint8_t bytes[SPU_SMC_MEMO_MAX];
+    /* The stub decoded, when it is all lqa/stqa (absolute addresses) and stores none of them
+     * into its own bytes: what spu_smc_microstep's fast loop does for each word, in order,
+     * then the branch. */
+    int decoded;
+    uint32_t nops, branch;
+    uint32_t addr[SPU_SMC_MEMO_MAX / 4];
+    uint8_t rt[SPU_SMC_MEMO_MAX / 4], store[SPU_SMC_MEMO_MAX / 4];
+} spu_smc_memo_ent;
+/* Two entries: the WWS handler writes its save stub (stqa) and its restore stub (lqa) at the
+ * same address, one after the other. */
+static SPU_THREAD_LOCAL spu_smc_memo_ent t_smc_memo[2];
+static SPU_THREAD_LOCAL unsigned t_smc_memo_next;
+
+/* The bytes of a straight stub at pc (lqd, stqd, lqa, stqa, then bi or bisl), else 0. */
+static uint32_t spu_smc_straight_len(const spu_context* ctx, uint32_t pc)
+{
+    for (uint32_t n = 0; n < SPU_SMC_MEMO_MAX && pc + n + 4u <= SPU_LS_SIZE; n += 4u) {
+        uint32_t w;
+        memcpy(&w, ctx->ls + pc + n, 4);
+        w = SPU_BSWAP32(w);
+        const uint32_t op8 = w >> 24, op9 = w >> 23, op11 = w >> 21;
+        if (op8 == 0x24 || op8 == 0x34 || op9 == 0x041 || op9 == 0x061) continue;
+        return (op11 == 0x1A8 || op11 == 0x1A9) ? n + 4u : 0u;
+    }
+    return 0;
+}
+
+static inline uint32_t spu_smc_page_gen(const spu_context* ctx, uint32_t pc)
+{
+    return ctx->dcache_page_gen[(pc >> 12) & ((SPU_LS_SIZE >> 12) - 1u)];
+}
+
+/* Before the full path's micro-step: remember a straight stub in the entry holding this
+ * context, pc and first word, else in the older entry. The entry, or -1 for none. */
+static int spu_smc_memo_note(spu_context* ctx, uint32_t pc)
+{
+    const uint32_t len = spu_smc_straight_len(ctx, pc);
+    if (!len) return -1;
+    int k = -1;
+    for (int i = 0; i < 2; i++)
+        if (t_smc_memo[i].ctx == ctx && t_smc_memo[i].pc == pc &&
+            !memcmp(t_smc_memo[i].bytes, ctx->ls + pc, 4))
+            k = i;
+    if (k < 0) { k = (int)t_smc_memo_next; t_smc_memo_next ^= 1u; }
+    spu_smc_memo_ent* const m = &t_smc_memo[k];
+    m->ctx = ctx; m->pc = pc; m->len = len;
+    m->image_id = ctx->image_id; m->policy_mode = ctx->policy_mode;
+    m->resident_ovl = ctx->resident_ovl; m->resident_task = ctx->resident_task;
+    m->page_gen = spu_smc_page_gen(ctx, pc);
+    m->rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+    m->pic_n = __atomic_load_n(&s_pic_sig_n, __ATOMIC_ACQUIRE);
+    memcpy(m->bytes, ctx->ls + pc, len);
+    m->nops = len / 4u - 1u;
+    m->decoded = 1;
+    for (uint32_t i = 0; i <= m->nops; i++) {
+        uint32_t w;
+        memcpy(&w, m->bytes + 4u * i, 4);
+        w = SPU_BSWAP32(w);
+        if (i == m->nops) { m->branch = w; break; }
+        const uint32_t op9 = w >> 23;
+        if (op9 != 0x041 && op9 != 0x061) { m->decoded = 0; break; }     /* lqd/stqd: by register */
+        const uint32_t a = ((((w >> 7) & 0xFFFFu) << 2) & SPU_LS_MASK) & ~15u;
+        if (op9 == 0x041 && a < pc + len && a + 16u > pc) { m->decoded = 0; break; }   /* into itself */
+        m->addr[i] = a; m->rt[i] = (uint8_t)(w & 0x7F); m->store[i] = op9 == 0x041;
+    }
+    return k;
+}
+
+/* A remembered stub run from its decoded list: the stores and loads of the micro-step's fast
+ * loop, in order and byte for byte, then its bi or bisl. Only where that loop would run them
+ * (no local-store diagnostic armed, not image 2). */
+static int spu_smc_memo_run(spu_context* ctx, const spu_smc_memo_ent* m)
+{
+    if (!m->decoded || g_spu_ls_watch_n != 0 || g_spu_ls_probe != 0 || g_spu_smc_watch != 0 ||
+        ctx->image_id == 2)
+        return 0;
+    for (uint32_t i = 0; i < m->nops; i++) {
+        uint8_t* const p = ctx->ls + m->addr[i];
+        u128* const r = &ctx->gpr[m->rt[i]];
+        if (m->store[i]) {
+            const uint32_t q[4] = { SPU_BSWAP32(r->_u32[0]), SPU_BSWAP32(r->_u32[1]),
+                                    SPU_BSWAP32(r->_u32[2]), SPU_BSWAP32(r->_u32[3]) };
+            memcpy(p, q, 16);
+        } else {
+            uint32_t q[4];
+            memcpy(q, p, 16);
+            for (int k = 0; k < 4; k++) r->_u32[k] = SPU_BSWAP32(q[k]);
+        }
+    }
+    const uint32_t w = m->branch;
+    if (w & 0x40000) ctx->int_enable = 1;
+    else if (w & 0x80000) ctx->int_enable = 0;
+    const uint32_t tgt = ctx->gpr[(w >> 7) & 0x7F]._u32[0];
+    if ((w >> 21) == 0x1A9)                                                  /* bisl */
+        ctx->gpr[w & 0x7F] = spu_splat_u32(m->pc + 4u * m->nops + 4u);
+    ctx->pc = tgt & SPU_LS_MASK & ~3u;
+    g_spu_trampoline_fn = spu_indirect_branch;
+    return 1;
+}
+
+static inline int spu_smc_memo_ent_holds(const spu_smc_memo_ent* m, const spu_context* ctx)
+{
+    return ctx == m->ctx && ctx->pc == m->pc &&
+           ctx->image_id == m->image_id && ctx->policy_mode == m->policy_mode &&
+           ctx->resident_ovl == m->resident_ovl && ctx->resident_task == m->resident_task &&
+           spu_smc_page_gen(ctx, m->pc) == m->page_gen &&
+           __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE) == m->rgen &&
+           __atomic_load_n(&s_pic_sig_n, __ATOMIC_ACQUIRE) == m->pic_n &&
+           !memcmp(ctx->ls + m->pc, m->bytes, m->len);
+}
+
+/* At the fast path: the stub remembered for this context and pc, everything still the same. */
+static inline const spu_smc_memo_ent* spu_smc_memo_holds(const spu_context* ctx)
+{
+    if (spu_smc_memo_ent_holds(&t_smc_memo[0], ctx)) return &t_smc_memo[0];
+    if (spu_smc_memo_ent_holds(&t_smc_memo[1], ctx)) return &t_smc_memo[1];
+    return NULL;
+}
+
 /* Resolve both fresh launches and mid-function resumes from TaskInfo.
  * A scheduler call temporarily leaves the task region, but its return PC
  * is usually not an ELF entry. Prefer the policy's selected ELF so tasks
@@ -3299,6 +3560,11 @@ void spu_indirect_branch(spu_context* ctx)
                          (!ctx->irq_saved || ctx->pc != (ctx->irq_resume_pc & SPU_LS_MASK)) &&
                          ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID && !spu_ib_diag(), 1)) {
         spu_ib_resolve_task(ctx);
+        const spu_smc_memo_ent* const memo = spu_smc_memo_holds(ctx);
+        if (memo) {                          /* a runtime stub the full path ran (t_smc_memo) */
+            if (!spu_smc_memo_run(ctx, memo)) spu_smc_microstep(ctx);
+            return;
+        }
         spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
         if (fn && (ctx->policy_mode || ctx->pc != SPU_JOB_RETURN_LS)) {
             spu_check_stack_reset(ctx, fn);
@@ -3912,8 +4178,10 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * WWS jobmanager writes a save/restore stub above its static
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
+    const int memo = spu_smc_memo_note(ctx, ctx->pc);
     if (spu_smc_microstep(ctx))
         return;
+    if (memo >= 0) t_smc_memo[memo].ctx = NULL;
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command

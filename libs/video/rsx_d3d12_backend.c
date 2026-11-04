@@ -13444,7 +13444,49 @@ static struct {
     unsigned long long attr[8][5], nattr[17], freq, wide;
     unsigned long long raw_segs, raw_ext, raw_bytes;
     long long t_up, t0;
+    /* by kind ([1] the draws from a registered vertex ring): indexed draws, index references,
+     * the path taken (raw fetch, ix, the CPU's conversions), raw bytes copied, upload time */
+    unsigned long long c_draws[2], c_refs[2], c_raw[2], c_ix[2], c_cpu[2], c_raw_bytes[2];
+    long long c_t[2];
 } s_vs;
+
+/* ---- Vertex rings a port names (God of War: Ascension's EDGE output rings) ----
+ * Main-memory IO offsets [io_offset, io_offset + size). Phase 2b's first step: with VTX_STATS=1
+ * the indexed draws whose position array (attribute 0) lies in one are counted apart. */
+#define VR_MAX 8
+static u32 s_vr_off[VR_MAX], s_vr_size[VR_MAX];
+static volatile LONG s_vr_n, s_vr_lock;
+static int s_vr_cls;                  /* the indexed draw being uploaded: 1 a ring's */
+void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
+{
+    if (!size) return;
+    for (LONG i = 0, n = s_vr_n; i < n; i++)
+        if (s_vr_off[i] == io_offset && s_vr_size[i] == size) return;
+    while (InterlockedCompareExchange(&s_vr_lock, 1, 0) != 0) YieldProcessor();
+    const LONG n = s_vr_n;
+    int known = 0;
+    for (LONG i = 0; i < n; i++)
+        if (s_vr_off[i] == io_offset && s_vr_size[i] == size) known = 1;
+    if (!known && n < VR_MAX) {
+        s_vr_off[n] = io_offset;
+        s_vr_size[n] = size;
+        MemoryBarrier();
+        InterlockedExchange(&s_vr_n, n + 1);
+        fprintf(stderr, "[vring] ring %ld: io 0x%08X, %u bytes\n", (long)n, io_offset, size);
+    }
+    InterlockedExchange(&s_vr_lock, 0);
+}
+static int vr_class(const rsx_state* st)
+{
+    const LONG n = s_vr_n;
+    if (!n || !st || !st->vertex_attribs[0].enabled) return 0;
+    const u32 raw = st->vertex_attribs[0].offset;
+    if (!(raw & 0x80000000u)) return 0;           /* local memory */
+    const u32 off = raw & 0x7FFFFFFFu;
+    for (LONG i = 0; i < n; i++)
+        if (off - s_vr_off[i] < s_vr_size[i]) return 1;
+    return 0;
+}
 static u32* s_vs_stamp;
 static u32 s_vs_gen;
 static int vs_on(void) { if (s_vs_on < 0) s_vs_on = getenv("VTX_STATS") ? 1 : 0; return s_vs_on; }
@@ -13487,6 +13529,12 @@ static void vs_report(void)
     fprintf(stderr, "; freq-divided %.0f, indices >= 2^20 %.0f%c", s_vs.freq / sec, s_vs.wide / sec, 10);
     fprintf(stderr, "[vtx-stats]   raw fetch per s: segments %.0f, batches extending one %.0f, %.1f MB copied%c",
             s_vs.raw_segs / sec, s_vs.raw_ext / sec, s_vs.raw_bytes / sec / 1048576.0, 10);
+    for (int k = 1; k >= 0; k--)
+        fprintf(stderr, "[vtx-stats]   %s indexed draws per s: %.0f (raw %.0f, ix %.0f, CPU conversion %.0f),"
+                        " index refs %.0f, raw %.1f MB, upload %.1f ms/s%c",
+                k ? "vertex-ring" : "other", s_vs.c_draws[k] / sec, s_vs.c_raw[k] / sec, s_vs.c_ix[k] / sec,
+                s_vs.c_cpu[k] / sec, s_vs.c_refs[k] / sec, s_vs.c_raw_bytes[k] / sec / 1048576.0,
+                1000.0 * (double)s_vs.c_t[k] / (double)f.QuadPart / sec, 10);
     memset(&s_vs, 0, sizeof s_vs);
     s_vs.t0 = now;
 }
@@ -14268,7 +14316,7 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
     sg->lo = lo; sg->hi = hi;
     s_d3d.vp_ib_offset += count;
     s_raw_run_valid = 1;
-    if (s_vs_on > 0) { s_vs.raw_segs++; s_vs.raw_bytes += at - hdr; }
+    if (s_vs_on > 0) { s_vs.raw_segs++; s_vs.raw_bytes += at - hdr; s_vs.c_raw_bytes[s_vr_cls] += at - hdr; }
     return count;
 }
 
@@ -14862,6 +14910,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
     const long long vs_t0 = vs_begin_indexed(s_d3d.current_rsx_state, primitive, first, count);
+    s_vr_cls = vs_t0 ? vr_class(s_d3d.current_rsx_state) : 0;
     int ix_used = 0, ix_cont = 0, raw_used = 0, raw_cont = 0;
     const u32 ib0 = s_d3d.vp_ib_offset, seg0 = s_seg_n;
     /* A batch in the middle of another path's stream stays on that path: the
@@ -14896,6 +14945,13 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         return;
     }
     vs_end(vs_t0, emitted);
+    if (vs_t0) {
+        const int k = s_vr_cls;
+        s_vs.c_draws[k]++;
+        s_vs.c_refs[k] += count;
+        if (raw_used) s_vs.c_raw[k]++; else if (ix_used) s_vs.c_ix[k]++; else s_vs.c_cpu[k]++;
+        s_vs.c_t[k] += vs_now() - vs_t0;
+    }
     if (raw_used && raw_cont) {        /* a batch of the previous record's raw run */
         D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
         pv->index_count += emitted;
@@ -15625,5 +15681,6 @@ void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 void rsx_d3d12_backend_record_ahead(void) {}
+void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size) { (void)io_offset; (void)size; }
 
 #endif /* _WIN32 */

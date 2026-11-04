@@ -64,7 +64,11 @@
 #define FRAME_COUNT         2   /* double buffering */
 #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
-#define VP_MAX_INDICES  (1u << 21)  /* per-frame index buffer of indexed VP draws, x2 parity */
+/* Per-frame index buffer of indexed VP draws, x2 parity. God of War: Ascension's gate takes
+ * ~1.5 M a frame with EDGE culling its triangles on the SPUs and ~2.5 M without; past the end a
+ * batch falls to the CPU's conversion (ib_full_note), which at that rate cost two thirds of a
+ * core and dropped most of the frame's geometry (2 M, the old size, went black). */
+#define VP_MAX_INDICES  (1u << 22)
 #define MAX_DRAWS         8192  /* per-frame draw records. 2048 was sized
                                  * from God of War HD's worst case (~1841):
                                  * God of War: Ascension's first level needs
@@ -13488,6 +13492,9 @@ static struct {
     /* the vertex pass: segments lit on the GPU and their vertexes, segments of its stride in a ring
      * with no record, CPU-lit copies and guest blocks, segments the buffers had no room for */
     unsigned long long lit_segs, lit_verts, lit_miss, lit_cpu, lit_guest, lit_full, lit_lost, lit_stale;
+    /* a vertex ring's indexed draws by the face culling they draw with (rsx_cull_key), attribute
+     * 0's stride 54 (EDGE's lit layout) or another */
+    unsigned long long c_cull54[8], c_cullo[8];
 } s_vs;
 
 /* ---- Vertex rings a port names (God of War: Ascension's EDGE output rings) ----
@@ -14070,6 +14077,12 @@ static void vs_report(void)
                 k ? "vertex-ring" : "other", s_vs.c_draws[k] / sec, s_vs.c_raw[k] / sec, s_vs.c_ix[k] / sec,
                 s_vs.c_cpu[k] / sec, s_vs.c_refs[k] / sec, s_vs.c_raw_bytes[k] / sec / 1048576.0,
                 1000.0 * (double)s_vs.c_t[k] / (double)f.QuadPart / sec, 10);
+    { static const char* const cn[8] = { "off/CW", "back/CW", "off/CCW?", "front/CW", "off/CCW", "back/CCW", "?", "front/CCW" };
+      fprintf(stderr, "[vtx-stats]   vertex-ring draws per s by face culling (culled face / front face): stride 54:");
+      for (int c = 0; c < 8; c++) if (s_vs.c_cull54[c]) fprintf(stderr, " %s %.0f", cn[c], s_vs.c_cull54[c] / sec);
+      fprintf(stderr, "; other strides:");
+      for (int c = 0; c < 8; c++) if (s_vs.c_cullo[c]) fprintf(stderr, " %s %.0f", cn[c], s_vs.c_cullo[c] / sec);
+      fprintf(stderr, "%c", 10); }
     if (s_vpass.set)
         fprintf(stderr, "[vtx-stats]   vertex pass per s: %.0f segments (%.0f vertexes) on the GPU, %.0f"
                         " without a record (%.0f found written over, %.0f an older job's); on the CPU %.0f"
@@ -14643,13 +14656,22 @@ static int ix_can_continue(u32 first)
 }
 
 /* Returns the number of indices written; 0 means "use the list path". */
+/* The frame's index buffer is full: the batch goes to the CPU's conversion. Said the first times. */
+static void ib_full_note(u32 count)
+{
+    static int n = 0;
+    if (PS3_LOG_FIRST(n, 4))
+        fprintf(stderr, "[D3D12] the frame's index buffer is full (%u of %u indices, %u more asked):"
+                        " batches go to the CPU's conversion%c", s_d3d.vp_ib_offset, VP_MAX_INDICES, count, 10);
+}
+
 static u32 upload_tris_vp_ix(const rsx_state* state, u32 first, u32 count, int cont)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     if (!state || !vm_base || !s_d3d.vp_vb_mapped || !s_d3d.vp_ib_mapped) return 0;
     if (!state->vertex_attribs[0].enabled || !count) return 0;
-    if (s_d3d.vp_ib_offset + count > VP_MAX_INDICES) return 0;
+    if (s_d3d.vp_ib_offset + count > VP_MAX_INDICES) { ib_full_note(count); return 0; }
     if (!s_ix_stamp) {
         s_ix_stamp = (u32*)calloc(1u << 20, sizeof(u32));
         s_ix_slot  = (u32*)malloc((1u << 20) * sizeof(u32));
@@ -14752,7 +14774,8 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     if (!state || !vm_base || !s_d3d.vp_vb_mapped || !s_d3d.vp_ib_mapped || !count) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
-    if (s_d3d.vp_ib_offset + count > VP_MAX_INDICES || s_seg_n >= VP_MAX_SEGS) return 0;
+    if (s_d3d.vp_ib_offset + count > VP_MAX_INDICES) { ib_full_note(count); return 0; }
+    if (s_seg_n >= VP_MAX_SEGS) return 0;
     { static int pos = -1; if (pos < 0) pos = getenv("VTX_POS") ? 1 : 0; if (pos) return 0; }
 
     const int ilocal = ((state->index_array_dma & 0xF) == 0);
@@ -15498,6 +15521,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     vs_end(vs_t0, emitted);
     if (vs_t0) {
         const int k = s_vr_cls;
+        if (k && s_d3d.current_rsx_state) {
+            const u32 ck = rsx_cull_key(s_d3d.current_rsx_state) & 7u;
+            if (s_d3d.current_rsx_state->vertex_attribs[0].stride == 54) s_vs.c_cull54[ck]++; else s_vs.c_cullo[ck]++;
+        }
         s_vs.c_draws[k]++;
         s_vs.c_refs[k] += count;
         if (raw_used) s_vs.c_raw[k]++; else if (ix_used) s_vs.c_ix[k]++; else s_vs.c_cpu[k]++;

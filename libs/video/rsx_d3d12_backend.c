@@ -4886,7 +4886,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 const D3D12DrawRecord* r = &s_d3d.draws[d];
                 if (r->is_clear || !r->rt_off) continue;
                 const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
-                    + ((u64)par * MAX_DRAWS + d) * VP_CB_STRIDE);
+                    + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
                 int last_nz = -1; float maxabs = 0.0f;
                 for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++) {
                     float a = c[i] < 0 ? -c[i] : c[i];
@@ -4915,7 +4915,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 const D3D12DrawRecord* r = &s_d3d.draws[d];
                 if (r->is_clear || !r->dbt) continue;
                 const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
-                    + ((u64)par * MAX_DRAWS + d) * VP_CB_STRIDE);
+                    + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
                 fprintf(mf, "op%03u vs=%d n=%u sref=0x%02X\n", d, r->vs_idx, r->vertex_count,
                         (unsigned)r->stencil_ref);
                 for (int sl = 0; sl < RSX_MAX_VERTEX_CONSTANTS; sl++) {
@@ -8340,6 +8340,19 @@ static void vp_draw_raw(const D3D12DrawRecord* dr, int* ib_bound, int* raw_bound
     }
 }
 
+/* A draw's vp_cb slot (the vertex constants, the viewport epilogue, the raw fetch's attribute
+ * table) is made first in s_cbimg; vp_cb_commit writes it to the draw's slot, or gives the draw the
+ * slot the batch's last written one took when the two are the same. A draw used to write its whole
+ * constant bank, 8 KB of upload heap: ~20 MB a frame at God of War: Ascension's gate, where runs
+ * of draws (EDGE's jobs of one object, its pieces' records) share their constants. VP_CB_SHARE=0
+ * writes every slot. Only the recording thread. */
+#define VP_CB_IMG       VP_CB_RAW_OFF          /* the constants and the epilogue */
+#define VP_CB_RAW_BYTES 512u                   /* vp_fa[16], vp_fk[16] */
+static u8 s_cbimg[VP_CB_STRIDE], s_cblast[VP_CB_STRIDE];
+static int s_cbimg_ok, s_cbimg_raw, s_cblast_raw;
+static u32 s_cblast_slot, s_cblast_gen = ~0u, s_cb_gen;
+static unsigned long long s_cb_written, s_cb_shared;
+
 /* The raw-fetch attribute table for this draw's slot: the shader's vp_fa/vp_fk
  * (see s_vp_raw_hlsl), from the state the draw was recorded with. */
 static void vp_record_raw_cb(u32 slot, const rsx_state* st)
@@ -8357,10 +8370,11 @@ static void vp_record_raw_cb(u32 slot, const rsx_state* st)
         fa[i * 4 + 3] = on;
         memcpy(&fk[i * 4], st->vertex_data4f[i], 16);
     }
-    char* dst = (char*)s_d3d.vp_cb_mapped
-        + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE + VP_CB_RAW_OFF;
+    if (!s_cbimg_ok) return;                     /* written to the slot by vp_cb_commit */
+    u8* dst = s_cbimg + VP_CB_RAW_OFF;
     memcpy(dst, fa, sizeof fa);
     memcpy(dst + sizeof fa, fk, sizeof fk);
+    s_cbimg_raw = 1;
 }
 
 /* b1 slots taken from the half of vp_fpcb this frame's records use. */
@@ -8448,6 +8462,8 @@ static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
 static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
+    s_cbimg_ok = 0;
+    s_cbimg_raw = 0;
     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
     /* b1 as of this draw: fp_alpha, and the program's inline constants as
      * the guest has patched them for it, in a slot as long as they need.
@@ -8535,8 +8551,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
                       fprintf(stderr, "[FPK] distinct fp #%d = 0x%08X%c", ns, dr->fp_addr, 10); } } }
         }
     }
-    char* dst = (char*)s_d3d.vp_cb_mapped
-        + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+    char* dst = (char*)s_cbimg;             /* written to the slot by vp_cb_commit */
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
@@ -8618,6 +8633,34 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
         vpx[2] = 1.0f; vpx[6] = 0.0f;
     }
+    s_cbimg_ok = 1;
+}
+
+/* The slot made by vp_record_cb (and vp_record_raw_cb for a raw draw) to the draw: its own, or the
+ * last written one of this batch when the same. */
+static void vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
+{
+    static int share = -1;
+    if (share < 0) { const char* e = getenv("VP_CB_SHARE"); share = e ? atoi(e) != 0 : 1; }
+    if (!s_cbimg_ok || !dr || slot >= MAX_DRAWS) return;
+    s_cbimg_ok = 0;
+    if (share && s_cblast_gen == s_cb_gen && s_cblast_raw == s_cbimg_raw &&
+        !memcmp(s_cbimg, s_cblast, VP_CB_IMG) &&
+        (!s_cbimg_raw || !memcmp(s_cbimg + VP_CB_RAW_OFF, s_cblast + VP_CB_RAW_OFF, VP_CB_RAW_BYTES))) {
+        dr->cb_slot = s_cblast_slot;
+        s_cb_shared++;
+        return;
+    }
+    char* dst = (char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+    memcpy(dst, s_cbimg, VP_CB_IMG);
+    if (s_cbimg_raw) memcpy(dst + VP_CB_RAW_OFF, s_cbimg + VP_CB_RAW_OFF, VP_CB_RAW_BYTES);
+    memcpy(s_cblast, s_cbimg, VP_CB_IMG);
+    if (s_cbimg_raw) memcpy(s_cblast + VP_CB_RAW_OFF, s_cbimg + VP_CB_RAW_OFF, VP_CB_RAW_BYTES);
+    s_cblast_raw = s_cbimg_raw;
+    s_cblast_slot = slot;
+    s_cblast_gen = s_cb_gen;
+    dr->cb_slot = slot;
+    s_cb_written++;
 }
 
 /* The SET_SHADER_CONTROL bits a guest FP's translation depends on. */
@@ -11414,6 +11457,26 @@ static void rf_open(void)
 }
 
 /* The RT and texture prepass for records [from, to). */
+static unsigned long long s_pre_draws, s_pre_shared;   /* rf_prepass's draws, those whose units were shared */
+/* Whether a draw with these units' targets reads one of the targets it draws into (the draw pass
+ * gives such a unit RT_FEEDBACK's copy, in the draw's own window). */
+static int rec_reads_own(const D3D12DrawRecord* dr, const int* tex_rt)
+{
+    if (dr->no_color) return 0;
+    int own[4];
+    own[0] = dr->rt_off ? off_rt_find(dr->rt_off) : -1;
+    for (int m = 0; m < 3; m++) own[1 + m] = dr->rt_mrt[m] ? off_rt_find(dr->rt_mrt[m]) : -1;
+    for (int u = 0; u < VP_TEX_UNITS; u++)
+        if (tex_rt[u] >= 0)
+            for (int k = 0; k < 4; k++) if (own[k] >= 0 && tex_rt[u] == own[k]) return 1;
+    return 0;
+}
+/* A draw whose window another may bind: the draw pass rewrites none of it. */
+static int pre_shareable(const D3D12DrawRecord* dr)
+{
+    for (int u = 0; u < VP_TEX_UNITS; u++) if (dr->tex_dz[u] >= 0) return 0;
+    return !rec_reads_own(dr, dr->tex_rt);
+}
 static void rf_prepass(u32 from, u32 to)
 {
     u32 fi = s_rf.fi; (void)fi;
@@ -11460,9 +11523,19 @@ static void rf_prepass(u32 from, u32 to)
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
     double _pre0 = perf_on() ? perf_now() : 0.0;
+    /* The record before, when this one may take its units: its texture state, depth-read mask and
+     * program the same, every unit resolves the same within the pass, so the window and the
+     * uploads already made serve both, and the targets, copies and conversions each draw refreshes
+     * are named the same. Not a window the draw pass rewrites (pre_shareable): a depth plane's,
+     * whose view becomes null while its surface is the draw's own, and one that reads the draw's
+     * own target (RT_FEEDBACK's copy). God of War: Ascension's lit draws read targets, so this is
+     * the rule that lets their runs share. PREPASS_SHARE=0 resolves every draw's. */
+    static int pre_share = -1;
+    if (pre_share < 0) { const char* e = getenv("PREPASS_SHARE"); pre_share = e ? atoi(e) != 0 : 1; }
+    const D3D12DrawRecord* pp = NULL;
     for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
-        if (!dr->is_vp || dr->is_clear) continue;
+        if (!dr->is_vp || dr->is_clear) { pp = NULL; continue; }
         /* Debug: RTT_VIEWRT=<hex raw offset> makes display draws sample that
          * offscreen RT at t0 (the composite blit then shows it fullscreen). */
         { static const char* vr = (const char*)1;     /* hoisted: this runs per DRAW */
@@ -11539,6 +11612,20 @@ static void rf_prepass(u32 from, u32 to)
                               dr->tex[_u].fmt, dr->fp_addr, dr->vertex_count,
                               dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
               } }
+        int units_shared = 0;
+        if (pre_share && pp && pp->fp_addr == dr->fp_addr && pp->fp_snap == dr->fp_snap &&
+            pp->fp_units == dr->fp_units && pp->tex_zok == dr->tex_zok && !memcmp(pp->tex, dr->tex, sizeof dr->tex) &&
+            !rec_reads_own(dr, pp->tex_rt)) {
+            memcpy(dr->tex_rt, pp->tex_rt, sizeof dr->tex_rt);
+            memcpy(dr->tex_ds, pp->tex_ds, sizeof dr->tex_ds);
+            memcpy(dr->tex_cv, pp->tex_cv, sizeof dr->tex_cv);
+            memcpy(dr->tex_dz, pp->tex_dz, sizeof dr->tex_dz);
+            dr->srv_win = pp->srv_win;
+            units_shared = 1;
+            s_pre_shared++;
+        }
+        s_pre_draws++;
+        if (!units_shared) {
         /* Fill this draw's t0-t15 SRV window (DRAW_SRV_BASE + d*16): each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
@@ -11743,6 +11830,8 @@ static void rf_prepass(u32 from, u32 to)
         }
         srvq_commit(dr, _d);
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
+        pp = pre_shareable(dr) ? dr : NULL;
+        }
         double _ps0 = perf_on() ? perf_now() : 0.0;
         /* Queue every build the frame needs before waiting for any: the draw
          * pass below waits, within the budget, for the ones still running. */
@@ -13875,6 +13964,17 @@ static void vpass_cpu_copy(const vpr_head* h, LONG seq, u8* dst, u32 src, u32 nv
     if (s_vs_on > 0) s_vs.lit_cpu++;
 }
 
+/* A draw the vertex pass lights (a record not applied names its vertexes). */
+static int vpass_wants(const rsx_state* st)
+{
+    if (!s_vpass.set || !st) return 0;
+    const rsx_vertex_attrib* a0 = &st->vertex_attribs[0];
+    if (!(a0->offset & 0x80000000u) || a0->stride != s_vpass.stride) return 0;
+    LONG seq = 0;
+    const vpr_head* h = vpr_find(a0->offset & 0x7FFFFFFFu, &seq);
+    return h && !h->applied;
+}
+
 /* upload_tris_vp_raw's new segment: a lit copy if a record names its vertexes. dst: attribute 0's
  * copy, its offset in the vp_vb half (base); len: its bytes; src: the guest's; total: the
  * segment's bytes from its header. */
@@ -14022,6 +14122,7 @@ static void vpass_submit(u32 fi)
 /* With the segments: a new batch (after the parity flip), or a batch let go. */
 static void vpass_reset(void)
 {
+    s_cb_gen++;                 /* the constant slots: none of the last batch's to share */
     s_vpass.nseg = 0;
     s_vpass.lit_used = 0;
     s_vpass.rec_used = 0;
@@ -14083,6 +14184,11 @@ static void vs_report(void)
       fprintf(stderr, "; other strides:");
       for (int c = 0; c < 8; c++) if (s_vs.c_cullo[c]) fprintf(stderr, " %s %.0f", cn[c], s_vs.c_cullo[c] / sec);
       fprintf(stderr, "%c", 10); }
+    { static unsigned long long cw0, cs0, pd0, ps0;
+      fprintf(stderr, "[vtx-stats]   records per s: constant slots written %.0f, shared %.0f; prepass draws %.0f,"
+                      " their units shared %.0f%c", (s_cb_written - cw0) / sec, (s_cb_shared - cs0) / sec,
+              (s_pre_draws - pd0) / sec, (s_pre_shared - ps0) / sec, 10);
+      cw0 = s_cb_written; cs0 = s_cb_shared; pd0 = s_pre_draws; ps0 = s_pre_shared; }
     if (s_vpass.set)
         fprintf(stderr, "[vtx-stats]   vertex pass per s: %.0f segments (%.0f vertexes) on the GPU, %.0f"
                         " without a record (%.0f found written over, %.0f an older job's); on the CPU %.0f"
@@ -14809,7 +14915,9 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
         if (ix > hi) hi = ix;
     }
 #undef RAW_IX
-    if (!cont && hi - lo >= 4u * count + 256u) return 0;
+    /* A first batch spread much wider than its count goes to the ix path, but for one the vertex
+     * pass lights: there its block would be lit on the CPU. */
+    if (!cont && hi - lo >= 4u * count + 256u && !vpass_wants(state)) return 0;
 
     /* The bytes each enabled array can be read at, [start, end). */
     VPRawArr ar[16];
@@ -15299,6 +15407,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 rec_scissor(dr);
                 dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+                vp_cb_commit(dr, s_d3d.draw_count);
                 s_d3d.draw_count++;
             }
             return;
@@ -15416,6 +15525,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             rec_scissor(dr);
             dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+            vp_cb_commit(dr, s_d3d.draw_count);
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
             s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
@@ -15635,6 +15745,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         if (dr->raw) vp_record_raw_cb(s_d3d.draw_count, s_d3d.current_rsx_state);
+        vp_cb_commit(dr, s_d3d.draw_count);
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
         s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);

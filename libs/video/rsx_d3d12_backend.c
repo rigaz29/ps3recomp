@@ -258,12 +258,43 @@ typedef struct {
 /* An indexed run (upload_tris_vp_ix) may take the next batch; cleared with the records. */
 static int s_ix_run_valid;
 /* Raw-fetch segments, one per batch that needed its own copy; reset with the
- * records. hdr is the byte offset in vp_vb of the batch's 16 attribute bases. */
+ * records. hdr is the byte offset in vp_vb of the batch's 16 attribute bases;
+ * with lit set, the segment's draws read the vertex pass's copy, whose header
+ * is at lhdr in vp_lit (see "The vertex pass"). */
 #define VP_MAX_SEGS 16384
-typedef struct { u32 ib_first, count, hdr, lo, hi; } VPRawSeg;
+typedef struct { u32 ib_first, count, hdr, lo, hi, lhdr; int lit; } VPRawSeg;
 static VPRawSeg s_seg[VP_MAX_SEGS];
 static u32 s_seg_n;
 static int s_raw_run_valid;
+
+/* The vertex pass (phase 2b.1 of the God of War: Ascension port): see "The vertex pass" below. */
+#define VPT_SEGS 8192u                      /* a batch's lit segments: 32 bytes each in its table */
+#define VPT_SEGB (VPT_SEGS * 32u)
+#define VPT_HALF (VPT_SEGB + (2u << 20))   /* then the records */
+static struct {
+    const char* hlsl;
+    u32 stride, max_rec;
+    void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n);
+    volatile LONG set;
+    int state;                              /* 0 not built yet, 1 ready, -1 failed */
+    ID3D12RootSignature* rs;
+    ID3D12PipelineState* pso;
+    ID3D12Resource* lit;                    /* default heap: two halves of lit_half, by vp_parity */
+    ID3D12Resource* tab;                    /* upload: two halves of VPT_HALF */
+    u8* tab_mapped;
+    ID3D12CommandAllocator* alloc[FRAME_COUNT];
+    ID3D12GraphicsCommandList* cl;
+    u32 lit_half;
+    u8* rec_tmp;                            /* a record copied out for the CPU's pass */
+    /* this batch */
+    u32 nseg, lit_used, rec_used;
+    u32 last_key, last_rec;
+    LONG last_seq;
+    int last_ok;
+} s_vpass;
+static void vpass_submit(u32 fi);
+static void vpass_reset(void);
+static void vpass_check_read(void);
 
 /* Offscreen render target (render-to-texture). Persistent across frames --
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
@@ -8289,16 +8320,18 @@ static void vp_draw_raw(const D3D12DrawRecord* dr, int* ib_bound, int* raw_bound
         cl->lpVtbl->IASetIndexBuffer(cl, &ibv);
         *ib_bound = 1;
     }
-    if (!*raw_bound) {
-        cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 3,
-            s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb)
-            + (u64)s_d3d.vp_parity * MAX_VERTICES * 256);
-        *raw_bound = 1;
-    }
+    /* *raw_bound: 1 vp_vb is bound as the raw bytes (t8), 2 vp_lit (the vertex pass's copies) */
     for (u32 s = 0; s < dr->seg_n; s++) {
         const VPRawSeg* sg = &s_seg[dr->seg_first + s];
         if (!sg->count) continue;
-        cl->lpVtbl->SetGraphicsRoot32BitConstant(cl, 4, sg->hdr, 0);
+        const int want = sg->lit ? 2 : 1;
+        if (*raw_bound != want) {
+            cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 3, want == 2
+                ? s_vpass.lit->lpVtbl->GetGPUVirtualAddress(s_vpass.lit) + (u64)s_d3d.vp_parity * s_vpass.lit_half
+                : s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb) + (u64)s_d3d.vp_parity * MAX_VERTICES * 256);
+            *raw_bound = want;
+        }
+        cl->lpVtbl->SetGraphicsRoot32BitConstant(cl, 4, sg->lit ? sg->lhdr : sg->hdr, 0);
         cl->lpVtbl->DrawIndexedInstanced(cl, sg->count, 1, sg->ib_first, 0, 0);
     }
 }
@@ -11094,6 +11127,7 @@ static void rf_open(void)
       if (idle_wait || done0 < s_fence_last)
           wait_for_gpu();
       s_hl_gpuwait_s += perf_now() - t0;
+      vpass_check_read();     /* the last batch has run: its lit copies against the SPU's */
       /* RF_WAITLOG=1: every 50th open -- who opened the batch, how long after
        * the last submit, what the GPU had done by then, and the wait. */
       { static int on = -1; static long n;
@@ -12642,6 +12676,7 @@ static void render_frame(void)
         s_lock_valid = 1;
         s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
     }
+    vpass_submit(fi);      /* the vertex pass, executed before the batch's list */
     s_dbg_last_draws = s_d3d.draw_count;
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
@@ -12655,6 +12690,7 @@ static void render_frame(void)
     s_seg_n = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    vpass_reset();
     s_fpcb_used = 0;
     s_fpsnap_used = 0;     /* and their program snapshots */
     s_fpsnap_gen++;
@@ -13282,6 +13318,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     s_ix_run_valid = 0;
     s_raw_run_valid = 0;
     s_seg_n = 0;
+    vpass_reset();
     s_d3d.draw_count   = 0;
     s_d3d.vb_offset    = 0;
     s_d3d.vp_vb_offset = 0;
@@ -13448,6 +13485,9 @@ static struct {
      * the path taken (raw fetch, ix, the CPU's conversions), raw bytes copied, upload time */
     unsigned long long c_draws[2], c_refs[2], c_raw[2], c_ix[2], c_cpu[2], c_raw_bytes[2];
     long long c_t[2];
+    /* the vertex pass: segments lit on the GPU and their vertexes, segments of its stride in a ring
+     * with no record, CPU-lit copies and guest blocks, segments the buffers had no room for */
+    unsigned long long lit_segs, lit_verts, lit_miss, lit_cpu, lit_guest, lit_full, lit_lost, lit_stale;
 } s_vs;
 
 /* ---- Vertex rings a port names (God of War: Ascension's EDGE output rings) ----
@@ -13457,6 +13497,9 @@ static struct {
 static u32 s_vr_off[VR_MAX], s_vr_size[VR_MAX];
 static volatile LONG s_vr_n, s_vr_lock;
 static int s_vr_cls;                  /* the indexed draw being uploaded: 1 a ring's */
+/* per ring, the vertex pass's records: a word per 128 bytes (a ring's allocations are 128-byte
+ * blocks, each with one vertex array), its sequence << 32 | its IO offset */
+static volatile LONG64* s_vr_idx[VR_MAX];
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
 {
     if (!size) return;
@@ -13470,6 +13513,7 @@ void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
     if (!known && n < VR_MAX) {
         s_vr_off[n] = io_offset;
         s_vr_size[n] = size;
+        s_vr_idx[n] = (volatile LONG64*)calloc((size >> 7) + 1, sizeof(LONG64));
         MemoryBarrier();
         InterlockedExchange(&s_vr_n, n + 1);
         fprintf(stderr, "[vring] ring %ld: io 0x%08X, %u bytes\n", (long)n, io_offset, size);
@@ -13486,6 +13530,497 @@ static int vr_class(const rsx_state* st)
     for (LONG i = 0; i < n; i++)
         if (off - s_vr_off[i] < s_vr_size[i]) return 1;
     return 0;
+}
+
+/* ---- The vertex pass (phase 2b.1 of the God of War: Ascension port) ----
+ * A port registers a compute shader that rewrites a draw's raw copy on the GPU (EDGE's lighting:
+ * ids 27-30 of its 54-byte vertexes, from the position, normal and tangent, and a record of the
+ * job's lights), and publishes a record for the vertexes at an IO offset in a vertex ring.
+ *  - A record carries the first 16 bytes the job put out at its key: it is taken only while guest
+ *    memory holds them there (an older job's record at the same place in a ring is not). A publish
+ *    without a record clears the key.
+ *  - A raw segment whose attribute 0 lies at a published key (its copy whole vertexes of the
+ *    pass's stride) gets a lit copy in vp_lit, a default-heap buffer with a half per vp_parity: an
+ *    entry in the batch's table (the raw copy's header, the lit copy's header, the start of
+ *    attribute 0's copy from the header, its vertex count, the record's offset in the table, the
+ *    segment's bytes from the header), and the segment's draws read the lit copy. The pass copies
+ *    the whole segment, with the other arrays the draw has enabled (EDGE's draws keep some from
+ *    earlier draws), and rewrites attribute 0's.
+ *  - At the batch's end the pass runs, a group a segment, in a command list of its own executed
+ *    before the batch's: no barrier among the draws. vp_lit is a UAV there, and back in COMMON
+ *    (read by the draws through implicit promotion).
+ *  - Fallbacks, the port's C version of the pass: a draw that does not take the raw fetch (its
+ *    vertexes lit in guest memory, once a record), a full lit buffer or table, a shader that did
+ *    not build (the raw copy lit as it is made).
+ *  - A record marked applied (the port's check mode: the SPU lit the vertexes as well) is drawn as
+ *    the guest wrote it. VTX_LIT_CHECK=N compares every Nth of those segments' lit copies with the
+ *    guest's bytes, read back after the batch, for the vertexes the segment's first batch names
+ *    (a copy spans the batch's index range: the vertexes of culled triangles in it are lit only
+ *    here, the SPU's arrays keep what they held); VTX_LIT_DRAW=1 draws the lit copies instead.
+ * VTX_LIT_MB: the size of a vp_lit half (default 40). */
+#define VPR_POOL 8192u                 /* more than a ring set's jobs in flight */
+typedef struct { volatile LONG seq; u32 key, n, applied, bytes; volatile LONG done; u8 tag[16]; } vpr_head;
+static u8* s_vpr_pool;                 /* VPR_POOL slots: a head, then the record */
+static u32 s_vpr_slot;
+static volatile LONG s_vpr_seq;
+
+void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
+                               void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n))
+{
+    if (s_vpass.set || !hlsl || !stride || !max_record || max_record > 65536u) return;
+    s_vpr_slot = ((u32)sizeof(vpr_head) + max_record + 15u) & ~15u;
+    s_vpr_pool = (u8*)calloc(VPR_POOL, s_vpr_slot);
+    s_vpass.rec_tmp = (u8*)malloc(max_record);
+    if (!s_vpr_pool || !s_vpass.rec_tmp) return;
+    s_vpass.hlsl = hlsl;
+    s_vpass.stride = stride;
+    s_vpass.max_rec = max_record;
+    s_vpass.cpu = cpu;
+    MemoryBarrier();
+    InterlockedExchange(&s_vpass.set, 1);
+    fprintf(stderr, "[vtx-lit] vertex pass set: stride %u, records up to %u bytes%c", stride, max_record, 10);
+}
+
+/* From any thread (an SPU worker's job): the record for n vertexes at io; it replaces the one there
+ * before (the ring has been handed back for it). Not in a registered ring: dropped. */
+void rsx_d3d12_vertex_pass_publish(u32 io_offset, u32 n, const void* rec, u32 bytes, u32 applied,
+                                   const void* tag16)
+{
+    if (!s_vpass.set || bytes > s_vpass.max_rec) return;
+    const LONG nr = s_vr_n;
+    for (LONG r = 0; r < nr; r++) {
+        const u32 off = io_offset - s_vr_off[r];
+        if (off >= s_vr_size[r]) continue;
+        if (!s_vr_idx[r]) return;
+        if (!rec || !bytes || !tag16) {             /* no record: the key cleared */
+            InterlockedExchange64(&s_vr_idx[r][off >> 7], 0);
+            return;
+        }
+        LONG seq = InterlockedIncrement(&s_vpr_seq);
+        if (seq == 0) seq = InterlockedIncrement(&s_vpr_seq);
+        u8* sl = s_vpr_pool + (size_t)((u32)seq % VPR_POOL) * s_vpr_slot;
+        vpr_head* h = (vpr_head*)sl;
+        InterlockedExchange(&h->seq, 0);                /* being written */
+        h->key = io_offset; h->n = n; h->applied = applied; h->bytes = bytes;
+        memcpy(h->tag, tag16, 16);
+        InterlockedExchange(&h->done, 0);
+        memcpy(sl + sizeof(vpr_head), rec, bytes);
+        MemoryBarrier();
+        InterlockedExchange(&h->seq, seq);
+        InterlockedExchange64(&s_vr_idx[r][off >> 7], ((LONG64)(u32)seq << 32) | io_offset);
+        return;
+    }
+}
+
+/* The record published for io (the frame clock thread): its slot and sequence, or NULL. A slot
+ * may be written over VPR_POOL publishes later: copy it out, then see that seq still holds. */
+static vpr_head* vpr_find(u32 io, LONG* seq)
+{
+    if (!s_vpr_pool) return NULL;
+    const LONG nr = s_vr_n;
+    for (LONG r = 0; r < nr; r++) {
+        const u32 off = io - s_vr_off[r];
+        if (off >= s_vr_size[r]) continue;
+        if (!s_vr_idx[r]) return NULL;
+        const LONG64 e = s_vr_idx[r][off >> 7];
+        if ((u32)e != io) return NULL;
+        const LONG sq = (LONG)(e >> 32);
+        vpr_head* h = (vpr_head*)(s_vpr_pool + (size_t)((u32)sq % VPR_POOL) * s_vpr_slot);
+        if (h->seq != sq) { if (s_vs_on > 0) s_vs.lit_lost++; return NULL; }
+        {   /* the job's first bytes still there: not an older job's record */
+            extern uint8_t* vm_base;
+            extern u32 cellGcmResolveLocated(int local, u32 offset);
+            if (!vm_base || memcmp(vm_base + cellGcmResolveLocated(0, io), h->tag, 16) != 0) {
+                if (s_vs_on > 0) s_vs.lit_stale++;
+                return NULL;
+            }
+        }
+        *seq = sq;
+        return h;
+    }
+    return NULL;
+}
+/* the record out to dst; 0 if it was written over meanwhile */
+static int vpr_copy(const vpr_head* h, LONG seq, u8* dst)
+{
+    const u32 bytes = h->bytes;
+    if (bytes > s_vpass.max_rec) return 0;
+    memcpy(dst, (const u8*)h + sizeof(vpr_head), bytes);
+    MemoryBarrier();
+    return h->seq == seq;
+}
+
+static int vpass_check_n(void)
+{
+    static int n = -1;
+    if (n < 0) { const char* e = getenv("VTX_LIT_CHECK"); n = e ? atoi(e) : 0; if (n < 0) n = 0; }
+    return n;
+}
+static int vpass_draw_lit(void)
+{
+    static int d = -1;
+    if (d < 0) { const char* e = getenv("VTX_LIT_DRAW"); d = e && e[0] == '1'; }
+    return d;
+}
+
+/* The compute pipeline, the buffers and the command list, on first use (the frame clock thread). */
+static int vpass_build(void)
+{
+    if (s_vpass.state) return s_vpass.state > 0;
+    s_vpass.state = -1;
+    if (!s_vpass.hlsl || !s_d3d.device) return 0;
+    ID3D12Device* dev = s_d3d.device;
+    ID3DBlob *cs = NULL, *err = NULL, *sig = NULL;
+    HRESULT hr = D3DCompile(s_vpass.hlsl, strlen(s_vpass.hlsl), "vertex_pass", NULL, NULL, "main", "cs_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[vtx-lit] the vertex pass did not compile (0x%08lX): %s%c", hr,
+                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "", 10);
+        if (err) err->lpVtbl->Release(err);
+        return 0;
+    }
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    D3D12_ROOT_PARAMETER rp[4];
+    memset(rp, 0, sizeof rp);
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[0].Descriptor.ShaderRegister = 0;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[1].Descriptor.ShaderRegister = 1;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[2].Descriptor.ShaderRegister = 0;
+    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[3].Constants.ShaderRegister = 0; rp[3].Constants.Num32BitValues = 4;
+    for (int i = 0; i < 4; i++) rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 4;
+    rd.pParameters = rp;
+    hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (SUCCEEDED(hr))
+        hr = dev->lpVtbl->CreateRootSignature(dev, 0, sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
+                                              &IID_ID3D12RootSignature, (void**)&s_vpass.rs);
+    if (sig) sig->lpVtbl->Release(sig);
+    if (err) err->lpVtbl->Release(err);
+    if (SUCCEEDED(hr)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_vpass.rs;
+        pd.CS.pShaderBytecode = cs->lpVtbl->GetBufferPointer(cs);
+        pd.CS.BytecodeLength = cs->lpVtbl->GetBufferSize(cs);
+        hr = dev->lpVtbl->CreateComputePipelineState(dev, &pd, &IID_ID3D12PipelineState, (void**)&s_vpass.pso);
+    }
+    cs->lpVtbl->Release(cs);
+    if (FAILED(hr)) { fprintf(stderr, "[vtx-lit] the vertex pass's pipeline failed (0x%08lX)%c", hr, 10); return 0; }
+    { const char* e = getenv("VTX_LIT_MB"); u32 mb = e ? (u32)atoi(e) : 40u;
+      if (mb < 4) mb = 4;
+      if (mb > 512) mb = 512;
+      s_vpass.lit_half = mb << 20; }
+    D3D12_HEAP_PROPERTIES hp = {0};
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    bd.Width = 2ull * s_vpass.lit_half;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, NULL,
+                                              &IID_ID3D12Resource, (void**)&s_vpass.lit);
+    if (SUCCEEDED(hr)) {
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        bd.Width = 2ull * VPT_HALF;
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        hr = dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                  NULL, &IID_ID3D12Resource, (void**)&s_vpass.tab);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_RANGE nr0 = {0, 0};
+        hr = s_vpass.tab->lpVtbl->Map(s_vpass.tab, 0, &nr0, (void**)&s_vpass.tab_mapped);
+    }
+    for (int i = 0; SUCCEEDED(hr) && i < FRAME_COUNT; i++)
+        hr = dev->lpVtbl->CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
+                                                 (void**)&s_vpass.alloc[i]);
+    if (SUCCEEDED(hr))
+        hr = dev->lpVtbl->CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_vpass.alloc[0], NULL,
+                                            &IID_ID3D12GraphicsCommandList, (void**)&s_vpass.cl);
+    if (FAILED(hr)) { fprintf(stderr, "[vtx-lit] the vertex pass's buffers failed (0x%08lX)%c", hr, 10); return 0; }
+    s_vpass.cl->lpVtbl->Close(s_vpass.cl);
+    s_vpass.state = 1;
+    fprintf(stderr, "[vtx-lit] vertex pass ready: stride %u, vp_lit 2 x %u MB%c", s_vpass.stride,
+            s_vpass.lit_half >> 20, 10);
+    return 1;
+}
+
+/* The check (VTX_LIT_CHECK=N): sampled lit copies of applied records, with the guest's bytes. */
+#define VCK_MAX 64
+#define VCK_BYTES (4u << 20)
+static struct { u32 n, used, submitted; u32 off[VCK_MAX], len[VCK_MAX], at[VCK_MAX]; u8* spu[VCK_MAX]; u8* used_v[VCK_MAX]; } s_vck[2];
+static ID3D12Resource* s_vck_rb[2];
+static u32 s_vck_tick;
+static struct {
+    unsigned long long verts, skipped, units[5], nan;
+    double max27, maxh[3];
+    double wrel, wspu, wgpu;            /* the largest |d| / max(|SPU's|, 1) of ids 28-30, its values */
+    int wid;
+    long long t0;
+} s_vck_st;
+
+/* a segment to check: its lit copy at lit_off, the guest's bytes at src, and the vertexes its
+ * indexes name (ix: the guest's index array, n of them from first, 16 or 32 bits; lo the copy's
+ * first vertex) */
+static void vck_add(u32 lit_off, u32 len, u32 src, const u8* ix, int sixteen, u32 first, u32 n, u32 lo)
+{
+    extern uint8_t* vm_base;
+    const u32 par = s_d3d.vp_parity;
+    if (++s_vck_tick % (u32)vpass_check_n()) return;
+    if (s_vck[par].n >= VCK_MAX || s_vck[par].used + len > VCK_BYTES || !ix) return;
+    const u32 nv = len / 54u;
+    u8* cp = (u8*)malloc(len);
+    u8* uv = (u8*)calloc(nv ? nv : 1, 1);
+    if (!cp || !uv) { free(cp); free(uv); return; }
+    memcpy(cp, vm_base + src, len);
+    for (u32 k = first; k < first + n; k++) {
+        const u8* q = ix + (size_t)k * (sixteen ? 2u : 4u);
+        const u32 i = sixteen ? (((u32)q[0] << 8) | q[1])
+                              : (((u32)q[0] << 24) | ((u32)q[1] << 16) | ((u32)q[2] << 8) | q[3]);
+        if (i - lo < nv) uv[i - lo] = 1;
+    }
+    const u32 k = s_vck[par].n++;
+    s_vck[par].off[k] = lit_off; s_vck[par].len[k] = len; s_vck[par].at[k] = s_vck[par].used;
+    s_vck[par].spu[k] = cp;
+    s_vck[par].used_v[k] = uv;
+    s_vck[par].used += (len + 15u) & ~15u;
+}
+static void vck_free(u32 par)
+{
+    for (u32 k = 0; k < s_vck[par].n; k++) { free(s_vck[par].spu[k]); free(s_vck[par].used_v[k]); }
+    s_vck[par].n = s_vck[par].used = s_vck[par].submitted = 0;
+}
+static float vck_half(u32 h)
+{
+    const u32 e = (h >> 10) & 31u, m = h & 1023u;
+    const float v = e == 0 ? (float)m * (1.0f / 16777216.0f) : e == 31 ? 65536.0f * 4.0f
+                  : ldexpf(1.0f + (float)m / 1024.0f, (int)e - 15);
+    return (h & 0x8000u) ? -v : v;
+}
+static void vck_cmp(const u8* g, const u8* s, u32 len, const u8* used_v)
+{
+    for (u32 v = 0; v + 54 <= len; v += 54) {
+        if (!used_v[v / 54u]) { s_vck_st.skipped++; continue; }
+        s_vck_st.verts++;
+        for (int k = 0; k < 3; k++) {
+            const u8* a = g + v + 24 + 4 * k; const u8* b = s + v + 24 + 4 * k;
+            const u32 ua = ((u32)a[0] << 24) | ((u32)a[1] << 16) | ((u32)a[2] << 8) | a[3];
+            const u32 ub = ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | b[3];
+            float fa, fb; memcpy(&fa, &ua, 4); memcpy(&fb, &ub, 4);
+            const double d = fabs((double)fa - (double)fb);
+            if (!(d == d)) s_vck_st.nan++;
+            else if (d > s_vck_st.max27) s_vck_st.max27 = d;
+        }
+        for (int i = 0; i < 3; i++)
+            for (int k = 0; k < 3; k++) {
+                const u8* a = g + v + 36 + 6 * i + 2 * k; const u8* b = s + v + 36 + 6 * i + 2 * k;
+                const u32 ha = ((u32)a[0] << 8) | a[1], hb = ((u32)b[0] << 8) | b[1];
+                const u32 ma = ha & 0x7FFFu, mb = hb & 0x7FFFu;
+                const u32 du = ((ha ^ hb) & 0x8000u) ? ma + mb : (ma > mb ? ma - mb : mb - ma);
+                s_vck_st.units[du == 0 ? 0 : du == 1 ? 1 : du < 4 ? 2 : du < 16 ? 3 : 4]++;
+                const double fa = vck_half(ha), fb = vck_half(hb), d = fabs(fa - fb);
+                if (d > s_vck_st.maxh[i]) s_vck_st.maxh[i] = d;
+                const double rel = d / (fabs(fb) > 1.0 ? fabs(fb) : 1.0);
+                if (rel > s_vck_st.wrel) {
+                    s_vck_st.wrel = rel; s_vck_st.wspu = fb; s_vck_st.wgpu = fa; s_vck_st.wid = 28 + i;
+                }
+            }
+    }
+}
+static void vpass_check_read(void)
+{
+    const u32 par = s_d3d.vp_parity ^ 1u;    /* the batch that has just run */
+    if (!s_vck[par].n) return;
+    if (!s_vck[par].submitted || !s_vck_rb[par]) { vck_free(par); return; }
+    u8* m = NULL;
+    D3D12_RANGE rr = {0, s_vck[par].used};
+    if (SUCCEEDED(s_vck_rb[par]->lpVtbl->Map(s_vck_rb[par], 0, &rr, (void**)&m)) && m) {
+        for (u32 k = 0; k < s_vck[par].n; k++)
+            vck_cmp(m + s_vck[par].at[k], s_vck[par].spu[k], s_vck[par].len[k], s_vck[par].used_v[k]);
+        D3D12_RANGE wr = {0, 0};
+        s_vck_rb[par]->lpVtbl->Unmap(s_vck_rb[par], 0, &wr);
+    }
+    vck_free(par);
+    const double now = perf_now();
+    if (!s_vck_st.t0) s_vck_st.t0 = (long long)now;
+    if (now - (double)s_vck_st.t0 >= 5.0 && s_vck_st.verts) {
+        const double n = (double)s_vck_st.verts * 9.0;
+        fprintf(stderr, "[vtx-lit] check: %llu vertexes (%llu no index names); id 27 max |d| %.3g%s; ids 28-30 as F16:"
+                        " %.2f%% the same, %.2f%% 1 unit, %.2f%% 2-3, %.3f%% 4-15, %.3f%% 16 or more; max |d| %.3g %.3g %.3g;"
+                        " worst against max(|value|, 1): %.3g (id %d, SPU %.5g, GPU %.5g)%c",
+                s_vck_st.verts, s_vck_st.skipped, s_vck_st.max27, s_vck_st.nan ? " (NaN seen)" : "",
+                100.0 * s_vck_st.units[0] / n, 100.0 * s_vck_st.units[1] / n, 100.0 * s_vck_st.units[2] / n,
+                100.0 * s_vck_st.units[3] / n, 100.0 * s_vck_st.units[4] / n,
+                s_vck_st.maxh[0], s_vck_st.maxh[1], s_vck_st.maxh[2],
+                s_vck_st.wrel, s_vck_st.wid, s_vck_st.wspu, s_vck_st.wgpu, 10);
+        memset(&s_vck_st, 0, sizeof s_vck_st);
+        s_vck_st.t0 = (long long)now;
+    }
+}
+
+/* The CPU's pass over a raw copy as it is made (no lit copy to be had for it). */
+static void vpass_cpu_copy(const vpr_head* h, LONG seq, u8* dst, u32 src, u32 nv)
+{
+    extern uint8_t* vm_base;
+    if (!s_vpass.cpu || !vpr_copy(h, seq, s_vpass.rec_tmp)) return;
+    s_vpass.cpu(s_vpass.rec_tmp, vm_base + src, dst, nv);
+    if (s_vs_on > 0) s_vs.lit_cpu++;
+}
+
+/* upload_tris_vp_raw's new segment: a lit copy if a record names its vertexes. dst: attribute 0's
+ * copy, its offset in the vp_vb half (base); len: its bytes; src: the guest's; total: the
+ * segment's bytes from its header. */
+static void vpass_segment(const rsx_state* st, VPRawSeg* sg, u32 dst, u8* base, u32 len, u32 src, u32 total,
+                          const u8* ix, int sixteen, u32 first, u32 n)
+{
+    sg->lit = 0;
+    sg->lhdr = 0;
+    const rsx_vertex_attrib* a0 = &st->vertex_attribs[0];
+    if (!(a0->offset & 0x80000000u) || a0->stride != s_vpass.stride) return;
+    LONG seq = 0;
+    const vpr_head* h = vpr_find(a0->offset & 0x7FFFFFFFu, &seq);
+    if (!h) { if (s_vs_on > 0 && s_vr_cls) s_vs.lit_miss++; return; }
+    const u32 nv = sg->hi - sg->lo + 1;
+    if (len != nv * s_vpass.stride || dst - sg->hdr + len > total) return;
+    const int applied = h->applied != 0;
+    if (applied && !vpass_check_n() && !vpass_draw_lit()) return;
+    if (!vpass_build()) { if (!applied) vpass_cpu_copy(h, seq, base + dst, src, nv); return; }
+    const u32 par = s_d3d.vp_parity;
+    u8* tab = s_vpass.tab_mapped + (size_t)par * VPT_HALF;
+    u32 rec_off;
+    if (s_vpass.last_ok && s_vpass.last_key == h->key && s_vpass.last_seq == seq) {
+        rec_off = s_vpass.last_rec;
+    } else {
+        rec_off = VPT_SEGB + ((s_vpass.rec_used + 15u) & ~15u);
+        if (rec_off + h->bytes > VPT_HALF || s_vpass.nseg >= VPT_SEGS) {
+            if (s_vs_on > 0) s_vs.lit_full++;
+            if (!applied) vpass_cpu_copy(h, seq, base + dst, src, nv);
+            return;
+        }
+        if (!vpr_copy(h, seq, tab + rec_off)) return;
+        s_vpass.rec_used = rec_off - VPT_SEGB + h->bytes;
+        s_vpass.last_key = h->key; s_vpass.last_seq = seq; s_vpass.last_rec = rec_off; s_vpass.last_ok = 1;
+    }
+    /* the lit copy: the segment as it is laid out from its header, 64 bytes over for the last
+     * pair's store and the last word */
+    const u32 data = dst - sg->hdr;
+    const u32 lhdr = (s_vpass.lit_used + 15u) & ~15u;
+    const u32 need = total + 64u;
+    if (s_vpass.nseg >= VPT_SEGS || (u64)lhdr + need > s_vpass.lit_half) {
+        if (s_vs_on > 0) s_vs.lit_full++;
+        if (!applied) vpass_cpu_copy(h, seq, base + dst, src, nv);
+        return;
+    }
+    u32* e = (u32*)(tab + (size_t)s_vpass.nseg * 32u);
+    e[0] = sg->hdr; e[1] = lhdr; e[2] = data; e[3] = nv; e[4] = rec_off; e[5] = total; e[6] = 0; e[7] = 0;
+    s_vpass.nseg++;
+    s_vpass.lit_used = lhdr + need;
+    sg->lhdr = lhdr;
+    sg->lit = !applied || vpass_draw_lit();
+    if (s_vs_on > 0) { s_vs.lit_segs++; s_vs.lit_verts += nv; }
+    if (applied && vpass_check_n()) vck_add(lhdr + data, len, src, ix, sixteen, first, n, sg->lo);
+}
+
+/* A draw that did not take the raw fetch: its record's vertexes lit in guest memory, once. */
+static void vpass_guest(const rsx_state* st)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    if (!st || !s_vpass.cpu) return;
+    const rsx_vertex_attrib* a0 = &st->vertex_attribs[0];
+    if (!a0->enabled || !(a0->offset & 0x80000000u) || a0->stride != s_vpass.stride) return;
+    LONG seq = 0;
+    vpr_head* h = vpr_find(a0->offset & 0x7FFFFFFFu, &seq);
+    if (!h || h->applied || h->done) return;
+    const u32 key = h->key, n = h->n, len = n * s_vpass.stride;
+    if (!len) return;
+    const u32 ea = cellGcmResolveLocated(0, key);
+    if (cellGcmResolveLocated(0, key + len - 1) - ea != len - 1) return;
+    if (!vpr_copy(h, seq, s_vpass.rec_tmp)) return;
+    if (InterlockedCompareExchange(&h->done, 1, 0) != 0) return;
+    s_vpass.cpu(s_vpass.rec_tmp, vm_base + ea, vm_base + ea, n);
+    if (s_vs_on > 0) s_vs.lit_guest++;
+}
+
+static void vpass_barrier(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
+{
+    D3D12_RESOURCE_BARRIER br = {0};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br.Transition.pResource = s_vpass.lit;
+    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    br.Transition.StateBefore = a;
+    br.Transition.StateAfter = b;
+    cl->lpVtbl->ResourceBarrier(cl, 1, &br);
+}
+
+/* The batch's pass, before its list is executed (render_frame; the batch's parity still set). */
+static void vpass_submit(u32 fi)
+{
+    if (!s_vpass.nseg || s_vpass.state <= 0) return;
+    const u32 par = s_d3d.vp_parity;
+    ID3D12GraphicsCommandList* cl = s_vpass.cl;
+    if (FAILED(s_vpass.alloc[fi]->lpVtbl->Reset(s_vpass.alloc[fi])) ||
+        FAILED(cl->lpVtbl->Reset(cl, s_vpass.alloc[fi], s_vpass.pso))) {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[vtx-lit] the pass's command list did not reset%c", 10);
+        return;
+    }
+    cl->lpVtbl->SetComputeRootSignature(cl, s_vpass.rs);
+    vpass_barrier(cl, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->lpVtbl->SetComputeRootShaderResourceView(cl, 0,
+        s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb) + (u64)par * MAX_VERTICES * 256);
+    cl->lpVtbl->SetComputeRootShaderResourceView(cl, 1,
+        s_vpass.tab->lpVtbl->GetGPUVirtualAddress(s_vpass.tab) + (u64)par * VPT_HALF);
+    cl->lpVtbl->SetComputeRootUnorderedAccessView(cl, 2,
+        s_vpass.lit->lpVtbl->GetGPUVirtualAddress(s_vpass.lit) + (u64)par * s_vpass.lit_half);
+    for (u32 b0 = 0; b0 < s_vpass.nseg; b0 += 65535u) {
+        cl->lpVtbl->SetComputeRoot32BitConstant(cl, 3, b0, 0);
+        const u32 n = s_vpass.nseg - b0 < 65535u ? s_vpass.nseg - b0 : 65535u;
+        cl->lpVtbl->Dispatch(cl, n, 1, 1);
+    }
+    if (s_vck[par].n) {
+        if (!s_vck_rb[par]) {
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {0};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = VCK_BYTES; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_vck_rb[par]);
+        }
+        if (s_vck_rb[par]) {
+            vpass_barrier(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            for (u32 k = 0; k < s_vck[par].n; k++)
+                cl->lpVtbl->CopyBufferRegion(cl, s_vck_rb[par], s_vck[par].at[k], s_vpass.lit,
+                                             (u64)par * s_vpass.lit_half + s_vck[par].off[k], s_vck[par].len[k]);
+            vpass_barrier(cl, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            s_vck[par].submitted = 1;
+        } else {
+            vpass_barrier(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        }
+    } else {
+        vpass_barrier(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (FAILED(cl->lpVtbl->Close(cl))) {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[vtx-lit] the pass's command list did not close%c", 10);
+        return;
+    }
+    ID3D12CommandList* lists[] = { (ID3D12CommandList*)cl };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+}
+
+/* With the segments: a new batch (after the parity flip), or a batch let go. */
+static void vpass_reset(void)
+{
+    s_vpass.nseg = 0;
+    s_vpass.lit_used = 0;
+    s_vpass.rec_used = 0;
+    s_vpass.last_ok = 0;
+    const u32 par = s_d3d.vp_parity;
+    if (s_vck[par].n && !s_vck[par].submitted) vck_free(par);
 }
 static u32* s_vs_stamp;
 static u32 s_vs_gen;
@@ -13535,6 +14070,12 @@ static void vs_report(void)
                 k ? "vertex-ring" : "other", s_vs.c_draws[k] / sec, s_vs.c_raw[k] / sec, s_vs.c_ix[k] / sec,
                 s_vs.c_cpu[k] / sec, s_vs.c_refs[k] / sec, s_vs.c_raw_bytes[k] / sec / 1048576.0,
                 1000.0 * (double)s_vs.c_t[k] / (double)f.QuadPart / sec, 10);
+    if (s_vpass.set)
+        fprintf(stderr, "[vtx-stats]   vertex pass per s: %.0f segments (%.0f vertexes) on the GPU, %.0f"
+                        " without a record (%.0f found written over, %.0f an older job's); on the CPU %.0f"
+                        " copies, %.0f guest blocks; %.0f with no room%c",
+                s_vs.lit_segs / sec, s_vs.lit_verts / sec, s_vs.lit_miss / sec, s_vs.lit_lost / sec,
+                s_vs.lit_stale / sec, s_vs.lit_cpu / sec, s_vs.lit_guest / sec, s_vs.lit_full / sec, 10);
     memset(&s_vs, 0, sizeof s_vs);
     s_vs.t0 = now;
 }
@@ -14314,6 +14855,14 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
     sg->count    = count + rem;
     sg->hdr      = (u32)hdr;
     sg->lo = lo; sg->hi = hi;
+    sg->lit = 0; sg->lhdr = 0;
+    if (s_vpass.set) {          /* the vertex pass: a lit copy, if a record names these vertexes */
+        int g0 = -1;
+        for (int j = 0; j < na; j++) if (ar[j].slot == 0) g0 = (int)ar[j].grp;
+        if (g0 >= 0)
+            vpass_segment(state, sg, (u32)gr[g0].dst, base, (u32)(gr[g0].end - gr[g0].start), gr[g0].src,
+                          (u32)(at - hdr), ip, sixteen, first - rem, count + rem);
+    }
     s_d3d.vp_ib_offset += count;
     s_raw_run_valid = 1;
     if (s_vs_on > 0) { s_vs.raw_segs++; s_vs.raw_bytes += at - hdr; s_vs.c_raw_bytes[s_vr_cls] += at - hdr; }
@@ -14928,6 +15477,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             raw_used = emitted != 0;
         }
     }
+    /* the vertex pass's record, on another path: lit in guest memory, once */
+    if (!raw_used && s_vpass.set) vpass_guest(s_d3d.current_rsx_state);
     if (!raw_used && primitive == RSX_PRIMITIVE_TRIANGLES && ix_on()) {
         ix_cont = ix_can_continue(first);
         emitted = upload_tris_vp_ix(s_d3d.current_rsx_state, first, count, ix_cont);
@@ -15682,5 +16233,11 @@ int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 void rsx_d3d12_backend_record_ahead(void) {}
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size) { (void)io_offset; (void)size; }
+void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
+                               void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n))
+{ (void)hlsl; (void)stride; (void)max_record; (void)cpu; }
+void rsx_d3d12_vertex_pass_publish(u32 io_offset, u32 n, const void* rec, u32 bytes, u32 applied,
+                                   const void* tag16)
+{ (void)io_offset; (void)n; (void)rec; (void)bytes; (void)applied; (void)tag16; }
 
 #endif /* _WIN32 */

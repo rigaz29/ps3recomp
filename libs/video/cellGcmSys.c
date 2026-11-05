@@ -392,6 +392,19 @@ void (*cellGcm_zpass_observer)(int op, u32 a, u32 b);   /* 0 clear; 1 report (va
 static u32 s_zp_ea[ZP_N], s_zp_seq[ZP_N];   /* a report address and its latest report's number */
 static u32 s_zp_tslo[ZP_N];                 /* the time stamp's low word the walker wrote with it */
 static u32 s_zp_next;
+/* The walker writes a report (its number, then the guest's words) while the
+ * D3D12 backend's render thread (RSX_RENDER_THREAD) may be handing a count
+ * back: a count checked against the old report and written after the new
+ * one would stand as the new report's. One at a time. */
+#ifdef _WIN32
+static volatile LONG s_zp_lock;
+#define ZP_LOCK()   do { while (InterlockedCompareExchange(&s_zp_lock, 1, 0)) YieldProcessor(); } while (0)
+#define ZP_UNLOCK() InterlockedExchange(&s_zp_lock, 0)
+#else
+static volatile int s_zp_lock;
+#define ZP_LOCK()   do { while (__atomic_exchange_n(&s_zp_lock, 1, __ATOMIC_ACQUIRE)) {} } while (0)
+#define ZP_UNLOCK() __atomic_store_n(&s_zp_lock, 0, __ATOMIC_RELEASE)
+#endif
 /* GCM_ZPASS_TRACE=<from_ms>:<count>: from <from_ms> after the start, the next
  * <count> events of the ZPASS reports, with the time and the walker's flip
  * count: W the walker writes a report at GET_REPORT (the value it writes),
@@ -480,6 +493,7 @@ static u32 gcm_zp_report(u32 value_ea, u32 ts_lo)
 
 void cellGcm_zpass_result(u32 value_ea, u32 count, u32 seq)
 {
+    ZP_LOCK();
     const u32* s = gcm_zp_slot(value_ea, 0);
     const int current = s && *s == seq;
     /* The walker wrote the time stamp (its low word just before the value)
@@ -493,8 +507,8 @@ void cellGcm_zpass_result(u32 value_ea, u32 count, u32 seq)
                 ps3_ms_now(), s_flip_request_count, value_ea, count, vm_read32(value_ea),
                 !current ? " (a later report took it)" : !intact ? " (the title has taken it)" : "");
     }
-    if (!intact) return;
-    vm_write32(value_ea, count);
+    if (intact) vm_write32(value_ea, count);
+    ZP_UNLOCK();
 }
 
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
@@ -2603,6 +2617,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
             const u32 rea = gcm_io2ea(off);
             if (rea) {
                 const int zp = (v >> 24) == 1u && cellGcm_zpass_observer;
+                if (zp) ZP_LOCK();   /* until the report's words are written */
                 const u32 zseq = zp ? gcm_zp_report(rea + 8u, (u32)ts) : 0u;
                 if (zp) {
                     zt_init_observer();
@@ -2621,6 +2636,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
                 vm_write32(rea + 4u, (u32)ts);
                 vm_write32(rea + 8u, val);
                 vm_write32(rea + 12u, 0u);
+                if (zp) ZP_UNLOCK();
                 if (zp) cellGcm_zpass_observer(1, rea + 8u, zseq);
                 if (gcm_park_dump_ms()) {
                     extern unsigned long long ps3_ms_now(void);

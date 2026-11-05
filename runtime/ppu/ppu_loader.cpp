@@ -1859,6 +1859,19 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
  * stores (vm_write*_inl) likewise for the store diagnostics. */
 extern "C" int vm_inline_ok = 0;
 extern "C" int vm_inline_st_ok = 0;
+
+/* PPU_MM_LEAN's copy of the memory model (ppu_mm in ppu_recomp.h). All zero until ppu_mm_fix: every
+ * access out of line. The port calls it once the guest's memory is mapped, before the guest runs. */
+extern "C" struct { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } g_ppu_mm = { 0, 0, 0, 0 };
+extern "C" void ppu_mm_fix(void)
+{
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    const int64_t span = hi > 0x10000u ? (int64_t)(hi - 0x10000u) : 0;
+    g_ppu_mm.vb = vm_base;
+    g_ppu_mm.ld_span = vm_inline_ok ? span : 0;
+    g_ppu_mm.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
+    g_ppu_mm.poll = ppu_hle_inject_base + 0x2008u;
+}
 static struct VmInlineInit {
     VmInlineInit() {
         static const char* const vars[] = {

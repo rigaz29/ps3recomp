@@ -190,8 +190,25 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
  * mapping, and a span of 0 while a diagnostic is armed. An access then takes
  * one compare. The range is the old checks' or narrower. The one address
  * they also turned away, the gcm ref-poll word, is only special to vm_read32,
- * so only the 32-bit load still tests it. */
+ * so only the 32-bit load still tests it.
+ *
+ * PPU_MM_LEAN (a port's choice): the copy is made once, by ppu_mm_fix, before the guest runs: taking
+ * it was ~20 instructions at every function's entry. Until then it is all zero, a span of 0: every
+ * access goes out of line, which is always right. A store does not look at the store watches, so
+ * they are not for such a build. An access is one instruction at any alignment: an aligned one is
+ * as atomic as before, and the branch that told the two apart is gone. */
 typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+#ifdef PPU_MM_LEAN
+#ifdef __cplusplus
+extern "C" ppu_mm g_ppu_mm;
+#else
+extern ppu_mm g_ppu_mm;
+#endif
+typedef uint16_t vm_u16u __attribute__((aligned(1)));
+typedef uint32_t vm_u32u __attribute__((aligned(1)));
+typedef uint64_t vm_u64u __attribute__((aligned(1)));
+static inline ppu_mm ppu_mm_take(void) { return g_ppu_mm; }
+#else
 static inline ppu_mm ppu_mm_take(void)
 {
     const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
@@ -203,6 +220,7 @@ static inline ppu_mm ppu_mm_take(void)
     m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
     return m;
 }
+#endif
 /* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
  * subtraction wraps past any span. Signed, so span - n is computed once per
  * function and a span of 0 still turns everything away. */
@@ -216,9 +234,13 @@ static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
+#ifdef PPU_MM_LEAN
+    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1)) return 0;
+#else
     if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
         __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
         return 0;
+#endif
     const unsigned char* bits = g_spu_coh_bits;
     if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
     return 1;
@@ -233,30 +255,45 @@ static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
+#ifdef PPU_MM_LEAN
+        return __builtin_bswap16(*(const volatile vm_u16u*)(m->vb + ea));
+#else
         uint16_t v;
         if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 2);
-        return __builtin_bswap16(v); }
+        return __builtin_bswap16(v);
+#endif
+    }
     return vm_read16(a);
 }
 static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
+#ifdef PPU_MM_LEAN
+        return __builtin_bswap32(*(const volatile vm_u32u*)(m->vb + ea));
+#else
         uint32_t v;
         if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 4);
-        return __builtin_bswap32(v); }
+        return __builtin_bswap32(v);
+#endif
+    }
     return vm_read32(a);
 }
 static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_ok(m, ea, 8), 1)) {   /* aligned: single-copy atomic, as on Cell */
+#ifdef PPU_MM_LEAN
+        return __builtin_bswap64(*(const volatile vm_u64u*)(m->vb + ea));
+#else
         uint64_t v;
         if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 8);
-        return __builtin_bswap64(v); }
+        return __builtin_bswap64(v);
+#endif
+    }
     return vm_read64(a);
 }
 static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
@@ -269,9 +306,13 @@ static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_st_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
+#ifdef PPU_MM_LEAN
+        *(volatile vm_u16u*)(m->vb + ea) = __builtin_bswap16(v);
+#else
         const uint16_t be = __builtin_bswap16(v);
         if (!(ea & 1u)) __atomic_store_n((uint16_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 2);
+#endif
         return; }
     vm_write16(a, v);
 }
@@ -279,9 +320,13 @@ static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
+#ifdef PPU_MM_LEAN
+        *(volatile vm_u32u*)(m->vb + ea) = __builtin_bswap32(v);
+#else
         const uint32_t be = __builtin_bswap32(v);
         if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 4);
+#endif
         return; }
     vm_write32(a, v);
 }
@@ -289,9 +334,13 @@ static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_mm_st_ok(m, ea, 8), 1)) {
+#ifdef PPU_MM_LEAN
+        *(volatile vm_u64u*)(m->vb + ea) = __builtin_bswap64(v);
+#else
         const uint64_t be = __builtin_bswap64(v);
         if (!(ea & 7u)) __atomic_store_n((uint64_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 8);
+#endif
         return; }
     vm_write64(a, v);
 }

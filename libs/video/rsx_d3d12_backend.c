@@ -16315,8 +16315,8 @@ static void rf_ahead(u32 upto, int wait_gpu)
  *
  * Status (2026-11-05, God of War: Ascension's gate): the walk thread falls
  * from ~73% of a core to ~41%, the render thread takes ~34%, and the frame
- * rate falls ~3% (20.87 -> 20.18 flips/s, mode 2, two runs each): the PPU
- * main thread (~94%) and the SPU workers set the frame, not this thread.
+ * rate falls ~3% (20.87 -> 20.18 flips/s, mode 2, two runs each): the SPU
+ * workers set the frame, not this thread.
  * Mode 1 put the GPU in a hang (DXGI_ERROR_DEVICE_HUNG) in two of four runs,
  * after ~2,000 and ~4,000 frames; not found yet. Modes 2 and 3 did not, in
  * four and two runs. Kept here for when the frame clock thread binds. */

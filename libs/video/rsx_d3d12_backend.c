@@ -708,6 +708,16 @@ typedef struct {
 
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
+/* RSX_RENDER_THREAD: see "The render thread". 0 off; 1 the walk goes on from
+ * render_frame's reset; 2 from the end of the frame, its present included. */
+static int s_rt_mode;
+static void rt_start(void);
+static void rt_stop(void);
+static void rt_publish(void);
+static void rt_released(void);
+static void rt_render(int present, int full);
+static void rt_excl_begin(void);
+static void rt_excl_end(void);
 static u32 s_dbg_last_draws = 0;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
@@ -3228,6 +3238,7 @@ static int ovs_group(HANDLE h)
     if (!strcmp(n, "ppu main")) return 1;
     if (!strncmp(n, "spurs", 5) || !strncmp(n, "spu ", 4)) return 2;
     if (!strcmp(n, "frame clock")) return 3;
+    if (!strcmp(n, "rsx render")) return 4;
     return 0;
 }
 
@@ -3254,7 +3265,7 @@ static DWORD WINAPI ovs_sampler(LPVOID arg)
     ULONGLONG proc0 = ovs_ft64(k) + ovs_ft64(u), wall0 = GetTickCount64();
     for (;; tick++) {
         Sleep(500);
-        ULONGLONG d[4] = { 0, 0, 0, 0 };
+        ULONGLONG d[5] = { 0, 0, 0, 0, 0 };   /* by ovs_group: 4 is the render thread */
         /* the threads already known: their time since the last tick; one gone is dropped */
         for (int j = 0; j < n; ) {
             if (GetThreadTimes(th_h[j], &c, &e, &k, &u) &&
@@ -3299,7 +3310,8 @@ static DWORD WINAPI ovs_sampler(LPVOID arg)
         const double win = (double)(wall - wall0) * 1e4;   /* 100 ns units */
         if (win > 0) {
             const double pct[4] = { (double)(proc - proc0) * 100.0 / (win * ncpu), (double)d[1] * 100.0 / win,
-                                    (double)d[2] * 100.0 / (win * 6.0), (double)d[3] * 100.0 / win };
+                                    (double)d[2] * 100.0 / (win * 6.0),
+                                    (double)(d[3] > d[4] ? d[3] : d[4]) * 100.0 / win };   /* the busier RSX thread */
             for (int i = 0; i < 4; i++)
                 InterlockedExchange(&s_ovs_pct[i], (LONG)((pct[i] < 0 ? 0 : pct[i] > 100 ? 100 : pct[i]) * 10.0 + 0.5));
         }
@@ -5299,7 +5311,9 @@ static int vp_get_vs(const rsx_state* st)
     if (!s_d3d.vp_ready && st && st->vp_ucode_bytes >= 16) {
         const rsx_state* prev = s_d3d.current_rsx_state;
         s_d3d.current_rsx_state = st;
+        rt_excl_begin();   /* RSX_RENDER_THREAD: not while the render thread records */
         compile_vp();
+        rt_excl_end();
         s_d3d.current_rsx_state = prev;
     }
     return slot;
@@ -5382,10 +5396,8 @@ static ID3DBlob* vp_vs_ready(VPVSEntry* e)
     return e->vs;
 }
 
-static ID3DBlob* vp_vs_raw(int vs_idx)
+static ID3DBlob* vp_vs_raw_locked(VPVSEntry* e)
 {
-    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
-    VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
     if (e->vs_raw || e->raw_failed || !e->hlsl) return e->vs_raw;
     /* A worker is building it: until then the draw takes the indexed path,
      * which needs no raw variant. */
@@ -5489,6 +5501,23 @@ static ID3DBlob* vp_vs_raw(int vs_idx)
     e->vs_raw = vb;
     e->raw_failed = 0;
     return vb;
+}
+
+/* The walk asks for an entry's raw-fetch variant when it records a draw, the
+ * render thread (RSX_RENDER_THREAD) when it builds the draw's pipeline: the
+ * variant's build is one at a time. Once built it stays until the entry is
+ * replaced, which no draw of this frame or the last can see (vp_get_vs). */
+static SRWLOCK s_vs_lock = SRWLOCK_INIT;
+static ID3DBlob* vp_vs_raw(int vs_idx)
+{
+    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
+    VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
+    ID3DBlob* r = e->vs_raw;
+    if (r) return r;
+    AcquireSRWLockExclusive(&s_vs_lock);
+    r = vp_vs_raw_locked(e);
+    ReleaseSRWLockExclusive(&s_vs_lock);
+    return r;
 }
 
 /* --- Guest blend state -> packed PSO key ----------------------------------
@@ -11238,7 +11267,11 @@ static void rf_open(void)
      * added after frame 1 sampling stale texels -> torn text. The backend is
      * synchronous (wait_for_gpu each frame), so recreating the resource per
      * dirty frame is safe. */
-    if (s_d3d.tex_bound && (!s_d3d.tex_ready || s_d3d.tex_dirty) && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
+    /* The legacy atlas, for the legacy records only. Not when the render
+     * thread opens a batch ahead (RSX_RENDER_THREAD): the walk is binding its
+     * textures meanwhile, and a batch recorded ahead has no legacy records. */
+    if (!(s_rt_mode > 0 && s_rf_open_ahead) &&
+        s_d3d.tex_bound && (!s_d3d.tex_ready || s_d3d.tex_dirty) && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
         extern uint8_t* vm_base;
         u32 w = s_d3d.tex_w, h = s_d3d.tex_h;
         u32 pitch = (w + 255) & ~255u;   /* D3D12 requires 256-byte row pitch */
@@ -12787,6 +12820,7 @@ static void render_frame(void)
     s_fpcb_used = 0;
     s_fpsnap_used = 0;     /* and their program snapshots */
     s_fpsnap_gen++;
+    if (s_rt_mode > 0) rt_released();   /* RSX_RENDER_THREAD: the walk may go on */
 
     /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
      * into a readback buffer this frame and writes rt_save.bmp (half-float
@@ -13399,7 +13433,8 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
                    s_d3d.draw_count);
-        render_frame();
+        if (s_rt_mode > 0) rt_render(1, 1);   /* RSX_RENDER_THREAD: the walk resets the batch below */
+        else render_frame();
         s_clear_presents++;
         s_last_clear_presented_flip = s_last_clear_boundary_flip;
     }
@@ -15310,6 +15345,7 @@ static void surf_dbg(const rsx_state* st)
 
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
+    if (s_rt_mode > 0) rt_publish();   /* RSX_RENDER_THREAD: the records before the last are done */
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
@@ -15566,6 +15602,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
 {
+    if (s_rt_mode > 0) rt_publish();   /* RSX_RENDER_THREAD: the records before the last are done */
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
@@ -16108,6 +16145,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();
+    rt_start();
 
     printf("[D3D12] Backend ready: %ux%u\n", width, height);
     return 0;
@@ -16116,6 +16154,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 void rsx_d3d12_backend_shutdown(void)
 {
     if (!s_d3d.initialized) return;
+    rt_stop();
 
     wait_for_gpu();
     sj_stop();   /* a worker may be creating a pipeline on the device */
@@ -16202,23 +16241,18 @@ static int rf_ahead_on(void)
     return v;
 }
 
-/* Record what the batch holds so far, between drain passes. A pass that
- * catches only a few new records is left for the next one. */
+/* Record the batch's records before `upto` ahead of its end. A pass that
+ * catches only a few new records is left for the next one. wait_gpu: open the
+ * batch while the GPU still has the last one, rf_open waiting for it (the
+ * render thread); the drain leaves it to its next pass rather than stall. */
 #define RF_AHEAD_MIN 16
-void rsx_d3d12_backend_record_ahead(void)
+static void rf_ahead(u32 upto, int wait_gpu)
 {
-    if (s_d3d.initialized) { zq_poll(); mwb_poll(); }   /* ZPASS counts and main-memory surfaces of a batch the GPU has finished */
-    if (!s_d3d.initialized || !rf_ahead_on()) return;
-    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
-    if (n < 2) return;
-    const u32 upto = n - 1;            /* the last record may still be extended */
     if (!s_rf.open) {
         if (upto < RF_AHEAD_MIN || !s_d3d.vp_ready) return;
         for (u32 i = 0; i < upto; i++)
             if (!s_d3d.draws[i].is_vp) return;    /* legacy records: in one go */
-        /* rf_open waits for the GPU; leave it to the next pass until the
-         * previous batch has finished, rather than stall the drain here. */
-        if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) + 1 <
+        if (!wait_gpu && s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) + 1 <
             s_d3d.fence_values[s_d3d.frame_index])
             return;
         s_rf_open_ahead = 1;
@@ -16237,8 +16271,237 @@ void rsx_d3d12_backend_record_ahead(void)
     if (vupto > s_rf.done) s_rf.done = rf_vp_draws(s_rf.done, vupto, 1);
 }
 
+/* ---------------------------------------------------------------------------
+ * The render thread
+ * -----------------------------------------------------------------------*/
+/* RSX_RENDER_THREAD=1: the batch's recording, its submission and the presents
+ * on a thread of their own, "rsx render", while the frame clock thread walks
+ * the FIFO and captures the draws (their records and uploads).
+ * - The walk publishes the records it is done with, all but the last (the next
+ *   batch of indexes may still extend it, record-ahead's rule), at each draw
+ *   and after each drain pass; the render thread records them as record-ahead
+ *   did between drain passes.
+ * - A present, or a render at a display clear, is handed to the render thread
+ *   while the walk waits. The batch's state (records, segments, upload offsets,
+ *   the parity) is not doubled: the walk goes on once render_frame has reset
+ *   it, while the render thread submits and presents. RSX_RENDER_THREAD=2, a
+ *   render at a clear and a capture (which reads the records after the reset)
+ *   wait for all of it.
+ * - What else both touch: the vertex programs' entries (s_vs_lock), the base
+ *   pipeline's build (rt_excl_begin), and the walker's table of ZPASS reports
+ *   (a lock in cellGcmSys.c). The ZPASS and main-memory surface polls are the
+ *   render thread's.
+ * It needs record-ahead (D3D12_RECORD_AHEAD=1, the default).
+ * RSX_RENDER_THREAD=3, a diagnostic: the walk records ahead itself (under the
+ * render thread's lock) and only the batch's end moves.
+ *
+ * Status (2026-11-05, God of War: Ascension's gate): the walk thread falls
+ * from ~73% of a core to ~41%, the render thread takes ~34%, and the frame
+ * rate falls ~3% (20.87 -> 20.18 flips/s, mode 2, two runs each): the PPU
+ * main thread (~94%) and the SPU workers set the frame, not this thread.
+ * Mode 1 put the GPU in a hang (DXGI_ERROR_DEVICE_HUNG) in two of four runs,
+ * after ~2,000 and ~4,000 frames; not found yet. Modes 2 and 3 did not, in
+ * four and three runs. Kept here for when the frame clock thread binds. */
+static HANDLE s_rt_thread, s_rt_work_ev, s_rt_done_ev;
+static SRWLOCK s_rt_excl = SRWLOCK_INIT;   /* the render thread's while it works */
+static volatile LONG s_rt_pub;             /* records the walk is done with */
+static volatile LONG s_rt_req;             /* renders handed over (the walk) */
+static volatile LONG s_rt_rel;             /* ... the walk may go on from (the render thread) */
+static volatile LONG s_rt_done;            /* ... done, their presents included (the render thread) */
+static volatile LONG s_rt_sleeping;        /* the render thread waits, or is about to */
+static volatile LONG s_rt_quit;
+static int s_rt_req_present, s_rt_req_full;   /* the request's: written before s_rt_req moves */
+static u32 s_rt_woke;                      /* the walk: published when it last woke the render thread */
+static LONG s_rt_cur;                      /* the render thread: the request render_frame runs for */
+
+static LONG rt_get(volatile LONG* v) { return InterlockedCompareExchange(v, 0, 0); }
+
+/* A capture reads the records after render_frame has reset the batch. */
+static int rt_cap_on(void)
+{
+    static int v = -1;
+    if (v < 0) v = (getenv("RSX_CAP") || getenv("RSX_CAP_SHOT") || getenv("RSX_CAP_YELLOW") ||
+                    getenv("RSX_CAP_DIP")) ? 1 : 0;
+    return v;
+}
+
+/* ZPASS counts or main-memory surfaces waiting for the GPU. */
+static int rt_polls_pending(void)
+{
+    for (u32 fi = 0; fi < FRAME_COUNT; fi++)
+        if ((s_zq_resolved[fi] && s_zq_fence[fi]) || (s_mwb_n[fi] && s_mwb_fence[fi])) return 1;
+    return 0;
+}
+
+static DWORD WINAPI rt_main(LPVOID arg)
+{
+    (void)arg;
+    ps3_thread_name("rsx render");
+    LONG done = 0;
+    u32 stall = 0;   /* records published when a pass could not go on (a pipeline being built) */
+    for (;;) {
+        InterlockedExchange(&s_rt_sleeping, 1);
+        if (!rt_get(&s_rt_quit) && rt_get(&s_rt_req) == done) {
+            const u32 pub = (u32)rt_get(&s_rt_pub);
+            if (pub == stall || pub < (s_rf.open ? s_rf.done : 0) + RF_AHEAD_MIN)
+                WaitForSingleObject(s_rt_work_ev, (stall || rt_polls_pending()) ? 1 : INFINITE);
+        }
+        InterlockedExchange(&s_rt_sleeping, 0);
+        if (rt_get(&s_rt_quit)) break;
+        AcquireSRWLockExclusive(&s_rt_excl);
+        zq_poll();   /* ZPASS counts and main-memory surfaces of a batch the GPU has finished */
+        mwb_poll();
+        const LONG req = rt_get(&s_rt_req);
+        if (req != done) {
+            s_rt_cur = req;
+            s_present_this_frame = s_rt_req_present;
+            render_frame();
+            s_present_this_frame = 1;
+            ReleaseSRWLockExclusive(&s_rt_excl);
+            done = req;
+            stall = 0;
+            InterlockedExchange(&s_rt_rel, req);
+            InterlockedExchange(&s_rt_done, req);
+            SetEvent(s_rt_done_ev);
+            continue;
+        }
+        const u32 pub = (u32)rt_get(&s_rt_pub);
+        stall = 0;
+        if (pub >= (s_rf.open ? s_rf.done : 0) + RF_AHEAD_MIN) {
+            const int o0 = s_rf.open;
+            const u32 d0 = s_rf.done, p0 = s_rf.pre_done;
+            rf_ahead(pub, 1);
+            if (s_rf.open == o0 && s_rf.done == d0 && s_rf.pre_done == p0) stall = pub;
+        }
+        ReleaseSRWLockExclusive(&s_rt_excl);
+    }
+    return 0;
+}
+
+/* The walk: wait until *v reaches seq, answering what other threads send to
+ * the window meanwhile (it is this thread's; a present may send to it). */
+static void rt_wait(volatile LONG* v, LONG seq)
+{
+    while ((LONG)(rt_get(v) - seq) < 0) {
+        MSG m;
+        PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        MsgWaitForMultipleObjects(1, &s_rt_done_ev, FALSE, 50, QS_SENDMESSAGE);
+    }
+}
+
+/* The walk: the batch's records are done (all but the last). */
+static void rt_publish(void)
+{
+    if (s_rt_mode == 3) return;       /* the walk records ahead itself */
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    if (n < 2) return;
+    const u32 upto = n - 1;            /* the last record may still be extended */
+    if ((LONG)upto <= s_rt_pub) return;
+    InterlockedExchange(&s_rt_pub, (LONG)upto);
+    if (upto >= s_rt_woke + RF_AHEAD_MIN && rt_get(&s_rt_sleeping)) {
+        s_rt_woke = upto;
+        SetEvent(s_rt_work_ev);
+    }
+}
+
+/* The walk: the render thread renders the batch (present: s_present_this_frame
+ * for it). Back once render_frame has reset the batch; full: once all of it is
+ * done. */
+static void rt_render(int present, int full)
+{
+    rt_wait(&s_rt_done, rt_get(&s_rt_req));   /* the frame before, its present included */
+    InterlockedExchange(&s_rt_pub, 0);        /* the records are the render's until the reset */
+    s_rt_woke = 0;
+    s_rt_req_present = present;
+    s_rt_req_full = full || s_rt_mode == 2 || rt_cap_on();
+    const LONG req = InterlockedIncrement(&s_rt_req);
+    SetEvent(s_rt_work_ev);
+    rt_wait(s_rt_req_full ? &s_rt_done : &s_rt_rel, req);
+}
+
+/* The render thread, in render_frame: the batch is reset. */
+static void rt_released(void)
+{
+    if (!s_rt_cur || s_rt_req_full) return;
+    InterlockedExchange(&s_rt_rel, s_rt_cur);
+    SetEvent(s_rt_done_ev);
+}
+
+/* The walk: what the render thread may be using, kept from it meanwhile (the
+ * base pipeline's build). */
+static void rt_excl_begin(void)
+{
+    if (s_rt_mode <= 0) return;
+    while (!TryAcquireSRWLockExclusive(&s_rt_excl)) {
+        MSG m;
+        PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 1, QS_SENDMESSAGE);
+    }
+}
+static void rt_excl_end(void)
+{
+    if (s_rt_mode > 0) ReleaseSRWLockExclusive(&s_rt_excl);
+}
+
+static void rt_start(void)
+{
+    const char* e = getenv("RSX_RENDER_THREAD");
+    const int m = e ? atoi(e) : 0;
+    if (m <= 0) return;
+    if (!rf_ahead_on()) {
+        fprintf(stderr, "[D3D12] RSX_RENDER_THREAD needs record-ahead (D3D12_RECORD_AHEAD=1, no debug filter): off%c", 10);
+        return;
+    }
+    s_rt_work_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    s_rt_done_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (s_rt_work_ev && s_rt_done_ev)
+        s_rt_thread = CreateThread(NULL, 0, rt_main, NULL, CREATE_SUSPENDED, NULL);
+    if (!s_rt_thread) {
+        fprintf(stderr, "[D3D12] the render thread did not start: off%c", 10);
+        return;
+    }
+    SetThreadPriority(s_rt_thread, GetThreadPriority(GetCurrentThread()));   /* the frame clock's */
+    s_rt_mode = m >= 3 ? 3 : m >= 2 ? 2 : 1;
+    ResumeThread(s_rt_thread);
+    fprintf(stderr, "[D3D12] render thread on (mode %d): the walk goes on %s%c", s_rt_mode,
+            s_rt_mode == 2 ? "after each present" : "from each batch's reset", 10);
+}
+
+static void rt_stop(void)
+{
+    if (!s_rt_thread) return;
+    if (s_rt_req) rt_wait(&s_rt_done, rt_get(&s_rt_req));
+    InterlockedExchange(&s_rt_quit, 1);
+    SetEvent(s_rt_work_ev);
+    WaitForSingleObject(s_rt_thread, 5000);
+    CloseHandle(s_rt_thread);
+    s_rt_thread = NULL;
+    s_rt_mode = 0;
+}
+
+void rsx_d3d12_backend_record_ahead(void)
+{
+    if (s_rt_mode == 3) {             /* RSX_RENDER_THREAD=3: the walk records ahead, the render thread renders */
+        if (!s_d3d.initialized) return;
+        rt_excl_begin();
+        zq_poll(); mwb_poll();
+        const u32 n3 = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+        if (n3 >= 2 && rf_ahead_on()) rf_ahead(n3 - 1, 0);
+        rt_excl_end();
+        return;
+    }
+    if (s_rt_mode > 0) { rt_publish(); return; }   /* RSX_RENDER_THREAD: it records and polls */
+    if (s_d3d.initialized) { zq_poll(); mwb_poll(); }   /* ZPASS counts and main-memory surfaces of a batch the GPU has finished */
+    if (!s_d3d.initialized || !rf_ahead_on()) return;
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    if (n < 2) return;
+    rf_ahead(n - 1, 0);               /* the last record may still be extended */
+}
+
 void rsx_d3d12_backend_present(void)
 {
+    /* RSX_RENDER_THREAD: the frame before is done, its composite source read */
+    if (s_rt_mode > 0) rt_wait(&s_rt_done, rt_get(&s_rt_req));
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
@@ -16348,9 +16611,12 @@ void rsx_d3d12_backend_present(void)
           static int remap = -1;
           if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
           if (remap) rsx_reset_upload_claims(); }
-        s_present_this_frame = has_display;
-        render_frame();
-        s_present_this_frame = 1;
+        if (s_rt_mode > 0) rt_render(has_display, 0);   /* RSX_RENDER_THREAD */
+        else {
+            s_present_this_frame = has_display;
+            render_frame();
+            s_present_this_frame = 1;
+        }
     }
 }
 

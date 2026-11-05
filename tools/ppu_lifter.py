@@ -110,6 +110,24 @@ typedef struct ppu_context {
     void (*tramp)(void*);   /* PPU_MM_LEAN: g_trampoline_fn       */
 } ppu_context;
 
+/* PPU_CTX_RESTRICT (a port's choice): a lifted function's context as __restrict, and passing it on
+ * as noescape. A guest store then cannot change a guest register, and the compiler stops reading
+ * them all back after each one. LLVM gives up on a pointer with more than 100 uses, so the build
+ * has to raise -capture-tracking-max-uses-to-explore too, or nothing changes in any function of size.
+ *
+ * What reads a context behind the lifted code's back:
+ *  - ppu_stwcx32 and other threads breaking a reservation: reserve_addr, which is volatile here.
+ *  - anything through g_active_ctx from a call that does not take the context. That is diagnostics
+ *    only, and they may see a register before it is written back. */
+#ifdef PPU_CTX_RESTRICT
+#define PPU_CTXR __restrict
+#define PPU_NOESC __attribute__((noescape))
+#else
+#define PPU_CTXR
+#define PPU_NOESC
+#endif
+#define PPU_RESV_ADDR(c) (*(volatile uint64_t*)&(c)->reserve_addr)
+
 /* Memory access helpers (provided by runtime) */
 #ifdef __cplusplus
 extern "C" {
@@ -401,7 +419,7 @@ static inline void vm_write64_inl(uint64_t a, uint64_t v) { const ppu_mm m = ppu
 #ifdef __cplusplus
 extern "C"
 #endif
-void lv2_syscall(ppu_context* ctx);
+void lv2_syscall(ppu_context* ctx PPU_NOESC);
 
 /* Thread-local storage qualifier. The runtime's boot scaffold declares the
  * same objects the generated code does (g_active_ctx, g_trampoline_fn), so
@@ -658,15 +676,15 @@ extern "C" uint8_t* vm_base;
 /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
-extern "C" void ps3_indirect_call(ppu_context* ctx);
+extern "C" void ps3_indirect_call(ppu_context* ctx PPU_NOESC);
 /* Indirect call to an explicit target, CTR untouched (b<cond>lrl). */
-extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target);
+extern "C" void ps3_indirect_call_to(ppu_context* ctx PPU_NOESC, uint32_t target);
 
 /* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
  * is replaced with a direct call to the registered HLE handler for its NID
  * instead of running the literal `load OPD ptr; bctrl` trampoline (whose import
  * pointer table the recomp never fills). See --hle-stubs. */
-extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx PPU_NOESC);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
@@ -678,7 +696,7 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 /* In the context: a thread-local costs ~5 instructions more after every call. */
 #define DRAIN_TRAMPOLINE(ctx) do { \\
     while ((ctx)->tramp) { \\
-        void(*_tf)(void*) = (ctx)->tramp; \\
+        void(*_tf)(void* PPU_NOESC) = (void(*)(void* PPU_NOESC))(ctx)->tramp; \\
         (ctx)->tramp = 0; \\
         _tf((void*)(ctx)); \\
     } \\
@@ -2847,7 +2865,7 @@ class PPULifter:
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"PPU_RESV_ADDR(ctx) = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2857,26 +2875,26 @@ class PPULifter:
             # the atomic CAS). A plain conditional write loses concurrent updates
             # (lock-free free-list/refcount corruption under real host threads).
             return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
+                    f"int _sc = (PPU_RESV_ADDR(ctx) == (uint32_t)ea) && "
                     f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "  # CR0 EQ = success
-                    f"ctx->reserve_addr = 0; }}")
+                    f"PPU_RESV_ADDR(ctx) = 0; }}")
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"PPU_RESV_ADDR(ctx) = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
+                    f"int _sc = (PPU_RESV_ADDR(ctx) == (uint32_t)ea) && "
                     f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "
-                    f"ctx->reserve_addr = 0; }}")
+                    f"PPU_RESV_ADDR(ctx) = 0; }}")
 
         # ------- Data-stream hints: no architected effect -------
         if mn in ("dst", "dstst", "dss"):
@@ -4101,11 +4119,11 @@ class PPULifter:
         lines = [preamble]
         # Forward declarations
         for func in self.functions:
-            lines.append(f"void {func.name}(ppu_context* ctx);")
+            lines.append(f"void {func.name}(ppu_context* ctx PPU_NOESC);")
         # Also declare any call targets that aren't defined
         defined = {f.start_addr for f in self.functions}
         for target in sorted((self.call_targets | self.branch_targets) - defined):
-            lines.append(f"void {self.prefix}func_{target:08X}(ppu_context* ctx); /* external */")
+            lines.append(f"void {self.prefix}func_{target:08X}(ppu_context* ctx PPU_NOESC); /* external */")
         lines.append("")
         return "\n".join(lines)
 
@@ -4288,7 +4306,7 @@ class PPULifter:
         for h in hooks:
             lines += ["#ifdef __cplusplus", f'extern "C" void {h}(ppu_context* ctx, uint32_t addr);',
                       "#else", f"void {h}(ppu_context* ctx, uint32_t addr);", "#endif"]
-        lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+        lines.append(f"void {weak}{func.name}(ppu_context* PPU_CTXR ctx PPU_NOESC) {{")
         lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)

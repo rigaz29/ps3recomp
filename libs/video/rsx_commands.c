@@ -93,9 +93,12 @@ rsx_backend* rsx_get_backend(void)
  * State initialization
  * -----------------------------------------------------------------------*/
 
+static u32 s_vc_gen;
+
 void rsx_state_init(rsx_state* state)
 {
     memset(state, 0, sizeof(rsx_state));
+    state->vertex_constants_gen = ++s_vc_gen;
     /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
      * struct would leave w at 0. */
     for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
@@ -427,7 +430,8 @@ static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
           static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
           int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
           if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
-        state->vertex_constants[slot][lane] = f;
+        { u32 old; memcpy(&old, &state->vertex_constants[slot][lane], 4);
+          if (old != data) { state->vertex_constants[slot][lane] = f; state->vertex_constants_gen = ++s_vc_gen; } }
         { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
             fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
         if (!state->vertex_constants_dirty) {
@@ -450,11 +454,25 @@ static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
  * the constant window (a constant run may open with the load slot) are
  * handled here in one call. Returns 0, having done nothing, for any other run
  * and while RSX_TRACE is on. */
+/* A draw's DRAW_INDEX_ARRAY words, 256 indexes each, wait here while they follow one another in the
+ * index array (God of War: Ascension's EDGE draws: four words a draw, 130,000 a second), and go to
+ * the backend as one draw at the next other method, the END at the latest. Triangles only: a
+ * backend's other primitives take their batches as they come. RSX_DRAW_RUN=0: word by word. */
+#define RSX_DRAW_RUN_MAX 65536u
+static void rsx_draw_run_flush(rsx_state* state)
+{
+    const u32 first = state->draw_run_first, count = state->draw_run_count;
+    state->draw_run_count = 0;
+    if (s_backend && s_backend->draw_indexed)
+        s_backend->draw_indexed(s_backend->userdata, state->primitive_type, first, count);
+}
+
 int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 {
     static int tr = -1;
     if (tr < 0) tr = getenv("RSX_TRACE") ? 1 : 0;
     if (tr || !count) return 0;
+    if (state->draw_run_count) rsx_draw_run_flush(state);
     const u32 end = method + count * 4;
     if (method >= NV4097_SET_TRANSFORM_PROGRAM && end <= NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
         for (u32 i = 0; i < count; i++) {
@@ -484,6 +502,7 @@ int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    if (state->draw_run_count && method != NV4097_DRAW_INDEX_ARRAY) rsx_draw_run_flush(state);
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
@@ -1081,6 +1100,16 @@ m_draw_index_array:
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (PS3_LOG_FIRST(_d, 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         ps3_ms("rsx:draw_indexed");
+        static int run = -1;
+        if (run < 0) { const char* e = getenv("RSX_DRAW_RUN"); run = !(e && e[0] == '0'); }
+        if (run && state->primitive_type == RSX_PRIMITIVE_TRIANGLES) {
+            if (state->draw_run_count && (first != state->draw_run_first + state->draw_run_count ||
+                                          state->draw_run_count + count > RSX_DRAW_RUN_MAX))
+                rsx_draw_run_flush(state);
+            if (!state->draw_run_count) state->draw_run_first = first;
+            state->draw_run_count += count;
+            return 0;
+        }
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
                                     first, count);
@@ -1162,6 +1191,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             break;
         }
     }
+    if (state->draw_run_count) rsx_draw_run_flush(state);
 
     return methods_processed;
 }

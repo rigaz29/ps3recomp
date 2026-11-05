@@ -8345,13 +8345,19 @@ static void vp_draw_raw(const D3D12DrawRecord* dr, int* ib_bound, int* raw_bound
  * slot the batch's last written one took when the two are the same. A draw used to write its whole
  * constant bank, 8 KB of upload heap: ~20 MB a frame at God of War: Ascension's gate, where runs
  * of draws (EDGE's jobs of one object, its pieces' records) share their constants. VP_CB_SHARE=0
- * writes every slot. Only the recording thread. */
+ * writes every slot. Only the recording thread.
+ *
+ * Five records in six have the bank of the one before. rsx_state's generation says so without
+ * touching it: s_cbimg's constants are copied only when it has moved, and compared with the last
+ * written ones only when the two generations differ (a bank rewritten with other words). Each was
+ * 8 KB a record at 34,000 records a second. VP_CB_GEN=0 copies and compares every time. */
 #define VP_CB_IMG       VP_CB_RAW_OFF          /* the constants and the epilogue */
 #define VP_CB_RAW_BYTES 512u                   /* vp_fa[16], vp_fk[16] */
 static u8 s_cbimg[VP_CB_STRIDE], s_cblast[VP_CB_STRIDE];
 static int s_cbimg_ok, s_cbimg_raw, s_cblast_raw;
 static u32 s_cblast_slot, s_cblast_gen = ~0u, s_cb_gen;
-static unsigned long long s_cb_written, s_cb_shared;
+static u32 s_cbimg_bank, s_cblast_bank;     /* the bank's generation in each, 0 for none */
+static unsigned long long s_cb_written, s_cb_shared, s_cb_same_bank;
 
 /* The raw-fetch attribute table for this draw's slot: the shader's vp_fa/vp_fk
  * (see s_vp_raw_hlsl), from the state the draw was recorded with. */
@@ -8552,7 +8558,12 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         }
     }
     char* dst = (char*)s_cbimg;             /* written to the slot by vp_cb_commit */
-    memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+    { static int gen = -1;
+      if (gen < 0) { const char* e = getenv("VP_CB_GEN"); gen = !(e && e[0] == '0'); }
+      if (!gen || !s_cbimg_bank || s_cbimg_bank != st->vertex_constants_gen) {
+          memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+          s_cbimg_bank = gen ? st->vertex_constants_gen : 0;
+      } }
     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
      * vertex program from the outside -- both give zero fragments. */
@@ -8628,6 +8639,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         { static int _fb = 0; if (PS3_LOG_FIRST(_fb, 6))
             printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
                    slot, c00, vs_idx); }
+        s_cbimg_bank = 0;                   /* no longer the state's bank */
         for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
         c[0]=1.358f; c[5]=2.414f; c[11]=1.0f;
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
@@ -8644,11 +8656,16 @@ static void vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
     if (share < 0) { const char* e = getenv("VP_CB_SHARE"); share = e ? atoi(e) != 0 : 1; }
     if (!s_cbimg_ok || !dr || slot >= MAX_DRAWS) return;
     s_cbimg_ok = 0;
+    const u32 bank_bytes = RSX_MAX_VERTEX_CONSTANTS * 16;
+    const int same_bank = s_cbimg_bank && s_cbimg_bank == s_cblast_bank;
     if (share && s_cblast_gen == s_cb_gen && s_cblast_raw == s_cbimg_raw &&
-        !memcmp(s_cbimg, s_cblast, VP_CB_IMG) &&
+        !memcmp(s_cbimg + (same_bank ? bank_bytes : 0), s_cblast + (same_bank ? bank_bytes : 0),
+                VP_CB_IMG - (same_bank ? bank_bytes : 0)) &&
         (!s_cbimg_raw || !memcmp(s_cbimg + VP_CB_RAW_OFF, s_cblast + VP_CB_RAW_OFF, VP_CB_RAW_BYTES))) {
         dr->cb_slot = s_cblast_slot;
         s_cb_shared++;
+        s_cb_same_bank += (unsigned)same_bank;
+        s_cblast_bank = s_cbimg_bank;       /* the same words */
         return;
     }
     char* dst = (char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
@@ -8657,6 +8674,7 @@ static void vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
     memcpy(s_cblast, s_cbimg, VP_CB_IMG);
     if (s_cbimg_raw) memcpy(s_cblast + VP_CB_RAW_OFF, s_cbimg + VP_CB_RAW_OFF, VP_CB_RAW_BYTES);
     s_cblast_raw = s_cbimg_raw;
+    s_cblast_bank = s_cbimg_bank;
     s_cblast_slot = slot;
     s_cblast_gen = s_cb_gen;
     dr->cb_slot = slot;
@@ -14184,11 +14202,11 @@ static void vs_report(void)
       fprintf(stderr, "; other strides:");
       for (int c = 0; c < 8; c++) if (s_vs.c_cullo[c]) fprintf(stderr, " %s %.0f", cn[c], s_vs.c_cullo[c] / sec);
       fprintf(stderr, "%c", 10); }
-    { static unsigned long long cw0, cs0, pd0, ps0;
-      fprintf(stderr, "[vtx-stats]   records per s: constant slots written %.0f, shared %.0f; prepass draws %.0f,"
-                      " their units shared %.0f%c", (s_cb_written - cw0) / sec, (s_cb_shared - cs0) / sec,
-              (s_pre_draws - pd0) / sec, (s_pre_shared - ps0) / sec, 10);
-      cw0 = s_cb_written; cs0 = s_cb_shared; pd0 = s_pre_draws; ps0 = s_pre_shared; }
+    { static unsigned long long cw0, cs0, cb0, pd0, ps0;
+      fprintf(stderr, "[vtx-stats]   records per s: constant slots written %.0f, shared %.0f (%.0f by generation);"
+                      " prepass draws %.0f, their units shared %.0f%c", (s_cb_written - cw0) / sec, (s_cb_shared - cs0) / sec,
+              (s_cb_same_bank - cb0) / sec, (s_pre_draws - pd0) / sec, (s_pre_shared - ps0) / sec, 10);
+      cw0 = s_cb_written; cs0 = s_cb_shared; cb0 = s_cb_same_bank; pd0 = s_pre_draws; ps0 = s_pre_shared; }
     if (s_vpass.set)
         fprintf(stderr, "[vtx-stats]   vertex pass per s: %.0f segments (%.0f vertexes) on the GPU, %.0f"
                         " without a record (%.0f found written over, %.0f an older job's); on the CPU %.0f"

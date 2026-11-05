@@ -410,6 +410,10 @@ typedef struct rsx_state {
     u32 vertex_constants_lo;
     u32 vertex_constants_hi;
     int vertex_constants_dirty;
+    /* Names the bank's contents: a new number when a word changes, of any state. */
+    u32 vertex_constants_gen;
+    /* DRAW_INDEX_ARRAY words waiting to go to the backend as one draw (rsx_process_method) */
+    u32 draw_run_first, draw_run_count;
 
     /* Captured RSX vertex program microcode (NV40 ISA), filled by
      * NV4097_SET_TRANSFORM_PROGRAM. Words are host-endian (as delivered by the

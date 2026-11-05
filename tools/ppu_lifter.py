@@ -107,6 +107,7 @@ typedef struct ppu_context {
     uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
     int      reserve_valid; /* lwarx/stwcx. reservation flag    */
     uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
+    void (*tramp)(void*);   /* PPU_MM_LEAN: g_trampoline_fn       */
 } ppu_context;
 
 /* Memory access helpers (provided by runtime) */
@@ -192,13 +193,21 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
  * they also turned away, the gcm ref-poll word, is only special to vm_read32,
  * so only the 32-bit load still tests it.
  *
- * PPU_MM_LEAN (a port's choice): the copy is made once, by ppu_mm_fix, before the guest runs: taking
- * it was ~20 instructions at every function's entry. Until then it is all zero, a span of 0: every
- * access goes out of line, which is always right. A store does not look at the store watches, so
- * they are not for such a build. An access is one instruction at any alignment: an aligned one is
- * as atomic as before, and the branch that told the two apart is gone. */
-typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+ * PPU_MM_LEAN (a port's choice): everything in the copy is known before the guest runs, and taking
+ * it was ~20 instructions at every function's entry.
+ *  - The range and the poll word are constants, which ppu_mm_fix checks. An access takes one compare
+ *    against an immediate, whatever its size: the range's last 16 bytes go out of line.
+ *  - Nothing narrows the range then, and a store does not look at the store watches, so the read and
+ *    store diagnostics are for a build without it. ppu_mm_fix says so if one is armed.
+ *  - vb and the reserved-line bitmap are one copy, made by ppu_mm_fix before the guest runs.
+ *  - A store reads the bitmap a byte at a time, 8 lines or 1 KB of guest memory. That byte is almost
+ *    always 0, and only if not does it look for the line's bit.
+ *  - An access is one instruction at any alignment. An aligned one is as atomic as before, and the
+ *    branch that told the two apart is gone. */
 #ifdef PPU_MM_LEAN
+typedef struct ppu_mm { uint8_t* vb; const unsigned char* coh; } ppu_mm;
+#define PPU_MM_LIMIT 0xDFFEFFF0u   /* ea - 0x10000: up to 0xE0000000, less 16 */
+#define PPU_MM_POLL(m) 0x20002008u /* ppu_hle_inject_base + 0x2008 */
 #ifdef __cplusplus
 extern "C" ppu_mm g_ppu_mm;
 #else
@@ -207,8 +216,34 @@ extern ppu_mm g_ppu_mm;
 typedef uint16_t vm_u16u __attribute__((aligned(1)));
 typedef uint32_t vm_u32u __attribute__((aligned(1)));
 typedef uint64_t vm_u64u __attribute__((aligned(1)));
+typedef long long vm_v16u __attribute__((vector_size(16), aligned(1)));
 static inline ppu_mm ppu_mm_take(void) { return g_ppu_mm; }
+static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    (void)m; (void)n;
+    return (uint32_t)(ea - 0x10000u) <= PPU_MM_LIMIT;
+}
+static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    if (!__builtin_expect(vm_mm_ok(m, ea, n), 1)) return 0;
+    const unsigned b = m->coh[ea >> 10];
+    return !__builtin_expect(b != 0, 0) || !((b >> ((ea >> 7) & 7u)) & 1u);
+}
+/* A quadword is one access too: aligned, it is atomic on the hosts that have AVX. */
+static inline void vm_raw_ld16_mm(const ppu_mm* m, void* dst, uint64_t ea)
+{
+    const vm_v16u v = *(const volatile vm_v16u*)(m->vb + (uint32_t)ea);
+    memcpy(dst, &v, 16);
+}
+static inline void vm_raw_st16_mm(const ppu_mm* m, uint64_t ea, const void* src)
+{
+    vm_v16u v;
+    memcpy(&v, src, 16);
+    *(volatile vm_v16u*)(m->vb + (uint32_t)ea) = v;
+}
 #else
+typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+#define PPU_MM_POLL(m) ((m)->poll)
 static inline ppu_mm ppu_mm_take(void)
 {
     const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
@@ -220,7 +255,6 @@ static inline ppu_mm ppu_mm_take(void)
     m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
     return m;
 }
-#endif
 /* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
  * subtraction wraps past any span. Signed, so span - n is computed once per
  * function and a span of 0 still turns everything away. */
@@ -234,17 +268,14 @@ static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-#ifdef PPU_MM_LEAN
-    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1)) return 0;
-#else
     if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
         __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
         return 0;
-#endif
     const unsigned char* bits = g_spu_coh_bits;
     if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
     return 1;
 }
+#endif
 static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
@@ -269,7 +300,7 @@ static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != PPU_MM_POLL(m), 1)) {   /* aligned: single-copy atomic, as on Cell */
 #ifdef PPU_MM_LEAN
         return __builtin_bswap32(*(const volatile vm_u32u*)(m->vb + ea));
 #else
@@ -643,6 +674,17 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
  * Converts cross-fragment fallthrough chains into iterative loops. */
+#ifdef PPU_MM_LEAN
+/* In the context: a thread-local costs ~5 instructions more after every call. */
+#define DRAIN_TRAMPOLINE(ctx) do { \\
+    while ((ctx)->tramp) { \\
+        void(*_tf)(void*) = (ctx)->tramp; \\
+        (ctx)->tramp = 0; \\
+        _tf((void*)(ctx)); \\
+    } \\
+} while(0)
+#define g_trampoline_fn ctx->tramp
+#else
 #define DRAIN_TRAMPOLINE(ctx) do { \\
     while (g_trampoline_fn) { \\
         void(*_tf)(void*) = g_trampoline_fn; \\
@@ -650,10 +692,15 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
         _tf((void*)(ctx)); \\
     } \\
 } while(0)
+#endif
 
 /* Each lifted function opens with PPU_MM_SNAP; its loads and stores use that
  * copy of the memory model (ppu_mm in ppu_recomp.h). */
 #define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;
+#ifdef PPU_MM_LEAN
+#define vm_raw_ld16(d, a) vm_raw_ld16_mm(&_mm, d, a)
+#define vm_raw_st16(a, s) vm_raw_st16_mm(&_mm, a, s)
+#endif
 #ifndef PPU_NO_INLINE_LOADS
 #undef vm_read8
 #undef vm_read16

@@ -1860,17 +1860,21 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 extern "C" int vm_inline_ok = 0;
 extern "C" int vm_inline_st_ok = 0;
 
-/* PPU_MM_LEAN's copy of the memory model (ppu_mm in ppu_recomp.h). All zero until ppu_mm_fix: every
- * access out of line. The port calls it once the guest's memory is mapped, before the guest runs. */
-extern "C" struct { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } g_ppu_mm = { 0, 0, 0, 0 };
-extern "C" void ppu_mm_fix(void)
+/* PPU_MM_LEAN's copy of the memory model (ppu_mm in ppu_recomp.h). The port calls ppu_mm_fix once the
+ * guest's memory is mapped, before any lifted code runs, with spu_coh_bits_publish(). */
+extern "C" struct { uint8_t* vb; const unsigned char* coh; } g_ppu_mm = { 0, 0 };
+extern "C" void ppu_mm_fix(const unsigned char* coh)
 {
-    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
-    const int64_t span = hi > 0x10000u ? (int64_t)(hi - 0x10000u) : 0;
+    if (ppu_hle_inject_base != 0x20000000u || (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u)) {
+        fprintf(stderr, "[ppu] PPU_MM_LEAN's constants do not hold: inject base 0x%08X, size 0x%08X\n",
+                ppu_hle_inject_base, ppu_vm_size);
+        exit(1);
+    }
+    if (!vm_inline_ok || !vm_inline_st_ok)
+        fprintf(stderr, "[ppu] a read or store diagnostic is armed: it needs a build without "
+                        "PPU_MM_LEAN, and sees only the out-of-line accesses here\n");
     g_ppu_mm.vb = vm_base;
-    g_ppu_mm.ld_span = vm_inline_ok ? span : 0;
-    g_ppu_mm.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
-    g_ppu_mm.poll = ppu_hle_inject_base + 0x2008u;
+    g_ppu_mm.coh = coh;
 }
 static struct VmInlineInit {
     VmInlineInit() {
@@ -2343,6 +2347,17 @@ void flow_lookup_alloc(unsigned int p) {
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+
+/* A lifted function's tail call into another fragment, left for its caller to make: in the context
+ * from code built with PPU_MM_LEAN, in g_trampoline_fn from the rest. */
+static inline void (*ppu_tramp_take(ppu_context* c))(void*)
+{
+    void (*tf)(void*) = g_trampoline_fn;
+    if (tf) { g_trampoline_fn = 0; return tf; }
+    tf = c->tramp;
+    if (tf) c->tramp = 0;
+    return tf;
+}
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
@@ -2844,9 +2859,40 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
  * each call). NULL, as it stays without one: a load and a branch. */
 extern "C" { void (*g_ppu_icall_hook)(ppu_context*) = nullptr; }
 
+/* No indirect-call diagnostic armed: the call goes straight to its target. On the way through
+ * ps3_indirect_call_impl each of them is a load and a branch, a dozen and more a call. */
+static int icall_plain_init(void)
+{
+    static const char* const vars[] = {
+        "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
+        "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_TO", "PS3_CALLTRACE_FROM",
+        "PS3_CALLTRACE_R5", "FLOW_FORCE_RTCFG", "SPURS_TRACE", "PS3_PRX_CALLTRACE",
+        "PPU_TOCFIX", "PPU_RETWATCH", 0 };
+    for (int i = 0; vars[i]; i++) if (getenv(vars[i])) return 0;
+    return 1;
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     if (__builtin_expect(g_ppu_icall_hook != nullptr, 0)) g_ppu_icall_hook(ctx);
+    static int plain = -1;
+    if (__builtin_expect(plain < 0, 0)) plain = icall_plain_init();
+    if (__builtin_expect(plain, 1)) {
+        const uint32_t addr = g_icall_target_set ? g_icall_target : (uint32_t)ctx->ctr;
+        const ppu_fn fn = addr ? ppu_lookup_icall(addr) : nullptr;
+        if (__builtin_expect(fn != nullptr && g_dispatch_depth <= 4000, 1)) {
+            g_active_ctx = ctx;
+            g_icall_target_set = 0;
+            g_dispatch_depth++;
+            if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+            g_vcall_sp++;
+            fn(ctx);
+            for (void (*tf)(void*); (tf = ppu_tramp_take(ctx)) != nullptr;) tf(ctx);
+            if (g_vcall_sp > 0) g_vcall_sp--;
+            g_dispatch_depth--;
+            return;
+        }
+    }
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
@@ -3167,9 +3213,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
         g_vcall_sp++;
         fn(ctx);
-        while (g_trampoline_fn) {
-            void (*tf)(void*) = g_trampoline_fn;
-            g_trampoline_fn = 0;
+        for (void (*tf)(void*); (tf = ppu_tramp_take(ctx)) != nullptr;) {
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
@@ -4060,7 +4104,7 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     }
     g_active_ctx = ctx;
     fn(ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
+    for (void (*tf)(void*); (tf = ppu_tramp_take(ctx)) != nullptr;) tf(ctx);
 }
 
 /* Install that trampoline without going through ppu_run().
@@ -4216,7 +4260,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 #endif
     g_active_ctx = &ctx;
     fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    for (void (*tf)(void*); (tf = ppu_tramp_take(&ctx)) != nullptr;) tf(&ctx);
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
@@ -4253,7 +4297,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 #endif
     g_active_ctx = &ctx;
     fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    for (void (*tf)(void*); (tf = ppu_tramp_take(&ctx)) != nullptr;) tf(&ctx);
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
@@ -4426,7 +4470,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
     fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    for (void (*tf)(void*); (tf = ppu_tramp_take(&ctx)) != nullptr;) tf(&ctx);
     return 0;
 }
 

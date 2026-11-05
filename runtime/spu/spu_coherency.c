@@ -353,6 +353,13 @@ int spu_coh_is_reserved(uint32_t addr)
     return spu_coh_line_reserved(addr);
 }
 
+/* The bitmap, published from now on, for code that keeps its address (PPU_MM_LEAN). */
+const unsigned char* spu_coh_bits_publish(void)
+{
+    g_spu_coh_bits = s_coh_bitmap;
+    return s_coh_bitmap;
+}
+
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
  * reservation away for its own MFC write -- the MFC is part of the same SPE.
  * Our notify had no way to say "everyone but me", so an SPU that reserved a

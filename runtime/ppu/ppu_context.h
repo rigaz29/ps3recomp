@@ -98,6 +98,10 @@ typedef struct ppu_context {
     /* VRSAVE (SPR 256): software-managed; kept so mfspr returns what mtspr wrote */
     uint32_t vrsave;
 
+    /* A tail call into another lifted fragment, for the caller to make: where code built with
+     * PPU_MM_LEAN leaves it (g_trampoline_fn for the rest). */
+    void (*tramp)(void*);
+
 } ppu_context;
 
 /* ---------------------------------------------------------------------------

@@ -17436,7 +17436,7 @@ static void rf_ahead(u32 upto, int wait_gpu)
  * main thread (~94%) and the SPU workers set the frame, not this thread.
  * Mode 1 put the GPU in a hang (DXGI_ERROR_DEVICE_HUNG) in two of four runs,
  * after ~2,000 and ~4,000 frames; not found yet. Modes 2 and 3 did not, in
- * four and three runs. Kept here for when the frame clock thread binds. */
+ * four and two runs. Kept here for when the frame clock thread binds. */
 static HANDLE s_rt_thread, s_rt_work_ev, s_rt_done_ev;
 static SRWLOCK s_rt_excl = SRWLOCK_INIT;   /* the render thread's while it works */
 static volatile LONG s_rt_pub;             /* records the walk is done with */

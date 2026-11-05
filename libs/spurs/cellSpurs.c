@@ -461,6 +461,7 @@ enum {
 };
 
 #define MAX_SPURS_INST 4
+#define SPURS_LANES 3   /* SPURS_LANE's workers, beside one a SPU */
 struct SpursInst;
 struct SpursPmSlot {
     struct SpursInst* instance;
@@ -479,16 +480,18 @@ struct SpursPmSlot {
      * wakes it alone; the coordinator sleeps on the instance's. */
     CONDITION_VARIABLE cv;
     int boosted;    /* host thread raised for a SPURS_BOOST_WID workload */
+    int lane;       /* SPURS_LANE: which of its workers this is (from 1), 0 for the SPU's own */
 };
 static struct SpursInst {
     u32 ea, nspus;
+    u32 nslots;     /* workers: one a SPU, and SPURS_LANE's */
     char prefix[16];
     int kernel_live, stopping, starting;
     int kick;   /* an SPU committed the request line since the coordinator last looked */
     SRWLOCK lock;
     CONDITION_VARIABLE wake;
     HANDLE coordinator;
-    struct SpursPmSlot slots[6];
+    struct SpursPmSlot slots[6 + SPURS_LANES];
     u8 active[SPURS_MAX_WID], idle[SPURS_MAX_WID];
     u8 is2;   /* CellSpurs2: 32 workloads */
     u32 cursor, pass_no;
@@ -2498,6 +2501,23 @@ static int spurs_select_rr(void)
  * idle; RenJobSet, Batch and three small lists (jobs ~0.06-0.3 ms, p99 under 1 ms) may use it,
  * audio's kicks as before. General6 (jobs 1-4 ms) lent too fills it, as no reserve does, but
  * audio's kicks then wait ~1.3 ms on average and 12-25 ms at most (2026-11-04). */
+/* SPURS_LANE=<wid>:<spu>[,<wid>:<spu>...]: each of those workloads runs on a host worker of its
+ * own, as that SPU, and the SPU's own worker takes what the title's table gives it otherwise.
+ * The host has more threads than the PS3 has SPUs, so a workload with a deadline need not choose
+ * between waiting behind another's job and keeping an SPU to itself: God of War: Ascension's
+ * audio is half a core, on the one SPU the title lets it run on. Each runs in a context of its
+ * own, as any two workloads do on one SPU (spu_run_policy_module), only at the same time.
+ * Replaces SPURS_RESERVE: at its gate 20.67 flips/s against 22.98, the audio ring as far ahead;
+ * a second lane, for General6, adds nothing (22.86). */
+static struct { u32 wid, sn; } s_lane[SPURS_LANES];
+static u32 s_lane_n;
+/* The lane of a workload on an SPU (from 1), 0 for none. */
+static int spurs_lane_of(u32 wid, u32 sn)
+{
+    for (u32 i = 0; i < s_lane_n; i++)
+        if (s_lane[i].wid == wid && s_lane[i].sn == sn) return (int)i + 1;
+    return 0;
+}
 static u32 s_res_wid = 0xFFFFFFFFu, s_res_sn = 0xFFFFFFFFu, s_lend_wids;
 static char s_lend_names[16][32];
 static int s_lend_n;
@@ -2514,6 +2534,14 @@ static void spurs_reserve_parse(void)
     if (e && sscanf(e, "%u:%u", &w, &n) == 2 && w < SPURS_MAX_WID && n < 8) {
         s_res_wid = w; s_res_sn = n;
         fprintf(stderr, "[spurs] SPURS_RESERVE: SPU %u runs workload %u only\n", n, w);
+    }
+    for (e = getenv("SPURS_LANE"); e && *e && s_lane_n < SPURS_LANES; ) {
+        if (sscanf(e, "%u:%u", &w, &n) != 2 || w >= SPURS_MAX_WID || n >= 6) break;
+        s_lane[s_lane_n].wid = w; s_lane[s_lane_n].sn = n; s_lane_n++;
+        s_res_wid = s_res_sn = 0xFFFFFFFFu;
+        fprintf(stderr, "[spurs] SPURS_LANE: workload %u has a worker of its own, as SPU %u\n", w, n);
+        e = strchr(e, ',');
+        if (e) e++;
     }
     for (const char* l = getenv("SPURS_LEND"); l && *l && s_res_sn != 0xFFFFFFFFu; ) {
         const char* c = strchr(l, ',');
@@ -2546,18 +2574,19 @@ static void spurs_lend_mark(u32 wid)
                 s_workloads[wid].name[0] ? s_workloads[wid].name : "-", s_res_sn);
     s_workloads[wid].lent = lent;
 }
-static int spurs_reserved_away(u32 wid, u32 sn)
+static int spurs_reserved_away(u32 wid, u32 sn, int lane)
 {
     spurs_reserve_parse();
+    if (s_lane_n) return spurs_lane_of(wid, sn) != lane;
     return sn == s_res_sn && wid != s_res_wid && !s_workloads[wid].lent;
 }
 
-static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, u32 enabled, u32 contention,
-                       u32 last_wid, int* asked)
+static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, int lane, u32 enabled,
+                       u32 contention, u32 last_wid, int* asked)
 {
     const u32 ea = si->ea;
     *asked = 0;
-    if (spurs_reserved_away(wid, sn))
+    if (spurs_reserved_away(wid, sn, lane))
         return 0;
     if (!(enabled & (0x80000000u >> wid)) || vm_read8(ea + wkl_state_off(wid)) != 2 ||
         !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
@@ -2613,7 +2642,7 @@ void spurs_debug_dump(const char* why)
         if (!ea) continue;
         fprintf(stderr, "[spurs-dump] %s: instance 0x%08X spus %u spurs2 %d kernel %d stopping %d kick %d pass %u cursor %u\n",
                 why, ea, si->nspus, si->is2, si->kernel_live, si->stopping, si->kick, si->pass_no, si->cursor);
-        for (u32 k = 0; k < si->nspus && k < 6; k++) {
+        for (u32 k = 0; k < si->nslots; k++) {
             const struct SpursPmSlot* sl = &si->slots[k];
             fprintf(stderr, "[spurs-dump]   slot %u spu %u busy %d wid %u last %u polls %u\n",
                     k, sl->spu_num, sl->busy, sl->wid, sl->last_wid, sl->last_polls);
@@ -2727,7 +2756,7 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
         u32 pick = SPURS_MAX_WID, best = 0;
         for (u32 wid = 0; wid < nwid; wid++) {
             int asked;
-            const u32 w = spurs_claim(si, wid, sn, enabled, si->active[wid], slot->wid, &asked);
+            const u32 w = spurs_claim(si, wid, sn, slot->lane, enabled, si->active[wid], slot->wid, &asked);
             if (!w) continue;
             if (asked) si->idle[wid] = 0;
             else if (!spurs_probe_due(si, wid, mode)) continue;
@@ -2748,6 +2777,8 @@ static int spurs_pick(struct SpursInst* si, struct SpursPmSlot* slot, int mode)
             continue;
         if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn))
             continue; /* priority zero makes this physical lane ineligible */
+        if (s_lane_n && spurs_lane_of(wid, sn) != slot->lane)
+            continue; /* SPURS_LANE: that workload's worker, and only its */
         u32 maxcont = spurs_maxcont_override(wid, wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2));
         if (!maxcont || si->active[wid] >= maxcont) continue;
         if (!spurs_resolve_pm(wid)) continue;
@@ -2789,11 +2820,12 @@ static uint64_t spurs_kernel_poll(uint32_t ea, uint32_t sn, uint32_t cur)
     AcquireSRWLockExclusive(&s_workload_registry_lock);
     const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
     const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    const int lane = spurs_lane_of(cur, sn);   /* SPURS_LANE: which of the SPU's workers asks */
     u32 pick = 0x20, best = 0;
     for (u32 wid = 0; wid < nwid; wid++) {
         const u32 cont = si->active[wid] - (wid == cur && si->active[wid] ? 1u : 0u);
         int asked;
-        const u32 w = spurs_claim(si, wid, sn, enabled, cont, cur, &asked);
+        const u32 w = spurs_claim(si, wid, sn, lane, enabled, cont, cur, &asked);
         if (w && asked && w > best) { best = w; pick = wid; }
     }
     u32 status = 0;
@@ -2846,8 +2878,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (disabled) continue;
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         if (!kick_pass) si->pass_no++;
-        for (u32 sn = 0; sn < si->nspus; sn++) {
-            struct SpursPmSlot* slot = &si->slots[sn];
+        for (u32 k = 0; k < si->nslots; k++) {
+            struct SpursPmSlot* slot = &si->slots[k];
             if (slot->busy) continue;
             if (spurs_pick(si, slot, kick_pass ? SPURS_PICK_KICK : SPURS_PICK_FULL))
                 WakeConditionVariable(&slot->cv);
@@ -2869,10 +2901,13 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     if (kick_prof_secs()) g_ppu_line_commit_hook = kick_prof_ppu_commit;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
-    for (u32 sn = 0; sn < si->nspus; sn++) {
-        struct SpursPmSlot* slot = &si->slots[sn];
+    spurs_reserve_parse();
+    si->nslots = si->nspus + s_lane_n;
+    for (u32 k = 0; k < si->nslots; k++) {
+        struct SpursPmSlot* slot = &si->slots[k];
         memset(slot, 0, sizeof(*slot));
-        slot->instance = si; slot->spu_num = sn;
+        slot->lane = k >= si->nspus ? (int)(k - si->nspus) + 1 : 0;
+        slot->instance = si; slot->spu_num = slot->lane ? s_lane[slot->lane - 1].sn : k;
         slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
         if (!slot->thread) goto failed;
     }
@@ -2882,11 +2917,11 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
 failed:
     AcquireSRWLockExclusive(&si->lock);
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
-    for (u32 sn = 0; sn < si->nspus; sn++) WakeConditionVariable(&si->slots[sn].cv);
+    for (u32 k = 0; k < si->nslots; k++) WakeConditionVariable(&si->slots[k].cv);
     ReleaseSRWLockExclusive(&si->lock);
-    for (u32 sn = 0; sn < si->nspus; sn++) {
-        HANDLE h = si->slots[sn].thread;
-        if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
+    for (u32 k = 0; k < si->nslots; k++) {
+        HANDLE h = si->slots[k].thread;
+        if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[k].thread = NULL; }
     }
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0; si->stopping = 0;
@@ -2902,12 +2937,12 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     for (u32 wid = 0; wid < SPURS_MAX_WID; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
-    for (u32 sn = 0; sn < si->nspus; sn++) WakeConditionVariable(&si->slots[sn].cv);
+    for (u32 k = 0; k < si->nslots; k++) WakeConditionVariable(&si->slots[k].cv);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
-    for (u32 sn = 0; sn < si->nspus; sn++) {
-        HANDLE h = si->slots[sn].thread;
-        if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
+    for (u32 k = 0; k < si->nslots; k++) {
+        HANDLE h = si->slots[k].thread;
+        if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[k].thread = NULL; }
     }
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0;

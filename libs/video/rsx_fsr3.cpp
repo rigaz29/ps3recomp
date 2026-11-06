@@ -56,8 +56,12 @@ struct fsr3_camera {
 #define FSR3_CUT_COS  0.966      /* 15 degrees */
 #define FSR3_CUT_MOVE 20.0       /* near planes: the one length a matrix gives */
 #define FSR3_CUT_FOV  0.1
+#define FSR3_FLOOR_BACK 2.0
 static fsr3_camera s_prev;
 static bool s_prev_ok;              /* the last frame was a scene */
+static double s_floor, s_rate_ms;   /* see fsr3_rate */
+static int s_rate_n, s_rate_streak;
+static bool s_under;
 
 int rsx_fsr3_available(void)
 {
@@ -419,6 +423,29 @@ void rsx_fsr3_fg_destroy(void)
     s_fg_ctx = nullptr;
 }
 
+/* A frame rate over 1.5 s, which a single hitch does not bring under the floor, and two of
+ * those in a row to change: over the floor by a margin to come back, as generation costs some
+ * of the rate it is judged on. */
+void rsx_fsr3_fg_floor(double fps) { s_floor = fps; }
+
+static void fsr3_rate(float frame_ms)
+{
+    if (s_floor <= 0.0) return;
+    s_rate_ms += frame_ms;
+    s_rate_n++;
+    if (s_rate_ms < 1500.0) return;
+    const double rate = s_rate_n * 1000.0 / s_rate_ms;
+    s_rate_ms = 0.0;
+    s_rate_n = 0;
+    const bool under = rate < (s_under ? s_floor + FSR3_FLOOR_BACK : s_floor);
+    s_rate_streak = under != s_under ? s_rate_streak + 1 : 0;
+    if (s_rate_streak >= 2) {
+        s_under = under;
+        s_rate_streak = 0;
+        printf("[fsr3] %.1f frames a second: generation %s\n", rate, under ? "stands aside" : "is back");
+    }
+}
+
 /* The motion across a cut means nothing. */
 static bool fsr3_cut(const fsr3_camera& a, const fsr3_camera& b)
 {
@@ -431,8 +458,9 @@ static bool fsr3_cut(const fsr3_camera& a, const fsr3_camera& b)
 void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
 {
     if (!s_fg_ctx) return;
+    fsr3_rate(frame_ms);
     fsr3_camera cam;
-    bool on = s_generate && f->scene && f->depth && f->hudless &&
+    bool on = s_generate && !s_under && f->scene && f->depth && f->hudless &&
               fsr3_pose(f->cam, f->z_scale, f->z_offset, &cam);
     double inv[4][4];
     if (on && !m4_inverse(cam.m, inv)) on = false;

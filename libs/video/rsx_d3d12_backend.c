@@ -979,6 +979,7 @@ static void fg_start(void)
     void* sc = s_d3d.swap_chain;
     if (rsx_fsr3_wrap(&sc, s_d3d.cmd_queue)) s_fg_mode = mode;
     s_d3d.swap_chain = (IDXGISwapChain3*)sc;
+    rsx_fsr3_fg_floor(atof(ps3_settings_str("graphics", "frame_generation_floor", "D3D12_FG_FLOOR", "25")));
 }
 
 int rsx_d3d12_backend_generating(void) { return s_fg_mode == 2; }

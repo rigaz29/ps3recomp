@@ -43,6 +43,9 @@ typedef struct rsx_fsr3_frame {
 /* Every presented frame, before the command list closes. */
 void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* frame, float frame_ms);
 
+/* Frames a second under which frames are shown as they are, until it recovers. 0: never. */
+void rsx_fsr3_fg_floor(double fps);
+
 #ifdef __cplusplus
 }
 #endif

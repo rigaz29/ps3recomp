@@ -462,6 +462,7 @@ typedef struct {
     u64 last_use;           /* frame_count of the last draw recorded with it */
     ID3DBlob* vs;
     int uses_c03;
+    int uses_cam;           /* reads the title's camera (rsx_d3d12_backend_camera_register) */
     char* hlsl;             /* the decompiled source, for vp_vs_raw */
     ID3DBlob* vs_raw;       /* raw-fetch variant, compiled on first use */
     int raw_failed;
@@ -947,6 +948,25 @@ static void rdoc_request(void)
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
 static int s_fg_ready;
 static double s_fg_last;
+/* What it takes from a frame, as the batch is recorded and replayed. */
+static struct {
+    int cam_reg;                /* the vertex constant the world-to-clip matrix starts at, or -1 */
+    int cam_ok;                 /* this frame has a 3D scene: a camera, and */
+    float cam[16], z_scale, z_offset;
+    u32 depth_off;              /* the depth surface it draws with */
+    int marked;                 /* the HUD's clear was reached: see fg_marker */
+    int copied;                 /* and the frame's depth and picture are in depth and hud_src */
+    int ready;                  /* the frame's inputs are all there */
+    ID3D12Resource* depth;      /* the scene's depth */
+    ID3D12Resource* hud_src;    /* the picture without its HUD, at the display target's size */
+    ID3D12Resource* hud_out[2]; /* that at the window's size, a frame about */
+    u32 hud_i;
+} s_fg = { -1 };
+
+/* The title's world-to-clip matrix: four vertex constants from reg, read by the
+ * programs that draw its scene. Without it frames are shown as they are. */
+void rsx_d3d12_backend_camera_register(int reg) { s_fg.cam_reg = reg; }
+
 static void fg_start(void)
 {
     const char* m = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
@@ -978,8 +998,17 @@ static void fg_frame(void)
                s_d3d.bb_w, s_d3d.bb_h, s_d3d.width, s_d3d.height, 10);
     }
     const double now = perf_now();
-    rsx_fsr3_fg_frame(s_d3d.cmd_list, s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f);
+    rsx_fsr3_frame f;
+    memset(&f, 0, sizeof f);
+    f.scene = s_fg.ready;
+    f.depth = s_fg.depth;
+    f.hudless = s_fg.hud_out[s_fg.hud_i];
+    memcpy(f.cam, s_fg.cam, sizeof f.cam);
+    f.z_scale = s_fg.z_scale;
+    f.z_offset = s_fg.z_offset;
+    rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f);
     s_fg_last = now;
+    s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.ready = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2957,7 +2986,10 @@ static void wait_for_gpu_once(void)
 #define PP_SLOT_AA_E(fi) (8u + 3u * (fi))
 #define PP_SLOT_AA_W     16u
 #define PP_SLOT_AA_N(fi) (20u + 3u * (fi))
-#define PP_SRV_SLOTS     32u
+#define PP_SLOT_HUD      32u   /* frame generation's picture without its HUD, */
+#define PP_SLOT_HUD_E    33u   /* and SMAA's tables for it */
+#define PP_SLOT_HUD_N    36u
+#define PP_SRV_SLOTS     40u
 
 /* RTVs for the swap chain's buffers, made again after each resize. */
 static void bb_views(void)
@@ -3058,7 +3090,7 @@ static int pp_init(void)
     HRESULT hr;
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = FRAME_COUNT + 1;   /* the back buffers, then pp_tmp */
+    hd.NumDescriptors = FRAME_COUNT + 3;   /* the back buffers, pp_tmp, then s_fg.hud_out */
     hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
                                                    (void**)&s_d3d.bb_rtv_heap);
     if (FAILED(hr)) { printf("[D3D12] ERROR: back buffer RTV heap (0x%08lX)\n", hr); return -1; }
@@ -3206,6 +3238,8 @@ static void bb_resize(void)
     if (s_fg_mode) {                     /* its size is the window's: made again at the next frame */
         rsx_fsr3_fg_destroy();
         s_fg_ready = 0;
+        for (int i = 0; i < 2; i++)
+            if (s_fg.hud_out[i]) { s_fg.hud_out[i]->lpVtbl->Release(s_fg.hud_out[i]); s_fg.hud_out[i] = NULL; }
     }
     HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, FRAME_COUNT, w, h,
                                                          DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -4104,7 +4138,7 @@ static void aa_draw(ID3D12PipelineState* pso, u32 src, D3D12_CPU_DESCRIPTOR_HAND
 /* SMAA 1x from display target fi into aa_out (left in PIXEL_SHADER_RESOURCE
  * for the scaling pass; aa_finish puts the targets back in COMMON). The
  * display target is already in PIXEL_SHADER_RESOURCE. */
-static void aa_run(u32 fi)
+static void aa_run(u32 table_e, u32 table_n)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     if (!s_d3d.aa_luts_ready) {
@@ -4141,7 +4175,7 @@ static void aa_run(u32 fi)
     /* Edges; the pass discards where there are none, so it starts cleared. */
     pp_barrier(s_d3d.aa_edges, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cl->lpVtbl->ClearRenderTargetView(cl, rtv[0], zero, 0, NULL);
-    aa_draw(s_d3d.aa_pso[0], PP_SLOT_AA_E(fi), rtv[0]);
+    aa_draw(s_d3d.aa_pso[0], table_e, rtv[0]);
     pp_barrier(s_d3d.aa_edges, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     /* Blending weights */
     pp_barrier(s_d3d.aa_blend, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4149,7 +4183,7 @@ static void aa_run(u32 fi)
     pp_barrier(s_d3d.aa_blend, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     /* Neighbourhood blending */
     pp_barrier(s_d3d.aa_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    aa_draw(s_d3d.aa_pso[2], PP_SLOT_AA_N(fi), rtv[2]);
+    aa_draw(s_d3d.aa_pso[2], table_n, rtv[2]);
     pp_barrier(s_d3d.aa_out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
@@ -4166,6 +4200,60 @@ static void aa_finish(void)
  * off). FSR 1 only scales up; a back buffer no larger than the display takes
  * bilinear. Everything ends where the next frame expects it: the display
  * target and pp_tmp in COMMON, the swap chain's buffer in PRESENT. */
+/* src (an SRV slot) through SMAA, when it is on, and the scaling into out, left as a
+ * render target. SMAA's targets stay as they are until aa_finish. */
+static void pp_chain(u32 src, u32 table_e, u32 table_n, D3D12_CPU_DESCRIPTOR_HANDLE out_rtv,
+                     D3D12_CPU_DESCRIPTOR_HANDLE tmp_rtv, ID3D12Resource* out, D3D12_RESOURCE_STATES before)
+{
+    const int up = s_d3d.bb_w > s_d3d.width && s_d3d.bb_h > s_d3d.height;
+    u32 c[16];
+    memset(c, 0, sizeof c);
+    if (s_d3d.aa_on) {
+        aa_run(table_e, table_n);
+        src = PP_SLOT_AA_OUT;
+    }
+    if (s_d3d.pp_mode == 2 && up) {
+        rsx_fsr1_easu_con(c, (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h);
+        if (s_d3d.pp_tmp) {
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            pp_draw(s_d3d.pp_pso_easu, src, tmp_rtv, c);
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            pp_barrier(out, before, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            memset(c, 0, sizeof c);
+            rsx_fsr1_rcas_con(c, s_d3d.pp_stops);
+            pp_draw(s_d3d.pp_pso_rcas, FRAME_COUNT, out_rtv, c);
+            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        } else {
+            pp_barrier(out, before, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            pp_draw(s_d3d.pp_pso_easu, src, out_rtv, c);
+        }
+    } else {
+        const float f[5] = { (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h,
+                             s_d3d.pp_mode == 1 ? 1.0f : 0.0f };
+        memcpy(c, f, sizeof f);
+        pp_barrier(out, before, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        pp_draw(s_d3d.pp_pso, src, out_rtv, c);
+    }
+}
+
+/* The picture without its HUD through the same pass as the frame, so that what differs
+ * between the two is the HUD and nothing else: frame generation goes by that. */
+static void fg_hudless(D3D12_CPU_DESCRIPTOR_HANDLE tmp_rtv)
+{
+    if (!s_fg.copied || !s_fg.hud_out[0]) return;
+    s_fg.hud_i ^= 1;
+    ID3D12Resource* out = s_fg.hud_out[s_fg.hud_i];
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = tmp_rtv;
+    rtv.ptr += (1 + s_fg.hud_i) * s_d3d.rtv_descriptor_size;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    pp_chain(PP_SLOT_HUD, PP_SLOT_HUD_E, PP_SLOT_HUD_N, rtv, tmp_rtv, out, read);
+    if (s_d3d.aa_on) aa_finish();
+    pp_barrier(out, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    s_fg.ready = 1;
+}
+
+static void fg_unmarked(ID3D12Resource* bb);
+
 static void present_to_backbuffer(u32 fi)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, tmp_rtv;
@@ -4175,38 +4263,11 @@ static void present_to_backbuffer(u32 fi)
     tmp_rtv.ptr += FRAME_COUNT * s_d3d.rtv_descriptor_size;
     ID3D12Resource* disp = s_d3d.render_targets[fi];
     ID3D12Resource* bb = s_d3d.backbuffers[fi];
-    const int up = s_d3d.bb_w > s_d3d.width && s_d3d.bb_h > s_d3d.height;
-    u32 c[16];
-    memset(c, 0, sizeof c);
 
+    fg_hudless(tmp_rtv);
     pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    u32 src = fi;   /* the display target, or SMAA's output */
-    if (s_d3d.aa_on) {
-        aa_run(fi);
-        src = PP_SLOT_AA_OUT;
-    }
-    if (s_d3d.pp_mode == 2 && up) {
-        rsx_fsr1_easu_con(c, (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h);
-        if (s_d3d.pp_tmp) {
-            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            pp_draw(s_d3d.pp_pso_easu, src, tmp_rtv, c);
-            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            memset(c, 0, sizeof c);
-            rsx_fsr1_rcas_con(c, s_d3d.pp_stops);
-            pp_draw(s_d3d.pp_pso_rcas, FRAME_COUNT, bb_rtv, c);
-            pp_barrier(s_d3d.pp_tmp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        } else {
-            pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            pp_draw(s_d3d.pp_pso_easu, src, bb_rtv, c);
-        }
-    } else {
-        const float f[5] = { (float)s_d3d.width, (float)s_d3d.height, (float)s_d3d.bb_w, (float)s_d3d.bb_h,
-                             s_d3d.pp_mode == 1 ? 1.0f : 0.0f };
-        memcpy(c, f, sizeof f);
-        pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        pp_draw(s_d3d.pp_pso, src, bb_rtv, c);
-    }
+    pp_chain(fi, PP_SLOT_AA_E(fi), PP_SLOT_AA_N(fi), bb_rtv, tmp_rtv, bb, D3D12_RESOURCE_STATE_PRESENT);
+    fg_unmarked(bb);
     ov_draw(fi, bb_rtv);
     if (s_d3d.aa_on) aa_finish();
     pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -5394,6 +5455,9 @@ static int vp_get_vs(const rsx_state* st)
     s_d3d.vp_vs[slot].uses_c03 =
         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
+    { char k[24];
+      snprintf(k, sizeof k, "vp_c[%d]", s_fg.cam_reg);
+      s_d3d.vp_vs[slot].uses_cam = s_fg.cam_reg >= 0 && strstr(hlsl, k) != NULL; }
     { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     memo_idx = slot;
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
@@ -8772,6 +8836,20 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
         vpx[2] = 1.0f; vpx[6] = 0.0f;
     }
+    /* The frame's first draw at the render's size through a perspective has its camera: a
+     * shadow pass goes through the same constants at another size, a screen of 2D through
+     * a flat matrix. */
+    if (s_fg_mode == 2 && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
+        vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
+        const float* m = c + s_fg.cam_reg * 4;
+        if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) {
+            memcpy(s_fg.cam, m, sizeof s_fg.cam);
+            s_fg.z_scale = vpx[2];
+            s_fg.z_offset = vpx[6];
+            s_fg.depth_off = dr->zeta_off;
+            s_fg.cam_ok = 1;
+        }
+    }
     s_cbimg_ok = 1;
 }
 
@@ -9825,6 +9903,125 @@ static void off_ds_transition(int i, D3D12_RESOURCE_STATES to)
     br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &br);
     z->st = to;
+}
+
+/* What the marker copies into, made on first use and, the window's size, after a resize. */
+static int fg_targets(void)
+{
+    ID3D12Device* dev = s_d3d.device;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    if (!s_fg.depth) {
+        rd.Width = s_d3d.width; rd.Height = s_d3d.height;
+        rd.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_fg.depth)))
+            return 0;
+    }
+    const UINT inc = dev->lpVtbl->GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE base;
+    s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &base);
+    if (!s_fg.hud_src) {
+        rd.Width = s_d3d.width; rd.Height = s_d3d.height;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_fg.hud_src)))
+            return 0;
+        D3D12_SHADER_RESOURCE_VIEW_DESC nd;
+        memset(&nd, 0, sizeof nd);
+        nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nd.Texture2D.MipLevels = 1;
+        struct { u32 slot; ID3D12Resource* res; } v[] = {
+            { PP_SLOT_HUD, s_fg.hud_src }, { PP_SLOT_HUD_E, s_fg.hud_src }, { PP_SLOT_HUD_E + 1, NULL }, { PP_SLOT_HUD_E + 2, NULL },
+            { PP_SLOT_HUD_N, s_fg.hud_src }, { PP_SLOT_HUD_N + 1, s_d3d.aa_on ? s_d3d.aa_blend : NULL }, { PP_SLOT_HUD_N + 2, NULL },
+        };
+        for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = base;
+            h.ptr += v[i].slot * inc;
+            dev->lpVtbl->CreateShaderResourceView(dev, v[i].res, v[i].res ? NULL : &nd, h);
+        }
+    }
+    for (u32 i = 0; i < 2; i++) {
+        if (s_fg.hud_out[i]) continue;
+        rd.Width = s_d3d.bb_w; rd.Height = s_d3d.bb_h;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, read, NULL,
+                &IID_ID3D12Resource, (void**)&s_fg.hud_out[i])))
+            return 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &h);
+        h.ptr += (FRAME_COUNT + 1 + i) * s_d3d.rtv_descriptor_size;
+        dev->lpVtbl->CreateRenderTargetView(dev, s_fg.hud_out[i], NULL, h);
+    }
+    return 1;
+}
+
+static void fg_copy_depth(int zi)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const D3D12_RESOURCE_STATES zs = s_d3d.off_ds[zi].st;
+    off_ds_transition(zi, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pp_barrier(s_fg.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->lpVtbl->CopyResource(cl, s_fg.depth, s_d3d.off_ds[zi].res);
+    pp_barrier(s_fg.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    off_ds_transition(zi, zs);
+}
+
+/* A clear of depth alone on a display surface, in the depth surface the scene drew with: the
+ * picture is finished and the HUD comes next (God of War: Ascension, when it has a HUD to
+ * draw), and the clear is about to wipe the scene's depth. Both are copied here. Nothing
+ * else of the draw pass changes: the surfaces go back to the states they were in. */
+static void fg_marker(const D3D12DrawRecord* dr)
+{
+    if (s_fg_mode != 2 || !s_fg.cam_ok || dr->zeta_off != s_fg.depth_off) return;
+    s_fg.marked = 1;
+    const int ri = off_rt_find(dr->rt_off), zi = off_ds_find(dr->zeta_off);
+    if (ri < 0 || zi < 0) return;
+    OffRT* rt = &s_d3d.off_rt[ri];
+    const OffDS* z = &s_d3d.off_ds[zi];
+    if (rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM || rt->w != s_d3d.width || rt->h != s_d3d.height ||
+        z->w != s_d3d.width || z->h != s_d3d.height || !fg_targets())
+        return;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const D3D12_RESOURCE_STATES rs = rt->st;
+    off_rt_transition(ri, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pp_barrier(s_fg.hud_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->lpVtbl->CopyResource(cl, s_fg.hud_src, rt->res);
+    pp_barrier(s_fg.hud_src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    off_rt_transition(ri, rs);
+    fg_copy_depth(zi);
+    s_fg.copied = 1;
+}
+
+/* A scene with no HUD to draw has no marker: its depth is whole at the frame's end, and the
+ * frame as it stands, before the overlay goes on, is the picture without a HUD. */
+static void fg_unmarked(ID3D12Resource* bb)
+{
+    if (s_fg_mode != 2 || !s_fg.cam_ok || s_fg.marked) return;
+    const int zi = off_ds_find(s_fg.depth_off);
+    if (zi < 0 || s_d3d.off_ds[zi].w != s_d3d.width || s_d3d.off_ds[zi].h != s_d3d.height || !fg_targets()) return;
+    fg_copy_depth(zi);
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    s_fg.hud_i ^= 1;
+    ID3D12Resource* out = s_fg.hud_out[s_fg.hud_i];
+    pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pp_barrier(out, read, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->lpVtbl->CopyResource(cl, out, bb);
+    pp_barrier(out, D3D12_RESOURCE_STATE_COPY_DEST, read);
+    pp_barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    s_fg.ready = 1;
 }
 
 /* The depth surface at this zeta offset, made on first use at the size of the
@@ -12275,6 +12472,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     continue;
                 }
                 if (dr->zq_op) { zq_op_replay(dr); continue; }
+                if (dr->is_clear && dr->clear_mask == 1u && (dr->rt_off & DISP_RT_TAG)) fg_marker(dr);
                 if (!dr->is_clear) zq_before_draw();
                 /* The targets and depth surface this draw binds (as the retarget
                  * below picks them): a copy of one of those is not refreshed here

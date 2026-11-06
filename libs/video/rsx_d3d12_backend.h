@@ -50,6 +50,10 @@ int rsx_d3d12_backend_pump_messages(void);
  * half the display's rate, and the frame clock caps it. */
 int rsx_d3d12_backend_generating(void);
 
+/* The first of the four vertex constants that hold the title's world-to-clip matrix, which
+ * frame generation needs. Before rsx_d3d12_backend_init. */
+void rsx_d3d12_backend_camera_register(int reg);
+
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 

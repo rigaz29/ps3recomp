@@ -28,8 +28,20 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
 /* Destroys it, for another rsx_fsr3_fg_create after a resize. */
 void rsx_fsr3_fg_destroy(void);
 
+/* What a frame gives frame generation. With scene 0 (a menu, a movie) the frame
+ * is shown as it is and the rest is not read. */
+typedef struct rsx_fsr3_frame {
+    int   scene;
+    void* depth;            /* ID3D12Resource*: the scene's D24S8 as R24G8_TYPELESS, in
+                             * NON_PIXEL_SHADER_RESOURCE, at the render's size */
+    void* hudless;          /* ID3D12Resource*: the picture without its HUD, at the display's
+                             * size, readable by pixel and compute shaders */
+    float cam[16];          /* world to clip, four columns: x, y, z and w's */
+    float z_scale, z_offset;/* clip z to the depth range: depth = ndc * scale + offset */
+} rsx_fsr3_frame;
+
 /* Every presented frame, before the command list closes. */
-void rsx_fsr3_fg_frame(void* cmd_list, float frame_ms);
+void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* frame, float frame_ms);
 
 #ifdef __cplusplus
 }

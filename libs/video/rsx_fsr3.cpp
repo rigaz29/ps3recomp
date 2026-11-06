@@ -12,7 +12,9 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_5.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,8 +35,29 @@ static void* s_swap;
 static int s_generate;
 static unsigned s_dw, s_dh, s_rw, s_rh;
 static uint64_t s_frame_id;
-static ID3D12Resource* s_depth;
-static ID3D12Resource* s_motion;
+static ID3D12Resource* s_depth;     /* R32_FLOAT at the render's size */
+static ID3D12Resource* s_motion;    /* R16G16_FLOAT, in UV units, from a pixel to where it was */
+
+/* The inputs' pass: see fsr3_inputs. */
+static ID3D12RootSignature* s_in_root;
+static ID3D12PipelineState* s_in_pso;
+static ID3D12DescriptorHeap* s_in_heap;
+static ID3D12Resource* s_in_src;    /* what the heap's SRV shows */
+static ID3D12Device* s_dev;
+
+/* The camera, from the matrix a scene draws with. */
+struct fsr3_camera {
+    double m[4][4];                 /* row, column */
+    double pos[3], right[3], up[3], fwd[3];
+    double znear, zfar, fov;
+};
+/* A cut, in one frame. The title's camera at most turns 2.1 degrees and moves 1.6 units, near
+ * being 0.25; its cuts move 7.7 and 502 units, the first with a third of the field of view. */
+#define FSR3_CUT_COS  0.966      /* 15 degrees */
+#define FSR3_CUT_MOVE 20.0       /* near planes: the one length a matrix gives */
+#define FSR3_CUT_FOV  0.1
+static fsr3_camera s_prev;
+static bool s_prev_ok;              /* the last frame was a scene */
 
 int rsx_fsr3_available(void)
 {
@@ -117,7 +140,29 @@ int rsx_fsr3_wrap(void** swap_chain, void* queue)
     return 1;
 }
 
-/* What phase 2 gives it: nothing moves, one depth. */
+/* The depth into the format the API takes, and the camera's motion at every pixel:
+ * back to the world through this frame's matrix, forward through last frame's.
+ * A depth is what the rasteriser wrote, so a moving object gets the motion of the
+ * world behind where it stands; frame generation's optical flow carries it. */
+static const char s_in_hlsl[] =
+    "Texture2D<float> depth_in : register(t0);\n"
+    "RWTexture2D<float> depth_out : register(u0);\n"
+    "RWTexture2D<float2> motion_out : register(u1);\n"
+    "cbuffer C : register(b0) { float4 r0, r1, r2, r3; float4 k; };\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    uint w, h;\n"
+    "    depth_out.GetDimensions(w, h);\n"
+    "    if (id.x >= w || id.y >= h) return;\n"
+    "    float d = depth_in[id.xy];\n"
+    "    depth_out[id.xy] = d;\n"
+    "    float2 uv = (float2(id.xy) + 0.5) * k.zw;\n"
+    "    float4 n = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (d - k.y) / k.x, 1.0);\n"
+    "    float4 p = float4(dot(r0, n), dot(r1, n), dot(r2, n), dot(r3, n));\n"
+    "    float2 was = float2(p.x / p.w * 0.5 + 0.5, 0.5 - p.y / p.w * 0.5);\n"
+    "    motion_out[id.xy] = p.w > 0.0 ? was - uv : float2(0.0, 0.0);\n"
+    "}\n";
+
 static ID3D12Resource* fsr3_target(ID3D12Device* dev, DXGI_FORMAT fmt, unsigned w, unsigned h)
 {
     D3D12_HEAP_PROPERTIES hp{};
@@ -130,6 +175,7 @@ static ID3D12Resource* fsr3_target(ID3D12Device* dev, DXGI_FORMAT fmt, unsigned 
     rd.MipLevels = 1;
     rd.Format = fmt;
     rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource* r = nullptr;
     dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -137,14 +183,179 @@ static ID3D12Resource* fsr3_target(ID3D12Device* dev, DXGI_FORMAT fmt, unsigned 
     return r;
 }
 
+static int fsr3_inputs_init(ID3D12Device* dev)
+{
+    if (s_in_pso) return 1;
+    ID3DBlob* cs = nullptr;
+    ID3DBlob* err = nullptr;
+    if (FAILED(D3DCompile(s_in_hlsl, sizeof s_in_hlsl - 1, "fsr3_inputs", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) {
+        printf("[fsr3] inputs' pass: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
+        return 0;
+    }
+    D3D12_DESCRIPTOR_RANGE range[2]{};
+    range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range[0].NumDescriptors = 1;
+    range[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range[1].NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER rp[3]{};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &range[0];
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[1].DescriptorTable.NumDescriptorRanges = 1;
+    rp[1].DescriptorTable.pDescriptorRanges = &range[1];
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[2].Constants.Num32BitValues = 20;
+    D3D12_ROOT_SIGNATURE_DESC rd{};
+    rd.NumParameters = 3;
+    rd.pParameters = rp;
+    ID3DBlob* sig = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&s_in_root))))
+        return 0;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = s_in_root;
+    pd.CS.pShaderBytecode = cs->GetBufferPointer();
+    pd.CS.BytecodeLength = cs->GetBufferSize();
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s_in_pso)))) return 0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 3;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_in_heap)))) return 0;
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h = s_in_heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += inc;
+    dev->CreateUnorderedAccessView(s_depth, nullptr, nullptr, h);
+    h.ptr += inc;
+    dev->CreateUnorderedAccessView(s_motion, nullptr, nullptr, h);
+    return 1;
+}
+
+static void fsr3_barrier(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b[2]{};
+    ID3D12Resource* const r[2] = { s_depth, s_motion };
+    for (int i = 0; i < 2; i++) {
+        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[i].Transition.pResource = r[i];
+        b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[i].Transition.StateBefore = from;
+        b[i].Transition.StateAfter = to;
+    }
+    cl->ResourceBarrier(2, b);
+}
+
+/* reproject: last frame's matrix after the inverse of this frame's, by rows. */
+static void fsr3_inputs(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, const double reproject[4][4],
+                        float z_scale, float z_offset)
+{
+    if (depth != s_in_src) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        s_dev->CreateShaderResourceView(depth, &v, s_in_heap->GetCPUDescriptorHandleForHeapStart());
+        s_in_src = depth;
+    }
+    float c[20];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) c[r * 4 + k] = (float)reproject[r][k];
+    c[16] = z_scale;
+    c[17] = z_offset;
+    c[18] = 1.0f / (float)s_rw;
+    c[19] = 1.0f / (float)s_rh;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    fsr3_barrier(cl, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->SetDescriptorHeaps(1, &s_in_heap);
+    cl->SetComputeRootSignature(s_in_root);
+    cl->SetPipelineState(s_in_pso);
+    D3D12_GPU_DESCRIPTOR_HANDLE g = s_in_heap->GetGPUDescriptorHandleForHeapStart();
+    cl->SetComputeRootDescriptorTable(0, g);
+    g.ptr += s_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cl->SetComputeRootDescriptorTable(1, g);
+    cl->SetComputeRoot32BitConstants(2, 20, c, 0);
+    cl->Dispatch((s_rw + 7) / 8, (s_rh + 7) / 8, 1);
+    fsr3_barrier(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+}
+
+static void v3_norm(double v[3])
+{
+    const double n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (n > 0.0) { v[0] /= n; v[1] /= n; v[2] /= n; }
+}
+
+/* 4x4 inverse by Gauss-Jordan, in doubles: a far pixel's motion is a small difference. */
+static bool m4_inverse(const double a[4][4], double out[4][4])
+{
+    double t[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) { t[r][c] = a[r][c]; t[r][c + 4] = r == c ? 1.0 : 0.0; }
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(t[r][c]) > fabs(t[p][c])) p = r;
+        if (fabs(t[p][c]) < 1e-20) return false;
+        if (p != c) for (int k = 0; k < 8; k++) { const double x = t[p][k]; t[p][k] = t[c][k]; t[c][k] = x; }
+        const double d = 1.0 / t[c][c];
+        for (int k = 0; k < 8; k++) t[c][k] *= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            const double f = t[r][c];
+            for (int k = 0; k < 8; k++) t[r][k] -= f * t[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r][c] = t[r][c + 4];
+    return true;
+}
+
+/* The pose out of a view-projection: its first, second and fourth rows are the planes
+ * through the camera, and their normals its axes. The fourth row gives the view
+ * depth. The third, against it, gives where depth 0 and 1 are. */
+static bool fsr3_pose(const float cam[16], float z_scale, float z_offset, fsr3_camera* c)
+{
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) c->m[r][k] = cam[k * 4 + r];
+    const double a[3][3] = { { c->m[0][0], c->m[0][1], c->m[0][2] },
+                             { c->m[1][0], c->m[1][1], c->m[1][2] },
+                             { c->m[3][0], c->m[3][1], c->m[3][2] } };
+    const double b[3] = { -c->m[0][3], -c->m[1][3], -c->m[3][3] };
+    const double det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                       a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if (fabs(det) < 1e-20) return false;
+    for (int i = 0; i < 3; i++) {               /* Cramer */
+        double m[3][3];
+        memcpy(m, a, sizeof m);
+        for (int r = 0; r < 3; r++) m[r][i] = b[r];
+        c->pos[i] = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                     m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+    }
+    for (int i = 0; i < 3; i++) { c->right[i] = c->m[0][i]; c->up[i] = c->m[1][i]; c->fwd[i] = c->m[3][i]; }
+    const double len_w = sqrt(c->fwd[0] * c->fwd[0] + c->fwd[1] * c->fwd[1] + c->fwd[2] * c->fwd[2]);
+    const double len_y = sqrt(c->up[0] * c->up[0] + c->up[1] * c->up[1] + c->up[2] * c->up[2]);
+    v3_norm(c->right);
+    v3_norm(c->up);
+    v3_norm(c->fwd);
+    if (len_w <= 0.0 || len_y <= 0.0) return false;
+    c->fov = 2.0 * atan(len_w / len_y);
+    /* clip z along the view at depth t: A t + B, clip w: len_w t */
+    const double A = c->m[2][0] * c->fwd[0] + c->m[2][1] * c->fwd[1] + c->m[2][2] * c->fwd[2];
+    const double B = c->m[2][0] * c->pos[0] + c->m[2][1] * c->pos[1] + c->m[2][2] * c->pos[2] + c->m[2][3];
+    const double S = z_scale, O = z_offset;
+    c->znear = -B * S / (A * S + O * len_w);
+    c->zfar  = -B * S / (A * S - (1.0 - O) * len_w);
+    return true;
+}
+
 int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsigned display_h,
                        unsigned render_w, unsigned render_h, int generate)
 {
     if (!s_swap_ctx) return 0;
     ID3D12Device* dev = (ID3D12Device*)device;
+    s_dev = dev;
     if (!s_depth) s_depth = fsr3_target(dev, DXGI_FORMAT_R32_FLOAT, render_w, render_h);
     if (!s_motion) s_motion = fsr3_target(dev, DXGI_FORMAT_R16G16_FLOAT, render_w, render_h);
-    if (!s_depth || !s_motion) return 0;
+    if (!s_depth || !s_motion || !fsr3_inputs_init(dev)) return 0;
 
     ffxCreateContextDescFrameGenerationVersion ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
@@ -179,10 +390,11 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     s_generate = generate;
     s_dw = display_w; s_dh = display_h;
     s_rw = render_w; s_rh = render_h;
+    s_prev_ok = false;
     return 1;
 }
 
-static void fsr3_configure(bool enabled)
+static void fsr3_configure(bool enabled, void* hudless)
 {
     ffxConfigureDescFrameGeneration c{};
     c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -192,6 +404,7 @@ static void fsr3_configure(bool enabled)
     };
     c.frameGenerationCallbackUserContext = &s_fg_ctx;
     c.frameGenerationEnabled = enabled;
+    if (hudless) c.HUDLessColor = ffxApiGetResourceDX12((ID3D12Resource*)hudless, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     c.generationRect.width = (int32_t)s_dw;
     c.generationRect.height = (int32_t)s_dh;
     c.frameID = s_frame_id;
@@ -201,16 +414,44 @@ static void fsr3_configure(bool enabled)
 void rsx_fsr3_fg_destroy(void)
 {
     if (!s_fg_ctx) return;
-    fsr3_configure(false);
+    fsr3_configure(false, nullptr);
     s_ffx.DestroyContext(&s_fg_ctx, nullptr);
     s_fg_ctx = nullptr;
 }
 
-void rsx_fsr3_fg_frame(void* cmd_list, float frame_ms)
+/* The motion across a cut means nothing. */
+static bool fsr3_cut(const fsr3_camera& a, const fsr3_camera& b)
+{
+    const double turn = a.fwd[0] * b.fwd[0] + a.fwd[1] * b.fwd[1] + a.fwd[2] * b.fwd[2];
+    double d[3] = { a.pos[0] - b.pos[0], a.pos[1] - b.pos[1], a.pos[2] - b.pos[2] };
+    const double moved = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    return turn < FSR3_CUT_COS || moved > FSR3_CUT_MOVE * a.znear || fabs(a.fov - b.fov) > FSR3_CUT_FOV * a.fov;
+}
+
+void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
 {
     if (!s_fg_ctx) return;
-    fsr3_configure(s_generate != 0);
-    if (s_generate) {
+    fsr3_camera cam;
+    bool on = s_generate && f->scene && f->depth && f->hudless &&
+              fsr3_pose(f->cam, f->z_scale, f->z_offset, &cam);
+    double inv[4][4];
+    if (on && !m4_inverse(cam.m, inv)) on = false;
+    const bool reset = on && (!s_prev_ok || fsr3_cut(cam, s_prev));
+    if (on) {
+        double rep[4][4];
+        for (int r = 0; r < 4; r++)
+            for (int k = 0; k < 4; k++) {
+                double v = 0.0;
+                if (reset) v = r == k ? 1.0 : 0.0;
+                else for (int i = 0; i < 4; i++) v += s_prev.m[r][i] * inv[i][k];
+                rep[r][k] = v;
+            }
+        /* From clip space to clip space, and the pass gives it NDC: the same point, as a
+         * projective map does not mind the scale. */
+        fsr3_inputs((ID3D12GraphicsCommandList*)cmd_list, (ID3D12Resource*)f->depth, rep, f->z_scale, f->z_offset);
+    }
+    fsr3_configure(on, on ? f->hudless : nullptr);
+    if (on) {
         ffxDispatchDescFrameGenerationPrepareV2 p{};
         p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
         p.frameID = s_frame_id;
@@ -220,19 +461,31 @@ void rsx_fsr3_fg_frame(void* cmd_list, float frame_ms)
         p.motionVectorScale.x = (float)s_rw;
         p.motionVectorScale.y = (float)s_rh;
         p.frameTimeDelta = frame_ms;
-        p.cameraNear = 0.1f;
-        p.cameraFar = 1000.0f;
-        p.cameraFovAngleVertical = 1.0f;
+        p.reset = reset;
+        p.cameraNear = (float)cam.znear;
+        p.cameraFar = (float)cam.zfar;
+        p.cameraFovAngleVertical = (float)cam.fov;
         p.depth = ffxApiGetResourceDX12(s_depth, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         p.motionVectors = ffxApiGetResourceDX12(s_motion, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-        p.cameraUp[1] = 1.0f;
-        p.cameraRight[0] = 1.0f;
-        p.cameraForward[2] = 1.0f;
+        for (int i = 0; i < 3; i++) {
+            p.cameraPosition[i] = (float)cam.pos[i];
+            p.cameraUp[i] = (float)cam.up[i];
+            p.cameraRight[i] = (float)cam.right[i];
+            p.cameraForward[i] = (float)cam.fwd[i];
+        }
         const ffxReturnCode_t rc = s_ffx.Dispatch(&s_fg_ctx, &p.header);
         static int said;
         if (rc != FFX_API_RETURN_OK && !said++)
             fprintf(stderr, "[fsr3] prepare failed (%u)\n", (unsigned)rc);
+        if (!s_prev_ok) {
+            static int told;
+            if (!told++)
+                printf("[fsr3] camera: near %.3f far %.1f fov %.1f at (%.1f %.1f %.1f)\n", cam.znear, cam.zfar,
+                       cam.fov * 57.29578, cam.pos[0], cam.pos[1], cam.pos[2]);
+        }
+        s_prev = cam;
     }
+    s_prev_ok = on;
     s_frame_id++;
 }
 

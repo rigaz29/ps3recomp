@@ -279,7 +279,7 @@ static int s_res_full;          /* a block found no room: start over after this 
 /* The vertex pass (phase 2b.1 of the God of War: Ascension port): see "The vertex pass" below. */
 #define VPT_SEGS 8192u                      /* a batch's lit segments: 32 bytes each in its table */
 #define VPT_SEGB (VPT_SEGS * 32u)
-#define VPT_HALF (VPT_SEGB + (2u << 20))   /* then the records */
+#define VPT_HALF (VPT_SEGB + (4u << 20))   /* then the records */
 static struct {
     const char* hlsl;
     u32 stride, max_rec;
@@ -13635,7 +13635,7 @@ static int s_vr_cls;                  /* the indexed draw being uploaded: 1 a ri
  * blocks, each with one vertex array), its sequence << 32 | its IO offset */
 static volatile LONG64* s_vr_idx[VR_MAX];
 /* and the kept blocks (rsx_kept.h), a slot per 128 bytes */
-typedef struct { rsx_kept* volatile k; volatile u32 io; } vr_kept;
+typedef struct { rsx_kept* volatile k; volatile u32 io, alt_on; u8 alt[16]; } vr_kept;
 static vr_kept* s_vr_kept[VR_MAX];
 static volatile LONG s_kept_seen;
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
@@ -13698,7 +13698,7 @@ static int vr_class(const rsx_state* st)
  *    here, the SPU's arrays keep what they held); VTX_LIT_DRAW=1 draws the lit copies instead.
  * VTX_LIT_MB: the size of a vp_lit half (default 40). */
 #define VPR_POOL 8192u                 /* more than a ring set's jobs in flight */
-typedef struct { volatile LONG seq; u32 key, n, applied, bytes; volatile LONG done; u8 tag[16]; } vpr_head;
+typedef struct { volatile LONG seq; u32 key, n, applied, bytes, skin; volatile LONG done; u8 tag[16]; } vpr_head;
 static u8* s_vpr_pool;                 /* VPR_POOL slots: a head, then the record */
 static u32 s_vpr_slot;
 static volatile LONG s_vpr_seq;
@@ -13714,11 +13714,22 @@ void rsx_d3d12_kept_publish(u32 io_offset, rsx_kept* k)
         if (!e) return;
         if (!k && !e->k) return;
         e->io = io_offset;
+        e->alt_on = 0;
         MemoryBarrier();
         e->k = k;
         if (k && !s_kept_seen) InterlockedExchange(&s_kept_seen, 1);
         return;
     }
+}
+
+static vr_kept* kept_slot(u32 io)
+{
+    const LONG nr = s_vr_n;
+    for (LONG r = 0; r < nr; r++) {
+        const u32 off = io - s_vr_off[r];
+        if (off < s_vr_size[r]) return s_vr_kept[r] ? &s_vr_kept[r][off >> 7] : NULL;
+    }
+    return NULL;
 }
 
 /* The kept block of a draw's attribute 0, if guest memory still holds its first bytes. */
@@ -13738,7 +13749,8 @@ static rsx_kept* kept_find(const rsx_state* st, u32* io)
         if (!e) return NULL;
         rsx_kept* k = e->k;
         if (!k || e->io != a || k->stride != st->vertex_attribs[0].stride) return NULL;
-        if (memcmp(vm_base + cellGcmResolveLocated(0, a), k->tag, 16) != 0) return NULL;
+        const u8* g = vm_base + cellGcmResolveLocated(0, a);
+        if (memcmp(g, k->tag, 16) != 0 && !(e->alt_on && memcmp(g, e->alt, 16) == 0)) return NULL;
         *io = a;
         return k;
     }
@@ -13765,9 +13777,9 @@ void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
 /* From any thread (an SPU worker's job): the record for n vertexes at io; it replaces the one there
  * before (the ring has been handed back for it). Not in a registered ring: dropped. */
 void rsx_d3d12_vertex_pass_publish(u32 io_offset, u32 n, const void* rec, u32 bytes, u32 applied,
-                                   const void* tag16)
+                                   const void* tag16, const void* skin, u32 skin_bytes)
 {
-    if (!s_vpass.set || bytes > s_vpass.max_rec) return;
+    if (!s_vpass.set || bytes + skin_bytes > s_vpass.max_rec) return;
     const LONG nr = s_vr_n;
     for (LONG r = 0; r < nr; r++) {
         const u32 off = io_offset - s_vr_off[r];
@@ -13782,10 +13794,12 @@ void rsx_d3d12_vertex_pass_publish(u32 io_offset, u32 n, const void* rec, u32 by
         u8* sl = s_vpr_pool + (size_t)((u32)seq % VPR_POOL) * s_vpr_slot;
         vpr_head* h = (vpr_head*)sl;
         InterlockedExchange(&h->seq, 0);                /* being written */
-        h->key = io_offset; h->n = n; h->applied = applied; h->bytes = bytes;
+        h->key = io_offset; h->n = n; h->applied = applied; h->bytes = bytes + skin_bytes;
+        h->skin = skin_bytes ? bytes : 0;
         memcpy(h->tag, tag16, 16);
         InterlockedExchange(&h->done, 0);
         memcpy(sl + sizeof(vpr_head), rec, bytes);
+        if (skin_bytes) memcpy(sl + sizeof(vpr_head) + bytes, skin, skin_bytes);
         MemoryBarrier();
         InterlockedExchange(&h->seq, seq);
         InterlockedExchange64(&s_vr_idx[r][off >> 7], ((LONG64)(u32)seq << 32) | io_offset);
@@ -14963,7 +14977,8 @@ static unsigned long long s_kept_draws, s_kept_fills;
 static int kept_resident(rsx_kept* k)
 {
     if (k->res_state && k->res_gen == s_res_gen) return k->res_state == 1;
-    const u32 vb = (k->nverts * k->stride + 64u + 255u) & ~255u, nix = k->list_bytes / 2u;
+    const u32 rs = k->skin ? k->rec : k->stride;
+    const u32 vb = (k->nverts * rs + 64u + 255u) & ~255u, nix = k->list_bytes / 2u;
     k->res_gen = s_res_gen;
     if (s_res_vb_used + vb > s_res_vb_size || s_res_ib_used + nix > s_res_ib_size) {
         k->res_state = 2;
@@ -14972,8 +14987,8 @@ static int kept_resident(rsx_kept* k)
     }
     u8* d = (u8*)s_d3d.vp_vb_mapped + (u64)2 * MAX_VERTICES * VP_VERT_STRIDE + s_res_vb_used;
     const u8* v = (const u8*)k->verts;
-    if (k->rec == k->stride) memcpy(d, v, (size_t)k->nverts * k->rec);
-    else for (u32 i = 0; i < k->nverts; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    if (k->rec == rs) memcpy(d, v, (size_t)k->nverts * k->rec);
+    else for (u32 i = 0; i < k->nverts; i++) memcpy(d + (size_t)i * rs, v + (size_t)i * k->rec, k->rec);
     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)2 * VP_MAX_INDICES + s_res_ib_used;
     const u8* l = (const u8*)k->list;
     for (u32 i = 0; i < nix; i++) ib[i] = ((u32)l[2 * i] << 8) | l[2 * i + 1];
@@ -14999,8 +15014,23 @@ static void kept_fill(const rsx_state* st, const rsx_kept* k, u32 io, u32 first,
     u8* d = vm_base + cellGcmResolveLocated(0, io);
     const u8* v = (const u8*)k->verts;
     const u32 n = k->put_verts < k->nverts ? k->put_verts : k->nverts;
-    if (k->rec == k->stride) memcpy(d, v, (size_t)n * k->rec);
-    else for (u32 i = 0; i < n; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    if (k->skin) {
+        /* the vertexes of this frame, from the job's record. The block's first bytes change with
+         * them: it stays known by those, until the next job there. */
+        LONG seq = 0;
+        vpr_head* h = vpr_find(io, &seq);
+        vr_kept* e = kept_slot(io);
+        if (h && h->skin && e && vpr_copy(h, seq, s_vpass.rec_tmp)) {
+            k->fill(k, s_vpass.rec_tmp + h->skin, d, n);
+            memcpy(h->tag, d, 16);
+            memcpy(e->alt, d, 16);
+            e->alt_on = 1;
+        }
+    } else if (k->rec == k->stride) {
+        memcpy(d, v, (size_t)n * k->rec);
+    } else {
+        for (u32 i = 0; i < n; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    }
     const int ilocal = ((st->index_array_dma & 0xF) == 0);
     const u32 lb = (first + count) * 2u;
     if (((st->index_array_dma >> 4) & 0xF) == 1 && lb <= k->list_bytes)
@@ -15090,10 +15120,11 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
 
     u32 lhdr = 0;
     int lit = 0;
-    if (s_vpass.set && k->stride == s_vpass.stride) {
+    if (k->skin && !s_vpass.set) return 0;
+    if (s_vpass.set && (k->stride == s_vpass.stride || k->skin)) {
         LONG seq = 0;
         const vpr_head* h = vpr_find(io, &seq);
-        if (!h || h->applied || !vpass_build()) return 0;
+        if (!h || h->applied || !vpass_build() || (k->skin != 0) != (h->skin != 0)) return 0;
         u8* tab = s_vpass.tab_mapped + (size_t)par * VPT_HALF;
         u32 rec_off;
         if (s_vpass.last_ok && s_vpass.last_key == h->key && s_vpass.last_seq == seq) {
@@ -15110,7 +15141,8 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
         if (s_vpass.nseg >= VPT_SEGS || (u64)lhdr + need > s_vpass.lit_half) return 0;
         /* the pass copies the header and the other arrays, and lights from the resident bytes */
         u32* e = (u32*)(tab + (size_t)s_vpass.nseg * 32u);
-        e[0] = (u32)hdr; e[1] = lhdr; e[2] = data; e[3] = k->nverts; e[4] = rec_off; e[5] = data; e[6] = rv; e[7] = 0;
+        e[0] = (u32)hdr; e[1] = lhdr; e[2] = data; e[3] = k->nverts; e[4] = rec_off; e[5] = data; e[6] = rv;
+        e[7] = k->skin ? (rec_off + h->skin) | (k->stride != s_vpass.stride ? 1u : 0u) : 0;
         s_vpass.nseg++;
         s_vpass.lit_used = lhdr + need;
         lit = 1;
@@ -16653,7 +16685,7 @@ void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
                                void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n))
 { (void)hlsl; (void)stride; (void)max_record; (void)cpu; }
 void rsx_d3d12_vertex_pass_publish(u32 io_offset, u32 n, const void* rec, u32 bytes, u32 applied,
-                                   const void* tag16)
-{ (void)io_offset; (void)n; (void)rec; (void)bytes; (void)applied; (void)tag16; }
+                                   const void* tag16, const void* skin, u32 skin_bytes)
+{ (void)io_offset; (void)n; (void)rec; (void)bytes; (void)applied; (void)tag16; (void)skin; (void)skin_bytes; }
 
 #endif /* _WIN32 */

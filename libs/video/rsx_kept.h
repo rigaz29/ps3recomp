@@ -26,6 +26,11 @@ typedef struct rsx_kept {
     const void* verts;      /* nverts records, the first rec bytes of each of the ring's vertexes */
     uint32_t list_bytes, nverts, rec, stride;
     uint32_t put_verts;     /* the vertexes a job puts in the ring */
+    /* A skinned block: verts are inputs of rec bytes, contiguous, that the vertex pass makes the
+     * vertexes from with the job's record; fill makes them on the CPU instead, first rec bytes
+     * of each vertex at stride, from the skin part of the record. */
+    uint32_t skin;
+    void (*fill)(const struct rsx_kept* k, const void* skin, uint8_t* ring, uint32_t n);
     uint8_t  tag[16];       /* the first 16 bytes of the ring's vertexes */
     /* the backend's, from its drawing thread */
     uint32_t res_vb, res_ib;    /* byte and index offsets in the resident parts */

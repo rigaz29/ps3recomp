@@ -53,6 +53,7 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include "rsx_dxc.h"
+#include "rsx_fsr3.h"
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -937,6 +938,46 @@ static void vp_sampler_defaults(void);
 static void rdoc_request(void)
 {
     if (s_rdoc && !s_rdoc_pending && !s_rdoc_active && s_rdoc_done < s_rdoc_max) s_rdoc_pending = 1;
+}
+
+/* graphics.frame_generation (D3D12_FRAME_GENERATION): off, on, or passthrough, which
+ * is the proxy swapchain and its threads with nothing generated, to measure them.
+ * The swap chain goes behind the proxy before anything asks it for a buffer; the
+ * context waits for the first frame, when the window's size is known. */
+static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
+static int s_fg_ready;
+static double s_fg_last;
+static void fg_start(void)
+{
+    const char* m = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
+    const int mode = ps3_settings_ieq(m, "on") ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
+    if (!mode) return;
+    if (!rsx_fsr3_available()) {
+        printf("[D3D12] frame generation: no amd_fidelityfx_loader_dx12.dll beside the exe%c", 10);
+        return;
+    }
+    void* sc = s_d3d.swap_chain;
+    if (rsx_fsr3_wrap(&sc, s_d3d.cmd_queue)) s_fg_mode = mode;
+    s_d3d.swap_chain = (IDXGISwapChain3*)sc;
+}
+
+/* Every presented frame, before the list closes. */
+static void fg_frame(void)
+{
+    if (!s_fg_mode) return;
+    if (!s_fg_ready) {
+        s_fg_ready = 1;
+        if (!rsx_fsr3_fg_create(s_d3d.device, s_d3d.swap_chain, s_d3d.bb_w, s_d3d.bb_h,
+                                s_d3d.width, s_d3d.height, s_fg_mode == 2)) {
+            s_fg_mode = 0;
+            return;
+        }
+        printf("[D3D12] frame generation %s: %ux%u from %ux%u%c", s_fg_mode == 2 ? "on" : "passthrough",
+               s_d3d.bb_w, s_d3d.bb_h, s_d3d.width, s_d3d.height, 10);
+    }
+    const double now = perf_now();
+    rsx_fsr3_fg_frame(s_d3d.cmd_list, s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f);
+    s_fg_last = now;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2227,6 +2268,7 @@ static int init_d3d12(u32 width, u32 height)
         return -1;
     }
 
+    fg_start();
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
     /* Create RTV descriptor heap */
@@ -3159,6 +3201,10 @@ static void bb_resize(void)
     wait_for_gpu();
     for (u32 i = 0; i < FRAME_COUNT; i++)
         if (s_d3d.backbuffers[i]) { s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]); s_d3d.backbuffers[i] = NULL; }
+    if (s_fg_mode) {                     /* its size is the window's: made again at the next frame */
+        rsx_fsr3_fg_destroy();
+        s_fg_ready = 0;
+    }
     HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, FRAME_COUNT, w, h,
                                                          DXGI_FORMAT_R8G8B8A8_UNORM,
                                                          s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
@@ -13041,6 +13087,7 @@ skip_dump_consider: ;
     if (s_present_this_frame) s_fo_batch = s_fo_dropped = s_fo_failed = 0;
     if (s_present_this_frame) present_to_backbuffer(fi);
     if (shot && !d3d12_shot_game()) shot_copy_bb(fi);
+    if (s_present_this_frame) fg_frame();
 
     /* Close and execute */
     zq_resolve();

@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_settings.h"
+#include "rsx_kept.h"
 #include "rsx_fsr1.h"
 #include "rsx_smaa.h"
 #include "ps3emu/thread_name.h"
@@ -270,6 +271,10 @@ typedef struct { u32 ib_first, count, hdr, lo, hi, lhdr; int lit; } VPRawSeg;
 static VPRawSeg s_seg[VP_MAX_SEGS];
 static u32 s_seg_n;
 static int s_raw_run_valid;
+/* The resident parts of vp_vb and vp_ib (rsx_kept.h): sizes in bytes and indexes, what is used. */
+static u32 s_res_vb_size, s_res_ib_size, s_res_vb_used, s_res_ib_used;
+static u32 s_res_gen;           /* what a block was put there under; a new one starts it over */
+static int s_res_full;          /* a block found no room: start over after this batch */
 
 /* The vertex pass (phase 2b.1 of the God of War: Ascension port): see "The vertex pass" below. */
 #define VPT_SEGS 8192u                      /* a batch's lit segments: 32 bytes each in its table */
@@ -2733,7 +2738,12 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = (u64)MAX_VERTICES * 256 * 2;  /* generic VP vertex: 16 float4 slots,
+        /* VTX_RESIDENT_MB: a resident part after the two halves (rsx_kept.h), and a sixteenth of it
+         * in indexes after vp_ib's */
+        { const char* e = getenv("VTX_RESIDENT_MB");
+          s_res_vb_size = e ? (u32)atoi(e) << 20 : 0;
+          s_res_ib_size = s_res_vb_size / 16u; }
+        bd.Width = (u64)MAX_VERTICES * 256 * 2 + s_res_vb_size;  /* generic VP vertex: 16 float4 slots,
                                           * DOUBLE-buffered by frame parity so a
                                           * new frame's upload never overwrites
                                           * vertices the in-flight GPU frame is
@@ -2752,7 +2762,7 @@ static int init_d3d12(u32 width, u32 height)
         else
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
-        bd.Width = (u64)VP_MAX_INDICES * 4 * 2;   /* u32 indices, x2 parity */
+        bd.Width = (u64)VP_MAX_INDICES * 4 * 2 + (u64)s_res_ib_size * 4;   /* u32 indices, x2 parity */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_ib)))
@@ -8319,7 +8329,7 @@ static void vp_draw_raw(const D3D12DrawRecord* dr, int* ib_bound, int* raw_bound
         D3D12_INDEX_BUFFER_VIEW ibv;
         ibv.BufferLocation = s_d3d.vp_ib->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_ib)
                            + (u64)s_d3d.vp_parity * VP_MAX_INDICES * 4;
-        ibv.SizeInBytes = VP_MAX_INDICES * 4;
+        ibv.SizeInBytes = (2u - s_d3d.vp_parity) * VP_MAX_INDICES * 4 + s_res_ib_size * 4;   /* and the resident part */
         ibv.Format = DXGI_FORMAT_R32_UINT;
         cl->lpVtbl->IASetIndexBuffer(cl, &ibv);
         *ib_bound = 1;
@@ -12561,7 +12571,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         D3D12_INDEX_BUFFER_VIEW ibv;
                         ibv.BufferLocation = s_d3d.vp_ib->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_ib)
                                            + (u64)s_d3d.vp_parity * VP_MAX_INDICES * 4;
-                        ibv.SizeInBytes = VP_MAX_INDICES * 4;
+                        ibv.SizeInBytes = (2u - s_d3d.vp_parity) * VP_MAX_INDICES * 4 + s_res_ib_size * 4;
                         ibv.Format = DXGI_FORMAT_R32_UINT;
                         s_d3d.cmd_list->lpVtbl->IASetIndexBuffer(s_d3d.cmd_list, &ibv);
                         ib_bound = 1;
@@ -12969,6 +12979,16 @@ skip_dump_consider: ;
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
+
+    /* The resident part is full, of blocks nobody may draw any more among others: it starts over
+     * once this batch has read what it reads there. Rare: it takes a level's worth of new results. */
+    if (s_res_full && s_res_vb_size) {
+        wait_for_gpu();
+        s_res_vb_used = s_res_ib_used = 0;
+        s_res_gen++;
+        s_res_full = 0;
+        fprintf(stderr, "[vtx-kept] resident part full: started over (%u)%c", s_res_gen, 10);
+    }
 
     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
      * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
@@ -13614,6 +13634,10 @@ static int s_vr_cls;                  /* the indexed draw being uploaded: 1 a ri
 /* per ring, the vertex pass's records: a word per 128 bytes (a ring's allocations are 128-byte
  * blocks, each with one vertex array), its sequence << 32 | its IO offset */
 static volatile LONG64* s_vr_idx[VR_MAX];
+/* and the kept blocks (rsx_kept.h), a slot per 128 bytes */
+typedef struct { rsx_kept* volatile k; volatile u32 io; } vr_kept;
+static vr_kept* s_vr_kept[VR_MAX];
+static volatile LONG s_kept_seen;
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
 {
     if (!size) return;
@@ -13628,6 +13652,7 @@ void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size)
         s_vr_off[n] = io_offset;
         s_vr_size[n] = size;
         s_vr_idx[n] = (volatile LONG64*)calloc((size >> 7) + 1, sizeof(LONG64));
+        s_vr_kept[n] = (vr_kept*)calloc((size >> 7) + 1, sizeof(vr_kept));
         MemoryBarrier();
         InterlockedExchange(&s_vr_n, n + 1);
         fprintf(stderr, "[vring] ring %ld: io 0x%08X, %u bytes\n", (long)n, io_offset, size);
@@ -13677,6 +13702,48 @@ typedef struct { volatile LONG seq; u32 key, n, applied, bytes; volatile LONG do
 static u8* s_vpr_pool;                 /* VPR_POOL slots: a head, then the record */
 static u32 s_vpr_slot;
 static volatile LONG s_vpr_seq;
+
+/* From any thread (rsx_kept.h). */
+void rsx_d3d12_kept_publish(u32 io_offset, rsx_kept* k)
+{
+    const LONG nr = s_vr_n;
+    for (LONG r = 0; r < nr; r++) {
+        const u32 off = io_offset - s_vr_off[r];
+        if (off >= s_vr_size[r]) continue;
+        vr_kept* e = s_vr_kept[r] ? &s_vr_kept[r][off >> 7] : NULL;
+        if (!e) return;
+        if (!k && !e->k) return;
+        e->io = io_offset;
+        MemoryBarrier();
+        e->k = k;
+        if (k && !s_kept_seen) InterlockedExchange(&s_kept_seen, 1);
+        return;
+    }
+}
+
+/* The kept block of a draw's attribute 0, if guest memory still holds its first bytes. */
+static rsx_kept* kept_find(const rsx_state* st, u32* io)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    if (!s_kept_seen || !st || !st->vertex_attribs[0].enabled) return NULL;
+    const u32 raw = st->vertex_attribs[0].offset;
+    if (!(raw & 0x80000000u)) return NULL;
+    const u32 a = raw & 0x7FFFFFFFu;
+    const LONG nr = s_vr_n;
+    for (LONG r = 0; r < nr; r++) {
+        const u32 off = a - s_vr_off[r];
+        if (off >= s_vr_size[r]) continue;
+        const vr_kept* e = s_vr_kept[r] ? &s_vr_kept[r][off >> 7] : NULL;
+        if (!e) return NULL;
+        rsx_kept* k = e->k;
+        if (!k || e->io != a || k->stride != st->vertex_attribs[0].stride) return NULL;
+        if (memcmp(vm_base + cellGcmResolveLocated(0, a), k->tag, 16) != 0) return NULL;
+        *io = a;
+        return k;
+    }
+    return NULL;
+}
 
 void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
                                void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n))
@@ -14891,6 +14958,178 @@ static int raw_can_continue(u32 first)
            pv->seg_first + pv->seg_n == s_seg_n;
 }
 
+/* A kept block's bytes in the resident parts, the first time (rsx_kept.h). 0: no room. */
+static unsigned long long s_kept_draws, s_kept_fills;
+static int kept_resident(rsx_kept* k)
+{
+    if (k->res_state && k->res_gen == s_res_gen) return k->res_state == 1;
+    const u32 vb = (k->nverts * k->stride + 64u + 255u) & ~255u, nix = k->list_bytes / 2u;
+    k->res_gen = s_res_gen;
+    if (s_res_vb_used + vb > s_res_vb_size || s_res_ib_used + nix > s_res_ib_size) {
+        k->res_state = 2;
+        s_res_full = 1;
+        return 0;
+    }
+    u8* d = (u8*)s_d3d.vp_vb_mapped + (u64)2 * MAX_VERTICES * VP_VERT_STRIDE + s_res_vb_used;
+    const u8* v = (const u8*)k->verts;
+    if (k->rec == k->stride) memcpy(d, v, (size_t)k->nverts * k->rec);
+    else for (u32 i = 0; i < k->nverts; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)2 * VP_MAX_INDICES + s_res_ib_used;
+    const u8* l = (const u8*)k->list;
+    for (u32 i = 0; i < nix; i++) ib[i] = ((u32)l[2 * i] << 8) | l[2 * i + 1];
+    if (!k->res_n) k->res_lo = 0xFFFFFFFFu;
+    k->res_vb = s_res_vb_used;
+    k->res_ib = s_res_ib_used;
+    if ((s_res_vb_used + vb) >> 25 != s_res_vb_used >> 25)
+        fprintf(stderr, "[vtx-kept] resident: %u MB of vertexes, %u MB of indexes%c",
+                (s_res_vb_used + vb) >> 20, (s_res_ib_used + nix) >> 18, 10);
+    s_res_vb_used += vb;
+    s_res_ib_used += nix;
+    k->res_state = 1;
+    return 1;
+}
+
+/* A path that reads the ring: the block's bytes there, as the job would have put them. */
+static void kept_fill(const rsx_state* st, const rsx_kept* k, u32 io)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    u8* d = vm_base + cellGcmResolveLocated(0, io);
+    const u8* v = (const u8*)k->verts;
+    if (k->rec == k->stride) memcpy(d, v, (size_t)k->nverts * k->rec);
+    else for (u32 i = 0; i < k->nverts; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    const int ilocal = ((st->index_array_dma & 0xF) == 0);
+    memcpy(vm_base + cellGcmResolveLocated(ilocal, st->index_array_offset), k->list, k->list_bytes);
+    s_kept_fills++;
+}
+
+/* A draw of a kept block, from the resident parts. What the draw has enabled outside the block (a
+ * mesh's own arrays, set by the PPU's command buffer) is copied as upload_tris_vp_raw copies it. A lit
+ * block's segment leaves room for the vertexes in the lit copy, and the pass reads them from the
+ * resident part. 0: not this way. */
+static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
+    if (!sixteen || (first + count) * 2u > k->list_bytes || count % 3u || first % 3u) return 0;
+    if (s_seg_n >= VP_MAX_SEGS || !kept_resident(k)) return 0;
+    /* the range of what has been drawn: past the job's count the list holds junk */
+    if (first + count > k->res_n) {
+        const u8* l = (const u8*)k->list;
+        for (u32 i = k->res_n; i < first + count; i++) {
+            const u32 x = ((u32)l[2 * i] << 8) | l[2 * i + 1];
+            if (x < k->res_lo) k->res_lo = x;
+            if (x > k->res_hi) k->res_hi = x;
+        }
+        k->res_n = first + count;
+    }
+    if (k->res_hi >= k->nverts) return 0;
+    const u32 par = s_d3d.vp_parity, lo = k->res_lo, hi = k->res_hi;
+    /* the resident bytes, from the half's start, as a segment's bases are */
+    const u32 rv = (2u - par) * (u32)(MAX_VERTICES * VP_VERT_STRIDE) + k->res_vb;
+
+    u32 bslot[16], bd[16];
+    int nb = 0;
+    VPRawArr ar[16];
+    int na = 0;
+    for (int i = 0; i < 16; i++) {
+        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+        if (!a->enabled || a->stride == 0) continue;
+        if (a->frequency > 1 || a->type < 1 || a->type > 7) return 0;
+        const u32 off = a->offset & 0x7FFFFFFFu;
+        if ((a->offset & 0x80000000u) && off - io < k->stride) {
+            bslot[nb] = (u32)i; bd[nb] = off - io; nb++;
+            continue;
+        }
+        u32 c = a->size ? a->size : 4; if (c > 4) c = 4;
+        ar[na].slot  = (u32)i;
+        ar[na].off   = off;
+        ar[na].loc   = (a->offset & 0x80000000u) ? 0u : 1u;
+        ar[na].start = (u64)off + (u64)lo * a->stride;
+        ar[na].end   = (u64)off + (u64)hi * a->stride + vp_raw_elem_bytes(a->type, c);
+        if (ar[na].end > 0xFFFFFFFFull) return 0;
+        na++;
+    }
+    for (int j = 1; j < na; j++)
+        for (int m = j; m > 0 && (ar[m - 1].loc > ar[m].loc ||
+             (ar[m - 1].loc == ar[m].loc && ar[m - 1].start > ar[m].start)); m--) {
+            const VPRawArr t = ar[m]; ar[m] = ar[m - 1]; ar[m - 1] = t;
+        }
+    struct { u64 start, end, dst; u32 loc, src; } gr[16];
+    int ng = 0;
+    for (int j = 0; j < na; j++) {
+        if (ng && gr[ng - 1].loc == ar[j].loc && ar[j].start <= gr[ng - 1].end + 64) {
+            if (ar[j].end > gr[ng - 1].end) gr[ng - 1].end = ar[j].end;
+        } else {
+            gr[ng].start = ar[j].start; gr[ng].end = ar[j].end; gr[ng].loc = ar[j].loc; ng++;
+        }
+        ar[j].grp = (u32)(ng - 1);
+    }
+    const u64 hdr = ((u64)s_d3d.vp_vb_offset + 15) & ~15ull;
+    u64 at = hdr + 64;
+    for (int g = 0; g < ng; g++) {
+        const u32 len = (u32)(gr[g].end - gr[g].start);
+        gr[g].src = cellGcmResolveLocated((int)gr[g].loc, (u32)gr[g].start);
+        if (!gr[g].loc && cellGcmResolveLocated(0, (u32)gr[g].end - 1) - gr[g].src != len - 1)
+            return 0;                               /* main memory, not contiguous */
+        at = (at + 15) & ~15ull;
+        gr[g].dst = at;
+        at += len;
+    }
+    at = (at + 15) & ~15ull;
+    if (at + 256 > (u64)MAX_VERTICES * VP_VERT_STRIDE) return 0;
+    const u32 data = (u32)(at - hdr);
+
+    u32 lhdr = 0;
+    int lit = 0;
+    if (s_vpass.set && k->stride == s_vpass.stride) {
+        LONG seq = 0;
+        const vpr_head* h = vpr_find(io, &seq);
+        if (!h || h->applied || !vpass_build()) return 0;
+        u8* tab = s_vpass.tab_mapped + (size_t)par * VPT_HALF;
+        u32 rec_off;
+        if (s_vpass.last_ok && s_vpass.last_key == h->key && s_vpass.last_seq == seq) {
+            rec_off = s_vpass.last_rec;
+        } else {
+            rec_off = VPT_SEGB + ((s_vpass.rec_used + 15u) & ~15u);
+            if (rec_off + h->bytes > VPT_HALF || s_vpass.nseg >= VPT_SEGS) return 0;
+            if (!vpr_copy(h, seq, tab + rec_off)) return 0;
+            s_vpass.rec_used = rec_off - VPT_SEGB + h->bytes;
+            s_vpass.last_key = h->key; s_vpass.last_seq = seq; s_vpass.last_rec = rec_off; s_vpass.last_ok = 1;
+        }
+        lhdr = (s_vpass.lit_used + 15u) & ~15u;
+        const u32 need = data + k->nverts * k->stride + 64u;
+        if (s_vpass.nseg >= VPT_SEGS || (u64)lhdr + need > s_vpass.lit_half) return 0;
+        /* the pass copies the header and the other arrays, and lights from the resident bytes */
+        u32* e = (u32*)(tab + (size_t)s_vpass.nseg * 32u);
+        e[0] = (u32)hdr; e[1] = lhdr; e[2] = data; e[3] = k->nverts; e[4] = rec_off; e[5] = data; e[6] = rv; e[7] = 0;
+        s_vpass.nseg++;
+        s_vpass.lit_used = lhdr + need;
+        lit = 1;
+        if (s_vs_on > 0) { s_vs.lit_segs++; s_vs.lit_verts += k->nverts; }
+    }
+    u8* base = (u8*)s_d3d.vp_vb_mapped + (u64)par * MAX_VERTICES * VP_VERT_STRIDE;
+    for (int g = 0; g < ng; g++)
+        memcpy(base + gr[g].dst, vm_base + gr[g].src, (size_t)(gr[g].end - gr[g].start));
+    u32 hb[16] = {0};
+    for (int j = 0; j < na; j++)
+        hb[ar[j].slot] = (u32)gr[ar[j].grp].dst + ar[j].off - (u32)gr[ar[j].grp].start;
+    for (int j = 0; j < nb; j++)
+        hb[bslot[j]] = (lit ? (u32)at : rv) + bd[j];
+    memcpy(base + hdr, hb, sizeof hb);
+    s_d3d.vp_vb_offset = (u32)((at + 16 + VP_VERT_STRIDE - 1) / VP_VERT_STRIDE * VP_VERT_STRIDE);
+    VPRawSeg* sg = &s_seg[s_seg_n++];
+    sg->ib_first = (2u - par) * VP_MAX_INDICES + k->res_ib + first;
+    sg->count    = count;
+    sg->hdr      = (u32)hdr;
+    sg->lo = lo; sg->hi = hi;
+    sg->lit = lit; sg->lhdr = lhdr;
+    s_raw_run_valid = 0;
+    s_kept_draws++;
+    return count;
+}
+
 /* Returns the number of indices taken; 0 means "use another path". */
 static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int cont)
 {
@@ -14901,6 +15140,14 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
     if (s_d3d.vp_ib_offset + count > VP_MAX_INDICES) { ib_full_note(count); return 0; }
     if (s_seg_n >= VP_MAX_SEGS) return 0;
     { static int pos = -1; if (pos < 0) pos = getenv("VTX_POS") ? 1 : 0; if (pos) return 0; }
+    {   u32 kio = 0;
+        rsx_kept* k = kept_find(state, &kio);
+        if (k) {
+            const u32 taken = upload_tris_kept(state, k, kio, first, count);
+            if (taken) return taken;
+            kept_fill(state, k, kio);
+        }
+    }
 
     const int ilocal = ((state->index_array_dma & 0xF) == 0);
     const u8* ip = vm_base + cellGcmResolveLocated(ilocal, state->index_array_offset);
@@ -15627,6 +15874,12 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             emitted = upload_tris_vp_raw(s_d3d.current_rsx_state, first, count, raw_cont);
             raw_used = emitted != 0;
         }
+    }
+    /* a kept block, on another path: its bytes to the ring (raw has done that if it declined) */
+    if (!raw_used && s_kept_seen) {
+        u32 kio = 0;
+        const rsx_kept* k = kept_find(s_d3d.current_rsx_state, &kio);
+        if (k) kept_fill(s_d3d.current_rsx_state, k, kio);
     }
     /* the vertex pass's record, on another path: lit in guest memory, once */
     if (!raw_used && s_vpass.set) vpass_guest(s_d3d.current_rsx_state);

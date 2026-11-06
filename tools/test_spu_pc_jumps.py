@@ -71,9 +71,7 @@ class PcJumps(unittest.TestCase):
             lifter = SPULifter()
             lifter.pc_jump = compute_pc_jumps(code)
             lifter.func_starts = {0x00, 0x04, 0x0C}
-            text = "\n".join(lifter.lift_function(code, 0x04, 0x0C).body_lines
-                             if lifter.lift_function(code, 0x04, 0x0C) else
-                             lifter.functions[-1].body_lines)
+            text = "\n".join(lifter.lift_function(code, 0x04, 0x0C).body_lines)
             self.assertIn(bit, text)
             self.assertNotIn("spu_indirect_branch", text)
             self.assertIn("spu_func_0000000C", text)

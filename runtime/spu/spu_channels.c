@@ -79,22 +79,25 @@ static uint64_t spu_host_ns(void)
 #endif
 }
 
-/* The decrementer's clock: a stamp (ctx->dec_base_ns) and what has passed since it, in ticks. */
+/* The decrementer's clock: a stamp (ctx->dec_base_ns) and what has passed since it, in ticks.
+ * On Windows the time stamp counter itself, which every CPU this build runs on (AVX2) keeps
+ * constant and in step: QueryPerformanceCounter took ~150 ns here, five times a job. Its rate
+ * comes from 10 ms of QueryPerformanceCounter, the first time it is asked for. */
 #ifdef _WIN32
-static inline uint64_t spu_dec_now(void)
-{
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return (uint64_t)c.QuadPart;
-}
+static inline uint64_t spu_dec_now(void) { return __rdtsc(); }
 static inline uint32_t spu_dec_ticks(uint64_t counts)
 {
     static volatile uint64_t s_ticks_per_count;   /* 32.32 */
     uint64_t m = s_ticks_per_count;
     if (!m) {
-        LARGE_INTEGER f;
+        LARGE_INTEGER f, c0, c1;
         QueryPerformanceFrequency(&f);
-        s_ticks_per_count = m = (SPU_DECREMENTER_HZ << 32) / (uint64_t)f.QuadPart;
+        QueryPerformanceCounter(&c0);
+        const uint64_t t0 = __rdtsc();
+        do QueryPerformanceCounter(&c1); while (c1.QuadPart - c0.QuadPart < f.QuadPart / 100);
+        const uint64_t tsc_hz = (uint64_t)((double)(__rdtsc() - t0) * (double)f.QuadPart /
+                                           (double)(c1.QuadPart - c0.QuadPart));
+        s_ticks_per_count = m = (SPU_DECREMENTER_HZ << 32) / tsc_hz;
     }
     return (uint32_t)((counts * m) >> 32);
 }

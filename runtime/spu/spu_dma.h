@@ -972,6 +972,16 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                                uint32_t num_left, uint32_t dest_lsa,
                                uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
 {
+    /* A job's input list is a dozen small blocks from all over memory, cold: one miss after
+     * another, each as long as the copy. All the misses start here at once. */
+#if defined(__SSE2__) || defined(_M_X64)
+    if (num_left > 1 && mfc_is_get(base_cmd))
+        for (uint32_t i = 0; i < num_left; i++) {
+            const uint8_t* const p = vm_base + spu_ls_read32(spu, (elem_lsa + i * 8 + 4) & SPU_LS_MASK);
+            _mm_prefetch((const char*)p, _MM_HINT_T0);
+            _mm_prefetch((const char*)p + 64, _MM_HINT_T0);
+        }
+#endif
     for (uint32_t i = 0; i < num_left; i++) {
         uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
         uint32_t size_and_flags = spu_ls_read32(spu, el);

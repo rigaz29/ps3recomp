@@ -14989,18 +14989,25 @@ static int kept_resident(rsx_kept* k)
     return 1;
 }
 
-/* A path that reads the ring: the block's bytes there, as the job would have put them. */
-static void kept_fill(const rsx_state* st, const rsx_kept* k, u32 io)
+/* A path that reads the ring: the block's bytes there, as the job would have put them, and no more.
+ * The list runs on past what the job puts, and past that the ring holds the next job's block: only
+ * the indexes up to the draw's last go there. */
+static void kept_fill(const rsx_state* st, const rsx_kept* k, u32 io, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     u8* d = vm_base + cellGcmResolveLocated(0, io);
     const u8* v = (const u8*)k->verts;
-    if (k->rec == k->stride) memcpy(d, v, (size_t)k->nverts * k->rec);
-    else for (u32 i = 0; i < k->nverts; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
+    const u32 n = k->put_verts < k->nverts ? k->put_verts : k->nverts;
+    if (k->rec == k->stride) memcpy(d, v, (size_t)n * k->rec);
+    else for (u32 i = 0; i < n; i++) memcpy(d + (size_t)i * k->stride, v + (size_t)i * k->rec, k->rec);
     const int ilocal = ((st->index_array_dma & 0xF) == 0);
-    memcpy(vm_base + cellGcmResolveLocated(ilocal, st->index_array_offset), k->list, k->list_bytes);
+    const u32 lb = (first + count) * 2u;
+    if (((st->index_array_dma >> 4) & 0xF) == 1 && lb <= k->list_bytes)
+        memcpy(vm_base + cellGcmResolveLocated(ilocal, st->index_array_offset), k->list, lb);
     s_kept_fills++;
+    if (!(s_kept_fills & (s_kept_fills - 1)))
+        fprintf(stderr, "[vtx-kept] %llu fills, %llu draws from the resident part%c", s_kept_fills, s_kept_draws, 10);
 }
 
 /* A draw of a kept block, from the resident parts. What the draw has enabled outside the block (a
@@ -15145,7 +15152,7 @@ static u32 upload_tris_vp_raw(const rsx_state* state, u32 first, u32 count, int 
         if (k) {
             const u32 taken = upload_tris_kept(state, k, kio, first, count);
             if (taken) return taken;
-            kept_fill(state, k, kio);
+            kept_fill(state, k, kio, first, count);
         }
     }
 
@@ -15879,7 +15886,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     if (!raw_used && s_kept_seen) {
         u32 kio = 0;
         const rsx_kept* k = kept_find(s_d3d.current_rsx_state, &kio);
-        if (k) kept_fill(s_d3d.current_rsx_state, k, kio);
+        if (k) kept_fill(s_d3d.current_rsx_state, k, kio, first, count);
     }
     /* the vertex pass's record, on another path: lit in guest memory, once */
     if (!raw_used && s_vpass.set) vpass_guest(s_d3d.current_rsx_state);

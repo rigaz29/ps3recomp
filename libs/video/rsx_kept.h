@@ -21,9 +21,11 @@ extern "C" {
 #endif
 
 typedef struct rsx_kept {
-    const void* list;       /* the indexes as the ring would hold them: big-endian u16 */
+    const void* list;       /* the indexes as the ring would hold them: big-endian u16; list_bytes
+                               can run past what a job puts, with junk after the job's count */
     const void* verts;      /* nverts records, the first rec bytes of each of the ring's vertexes */
     uint32_t list_bytes, nverts, rec, stride;
+    uint32_t put_verts;     /* the vertexes a job puts in the ring */
     uint8_t  tag[16];       /* the first 16 bytes of the ring's vertexes */
     /* the backend's, from its drawing thread */
     uint32_t res_vb, res_ib;    /* byte and index offsets in the resident parts */

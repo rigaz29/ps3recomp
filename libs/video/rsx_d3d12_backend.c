@@ -398,6 +398,8 @@ typedef struct {
 #define DRAW_SRV_BASE ((DS_SRV_BASE + 2 * MAX_OFF_DS + 31) & ~31)
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
 
+#define TEX_CSUM_PARTS 8u   /* see tex_changed */
+
 /* VP texture slot: a guest texture held for the VP draws, uploaded again when
  * its source bytes change (gcm/cube's plasma animates in guest memory). Each
  * draw that samples it writes its own SRV into its window at DRAW_SRV_BASE. */
@@ -405,7 +407,9 @@ typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
-    u32 csum;           /* sparse checksum of the source bytes last uploaded */
+    u32 csum[TEX_CSUM_PARTS];   /* sparse checksum of the source bytes last uploaded */
+    u32 csum_bytes;     /* the bytes it covers */
+    u8  csum_next;      /* the part to compare next */
     int cube;           /* its shape (tex_shape_*): 0 a 2D image, 1 a 6-face cube
                          * sampled as TextureCube, else a volume (Texture3D)
                          * of the depth above bit 8 */
@@ -7109,27 +7113,42 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
  * NV40 layout (matches RPCS3 convert_linear_swizzle). POT dims only, which is
  * what the hardware requires for swizzled textures. */
 
-/* Sparse FNV-1a over a texture's source bytes -- enough to notice an animated
- * surface changing, cheap enough to run on every bind. Kept a function rather
- * than a statement-expression macro so the file still compiles under MSVC;
- * ps3recomp builds with clang-cl, but titles like Tokyo Jungle drive the build
- * through the Visual Studio generator. */
-static u32 tex_csum(const u8* base, u32 nbytes)
+/* Sparse FNV-1a over a texture's source bytes, enough to notice an animated
+ * surface changing: every eighth of up to 1,024 samples, from sample `part`. */
+static u32 tex_csum_part(const u8* base, u32 nbytes, u32 part)
 {
     u32 h = 2166136261u;
-    u32 step = nbytes > 4096u ? nbytes / 1024u : 4u;
-    for (u32 i = 0; i + 3 < nbytes; i += step) {
+    const u32 step = nbytes > 4096u ? nbytes / 1024u : 4u;
+    for (u32 i = part * step; i + 3 < nbytes; i += step * TEX_CSUM_PARTS) {
         u32 w32; memcpy(&w32, base + i, sizeof w32);
         h ^= w32; h *= 16777619u;
     }
     return h;
 }
 
+/* Whether a held texture's source bytes differ from what was uploaded, at its
+ * first bind of a frame. All the samples of every texture every frame was 11%
+ * of the RSX thread, nearly all of it waiting on memory, a line a sample, for
+ * textures that hardly ever change. So a check reads one part, in turn: a new
+ * image shows in any part at once, and a change in a few samples within eight
+ * checks. 4 KB or less is read whole, as those are the textures it sees to the
+ * word. TEX_CHECK_ALL=1: every part at every check. */
+static int tex_changed(VPTexSlot* c, const u8* base)
+{
+    static int all = -1;
+    if (all < 0) all = getenv("TEX_CHECK_ALL") ? 1 : 0;
+    for (u32 n = all || c->csum_bytes <= 4096u ? TEX_CSUM_PARTS : 1u; n; n--) {
+        const u32 p = c->csum_next++ % TEX_CSUM_PARTS;
+        if (tex_csum_part(base, c->csum_bytes, p) != c->csum[p]) return 1;
+    }
+    return 0;
+}
+
 /* The DXGI format a guest texture is uploaded as -- the DECODED image's, which
  * is not always the guest's: the packed 16-bit colour formats arrive unpacked
  * to RGBA8, and DEPTH24_D8 as a float. rsx_texture_layout.h says which class
  * each format byte lands in. The SRV over the upload must name the same one. */
-static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
+static DXGI_FORMAT vp_tex_dxgi_of(u32 fmt)
 {
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, 4, 4, &tl);
@@ -7147,6 +7166,16 @@ static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
     case RSX_TEXFMT_R32G32B32A32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     default:                       return DXGI_FORMAT_R8_UNORM;
     }
+}
+
+/* Asked for every texture unit of every draw, and only these bits of the format
+ * byte choose the answer (rsx_texture_layout_pitched's base format). */
+static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
+{
+    static DXGI_FORMAT memo[0x9F + 1];
+    DXGI_FORMAT* m = &memo[fmt & 0x9Fu];
+    if (*m == DXGI_FORMAT_UNKNOWN) *m = vp_tex_dxgi_of(fmt);
+    return *m;
 }
 
 /* TEX_STATS=<frames>: the texture binds of the prepass by outcome, every so many
@@ -7687,6 +7716,25 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     extern uint8_t* vm_base;
 
     if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
+    const u32 key_off = off;         /* lookup key: the offset as bound */
+    /* Before any of the format's arithmetic: nearly all of a frame's calls end here. */
+    int slot = vp_tex_find(key_off, w, h, fmt, cube);
+    if (slot >= 0) {
+        VPTexSlot* c = &s_d3d.vp_tex[slot];
+        c->last_frame = s_d3d.frame_count;
+        if (c->used) { s_ts_out = TS_HIT; return slot; }   /* already bound this frame */
+        static int nocache = -1;                 /* TEX_NOCACHE=1: always re-upload */
+        if (nocache < 0) { const char* e = getenv("TEX_NOCACHE"); nocache = e ? atoi(e) : 0; }
+        /* Held from an earlier frame: re-upload only if the guest bytes
+         * changed. Most of this scene's textures are static, and converting
+         * every one of them every frame was ~70% of the frame's CPU time. */
+        if (!nocache && !tex_changed(c, vm_base + c->off)) {
+            c->used = 1;
+            s_ts_out = TS_SAME;
+            return slot;
+        }
+        /* stale: uploaded again below, in its own slot */
+    }
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45
@@ -7709,29 +7757,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;
     u32 blkrows = dxt ? tl.rows      : 0;
-    const u32 key_off = off;         /* lookup key: the offset as bound */
-    /* Sparse checksum of a texture's source bytes -- enough to notice an
-     * animated surface changing, cheap enough to run on every bind. */
-    /* (portable helper tex_csum() -- see above; a statement-expression macro
-     * here was a GCC/Clang extension MSVC rejects.) */
-    #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
-    int slot = vp_tex_find(key_off, w, h, fmt, cube);
-    if (slot >= 0) {
-        VPTexSlot* c = &s_d3d.vp_tex[slot];
-        c->last_frame = s_d3d.frame_count;
-        if (c->used) { s_ts_out = TS_HIT; return slot; }   /* already bound this frame */
-        static int nocache = -1;                 /* TEX_NOCACHE=1: always re-upload */
-        if (nocache < 0) { const char* e = getenv("TEX_NOCACHE"); nocache = e ? atoi(e) : 0; }
-        if (!nocache) {
-            /* Held from an earlier frame: re-upload only if the guest bytes
-             * changed. Most of this scene's textures are static, and converting
-             * every one of them every frame was ~70% of the frame's CPU time. */
-            u32 nb = (dxt ? (blkrow * blkrows) : (w * h * bpp)) * vdepth;
-            u32 cs = TEX_CSUM(vm_base + c->off, nb);
-            if (cs == c->csum) { c->used = 1; s_ts_out = TS_SAME; return slot; }
-        }
-        /* stale: uploaded again below, in its own slot */
-    }
     /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
      * Measured on the Rubber Ducky demo: at the bind offset every texture reads
      * as all-zero, while [off - w*h*bpp, off) holds the image (3800-4160 of 4298
@@ -8342,9 +8367,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
         t->up = NULL;
     }
-    { u32 nb = (dxt ? (blkrow * blkrows) : (w * h * bpp)) * vdepth;
-      t->csum = TEX_CSUM(vm_base + off, nb); }
-    #undef TEX_CSUM
+    t->csum_bytes = (dxt ? (blkrow * blkrows) : (w * h * bpp)) * vdepth;
+    for (u32 i = 0; i < TEX_CSUM_PARTS; i++)
+        t->csum[i] = tex_csum_part(vm_base + off, t->csum_bytes, i);
     s_ts_out = ts_new ? TS_NEW : TS_CHANGED;
     return slot;
 }

@@ -52,6 +52,7 @@
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include "rsx_dxc.h"
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -937,20 +938,26 @@ static void rdoc_request(void)
 /* ---------------------------------------------------------------------------
  * Compiled guest shaders on disk (D3D12_SHADER_CACHE=<file>)
  *
- * Guest vertex and fragment programs are decompiled to HLSL and compiled with
- * D3DCompile on the drain thread when a draw first needs them, tens of
- * milliseconds each, so a scene that brings in new programs stops the drain
- * for as long as they take. With D3D12_SHADER_CACHE set, every compiled
- * program is appended to that file under a hash of its source and target, and
- * the next run reads the file at its first compile and skips D3DCompile for
- * every program it has seen. A damaged record ends the read, and the file is
- * then rewritten from what was read before it.
+ * Guest vertex and fragment programs are decompiled to HLSL and compiled when
+ * a draw first needs them, tens of milliseconds each, so a scene that brings
+ * in new programs stops the drain for as long as they take. With
+ * D3D12_SHADER_CACHE set, every compiled program is appended to that file
+ * under a hash of its source and target, and the next run reads the file at
+ * its first compile and skips the compiler for every program it has seen. A
+ * damaged record ends the read, and the file is then rewritten from what was
+ * read before it.
+ *
+ * Programs come from DXC, or from D3DCompile (see shc_pick_compiler). D3D12
+ * refuses a pipeline with one of each, so every program of a guest pipeline
+ * comes from the same one, and DXC's are kept in a file of their own,
+ * <shader cache>.dxil, with its pipelines in <shader cache>.dxil.pso.
  * -----------------------------------------------------------------------*/
 typedef struct { u64 key; u32 srclen; ID3DBlob* blob; } ShaderCacheEntry;
 static ShaderCacheEntry* s_shc;     /* open addressing, s_shc_cap slots (a power of two) */
 static u32    s_shc_cap, s_shc_n;
 static FILE*  s_shc_file;
 static int    s_shc_on = -1;
+static int    s_shc_dxc;            /* guest programs come from DXC, settled by shc_open */
 static SRWLOCK s_shc_lock = SRWLOCK_INIT;
 static u32    s_shc_stat_compiled, s_shc_stat_hits, s_shc_stat_pso;   /* PERF=1 report */
 static double s_shc_stat_compile_s, s_shc_stat_pso_s;
@@ -973,6 +980,18 @@ static UINT shc_flags(void)
     case 2:  return D3DCOMPILE_OPTIMIZATION_LEVEL2;
     case 3:  return D3DCOMPILE_OPTIMIZATION_LEVEL3;
     default: return D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    }
+}
+
+/* The same level for DXC. */
+static const wchar_t* shc_dxc_level(UINT flags)
+{
+    switch (flags) {
+    case D3DCOMPILE_SKIP_OPTIMIZATION:   return L"-Od";
+    case D3DCOMPILE_OPTIMIZATION_LEVEL0: return L"-O0";
+    case D3DCOMPILE_OPTIMIZATION_LEVEL2: return L"-O2";
+    case D3DCOMPILE_OPTIMIZATION_LEVEL3: return L"-O3";
+    default:                             return L"-O1";
     }
 }
 
@@ -1037,12 +1056,35 @@ static ID3DBlob* shc_copy(ID3DBlob* b)
     return c;
 }
 
+/* graphics.shader_compiler (D3D12_SHADER_COMPILER): dxc, or fxc for D3DCompile.
+ * DXC needs its DLLs beside the exe and shader model 6 from the driver; without
+ * either the programs come from D3DCompile, as with fxc. */
+static void shc_pick_compiler(void)
+{
+    const char* c = ps3_settings_str("graphics", "shader_compiler", "D3D12_SHADER_COMPILER", "dxc");
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
+    const char* why = NULL;
+    if (ps3_settings_ieq(c, "fxc"))
+        why = "the setting";
+    else if (FAILED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)) ||
+             sm.HighestShaderModel < D3D_SHADER_MODEL_6_0)
+        why = "no shader model 6 here";
+    else if (!rsx_dxc_available())
+        why = "no dxcompiler.dll and dxil.dll beside the exe";
+    s_shc_dxc = !why;
+    if (why) printf("[d3d12] guest shaders from D3DCompile: %s%c", why, 10);
+    else     printf("[d3d12] guest shaders from DXC%c", 10);
+}
+
 /* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. */
 static void shc_open(void)
 {
+    shc_pick_compiler();
     const char* path = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
     s_shc_on = path && *path && strcmp(path, "0") != 0 && !ps3_settings_ieq(path, "off");
     if (!s_shc_on) return;
+    char dxil[1024];
+    if (s_shc_dxc) { snprintf(dxil, sizeof dxil, "%s.dxil", path); path = dxil; }
     u32 loaded = 0;
     int clean = 0;
     FILE* f = fopen(path, "rb");
@@ -1075,7 +1117,7 @@ static void shc_open(void)
            s_shc_file ? "" : " (cannot write it)", 10);
 }
 
-/* D3DCompile for the guest programs (entry "main"), through the disk cache. */
+/* A guest program (entry "main") through the disk cache. */
 static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
                                   const char* target, ID3DBlob** out, ID3DBlob** err)
 {
@@ -1097,7 +1139,8 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
     const double t0 = perf_now();
-    HRESULT hr = D3DCompile(src, len, name, NULL, NULL, "main", target, flags, 0, out, err);
+    HRESULT hr = s_shc_dxc ? rsx_dxc_compile(src, len, target, shc_dxc_level(flags), out, err)
+                           : D3DCompile(src, len, name, NULL, NULL, "main", target, flags, 0, out, err);
     const double dt = perf_now() - t0;
     if (dt >= 0.1) {
         static int n = 0;
@@ -1578,7 +1621,7 @@ static void psoc_start(void)
     const char* sc = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
     if (!sc || !*sc) return;
     char path[1024];
-    snprintf(path, sizeof path, "%s.pso", sc);
+    snprintf(path, sizeof path, "%s%s.pso", sc, s_shc_dxc ? ".dxil" : "");
     dbt_ready();   /* a depth-bounds pipeline needs it, and it is made on this thread */
     u32 cap = 0;
     FILE* f = fopen(path, "rb");
@@ -1659,7 +1702,7 @@ static void sj_build(ShaderJob* j)
         char k[40];
         if (cb) snprintf(k, sizeof k, "fp_constants[%lu]", strtoul(cb + 13, NULL, 10));
         else snprintf(k, sizeof k, "constants compiled in");
-        fprintf(stderr, "[FP] pipeline refused (0x%08lX): %u bytes of HLSL, %u of DXBC, %s, dbt %d, %u targets%c",
+        fprintf(stderr, "[FP] pipeline refused (0x%08lX): %u bytes of HLSL, %u of code, %s, dbt %d, %u targets%c",
                 (unsigned long)j->hr, (unsigned)j->len, (unsigned)j->pd.PS.BytecodeLength,
                 k, j->dbt, j->pd.NumRenderTargets, 10);
     }
@@ -5021,9 +5064,11 @@ static void compile_vp(void)
         "  if (cov <= 0.5) discard; return float4(i.col0.rgb, 1); }\n";
 
     ID3DBlob *vb=NULL,*pb=NULL,*e=NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "vp", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &e);
+    /* Through the guest programs' compiler: this vertex shader goes on to pair
+     * with them (vp_vs_blob), and the two pixel shaders here with it. */
+    HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "vp", "vs_5_0", &vb, &e);
     if (FAILED(hr)) { printf("[VP] VS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
-    hr = D3DCompile(ps, sizeof(ps)-1, "vpps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &e);
+    hr = d3d_compile_cached(ps, sizeof(ps)-1, "vpps", "ps_5_0", &pb, &e);
     if (FAILED(hr)) { printf("[VP] PS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); if(vb)vb->lpVtbl->Release(vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
 
     /* The decompiled VS declares inputs a0:ATTR0 .. a15:ATTR15 and the HLSL
@@ -5085,8 +5130,7 @@ static void compile_vp(void)
             "  float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7; };\n"
             "float4 main(PSIn i):SV_TARGET{ return float4(i.col0.rgb, 1); }\n";
         ID3DBlob *pcb=NULL,*ec=NULL;
-        if (SUCCEEDED(D3DCompile(ps_col, sizeof(ps_col)-1, "vppsc", NULL, NULL,
-                                 "main", "ps_5_0", 0, 0, &pcb, &ec)) && pcb) {
+        if (SUCCEEDED(d3d_compile_cached(ps_col, sizeof(ps_col)-1, "vppsc", "ps_5_0", &pcb, &ec)) && pcb) {
             pd.PS.pShaderBytecode = pcb->lpVtbl->GetBufferPointer(pcb);
             pd.PS.BytecodeLength  = pcb->lpVtbl->GetBufferSize(pcb);
             HRESULT hr2 = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(

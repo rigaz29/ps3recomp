@@ -459,7 +459,12 @@ def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
     (`brsl $rX, .+4`) plus an immediate `ai $rX, $rX, K` within `window`
     instructions. Seed link+K plus the following `span` bytes at 4-byte
     stride — the ladder entries are all real instruction starts, and the
-    final in-code/valid-instruction filter drops any overshoot."""
+    final in-code/valid-instruction filter drops any overshoot.
+
+    With nothing but the `ai` on the way, the target is one address and no
+    ladder follows: `brsl $r2, .+4; ai $r2, $r2, 8; bid $r2` is how the SDK turns
+    interrupts off and goes on at the next instruction, around every DMA of a
+    job. Taken for a ladder, each one made 17 functions of the code after it."""
     targets = set()
     for idx, ins in enumerate(insns):
         if ins.mnemonic != "bi":
@@ -470,6 +475,7 @@ def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
         reg = ops[0]
         link = None
         imm = 0
+        computed = False
         for j in range(idx - 1, max(-1, idx - 1 - window), -1):
             w = insns[j]
             wops = [t.strip() for t in w.operands.split(",") if t.strip()]
@@ -488,10 +494,12 @@ def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
                 if tgt == w.addr + 4:       # PC-getter, not a real call
                     link = w.addr + 4
                 break
+            if wops and wops[0] == reg:
+                computed = True             # `a $r8, $r8, $r4`: the jump into the ladder
         if link is None or imm <= 0:
             continue
         base = link + imm
-        for o in range(0, span + 4, 4):
+        for o in range(0, span + 4 if computed else 4, 4):
             t = base + o
             if code_start <= t < code_end:
                 targets.add(t)

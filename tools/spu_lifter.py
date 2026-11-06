@@ -408,6 +408,38 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def compute_pc_jumps(insns) -> dict:
+    """`brsl $rX, .+4; ai $rX, $rX, K; bi[d|e] $rX`, or a conditional form of the
+    branch: a branch to a constant, link + K. The SDK turns interrupts off and on
+    this way, the branch only for its D or E bit, and K is 8: the next
+    instruction. ~30 of an EDGE job's 67 indirect branches and 80% of a RenJobSet
+    job's are these, around every DMA. Returns {branch address: target}."""
+    out = {}
+    targets = set()
+    for ins in insns:
+        t = SPULifter._branch_target(ins)
+        if t is not None and ins.mnemonic not in ("brsl", "brasl"):
+            targets.add(t)
+    for i in range(2, len(insns)):
+        pc, add, br = insns[i - 2], insns[i - 1], insns[i]
+        if br.mnemonic not in ("bi", "biz", "binz", "bihz", "bihnz") or add.mnemonic != "ai" \
+                or pc.mnemonic != "brsl" or add.addr != pc.addr + 4 or br.addr != add.addr + 4:
+            continue
+        reg = br.operands.split(",")[-1].strip()
+        ops = [t.strip() for t in add.operands.split(",")]
+        if len(ops) != 3 or ops[0] != reg or ops[1] != reg or reg == "$r0":
+            continue
+        if (pc.raw & 0x7F) != int(reg[2:]) or SPULifter._branch_target(pc) != add.addr:
+            continue
+        if add.addr in targets or br.addr in targets:     # reached with another value in it
+            continue
+        try:
+            out[br.addr] = add.addr + int(ops[2], 0)
+        except ValueError:
+            pass
+    return out
+
+
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
     """Group contiguous chunks into function-sized runs for --merge-chunks.
 
@@ -424,7 +456,7 @@ def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
     for ins in insns:
         if ins.mnemonic in ("brsl", "brasl"):
             tgt = SPULifter._branch_target(ins)
-            if tgt is not None:
+            if tgt is not None and tgt != ins.addr + 4:   # a PC-getter is no call
                 call_targets.add(tgt)
     groups = {}
     ordered = sorted(bounds)
@@ -604,6 +636,8 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # {branch address: target}: indirect branches to a constant, compute_pc_jumps().
+        self.pc_jump: dict = {}
         # --float-spec N: a function that can run again from its entry and has at
         # least N single-precision float ops gets a speculative body (_float_spec).
         # 0 = off.
@@ -801,6 +835,8 @@ class SPULifter:
             if insn.addr < start or insn.addr >= end:
                 continue
             tgt = self._branch_target(insn)
+            if tgt is None:
+                tgt = self.pc_jump.get(insn.addr)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
             if self.ijmp_local and not has_ijmp and self._computed_jump(insn):
@@ -1373,6 +1409,15 @@ class SPULifter:
         # stall-and-notify handler and wedges the whole job pipeline.
         _ied = ("ctx->int_enable = 1; " if insn.raw & 0x40000 else
                 "ctx->int_enable = 0; " if insn.raw & 0x80000 else "")
+        # A branch to a constant (compute_pc_jumps): no dispatcher. An enabled
+        # interrupt is taken at the target as ever: SPU_DIRECT leaves it to the
+        # drain loop, and the target's label in a merged function has the check.
+        pc_tgt = self.pc_jump.get(addr)
+        if pc_tgt is not None:
+            if mn == "bi":
+                return f"{_ied}{self._uncond_branch(pc_tgt, func)}"
+            cond = self._cond(mn[1:], _reg(ops[0]))
+            return f"if ({cond}) {{ {_ied}{self._uncond_branch(pc_tgt, func)} }}"
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -1806,6 +1851,9 @@ def main() -> None:
     lifter.loop_locals_max = args.loop_locals_max
     if args.insn_patches:
         lifter.insn_patches, lifter.insn_patches_optional = load_insn_patches(args.insn_patches)
+    lifter.pc_jump = compute_pc_jumps(insns)
+    if lifter.pc_jump:
+        print(f"  {len(lifter.pc_jump)} indirect branch(es) to a constant")
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

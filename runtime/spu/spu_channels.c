@@ -79,6 +79,36 @@ static uint64_t spu_host_ns(void)
 #endif
 }
 
+/* The decrementer's clock: a stamp (ctx->dec_base_ns) and what has passed since it, in ticks. */
+#ifdef _WIN32
+static inline uint64_t spu_dec_now(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (uint64_t)c.QuadPart;
+}
+static inline uint32_t spu_dec_ticks(uint64_t counts)
+{
+    static volatile uint64_t s_ticks_per_count;   /* 32.32 */
+    uint64_t m = s_ticks_per_count;
+    if (!m) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_ticks_per_count = m = (SPU_DECREMENTER_HZ << 32) / (uint64_t)f.QuadPart;
+    }
+    return (uint32_t)((counts * m) >> 32);
+}
+#else
+static inline uint64_t spu_dec_now(void) { return spu_host_ns(); }
+static inline uint32_t spu_dec_ticks(uint64_t ns)
+{
+    /* Split seconds from the remainder before scaling: ns * 79.8M overflows 64 bits 231 s
+     * after the stamp. */
+    return (uint32_t)((ns / 1000000000ull) * SPU_DECREMENTER_HZ +
+                      ((ns % 1000000000ull) * SPU_DECREMENTER_HZ) / 1000000000ull);
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Clean SPU job abort (longjmp). The `br .` halt idiom and other terminal
  * spins can't be escaped by setting a status flag (lifted code never checks
@@ -1335,7 +1365,7 @@ static SPU_CH_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u1
         if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, v);
         break;
     case SPU_WrDec:          ctx->decrementer = v;
-                             ctx->dec_base_ns = spu_host_ns();              break;
+                             ctx->dec_base_ns = spu_dec_now();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
         SPU_JS_ADD(SPU_JS_EVACK, 1);
@@ -1512,17 +1542,48 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 static SPU_CH_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
 
-/* The MFC read channels and SPU_RdMachStat, with no channel diagnostic on: the stop check and
- * the field, read as spu_rdch_full reads it, without that function's frame. */
+/* The decrementer must actually DECREMENT. Returning the latched WrDec
+ * value verbatim makes every `rdch $ch8` deadline poll spin forever: the
+ * elapsed-time term is always zero, so the deadline never passes. LBP's
+ * wwsjob SPURS policy module hangs on exactly that at LS 0x2D68:
+ *
+ *     2d6c:  lqa   $2, 0x1530     ; deadline
+ *     2d74:  rdch  $5, $ch8       ; now  <- always read 0
+ *     2d78:  sf    $6, $2, $5     ; now - deadline
+ *     2d80:  cgti  $5, $6, 0
+ *     2d88:  binz  $2, $0         ; leave once it goes positive
+ *
+ * It never leaves, never reaches its first DMA, and blocks the workload.
+ * Wraparound on subtract is deliberate -- it is what hardware does, and the
+ * `cgti > 0` test above is written to tolerate it.
+ *
+ * The job manager reads it five times a job. Each read made six 64-bit divides
+ * here and in spu_host_ns: 2-3 ms of worker time a flip in God of War:
+ * Ascension's fight. So the stamp is in the clock's own counts (spu_dec_now),
+ * and counts become ticks by one multiply: only the ticks' low 32 bits count,
+ * and those are bits 32-63 of a 32.32 product whose top bits may wrap. */
+static uint32_t spu_rdch_dec(spu_context* ctx)
+{
+    /* Never armed by a WrDec: stamp the base on first read rather than
+     * measuring from epoch 0, which would subtract the host's entire
+     * uptime and hand back a wild value to code that has every right to
+     * read the decrementer before writing it. */
+    if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_dec_now();
+    return ctx->decrementer - spu_dec_ticks(spu_dec_now() - ctx->dec_base_ns);
+}
+
+/* The MFC read channels, SPU_RdMachStat and SPU_RdDec, with no channel diagnostic on: the stop
+ * check and the field, read as spu_rdch_full reads it, without that function's frame. */
 #ifdef PS3_SPU_JOBCAP
 static u128 spu_rdch_body(spu_context* ctx, uint32_t channel)
 #else
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 #endif
 {
-    if ((channel_is_mfc(channel) || channel == SPU_RdMachStat) && !spu_chan_diag()) {
+    if ((channel_is_mfc(channel) || channel == SPU_RdMachStat || channel == SPU_RdDec) && !spu_chan_diag()) {
         spu_honour_stop_request(ctx);
-        return spu_make_preferred_u32(channel == SPU_RdMachStat ? (uint32_t)(ctx->int_enable & 1u)
+        return spu_make_preferred_u32(channel == SPU_RdMachStat ? (uint32_t)(ctx->int_enable & 1u) :
+                                      channel == SPU_RdDec      ? spu_rdch_dec(ctx)
                                                                 : mfc_channel_read(ctx, channel));
     }
     return spu_rdch_full(ctx, channel);
@@ -1573,38 +1634,7 @@ static SPU_CH_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
         break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
-    /* The decrementer must actually DECREMENT. Returning the latched WrDec
-     * value verbatim makes every `rdch $ch8` deadline poll spin forever: the
-     * elapsed-time term is always zero, so the deadline never passes. LBP's
-     * wwsjob SPURS policy module hangs on exactly that at LS 0x2D68:
-     *
-     *     2d6c:  lqa   $2, 0x1530     ; deadline
-     *     2d74:  rdch  $5, $ch8       ; now  <- always read 0
-     *     2d78:  sf    $6, $2, $5     ; now - deadline
-     *     2d80:  cgti  $5, $6, 0
-     *     2d88:  binz  $2, $0         ; leave once it goes positive
-     *
-     * It never leaves, never reaches its first DMA, and blocks the workload.
-     * Wraparound on subtract is deliberate -- it is what hardware does, and the
-     * `cgti > 0` test above is written to tolerate it. */
-    case SPU_RdDec: {
-        /* Never armed by a WrDec: stamp the base on first read rather than
-         * measuring from epoch 0, which would subtract the host's entire
-         * uptime and hand back a wild value to code that has every right to
-         * read the decrementer before writing it. */
-        if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_host_ns();
-        uint64_t elapsed = spu_host_ns() - ctx->dec_base_ns;
-        /* Split seconds from the remainder before scaling: elapsed_ns * 79.8M
-         * overflows 64 bits 231 s after the base stamp, and a context that
-         * never writes its decrementer (the SPURS kernel's) keeps the stamp
-         * from boot, so every timed loop on that SPU saw the counter jump
-         * forward by ~16 s of ticks at 231 s, 462 s, 693 s... */
-        const uint64_t secs = elapsed / 1000000000ull, rem = elapsed % 1000000000ull;
-        uint32_t ticks   = (uint32_t)(secs * SPU_DECREMENTER_HZ +
-                                      (rem * SPU_DECREMENTER_HZ) / 1000000000ull);
-        v = ctx->decrementer - ticks;
-        break;
-    }
+    case SPU_RdDec:         v = spu_rdch_dec(ctx);                      break;
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
     /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.

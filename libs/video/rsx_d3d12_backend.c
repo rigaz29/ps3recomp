@@ -961,6 +961,8 @@ static void fg_start(void)
     s_d3d.swap_chain = (IDXGISwapChain3*)sc;
 }
 
+int rsx_d3d12_backend_generating(void) { return s_fg_mode == 2; }
+
 /* Every presented frame, before the list closes. */
 static void fg_frame(void)
 {
@@ -16795,6 +16797,7 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+int rsx_d3d12_backend_generating(void) { return 0; }
 void rsx_d3d12_backend_record_ahead(void) {}
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size) { (void)io_offset; (void)size; }
 void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,

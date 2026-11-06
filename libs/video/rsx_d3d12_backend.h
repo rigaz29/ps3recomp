@@ -46,6 +46,10 @@ void rsx_d3d12_backend_shutdown(void);
 /* Process Win32 messages. Returns 0 normally, -1 if window closed. */
 int rsx_d3d12_backend_pump_messages(void);
 
+/* 1 if frame generation is on, past rsx_d3d12_backend_init: the title then has to run at
+ * half the display's rate, and the frame clock caps it. */
+int rsx_d3d12_backend_generating(void);
+
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 

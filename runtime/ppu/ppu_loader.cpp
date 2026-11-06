@@ -1860,6 +1860,24 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 extern "C" int vm_inline_ok = 0;
 extern "C" int vm_inline_st_ok = 0;
 
+/* The lifter's --lazy-flags=check: a read where the flags' locals and ctx differ. what: a CR word
+ * bit, 32 for CA, 40 for an mfcr. Once per function and what. */
+extern "C" void ppu_lf_report(const char* fn, int what)
+{
+    enum { N = 2048 };
+    static const char* s_fn[N];
+    static int s_what[N];
+    static volatile long s_n, s_lock;
+    while (__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) { }
+    long i = 0;
+    for (; i < s_n; i++)
+        if (s_fn[i] == fn && s_what[i] == what) break;
+    const int fresh = i == s_n && s_n < N;
+    if (fresh) { s_fn[i] = fn; s_what[i] = what; s_n++; }
+    __atomic_store_n(&s_lock, 0, __ATOMIC_RELEASE);
+    if (fresh) { fprintf(stderr, "[lazy-flags] %s: %d differs\n", fn, what); fflush(stderr); }
+}
+
 /* PPU_MM_LEAN's copy of the memory model (ppu_mm in ppu_recomp.h). The port calls ppu_mm_fix once the
  * guest's memory is mapped, before any lifted code runs, with spu_coh_bits_publish(). */
 extern "C" struct { uint8_t* vb; const unsigned char* coh; } g_ppu_mm = { 0, 0 };

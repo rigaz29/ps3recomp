@@ -20,6 +20,8 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
+import ppu_lazy_flags
+
 # ---------------------------------------------------------------------------
 # We import the disassembler from the same directory.
 # ---------------------------------------------------------------------------
@@ -108,6 +110,7 @@ typedef struct ppu_context {
     int      reserve_valid; /* lwarx/stwcx. reservation flag    */
     uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
     void (*tramp)(void*);   /* PPU_MM_LEAN: g_trampoline_fn       */
+    uint32_t cr_lz, xer_lz; /* --lazy-flags=check: ctx as lazy flags leave it */
 } ppu_context;
 
 /* PPU_CTX_RESTRICT (a port's choice): a lifted function's context as __restrict, and passing it on
@@ -1138,6 +1141,8 @@ class PPULifter:
     """Translates PPU instructions into C source."""
 
     def __init__(self, prefix: str = "", weak_emit: bool = False):
+        self.lazy_flags = ""        # --lazy-flags: "", "on" or "check"
+        self._lf = None
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -4107,6 +4112,21 @@ class PPULifter:
     # Output generation
     # ------------------------------------------------------------------ #
 
+    def _lf_prepare(self, emit_funcs, func_by_addr, sorted_addrs, addr_index) -> None:
+        """--lazy-flags: what every function reads before writing, along its tail calls."""
+        self._lf = None
+        if not self.lazy_flags:
+            return
+        funcs = []
+        for f in emit_funcs:
+            tail = self._fallthrough_line(f, func_by_addr, sorted_addrs, addr_index, False)
+            funcs.append((f.name, f.body_lines + ([tail] if tail else [])))
+        self._lf = ppu_lazy_flags.Program(funcs)
+        self._lf.solve()
+        unknown = [n for n, fl in self._lf.flows.items() if not fl.ok]
+        print(f"  lazy flags ({self.lazy_flags}): {len(funcs) - len(unknown)} of {len(funcs)} functions"
+              + (f"; forms not known in {unknown[:8]}" if unknown else ""), flush=True)
+
     def emit_header(self) -> str:
         """Generate the C header file content."""
         # function_table / function_table_count are per-image; prefix their
@@ -4117,6 +4137,10 @@ class PPULifter:
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
+        if self.lazy_flags:
+            if self.lazy_flags == "check":
+                lines.append("#define PPU_LF_CHECK 1")
+            lines.append(ppu_lazy_flags.HEADER)
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx PPU_NOESC);")
@@ -4308,9 +4332,21 @@ class PPULifter:
                       "#else", f"void {h}(ppu_context* ctx, uint32_t addr);", "#endif"]
         lines.append(f"void {weak}{func.name}(ppu_context* PPU_CTXR ctx PPU_NOESC) {{")
         lines.append("    PPU_MM_SNAP")
-        for bline in _fuse_cr(func.body_lines):
+        tail = self._fallthrough_line(func, func_by_addr, sorted_addrs, addr_index, True)
+        done = False
+        if self._lf is not None:
+            body, done = ppu_lazy_flags.rewrite(func.name, self._lf, self.lazy_flags == "check")
+        if not done:
+            body = _fuse_cr(func.body_lines) + ([tail] if tail else [])
+        for bline in body:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
+        lines.append("}")
+        lines.append("")
+        return lines
+
+    def _fallthrough_line(self, func, func_by_addr, sorted_addrs, addr_index, warn: bool) -> str | None:
+        """The line a body that does not end in a terminator falls through to, or None."""
         # If a function doesn't end with blr/b/bctr (a return or unconditional
         # branch), PPC execution falls through to the next address. The lifter
         # may split one logical function into pieces at boundary points, so
@@ -4337,15 +4373,12 @@ class PPULifter:
                     if nxt.start_addr == func.fallthrough_to:
                         target = nxt.name
             if target:
-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
-            else:
+                return f"    {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}"
+            if warn:
                 print(f"  WARNING: {func.name} has no continuation at "
                       f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
-                lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
-
-        lines.append("}")
-        lines.append("")
-        return lines
+            return f"    /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;"
+        return None
 
     def _table_lines(self) -> list[str]:
         """The exported function table (typedef + extern declaration live in
@@ -4370,6 +4403,7 @@ class PPULifter:
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
+        self._lf_prepare(emit_funcs, func_by_addr, sorted_addrs, addr_index)
         lines = self._preamble_lines()
         for func in emit_funcs:
             lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
@@ -4419,6 +4453,7 @@ class PPULifter:
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
+        self._lf_prepare(emit_funcs, func_by_addr, sorted_addrs, addr_index)
 
         preamble = self._preamble_lines()
         written: list[str] = []
@@ -5196,6 +5231,9 @@ def main() -> None:
                              "`fn(ctx, addr);` ahead of the instruction, after "
                              "its label, fn being a function the port defines "
                              "(at a polling loop's head, a host wait).")
+    parser.add_argument("--lazy-flags", choices=("off", "on", "check"), default="off",
+                        help="the volatile CR fields and XER[CA] in locals of each function "
+                             "(ppu_lazy_flags.py); check keeps the exact accesses too and compares")
     parser.add_argument("--insn-patches", metavar="FILE", default=None,
                         help="JSON list of instruction patches to lift as "
                              "run-time switches: each {addr, orig, new, guard} "
@@ -5637,6 +5675,7 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
+    lifter.lazy_flags = "" if args.lazy_flags == "off" else args.lazy_flags
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has

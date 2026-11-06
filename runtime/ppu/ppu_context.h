@@ -102,6 +102,9 @@ typedef struct ppu_context {
      * PPU_MM_LEAN leaves it (g_trampoline_fn for the rest). */
     void (*tramp)(void*);
 
+    /* The lifter's --lazy-flags=check: ctx->cr and ctx->xer as lazy flags would leave them. */
+    uint32_t cr_lz, xer_lz;
+
 } ppu_context;
 
 /* ---------------------------------------------------------------------------

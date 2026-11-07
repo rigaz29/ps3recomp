@@ -317,6 +317,7 @@ typedef struct {
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
     u64                   last;        /* frame_count it was last bound or sampled */
+    u32                   grow_w, grow_h;   /* a size a batch that had bound it asked for: the next one makes it */
 } OffRT;
 /* demosaic double-buffers its 6-surface pass chain. God of War: Ascension
  * holds 29 targets by the gate after its first fight when started from that
@@ -387,7 +388,21 @@ typedef struct {
     u32                   gen;         /* bumped by every draw or clear that writes it */
     u32                   conv_gen;    /* gen its colour copy was made from */
     u64                   last_frame;  /* frame_count of the last pass that bound it */
+    u32                   grow_w, grow_h;   /* as OffRT's */
 } OffDS;
+/* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
+ * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
+ * earlier one already have: made anew there, those draws sample the old one through the views they
+ * copied while the barriers move the new one, a depth surface read in DEPTH_WRITE. God of War:
+ * Ascension's shadow atlas grows like that as the level starts, 48x66 to 1280x1408 over ten frames,
+ * three times within one batch, and the GPU hung there in half the runs. Until then the batch draws
+ * into what the target has. RT_GROW_NOW=1: made anew at once, as before. */
+static int grow_later(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("RT_GROW_NOW") ? 0 : 1;
+    return v;
+}
 /* Room to spare: God of War: Ascension's first level keeps six in use (the
  * scene's, a 1408x1408 one, the half-size passes'). */
 #define MAX_OFF_DS   12
@@ -5354,6 +5369,8 @@ static void compile_vp(void)
     if (!st || st->vp_ucode_bytes < 16 || !s_d3d.vp_root_sig) return;
 
     static char hlsl[64 * 1024];
+    extern void rsx_vp_set_branch_base(u32);
+    rsx_vp_set_branch_base(0);      /* from slot 0, as below from the program's start */
     int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
     /* Does this VP read vp_c[0..3]? Gates the garbage-projection fallback:
      * programs keeping their MVP elsewhere (gcm/cube: c[256..259]) must not
@@ -5551,6 +5568,14 @@ static int vp_get_vs(const rsx_state* st)
         if (s_d3d.vp_vs[i].hash == hash) { memo_idx = i; s_d3d.vp_vs[i].last_use = s_d3d.frame_count; return i; }
 
     static char hlsl[262144];
+    /* A branch's target is a slot of the whole store, the program's blocks count from its start: the
+     * decompiler takes that start as its branch base. Left at 0, a branching program loaded past slot
+     * 0 jumped to blocks it does not have, and its loop ran its 16384 rounds for every vertex.
+     * VP_BRANCH_BASE0=1: the base at 0, as before. */
+    { extern void rsx_vp_set_branch_base(u32);
+      static int base0 = -1;
+      if (base0 < 0) base0 = getenv("VP_BRANCH_BASE0") ? 1 : 0;
+      rsx_vp_set_branch_base(base0 ? 0u : vstart / 16u); }
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
     if (ni <= 0) return -1;
     if (getenv("VP_DUMP")) { static int _d=0; if (PS3_LOG_FIRST(_d, 4)) {
@@ -9444,6 +9469,12 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     int slot = off_rt_find(off);
     if (slot >= 0) {
         OffRT* r = &s_d3d.off_rt[slot];
+        const int in_batch = r->last == s_d3d.frame_count;   /* bound or sampled by this batch */
+        if (!in_batch) {   /* the size a batch before asked for (grow_later) */
+            if (r->dxgi == (u32)want_fmt && r->grow_w > w) w = r->grow_w;
+            if (r->dxgi == (u32)want_fmt && r->grow_h > h) h = r->grow_h;
+            r->grow_w = r->grow_h = 0;
+        }
         if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt) { r->used = 1; r->last = s_d3d.frame_count; return slot; }
         /* RT_REUSE (default 1): a re-bind of the same format no larger than
          * the surface keeps it -- the pass draws into its top-left corner
@@ -9457,6 +9488,12 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
               if (r->w >= w && r->h >= h) { r->used = 1; r->last = s_d3d.frame_count; return slot; }
               if (r->w > w) w = r->w;
               if (r->h > h) h = r->h;
+              if (in_batch && grow_later()) {
+                  if (w > r->grow_w) r->grow_w = w;
+                  if (h > r->grow_h) r->grow_h = h;
+                  r->used = 1;
+                  return slot;
+              }
           } }
         /* The frame in flight still references this resource -- releasing it here
          * is "was deleted prior to closing the command list" (D3D12 message 921),
@@ -9526,6 +9563,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             &IID_ID3D12Resource, (void**)&r->res)))
         return -1;
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
+    r->grow_w = r->grow_h = 0;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
     r->last = s_d3d.frame_count;
@@ -10306,10 +10344,21 @@ static int off_ds_get(u32 off, u32 w, u32 h)
     int i = off_ds_find(off);
     if (i >= 0) {
         OffDS* z = &s_d3d.off_ds[i];
+        const int in_batch = z->last_frame == s_d3d.frame_count;   /* bound or sampled by this batch */
+        if (!in_batch) {   /* the size a batch before asked for (grow_later) */
+            if (z->grow_w > w) w = z->grow_w;
+            if (z->grow_h > h) h = z->grow_h;
+            z->grow_w = z->grow_h = 0;
+        }
         z->last_frame = s_d3d.frame_count;
         if (w <= z->w && h <= z->h) return i;
         if (z->w > w) w = z->w;
         if (z->h > h) h = z->h;
+        if (in_batch && grow_later()) {
+            if (w > z->grow_w) z->grow_w = w;
+            if (h > z->grow_h) z->grow_h = h;
+            return i;
+        }
     } else {
         for (i = 0; i < MAX_OFF_DS && s_d3d.off_ds[i].res; i++) {}
         if (i >= MAX_OFF_DS) {
@@ -10346,6 +10395,7 @@ static int off_ds_get(u32 off, u32 w, u32 h)
             &IID_ID3D12Resource, (void**)&z->res)))
         return -1;
     z->off = off; z->w = w; z->h = h;
+    z->grow_w = z->grow_h = 0;
     z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     z->cleared = 0; z->gen = 0; z->conv_gen = 0xFFFFFFFFu;
     z->last_frame = s_d3d.frame_count;

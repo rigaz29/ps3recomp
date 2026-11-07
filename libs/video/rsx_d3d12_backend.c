@@ -991,6 +991,13 @@ static struct {
 
 /* The title's world-to-clip matrix: four vertex constants from reg, read by the
  * programs that draw its scene. Without it frames are shown as they are. */
+static const char* s_fsr3_refused;
+
+void rsx_d3d12_backend_fsr3_refuse(const char* why)
+{
+    s_fsr3_refused = why;
+}
+
 void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr)
 {
     s_fg.cam_reg = reg;
@@ -1004,6 +1011,10 @@ static void fg_start(void)
     const int mode = ps3_settings_ieq(m, "on") ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
     if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
     if (!mode) return;
+    if (s_fsr3_refused) {
+        printf("[D3D12] frame generation: off, %s%c", s_fsr3_refused, 10);
+        return;
+    }
     if (!rsx_fsr3_available()) {
         printf("[D3D12] frame generation: no amd_fidelityfx_loader_dx12.dll beside the exe%c", 10);
         return;
@@ -3237,8 +3248,10 @@ static int pp_init(void)
         if (!s_d3d.pp_mode && !ps3_settings_ieq(sc, "bilinear"))
             printf("[D3D12] graphics.scaling = %s is not bilinear, sharp, fsr1 or fsr3; bilinear\n", sc);
         if (ps3_settings_ieq(sc, "fsr3")) {
-            s_up.want = rsx_fsr3_available();
-            if (!s_up.want) printf("[D3D12] graphics.scaling = fsr3: no amd_fidelityfx_loader_dx12.dll beside the exe; FSR 1%c", 10);
+            s_up.want = !s_fsr3_refused && rsx_fsr3_available();
+            if (!s_up.want)
+                printf("[D3D12] graphics.scaling = fsr3: %s; FSR 1%c",
+                       s_fsr3_refused ? s_fsr3_refused : "no amd_fidelityfx_loader_dx12.dll beside the exe", 10);
         }
         static const struct { const char* name; float stops; } k[] = {
             { "off", -1.0f }, { "low", 1.0f }, { "medium", 0.5f }, { "high", 0.2f }, { "max", 0.0f } };

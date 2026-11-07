@@ -56,6 +56,9 @@ int rsx_d3d12_backend_generating(void);
  * for none. Before rsx_d3d12_backend_init. */
 void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 
+/* Before rsx_d3d12_backend_init: the title cannot give FSR 3 what it needs this run, and why. */
+void rsx_d3d12_backend_fsr3_refuse(const char* why);
+
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 

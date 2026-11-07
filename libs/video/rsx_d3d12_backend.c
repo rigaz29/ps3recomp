@@ -463,6 +463,7 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
     int uses_cam;           /* reads the title's camera (rsx_d3d12_backend_camera_register) */
+    int uses_prev;          /* and last frame's: it draws what moves */
     char* hlsl;             /* the decompiled source, for vp_vs_raw */
     ID3DBlob* vs_raw;       /* raw-fetch variant, compiled on first use */
     int raw_failed;
@@ -945,27 +946,46 @@ static void rdoc_request(void)
  * is the proxy swapchain and its threads with nothing generated, to measure them.
  * The swap chain goes behind the proxy before anything asks it for a buffer; the
  * context waits for the first frame, when the window's size is known. */
+#define FG_OBJ_MAX   1024      /* draws of what moves in a frame */
+#define FG_OBJ_PSOS  16        /* programs that draw them */
+#define FG_OBJ_NONE  60000.0f  /* in the target, where nothing moves */
+#define FG_OBJ_BIAS  (-64)     /* their depth against the scene's, from another program's arithmetic */
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
 static int s_fg_ready;
 static double s_fg_last;
 /* What it takes from a frame, as the batch is recorded and replayed. */
 static struct {
     int cam_reg;                /* the vertex constant the world-to-clip matrix starts at, or -1 */
+    int prev_reg, prev_attr;    /* last frame's, and the attribute of a vertex's last position */
     int cam_ok;                 /* this frame has a 3D scene: a camera, and */
     float cam[16], z_scale, z_offset;
     u32 depth_off;              /* the depth surface it draws with */
     int marked;                 /* the HUD's clear was reached: see fg_marker */
     int copied;                 /* and the frame's depth and picture are in depth and hud_src */
+    int depth_ok;               /* the frame's depth is in depth */
     int ready;                  /* the frame's inputs are all there */
     ID3D12Resource* depth;      /* the scene's depth */
     ID3D12Resource* hud_src;    /* the picture without its HUD, at the display target's size */
     ID3D12Resource* hud_out[2]; /* that at the window's size, a frame about */
     u32 hud_i;
-} s_fg = { -1 };
+    u32 obj[FG_OBJ_MAX];        /* this frame's records of what moves */
+    u32 obj_n;
+    int obj_drawn;
+    ID3D12Resource* obj_rt;     /* their motion, R16G16_FLOAT */
+    ID3D12DescriptorHeap* obj_rtv;
+    ID3D12DescriptorHeap* obj_dsv;   /* depth, read only */
+    ID3DBlob* obj_ps;
+    struct { u32 hash; struct ShaderJob* job; ID3D12PipelineState* pso; int tried; } obj_pso[FG_OBJ_PSOS];
+} s_fg = { -1, -1, -1 };
 
 /* The title's world-to-clip matrix: four vertex constants from reg, read by the
  * programs that draw its scene. Without it frames are shown as they are. */
-void rsx_d3d12_backend_camera_register(int reg) { s_fg.cam_reg = reg; }
+void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr)
+{
+    s_fg.cam_reg = reg;
+    s_fg.prev_reg = prev_reg;
+    s_fg.prev_attr = prev_attr;
+}
 
 static void fg_start(void)
 {
@@ -980,6 +1000,7 @@ static void fg_start(void)
     if (rsx_fsr3_wrap(&sc, s_d3d.cmd_queue)) s_fg_mode = mode;
     s_d3d.swap_chain = (IDXGISwapChain3*)sc;
     rsx_fsr3_fg_floor(atof(ps3_settings_str("graphics", "frame_generation_floor", "D3D12_FG_FLOOR", "25")));
+    if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
 }
 
 int rsx_d3d12_backend_generating(void) { return s_fg_mode == 2; }
@@ -1004,12 +1025,15 @@ static void fg_frame(void)
     f.scene = s_fg.ready;
     f.depth = s_fg.depth;
     f.hudless = s_fg.hud_out[s_fg.hud_i];
+    f.objects = s_fg.obj_drawn ? s_fg.obj_rt : NULL;
     memcpy(f.cam, s_fg.cam, sizeof f.cam);
     f.z_scale = s_fg.z_scale;
     f.z_offset = s_fg.z_offset;
     rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f);
     s_fg_last = now;
-    s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.ready = 0;
+    s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.depth_ok = s_fg.ready = 0;
+    s_fg.obj_n = 0;
+    s_fg.obj_drawn = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5458,7 +5482,9 @@ static int vp_get_vs(const rsx_state* st)
          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
     { char k[24];
       snprintf(k, sizeof k, "vp_c[%d]", s_fg.cam_reg);
-      s_d3d.vp_vs[slot].uses_cam = s_fg.cam_reg >= 0 && strstr(hlsl, k) != NULL; }
+      s_d3d.vp_vs[slot].uses_cam = s_fg.cam_reg >= 0 && strstr(hlsl, k) != NULL;
+      snprintf(k, sizeof k, "vp_c[%d]", s_fg.prev_reg);
+      s_d3d.vp_vs[slot].uses_prev = s_fg.prev_reg >= 0 && strstr(hlsl, k) != NULL; }
     { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     memo_idx = slot;
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
@@ -5553,26 +5579,9 @@ static ID3DBlob* vp_vs_ready(VPVSEntry* e)
     return e->vs;
 }
 
-static ID3DBlob* vp_vs_raw(int vs_idx)
+/* The raw-fetch variant's source, malloc'ed, or NULL. */
+static char* vp_raw_text(const VPVSEntry* e, size_t* len)
 {
-    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
-    VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
-    if (e->vs_raw || e->raw_failed || !e->hlsl) return e->vs_raw;
-    /* A worker is building it: until then the draw takes the indexed path,
-     * which needs no raw variant. */
-    if (e->raw_job) {
-        if (!sj_is_done(e->raw_job)) return NULL;
-        ShaderJob* j = e->raw_job;
-        e->raw_job = NULL;
-        if (SUCCEEDED(j->hr) && j->blob) { e->vs_raw = j->blob; j->blob = NULL; }
-        else { e->raw_failed = 1;
-               static int _e = 0;
-               if (PS3_LOG_FIRST(_e, 4))
-                   printf("[VP] raw-fetch VS compile FAIL (hash=0x%08X): %s\n", e->hash, j->err); }
-        sj_release(j);
-        return e->vs_raw;
-    }
-    e->raw_failed = 1;                      /* until it compiles */
     static const char cb_end[] = "    float4 vp_posoffset;\n};\n";
     static const char v_last[] = "v[15]=input.a15;\n";
     static const char cb_raw[] = "    float4 vp_posoffset;\n    uint4 vp_fa[16];\n    float4 vp_fk[16];\n};\n";
@@ -5629,6 +5638,33 @@ static ID3DBlob* vp_vs_raw(int vs_idx)
     VP_RAW_PUT(v1, strlen(v1));
 #undef VP_RAW_PUT
     out[o] = 0;
+    *len = o;
+    return out;
+}
+
+static ID3DBlob* vp_vs_raw(int vs_idx)
+{
+    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
+    VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
+    if (e->vs_raw || e->raw_failed || !e->hlsl) return e->vs_raw;
+    /* A worker is building it: until then the draw takes the indexed path,
+     * which needs no raw variant. */
+    if (e->raw_job) {
+        if (!sj_is_done(e->raw_job)) return NULL;
+        ShaderJob* j = e->raw_job;
+        e->raw_job = NULL;
+        if (SUCCEEDED(j->hr) && j->blob) { e->vs_raw = j->blob; j->blob = NULL; }
+        else { e->raw_failed = 1;
+               static int _e = 0;
+               if (PS3_LOG_FIRST(_e, 4))
+                   printf("[VP] raw-fetch VS compile FAIL (hash=0x%08X): %s\n", e->hash, j->err); }
+        sj_release(j);
+        return e->vs_raw;
+    }
+    e->raw_failed = 1;                      /* until it compiles */
+    size_t o = 0;
+    char* out = vp_raw_text(e, &o);
+    if (!out) return NULL;
     ID3DBlob* vb = NULL; ID3DBlob* err = NULL;
     if (sj_workers() > 0) {
         vb = shc_find(out, o, "vs_5_0");
@@ -8566,7 +8602,11 @@ static void vp_record_raw_cb(u32 slot, const rsx_state* st)
         fa[i * 4 + 1] = on ? a->stride : 0;
         fa[i * 4 + 2] = (a->type & 15u) | (c << 4);
         fa[i * 4 + 3] = on;
-        memcpy(&fk[i * 4], st->vertex_data4f[i], 16);
+        /* What an array leaves out is 0, 0, 0, 1 as the input assembler's is, not the attribute's
+         * constant: God of War: Ascension's last positions have three components, and their w
+         * came out 0 here, which sent its motion blur's vertexes off the screen. */
+        if (on) { fk[i * 4] = fk[i * 4 + 1] = fk[i * 4 + 2] = 0.0f; fk[i * 4 + 3] = 1.0f; }
+        else memcpy(&fk[i * 4], st->vertex_data4f[i], 16);
     }
     if (!s_cbimg_ok) return;                     /* written to the slot by vp_cb_commit */
     u8* dst = s_cbimg + VP_CB_RAW_OFF;
@@ -8851,6 +8891,9 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             s_fg.cam_ok = 1;
         }
     }
+    if (s_fg_mode == 2 && dr && s_fg.obj_n < FG_OBJ_MAX && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n &&
+        s_d3d.vp_vs[vs_idx].uses_prev)
+        s_fg.obj[s_fg.obj_n++] = slot;
     s_cbimg_ok = 1;
 }
 
@@ -9926,6 +9969,31 @@ static int fg_targets(void)
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_fg.depth)))
             return 0;
     }
+    if (!s_fg.obj_rt && s_fg.prev_reg >= 0) {
+        rd.Width = s_d3d.width; rd.Height = s_d3d.height;
+        rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.NumDescriptors = 1;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, read, NULL,
+                &IID_ID3D12Resource, (void**)&s_fg.obj_rt)) ||
+            FAILED(dev->lpVtbl->CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fg.obj_rtv)))
+            return 0;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        if (FAILED(dev->lpVtbl->CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fg.obj_dsv)))
+            return 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        s_fg.obj_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fg.obj_rtv, &h);
+        dev->lpVtbl->CreateRenderTargetView(dev, s_fg.obj_rt, NULL, h);
+        s_fg.obj_dsv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fg.obj_dsv, &h);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv;
+        memset(&dv, 0, sizeof dv);
+        dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+        dev->lpVtbl->CreateDepthStencilView(dev, s_fg.depth, &dv, h);
+    }
     const UINT inc = dev->lpVtbl->GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE base;
     s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &base);
@@ -10002,17 +10070,15 @@ static void fg_marker(const D3D12DrawRecord* dr)
     pp_barrier(s_fg.hud_src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     off_rt_transition(ri, rs);
     fg_copy_depth(zi);
-    s_fg.copied = 1;
+    s_fg.copied = s_fg.depth_ok = 1;
 }
 
-/* A scene with no HUD to draw has no marker: its depth is whole at the frame's end, and the
- * frame as it stands, before the overlay goes on, is the picture without a HUD. */
+/* A scene with no HUD to draw has no marker: its depth is whole at the frame's end (see
+ * fg_objects), and the frame as it stands, before the overlay goes on, is the picture without
+ * a HUD. */
 static void fg_unmarked(ID3D12Resource* bb)
 {
-    if (s_fg_mode != 2 || !s_fg.cam_ok || s_fg.marked) return;
-    const int zi = off_ds_find(s_fg.depth_off);
-    if (zi < 0 || s_d3d.off_ds[zi].w != s_d3d.width || s_d3d.off_ds[zi].h != s_d3d.height || !fg_targets()) return;
-    fg_copy_depth(zi);
+    if (s_fg_mode != 2 || s_fg.marked || !s_fg.depth_ok) return;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     s_fg.hud_i ^= 1;
@@ -12925,6 +12991,154 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
     return d < to ? d : to;
 }
 
+/* The title's draw of what moves, again: its stretch left out, last frame's position and this
+ * one's going to the pixel. */
+static const char s_fg_obj_ps[] =
+    "struct PSInput {\n"
+    "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
+    "    float4 fog : FOG;\n"
+    "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
+    "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+    "};\n"
+    "float2 main(PSInput i) : SV_Target {\n"
+    "    if (i.tc1.w <= 0.0) return float2(0.0, 0.0);\n"
+    "    float2 now = i.tc0.xy / i.tc0.w, was = i.tc1.xy / i.tc1.w;\n"
+    "    return float2(was.x - now.x, now.y - was.y) * 0.5;\n"
+    "}\n";
+
+static ID3D12PipelineState* fg_obj_pso(int vs_idx)
+{
+    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return NULL;
+    const VPVSEntry* e = &s_d3d.vp_vs[vs_idx];
+    int i = 0;
+    while (i < FG_OBJ_PSOS && s_fg.obj_pso[i].hash != e->hash && s_fg.obj_pso[i].tried) i++;
+    if (i == FG_OBJ_PSOS) return NULL;
+    if (s_fg.obj_pso[i].pso) return s_fg.obj_pso[i].pso;
+    ID3DBlob* vs = NULL;
+    if (!s_fg.obj_pso[i].tried) {
+        s_fg.obj_pso[i].tried = 1;
+        s_fg.obj_pso[i].hash = e->hash;
+        size_t n = 0;
+        char* raw = e->hlsl ? vp_raw_text(e, &n) : NULL;
+        const char* at = raw ? strstr(raw, "    VSOutput Out;\n") : NULL;
+        if (!at) { free(raw); return NULL; }
+        const int c = s_fg.cam_reg, p = s_fg.prev_reg, a = s_fg.prev_attr;
+        char mid[512];
+        const int m = snprintf(mid, sizeof mid,
+            "    o[0] = vp_c[%d] * v[0].x + vp_c[%d] * v[0].y + vp_c[%d] * v[0].z + vp_c[%d] * v[0].w;\n"
+            "    o[7] = o[0];\n"
+            "    o[8] = vp_c[%d] * v[%d].x + vp_c[%d] * v[%d].y + vp_c[%d] * v[%d].z + vp_c[%d] * v[%d].w;\n",
+            c, c + 1, c + 2, c + 3, p, a, p + 1, a, p + 2, a, p + 3, a);
+        const size_t head = (size_t)(at - raw);
+        char* src = (char*)malloc(n + (size_t)m + 1);
+        if (!src) { free(raw); return NULL; }
+        memcpy(src, raw, head);
+        memcpy(src + head, mid, (size_t)m);
+        memcpy(src + head + m, at, n - head + 1);
+        free(raw);
+        n += (size_t)m;
+        if (sj_workers() > 0) {
+            vs = shc_find(src, n, "vs_5_0");
+            if (!vs) s_fg.obj_pso[i].job = sj_submit(src, n, "guest_vp_motion", "vs_5_0", NULL, NULL, 0);
+        }
+        if (!vs && !s_fg.obj_pso[i].job) {
+            ID3DBlob* err = NULL;
+            d3d_compile_cached(src, n, "guest_vp_motion", "vs_5_0", &vs, &err);
+            if (err) err->lpVtbl->Release(err);
+        }
+        free(src);
+    }
+    if (s_fg.obj_pso[i].job) {
+        ShaderJob* j = s_fg.obj_pso[i].job;
+        if (!sj_is_done(j)) return NULL;
+        s_fg.obj_pso[i].job = NULL;
+        if (SUCCEEDED(j->hr) && j->blob) { vs = j->blob; j->blob = NULL; }
+        sj_release(j);
+    }
+    if (!s_fg.obj_ps) {
+        ID3DBlob* err = NULL;
+        d3d_compile_cached(s_fg_obj_ps, sizeof s_fg_obj_ps - 1, "fg_obj_ps", "ps_5_0", &s_fg.obj_ps, &err);
+        if (err) err->lpVtbl->Release(err);
+    }
+    if (!vs || !s_fg.obj_ps) {
+        if (vs) vs->lpVtbl->Release(vs);
+        static int said;
+        if (!said++) fprintf(stderr, "[D3D12] frame generation: no program for what moves%c", 10);
+        return NULL;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = s_d3d.vp_root_sig;
+    pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
+    pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
+    pd.PS.pShaderBytecode = s_fg.obj_ps->lpVtbl->GetBufferPointer(s_fg.obj_ps);
+    pd.PS.BytecodeLength = s_fg.obj_ps->lpVtbl->GetBufferSize(s_fg.obj_ps);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthBias = FG_OBJ_BIAS;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT32_MAX;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.SampleDesc.Count = 1;
+    const HRESULT hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                                         (void**)&s_fg.obj_pso[i].pso);
+    vs->lpVtbl->Release(vs);
+    if (FAILED(hr)) {
+        s_fg.obj_pso[i].pso = NULL;
+        fprintf(stderr, "[D3D12] frame generation: the pipeline for what moves failed (0x%08lX)%c", (unsigned long)hr, 10);
+    }
+    return s_fg.obj_pso[i].pso;
+}
+
+/* The frame's draws are in. Where no HUD's clear took the depth, it is taken now; and the title's
+ * draws of what moves go again, into a target of their own at the render's size, tested against
+ * that depth. The depth is the scene's at its end, so only what shows gets through. */
+static void fg_objects(void)
+{
+    if (s_fg_mode != 2 || !s_fg.cam_ok || !s_present_this_frame) { s_fg.obj_n = 0; return; }
+    if (!s_fg.marked) {
+        const int zi = off_ds_find(s_fg.depth_off);
+        if (zi < 0 || s_d3d.off_ds[zi].w != s_d3d.width || s_d3d.off_ds[zi].h != s_d3d.height || !fg_targets()) return;
+        fg_copy_depth(zi);
+        s_fg.depth_ok = 1;
+    }
+    if (!s_fg.depth_ok || !s_fg.obj_n || !s_fg.obj_rt) return;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    pp_barrier(s_fg.obj_rt, read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    pp_barrier(s_fg.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_READ);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv;
+    s_fg.obj_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fg.obj_rtv, &rtv);
+    s_fg.obj_dsv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fg.obj_dsv, &dsv);
+    const float none[4] = { FG_OBJ_NONE, FG_OBJ_NONE, 0.0f, 0.0f };
+    cl->lpVtbl->ClearRenderTargetView(cl, rtv, none, 0, NULL);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, &dsv);
+    const D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f };
+    const D3D12_RECT sc = { 0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height };
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    const u64 cb = s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb) + (u64)s_d3d.vp_parity * MAX_DRAWS * VP_CB_STRIDE;
+    for (u32 i = 0; i < s_fg.obj_n; i++) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[s_fg.obj[i]];
+        ID3D12PipelineState* pso = dr->raw ? fg_obj_pso(dr->vs_idx) : NULL;
+        if (!pso) continue;
+        cl->lpVtbl->SetPipelineState(cl, pso);
+        cl->lpVtbl->SetGraphicsRootConstantBufferView(cl, 0, cb + (u64)dr->cb_slot * VP_CB_STRIDE);
+        vp_draw_raw(dr, &s_rf.ib_bound, &s_rf.raw_bound);
+        s_fg.obj_drawn = 1;
+    }
+    pp_barrier(s_fg.depth, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    pp_barrier(s_fg.obj_rt, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    if (s_rf.cur_rt < 0) s_rf.cur_rt = 0;   /* rf_vp_end binds the display target again */
+    s_rf.force_rebind = 1;
+}
+
 /* The end of the VP pass: the display target bound again. */
 static void rf_vp_end(void)
 {
@@ -12973,6 +13187,7 @@ static void render_frame(void)
     gts_mark(1);
     rf_vp_draws(s_rf.done, cap_stop(s_d3d.draw_count), 0);
     gps_end(s_d3d.draw_count);
+    fg_objects();
     rf_vp_end();
     mwb_record();
     gts_mark(2);

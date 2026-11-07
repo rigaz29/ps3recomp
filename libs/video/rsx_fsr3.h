@@ -36,6 +36,8 @@ typedef struct rsx_fsr3_frame {
                              * NON_PIXEL_SHADER_RESOURCE, at the render's size */
     void* hudless;          /* ID3D12Resource*: the picture without its HUD, at the display's
                              * size, readable by pixel and compute shaders */
+    void* objects;          /* ID3D12Resource*, or NULL: R16G16_FLOAT at the render's size, readable,
+                             * the motion in UV units of what moves, over 30000 where nothing does */
     float cam[16];          /* world to clip, four columns: x, y, z and w's */
     float z_scale, z_offset;/* clip z to the depth range: depth = ndc * scale + offset */
 } rsx_fsr3_frame;

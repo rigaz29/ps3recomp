@@ -51,8 +51,10 @@ int rsx_d3d12_backend_pump_messages(void);
 int rsx_d3d12_backend_generating(void);
 
 /* The first of the four vertex constants that hold the title's world-to-clip matrix, which
- * frame generation needs. Before rsx_d3d12_backend_init. */
-void rsx_d3d12_backend_camera_register(int reg);
+ * frame generation needs. The title's draws of what moves: prev_reg, last frame's matrix, the
+ * same way, read only by them, and prev_attr, the attribute with a vertex's last position; -1
+ * for none. Before rsx_d3d12_backend_init. */
+void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);

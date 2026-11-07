@@ -42,7 +42,8 @@ static ID3D12Resource* s_motion;    /* R16G16_FLOAT, in UV units, from a pixel t
 static ID3D12RootSignature* s_in_root;
 static ID3D12PipelineState* s_in_pso;
 static ID3D12DescriptorHeap* s_in_heap;
-static ID3D12Resource* s_in_src;    /* what the heap's SRV shows */
+static ID3D12Resource* s_in_src;    /* what the heap's SRVs show */
+static ID3D12Resource* s_in_obj;
 static ID3D12Device* s_dev;
 
 /* The camera, from the matrix a scene draws with. */
@@ -145,14 +146,14 @@ int rsx_fsr3_wrap(void** swap_chain, void* queue)
 }
 
 /* The depth into the format the API takes, and the camera's motion at every pixel:
- * back to the world through this frame's matrix, forward through last frame's.
- * A depth is what the rasteriser wrote, so a moving object gets the motion of the
- * world behind where it stands; frame generation's optical flow carries it. */
+ * back to the world through this frame's matrix, forward through last frame's. That
+ * is right for what stands still; what moves comes from the title, drawn into objects. */
 static const char s_in_hlsl[] =
     "Texture2D<float> depth_in : register(t0);\n"
+    "Texture2D<float2> objects : register(t1);\n"
     "RWTexture2D<float> depth_out : register(u0);\n"
     "RWTexture2D<float2> motion_out : register(u1);\n"
-    "cbuffer C : register(b0) { float4 r0, r1, r2, r3; float4 k; };\n"
+    "cbuffer C : register(b0) { float4 r0, r1, r2, r3; float4 k; float4 k2; };\n"
     "[numthreads(8, 8, 1)]\n"
     "void main(uint3 id : SV_DispatchThreadID) {\n"
     "    uint w, h;\n"
@@ -164,7 +165,12 @@ static const char s_in_hlsl[] =
     "    float4 n = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (d - k.y) / k.x, 1.0);\n"
     "    float4 p = float4(dot(r0, n), dot(r1, n), dot(r2, n), dot(r3, n));\n"
     "    float2 was = float2(p.x / p.w * 0.5 + 0.5, 0.5 - p.y / p.w * 0.5);\n"
-    "    motion_out[id.xy] = p.w > 0.0 ? was - uv : float2(0.0, 0.0);\n"
+    "    float2 m = p.w > 0.0 ? was - uv : float2(0.0, 0.0);\n"
+    "    if (k2.x != 0.0) {\n"
+    "        float2 o = objects[id.xy];\n"
+    "        if (o.x < 30000.0) m = o;\n"
+    "    }\n"
+    "    motion_out[id.xy] = m;\n"
     "}\n";
 
 static ID3D12Resource* fsr3_target(ID3D12Device* dev, DXGI_FORMAT fmt, unsigned w, unsigned h)
@@ -198,7 +204,7 @@ static int fsr3_inputs_init(ID3D12Device* dev)
     }
     D3D12_DESCRIPTOR_RANGE range[2]{};
     range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range[0].NumDescriptors = 1;
+    range[0].NumDescriptors = 2;
     range[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     range[1].NumDescriptors = 2;
     D3D12_ROOT_PARAMETER rp[3]{};
@@ -209,7 +215,7 @@ static int fsr3_inputs_init(ID3D12Device* dev)
     rp[1].DescriptorTable.NumDescriptorRanges = 1;
     rp[1].DescriptorTable.pDescriptorRanges = &range[1];
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[2].Constants.Num32BitValues = 20;
+    rp[2].Constants.Num32BitValues = 24;
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 3;
     rd.pParameters = rp;
@@ -224,11 +230,18 @@ static int fsr3_inputs_init(ID3D12Device* dev)
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s_in_pso)))) return 0;
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;
+    hd.NumDescriptors = 4;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_in_heap)))) return 0;
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE h = s_in_heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC none{};
+    none.Format = DXGI_FORMAT_R16G16_FLOAT;
+    none.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    none.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    none.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(nullptr, &none, h);
     h.ptr += inc;
     dev->CreateUnorderedAccessView(s_depth, nullptr, nullptr, h);
     h.ptr += inc;
@@ -251,8 +264,8 @@ static void fsr3_barrier(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES fr
 }
 
 /* reproject: last frame's matrix after the inverse of this frame's, by rows. */
-static void fsr3_inputs(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, const double reproject[4][4],
-                        float z_scale, float z_offset)
+static void fsr3_inputs(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, ID3D12Resource* objects,
+                        const double reproject[4][4], float z_scale, float z_offset)
 {
     if (depth != s_in_src) {
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
@@ -263,13 +276,20 @@ static void fsr3_inputs(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, co
         s_dev->CreateShaderResourceView(depth, &v, s_in_heap->GetCPUDescriptorHandleForHeapStart());
         s_in_src = depth;
     }
-    float c[20];
+    if (objects && objects != s_in_obj) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s_in_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += s_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        s_dev->CreateShaderResourceView(objects, nullptr, h);
+        s_in_obj = objects;
+    }
+    float c[24] = {};
     for (int r = 0; r < 4; r++)
         for (int k = 0; k < 4; k++) c[r * 4 + k] = (float)reproject[r][k];
     c[16] = z_scale;
     c[17] = z_offset;
     c[18] = 1.0f / (float)s_rw;
     c[19] = 1.0f / (float)s_rh;
+    c[20] = objects ? 1.0f : 0.0f;
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     fsr3_barrier(cl, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetDescriptorHeaps(1, &s_in_heap);
@@ -277,9 +297,9 @@ static void fsr3_inputs(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, co
     cl->SetPipelineState(s_in_pso);
     D3D12_GPU_DESCRIPTOR_HANDLE g = s_in_heap->GetGPUDescriptorHandleForHeapStart();
     cl->SetComputeRootDescriptorTable(0, g);
-    g.ptr += s_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g.ptr += 2 * s_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     cl->SetComputeRootDescriptorTable(1, g);
-    cl->SetComputeRoot32BitConstants(2, 20, c, 0);
+    cl->SetComputeRoot32BitConstants(2, 24, c, 0);
     cl->Dispatch((s_rw + 7) / 8, (s_rh + 7) / 8, 1);
     fsr3_barrier(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
 }
@@ -476,7 +496,8 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
             }
         /* From clip space to clip space, and the pass gives it NDC: the same point, as a
          * projective map does not mind the scale. */
-        fsr3_inputs((ID3D12GraphicsCommandList*)cmd_list, (ID3D12Resource*)f->depth, rep, f->z_scale, f->z_offset);
+        fsr3_inputs((ID3D12GraphicsCommandList*)cmd_list, (ID3D12Resource*)f->depth,
+                    reset ? nullptr : (ID3D12Resource*)f->objects, rep, f->z_scale, f->z_offset);
     }
     fsr3_configure(on, on ? f->hudless : nullptr);
     if (on) {

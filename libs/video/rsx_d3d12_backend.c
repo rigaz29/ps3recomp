@@ -1027,6 +1027,44 @@ static void fg_start(void)
 
 int rsx_d3d12_backend_generating(void) { return s_fg_mode == 2; }
 
+/* From the display paths, which have 59.94 where EnumDisplaySettings has 59. */
+double rsx_d3d12_backend_refresh_hz(void)
+{
+    MONITORINFOEXW mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTOPRIMARY), (MONITORINFO*)&mi)) return 0.0;
+    double hz = 0.0;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS) {
+        DISPLAYCONFIG_PATH_INFO* paths = (DISPLAYCONFIG_PATH_INFO*)calloc(np + 1, sizeof *paths);
+        DISPLAYCONFIG_MODE_INFO* modes = (DISPLAYCONFIG_MODE_INFO*)calloc(nm + 1, sizeof *modes);
+        if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS)
+            for (UINT32 i = 0; i < np && hz <= 0.0; i++) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+                memset(&src, 0, sizeof src);
+                src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                src.header.size = sizeof src;
+                src.header.adapterId = paths[i].sourceInfo.adapterId;
+                src.header.id = paths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, mi.szDevice))
+                    continue;
+                const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+                if (r.Denominator) hz = (double)r.Numerator / (double)r.Denominator;
+            }
+        free(paths);
+        free(modes);
+    }
+    if (hz <= 1.0) {
+        DEVMODEW dm;
+        memset(&dm, 0, sizeof dm);
+        dm.dmSize = sizeof dm;
+        hz = EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1
+             ? (double)dm.dmDisplayFrequency : 0.0;
+    }
+    return hz;
+}
+
 static float fg_ms(double now)
 {
     return s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f;
@@ -17378,6 +17416,7 @@ void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 int rsx_d3d12_backend_generating(void) { return 0; }
+double rsx_d3d12_backend_refresh_hz(void) { return 0.0; }
 void rsx_d3d12_backend_record_ahead(void) {}
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size) { (void)io_offset; (void)size; }
 void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,

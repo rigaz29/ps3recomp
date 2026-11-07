@@ -171,6 +171,9 @@ typedef struct CellPadActParam {
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x1CF98800 */
+/* For a port, before cellPadInit: see the note at PAD_STICK_DEADZONE in cellPad.c. */
+void ps3_pad_tune(double stick_full, int flick_hold);
+
 s32 cellPadInit(u32 max_connect);
 
 /* NID: 0x4D9B75D5 */

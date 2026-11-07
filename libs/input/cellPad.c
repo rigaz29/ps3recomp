@@ -200,6 +200,53 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 
 /* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 #define PAD_STICK_DEADZONE  7849
+
+/* A title that reads the pad once a frame samples at 33 ms what a thumb does in 100, and one
+ * that wants a stick at the end of its travel for several reads misses most flicks at that
+ * rate. God of War: Ascension's evade is such a one: it smooths the right stick over its
+ * reads and wants ~0.87, so 255 for two reads does nothing, for three it rolls, and 240 takes
+ * eight. Its port asks for three things here, through ps3_pad_tune:
+ *   input.stick_full: the share of a stick's travel read as full deflection, both sticks,
+ *     with a round dead zone, its circle spread over the pad's square, or a diagonal flick
+ *     falls short. 1 leaves the sticks as they were.
+ *   input.flick_hold: a right stick that reached its end between two reads is held there for
+ *     that many reads. 0 for none.
+ *   and with either, a thread that polls the pad between the title's reads, so that the end
+ *     of a flick and a tap of a button are seen at all. */
+#define PAD_FLICK_REACH 114             /* of the right stick's 127: 0.9 */
+static double s_tune_full = 1.0;
+static int    s_tune_hold;
+static int    s_sampling;               /* the thread runs */
+static u16    s_latch_buttons[PAD_MAX_HOST_PORTS];
+static struct { u8 rx, ry; int reach; u8 hold_rx, hold_ry; int hold; } s_flick[PAD_MAX_HOST_PORTS];
+
+void ps3_pad_tune(double stick_full, int flick_hold)
+{
+    s_tune_full = stick_full;
+    s_tune_hold = flick_hold;
+}
+
+static float pad_stick_full(void)
+{
+    static float f = -1.0f;
+    if (f < 0.0f) {
+        double v = ps3_settings_num("input", "stick_full", NULL, s_tune_full);
+        if (v < 0.5) v = 0.5;
+        if (v > 1.0) v = 1.0;
+        f = (float)v;
+    }
+    return f;
+}
+
+static int pad_flick_hold(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        double v = ps3_settings_num("input", "flick_hold", NULL, (double)s_tune_hold);
+        n = v < 0.0 ? 0 : v > 16.0 ? 16 : (int)v;
+    }
+    return n;
+}
 #define PAD_TRIGGER_THRESHOLD 30
 
 /* XInput is resolved at run time. Only XInputGetState and XInputSetState are
@@ -233,6 +280,24 @@ static int pad_xinput_load(void)
     }
     printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
     return 0;
+}
+
+/* Both axes of a stick, with a round dead zone and full deflection at `full` of the travel. The
+ * pad's range is a square and a stick's gate a circle: the title takes the square for a disc
+ * (0.84, 0.84 is the end of its travel to it, 0.70, 0.70 falls short), so the end of the circle
+ * goes to the edge of the square. */
+static void pad_xinput_stick(short rx, short ry, short deadzone, float full, u8* ox, u8* oy)
+{
+    const float x = (float)rx / 32767.0f, y = (float)ry / 32767.0f;
+    const float m = sqrtf(x * x + y * y), d = (float)deadzone / 32767.0f;
+    if (m <= d || full <= d) { *ox = *oy = 128; return; }
+    float k = (m - d) / (full - d);
+    if (k > 1.0f) k = 1.0f;
+    const float ax = x < 0.0f ? -x : x, ay = y < 0.0f ? -y : y;
+    k *= 127.0f / (ax > ay ? ax : ay);
+    int vx = (int)(x * k) + 128, vy = (int)(y * k) + 128;
+    *ox = (u8)(vx < 1 ? 1 : vx > 255 ? 255 : vx);
+    *oy = (u8)(vy < 1 ? 1 : vy > 255 ? 255 : vy);
 }
 
 static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
@@ -510,10 +575,21 @@ static void pad_poll_xinput(void)
          * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
          * (via sagemono, PR #42) */
         const short dz = pad_deadzone();
-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, dz);
-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, dz));
-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, dz);
-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, dz));
+        const float full = pad_stick_full();
+        if (full < 1.0f) {
+            u8 vx, vy;
+            pad_xinput_stick(gp->sThumbLX, gp->sThumbLY, dz, full, &vx, &vy);
+            s_host_state[i].analog_lx = vx;
+            s_host_state[i].analog_ly = (u8)(256 - vy);
+            pad_xinput_stick(gp->sThumbRX, gp->sThumbRY, dz, full, &vx, &vy);
+            s_host_state[i].analog_rx = vx;
+            s_host_state[i].analog_ry = (u8)(256 - vy);
+        } else {
+            s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, dz);
+            s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, dz));
+            s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, dz);
+            s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, dz));
+        }
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -811,7 +887,12 @@ static void pad_shutdown_backend(void)
 static unsigned long long pad_now_ms(void)
 {
 #ifdef _WIN32
-    return (unsigned long long)GetTickCount64();
+    /* Not GetTickCount64: it moves every 15.6 ms, whatever the interval above says. */
+    static LARGE_INTEGER hz;
+    LARGE_INTEGER q;
+    if (!hz.QuadPart) QueryPerformanceFrequency(&hz);
+    QueryPerformanceCounter(&q);
+    return (unsigned long long)q.QuadPart * 1000ull / (unsigned long long)hz.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -844,8 +925,54 @@ static void pad_poll_backend(void)
     if (dev != PAD_DEV_PAD && !s_host_state[0].connected) pad_poll_keyboard();
 #endif
     pad_track_assign();
+    if (s_sampling)
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            const PadHostState* hs = &s_host_state[i];
+            const int dx = abs((int)hs->analog_rx - 128), dy = abs((int)hs->analog_ry - 128);
+            const int reach = dx > dy ? dx : dy;
+            s_latch_buttons[i] |= hs->buttons;
+            if (reach > s_flick[i].reach) {
+                s_flick[i].reach = reach;
+                s_flick[i].rx = hs->analog_rx;
+                s_flick[i].ry = hs->analog_ry;
+            }
+        }
     pad_unlock();
 }
+
+/* A packet goes out: what happened since the last one goes with it. */
+static void pad_take(u32 port, PadHostState* hs)
+{
+    if (!s_sampling || port >= PAD_MAX_HOST_PORTS) return;
+    pad_lock();
+    hs->buttons |= s_latch_buttons[port];
+    s_latch_buttons[port] = 0;
+    const int reach = s_flick[port].reach;
+    const u8 rx = s_flick[port].rx, ry = s_flick[port].ry;
+    s_flick[port].reach = 0;
+    pad_unlock();
+    if (pad_flick_hold() && reach >= PAD_FLICK_REACH) {
+        s_flick[port].hold = pad_flick_hold();
+        s_flick[port].hold_rx = rx;
+        s_flick[port].hold_ry = ry;
+    }
+    if (s_flick[port].hold > 0) {
+        s_flick[port].hold--;
+        hs->analog_rx = s_flick[port].hold_rx;
+        hs->analog_ry = s_flick[port].hold_ry;
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI pad_sampler(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        if (s_pad_initialized) pad_poll_backend();
+        Sleep(PAD_POLL_INTERVAL_MS);
+    }
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -877,6 +1004,14 @@ s32 cellPadInit(u32 max_connect)
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
+#ifdef _WIN32
+    if (!s_sampling && (pad_flick_hold() || pad_stick_full() < 1.0f)) {
+        s_sampling = 1;
+        HANDLE t = CreateThread(NULL, 0, pad_sampler, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+        else s_sampling = 0;
+    }
+#endif
     /* What is there at start is the baseline; only later changes are
      * flagged CELL_PAD_STATUS_ASSIGN_CHANGES. */
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
@@ -1006,6 +1141,10 @@ skip_inject: ;
             else                        s_data_fresh[port_no] = 0;
         }
     }
+    /* A copy, as the poll may run under this read, with what it left for this packet. */
+    PadHostState now = *hs;
+    hs = &now;
+    if (data->len) pad_take(port_no, hs);
     /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
      * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
      * whose button[0] is non-zero -- with len (8) there, every press was

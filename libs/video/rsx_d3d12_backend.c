@@ -3060,16 +3060,27 @@ static void wait_for_gpu_at(int line)
 #define wait_for_gpu() wait_for_gpu_at(__LINE__)
 
 static u64 s_fence_last;   /* the last value signalled on the queue */
+/* fence_values[fi] is the next value to signal for the frame index: a wait signals it, and leaves the
+ * one after it for the batch it sits in, which move_to_next_frame signals after the batch. The wait
+ * used to take the one after and leave it there: the batch then signalled the wait's own value
+ * again, already complete, and nothing waited for that batch. The next rf_open could reset its
+ * allocator and its texture ring under it, and its ZPASS counts and main-memory surfaces were read
+ * as done. D3D12_FENCE_REUSE=1: as before. */
+static int fence_reuse(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("D3D12_FENCE_REUSE") ? 1 : 0;
+    return v;
+}
 static void wait_for_gpu_once(void)
 {
     u32 fi = s_d3d.frame_index;
-    s_d3d.fence_values[fi]++;
-    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, s_d3d.fence_values[fi]);
-    s_fence_last = s_d3d.fence_values[fi];
+    const u64 v = fence_reuse() ? ++s_d3d.fence_values[fi] : s_d3d.fence_values[fi]++;
+    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, v);
+    s_fence_last = v;
 
-    if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
-        s_d3d.fence->lpVtbl->SetEventOnCompletion(
-            s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event);
+    if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < v) {
+        s_d3d.fence->lpVtbl->SetEventOnCompletion(s_d3d.fence, v, s_d3d.fence_event);
         /* NEVER wait unbounded here: this runs on the vblank ticker, which also
          * drives the guest's vblank handlers, the FIFO drain, and the fence
          * publication. A device removal (TDR) leaves the D3D12 fence unsignaled
@@ -3085,7 +3096,7 @@ static void wait_for_gpu_once(void)
             HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
             printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
                    2 * (tries + 1),
-                   (unsigned long long)s_d3d.fence_values[fi],
+                   (unsigned long long)v,
                    (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
                    (long)rr);
             fflush(stdout);

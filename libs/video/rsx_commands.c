@@ -565,12 +565,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * first level, GCM_METHOD_HIST, a second: NO_OPERATION ~500k,
      * DRAW_INDEX_ARRAY ~127k, SET_BEGIN_END ~88k, INLINE_ARRAY ~80k,
      * INVALIDATE_VERTEX_CACHE_FILE ~70k, each scissor word ~33k). Nothing
-     * below handles 0x0100 or 0x1714; they end at the -1 at the bottom.
+     * below handles 0x0100 or 0x1714; they end at the -1 at the bottom. Nor
+     * the others here that no test below takes, the most frequent at the gate
+     * with shadows on (RSX_CENSUS, 10 s): 0x0B00-0x0B64 ~2.1M, 0x1D00-0x1D3C
+     * ~0.7M, the reports 0x1800 and 0x17C8 ~0.47M (the walker takes them after
+     * the -1), 0x0300, 0x0374, 0x147C, 0x1EF8 ~0.5M. Not 0x018C or 0x0194:
+     * the chain sets the colour DMAs from them and goes on to the -1.
      * RSX_METHOD_FAST=0 walks the chain for them as before. */
     { static int fast = -1;
       if (fast < 0) { const char* e = getenv("RSX_METHOD_FAST"); fast = e ? atoi(e) : 1; }
       if (fast) switch (method) {
-      case 0x0100u: case 0x1714u:            return -1;
+      case 0x0100u: case 0x1714u:
+      case 0x0B00u ... 0x0B64u: case 0x1D00u ... 0x1D3Cu:
+      case 0x1800u: case 0x17C8u: case 0x17CCu:
+      case 0x0300u: case 0x0374u: case 0x147Cu: case 0x1EF8u:
+                                             return -1;
       case NV4097_SET_BEGIN_END:             goto m_begin_end;
       case 0x1818u:                          goto m_inline_array;
       case NV4097_DRAW_INDEX_ARRAY:          goto m_draw_index_array;

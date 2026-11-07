@@ -9411,9 +9411,24 @@ static int ort_cap(void)
     return v;
 }
 
+/* A bit for an offset, of 1024: most of the textures a draw binds were never a target, and a clear
+ * bit says so without walking the 64 slots (or the 64 aliases) for it. A set bit can be stale, so
+ * the walk still decides. */
+static inline u32 off_bit(u32 off) { return (off * 0x9E3779B1u) >> 22; }
+static inline int off_bit_get(const u64* s, u32 off) { const u32 b = off_bit(off); return (int)((s[b >> 6] >> (b & 63)) & 1u); }
+static inline void off_bit_set(u64* s, u32 off) { const u32 b = off_bit(off); s[b >> 6] |= 1ull << (b & 63); }
+static u64 s_ort_bits[16];      /* the offsets of off_rt's slots; set as one is made, rebuilt each batch */
+static void ort_bits_rebuild(void)
+{
+    memset(s_ort_bits, 0, sizeof s_ort_bits);
+    for (int i = 0; i < MAX_OFF_RTS; i++)
+        if (s_d3d.off_rt[i].off) off_bit_set(s_ort_bits, s_d3d.off_rt[i].off);
+}
+
 static int off_rt_find(u32 off)
 {
     if (!off) return -1;
+    if (!off_bit_get(s_ort_bits, off)) return -1;
     for (int i = 0; i < MAX_OFF_RTS; i++)
         if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].off == off) {
             s_d3d.off_rt[i].last = s_d3d.frame_count;   /* sampled: recent for eviction */
@@ -9574,6 +9589,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             &IID_ID3D12Resource, (void**)&r->res)))
         return -1;
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
+    off_bit_set(s_ort_bits, off);
     r->grow_w = r->grow_h = 0;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
@@ -10132,8 +10148,10 @@ static int tex_reads_depth(const D3D12DrawRecord* dr, int u)
 #define ALIAS_N 64
 static struct { u32 off; u8 kind; } s_alias[ALIAS_N];
 static int s_alias_n, s_alias_next;
+static u64 s_alias_bits[16];    /* the offsets in s_alias (off_bit), rebuilt as the ring comes round */
 static int alias_kind(u32 off)
 {
+    if (!off_bit_get(s_alias_bits, off)) return 0;
     for (int i = 0; i < s_alias_n; i++) if (s_alias[i].off == off) return s_alias[i].kind;
     return 0;
 }
@@ -10143,6 +10161,12 @@ static void alias_set(u32 off, int kind)
     for (int i = 0; i < s_alias_n; i++) if (s_alias[i].off == off) { s_alias[i].kind = (u8)kind; return; }
     int i = s_alias_n < ALIAS_N ? s_alias_n++ : (s_alias_next++ % ALIAS_N);
     s_alias[i].off = off; s_alias[i].kind = (u8)kind;
+    if (s_alias_n == ALIAS_N && s_alias_next % ALIAS_N == 0) {   /* the old offsets' bits go */
+        memset(s_alias_bits, 0, sizeof s_alias_bits);
+        for (int k = 0; k < s_alias_n; k++) off_bit_set(s_alias_bits, s_alias[k].off);
+    } else {
+        off_bit_set(s_alias_bits, off);
+    }
 }
 /* Record dr's reads (tex_zok), then its writes. */
 static void alias_note(D3D12DrawRecord* dr)
@@ -11862,6 +11886,7 @@ static void rf_open(void)
     zq_read();
     mwb_poll();
     rf_release_dead();   /* the batch that last referenced them has run */
+    ort_bits_rebuild();  /* the offsets of slots made anew since drop out of off_rt_find's bits */
     vp_tex_release_staging();
     rdoc_frame_begin(s_d3d.draw_count);
 
@@ -12182,7 +12207,10 @@ static void rf_prepass(u32 from, u32 to)
     }
     for (u32 _d = from; _d < to && _d < MAX_DRAWS; _d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
-        for (int _u = 0; _u < VP_TEX_UNITS && dr->is_vp && !dr->is_clear; _u++) {
+        if (!dr->is_vp || dr->is_clear) continue;
+        /* tex_reads_depth needs the unit's tex_zok bit: only those units (alias_note set them above) */
+        for (u32 zm = dr->tex_zok; zm; zm &= zm - 1) {
+            const int _u = __builtin_ctz(zm);
             if (dr_tex_depth_fmt(dr, _u)) continue;   /* its depth plane, no colour copy */
             const int ds = tex_reads_depth(dr, _u) ? off_ds_find(dr->tex[_u].raw) : -1;
             if (ds < 0) continue;

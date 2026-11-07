@@ -2583,9 +2583,10 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * synchronise on: NV406E SET_REFERENCE 0x50, SEMAPHORE_OFFSET 0x64, _ACQUIRE 0x68,
      * _RELEASE 0x6C; NV4097 SET_SEMAPHORE_OFFSET 0x1D6C, BACK_END_WRITE_SEMAPHORE_RELEASE
      * 0x1D70, TEXTURE_READ_SEMAPHORE_RELEASE 0x1D74. */
-    if ((m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98 || m == 0x50 || m == 0x64 ||
+    if (s_zt_on > 0 &&   /* the switch first: the compares ran for every method word */
+        (m == 0x17C8 || m == 0x17CC || m == 0x1804 || m == 0x1E98 || m == 0x50 || m == 0x64 ||
          m == 0x68 || m == 0x6C || m == 0x1D6C || m == 0x1D70 || m == 0x1D74) &&
-        s_zt_on > 0 && zt_active()) {
+        zt_active()) {
         extern unsigned long long ps3_ms_now(void);
         __atomic_fetch_sub(&s_zt_left, 1, __ATOMIC_RELAXED);
         fprintf(stderr, "[zt] M %llu f=%u m=0x%04X v=0x%08X fifo=0x%08X\n",

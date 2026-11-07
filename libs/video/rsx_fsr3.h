@@ -40,10 +40,29 @@ typedef struct rsx_fsr3_frame {
                              * the motion in UV units of what moves, over 30000 where nothing does */
     float cam[16];          /* world to clip, four columns: x, y, z and w's */
     float z_scale, z_offset;/* clip z to the depth range: depth = ndc * scale + offset */
+    float jitter_x, jitter_y;   /* of this frame, in pixels */
 } rsx_fsr3_frame;
+
+/* The frame's camera, and depth and motion into the form the API takes. 1 if the frame has a
+ * camera to go by. rsx_fsr3_fg_frame does this itself if it was not done. */
+int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* frame);
 
 /* Every presented frame, before the command list closes. */
 void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* frame, float frame_ms);
+
+/* The upscaler, from render_w x render_h to the display's size. sharpness 0 to 1, below 0 none. */
+int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
+                       unsigned render_w, unsigned render_h, float sharpness);
+
+/* Destroys it, for another rsx_fsr3_up_create after a resize. */
+void rsx_fsr3_up_destroy(void);
+
+/* The jitter of the frame-th frame, in pixels. */
+void rsx_fsr3_up_jitter(unsigned frame, float* x, float* y);
+
+/* After rsx_fsr3_prepare: color, in PIXEL_SHADER_RESOURCE, at the render's size, into output, in
+ * UNORDERED_ACCESS, at the display's. */
+void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* frame, void* color, void* output, float frame_ms);
 
 /* Frames a second under which frames are shown as they are, until it recovers. 0: never. */
 void rsx_fsr3_fg_floor(double fps);

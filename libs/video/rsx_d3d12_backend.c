@@ -951,6 +951,17 @@ static void rdoc_request(void)
 #define FG_OBJ_NONE  60000.0f  /* in the target, where nothing moves */
 #define FG_OBJ_BIAS  (-64)     /* their depth against the scene's, from another program's arithmetic */
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
+/* graphics.scaling = fsr3: FSR's upscaler on scene frames, FSR 1 on the rest. */
+static struct {
+    int want;                   /* asked for, and the DLLs are there */
+    int ready;                  /* the context is up: frames are jittered */
+    u32 frame;
+    float jx, jy;               /* the frame's jitter, in pixels, */
+    float cx, cy;               /* in clip space */
+    ID3D12RootSignature* root;
+    ID3D12PipelineState* pso;
+} s_up;
+#define FG_INPUTS() (s_fg_mode == 2 || s_up.want)
 static int s_fg_ready;
 static double s_fg_last;
 /* What it takes from a frame, as the batch is recorded and replayed. */
@@ -991,6 +1002,7 @@ static void fg_start(void)
 {
     const char* m = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
     const int mode = ps3_settings_ieq(m, "on") ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
+    if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
     if (!mode) return;
     if (!rsx_fsr3_available()) {
         printf("[D3D12] frame generation: no amd_fidelityfx_loader_dx12.dll beside the exe%c", 10);
@@ -1000,16 +1012,33 @@ static void fg_start(void)
     if (rsx_fsr3_wrap(&sc, s_d3d.cmd_queue)) s_fg_mode = mode;
     s_d3d.swap_chain = (IDXGISwapChain3*)sc;
     rsx_fsr3_fg_floor(atof(ps3_settings_str("graphics", "frame_generation_floor", "D3D12_FG_FLOOR", "25")));
-    if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
 }
 
 int rsx_d3d12_backend_generating(void) { return s_fg_mode == 2; }
 
+static float fg_ms(double now)
+{
+    return s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f;
+}
+
+static void fg_desc(rsx_fsr3_frame* f)
+{
+    memset(f, 0, sizeof *f);
+    f->scene = s_fg.depth_ok;
+    f->depth = s_fg.depth;
+    f->hudless = s_fg.ready ? s_fg.hud_out[s_fg.hud_i] : NULL;
+    f->objects = s_fg.obj_drawn ? s_fg.obj_rt : NULL;
+    memcpy(f->cam, s_fg.cam, sizeof f->cam);
+    f->z_scale = s_fg.z_scale;
+    f->z_offset = s_fg.z_offset;
+    if (s_up.ready) { f->jitter_x = s_up.jx; f->jitter_y = s_up.jy; }
+}
+
 /* Every presented frame, before the list closes. */
 static void fg_frame(void)
 {
-    if (!s_fg_mode) return;
-    if (!s_fg_ready) {
+    if (!s_fg_mode && !s_up.want) return;
+    if (s_fg_mode && !s_fg_ready) {
         s_fg_ready = 1;
         if (!rsx_fsr3_fg_create(s_d3d.device, s_d3d.swap_chain, s_d3d.bb_w, s_d3d.bb_h,
                                 s_d3d.width, s_d3d.height, s_fg_mode == 2)) {
@@ -1020,20 +1049,21 @@ static void fg_frame(void)
                s_d3d.bb_w, s_d3d.bb_h, s_d3d.width, s_d3d.height, 10);
     }
     const double now = perf_now();
-    rsx_fsr3_frame f;
-    memset(&f, 0, sizeof f);
-    f.scene = s_fg.ready;
-    f.depth = s_fg.depth;
-    f.hudless = s_fg.hud_out[s_fg.hud_i];
-    f.objects = s_fg.obj_drawn ? s_fg.obj_rt : NULL;
-    memcpy(f.cam, s_fg.cam, sizeof f.cam);
-    f.z_scale = s_fg.z_scale;
-    f.z_offset = s_fg.z_offset;
-    rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, s_fg_last > 0.0 ? (float)((now - s_fg_last) * 1000.0) : 33.3f);
+    if (s_fg_mode) {
+        rsx_fsr3_frame f;
+        fg_desc(&f);
+        f.scene = s_fg.ready;
+        rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, fg_ms(now));
+    }
     s_fg_last = now;
     s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.depth_ok = s_fg.ready = 0;
     s_fg.obj_n = 0;
     s_fg.obj_drawn = 0;
+    if (s_up.ready) {
+        rsx_fsr3_up_jitter(++s_up.frame, &s_up.jx, &s_up.jy);
+        s_up.cx = 2.0f * s_up.jx / (float)s_d3d.width;
+        s_up.cy = -2.0f * s_up.jy / (float)s_d3d.height;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -3014,7 +3044,8 @@ static void wait_for_gpu_once(void)
 #define PP_SLOT_HUD      32u   /* frame generation's picture without its HUD, */
 #define PP_SLOT_HUD_E    33u   /* and SMAA's tables for it */
 #define PP_SLOT_HUD_N    36u
-#define PP_SRV_SLOTS     40u
+#define PP_SLOT_UP(out, fi) (40u + 3u * ((out) * 2u + (fi)))   /* the upscaler's output, the frame, the picture */
+#define PP_SRV_SLOTS     52u
 
 /* RTVs for the swap chain's buffers, made again after each resize. */
 static void bb_views(void)
@@ -3110,6 +3141,8 @@ static void pp_tmp_create(void)
 
 /* One triangle over the whole target; the pixel shader samples the display
  * target, or for FSR 1, EASU into pp_tmp and RCAS from it (rsx_fsr1.c). */
+static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
+
 static int pp_init(void)
 {
     HRESULT hr;
@@ -3200,9 +3233,13 @@ static int pp_init(void)
      * off | low | medium | high | max (FSR 1's RCAS; high is AMD's 0.2). */
     {
         const char* sc = ps3_settings_str("graphics", "scaling", NULL, "bilinear");
-        s_d3d.pp_mode = ps3_settings_ieq(sc, "fsr1") ? 2 : ps3_settings_ieq(sc, "sharp") ? 1 : 0;
+        s_d3d.pp_mode = ps3_settings_ieq(sc, "fsr1") || ps3_settings_ieq(sc, "fsr3") ? 2 : ps3_settings_ieq(sc, "sharp") ? 1 : 0;
         if (!s_d3d.pp_mode && !ps3_settings_ieq(sc, "bilinear"))
-            printf("[D3D12] graphics.scaling = %s is not bilinear, sharp or fsr1; bilinear\n", sc);
+            printf("[D3D12] graphics.scaling = %s is not bilinear, sharp, fsr1 or fsr3; bilinear\n", sc);
+        if (ps3_settings_ieq(sc, "fsr3")) {
+            s_up.want = rsx_fsr3_available();
+            if (!s_up.want) printf("[D3D12] graphics.scaling = fsr3: no amd_fidelityfx_loader_dx12.dll beside the exe; FSR 1%c", 10);
+        }
         static const struct { const char* name; float stops; } k[] = {
             { "off", -1.0f }, { "low", 1.0f }, { "medium", 0.5f }, { "high", 0.2f }, { "max", 0.0f } };
         const char* sh = ps3_settings_str("graphics", "sharpening", NULL, "high");
@@ -3233,6 +3270,10 @@ static int pp_init(void)
             pp_tmp_create();
         }
     }
+    if (s_up.want && up_init(pd) != 0) {
+        printf("[D3D12] the upscaler's last pass failed; FSR 1%c", 10);
+        s_up.want = 0;
+    }
     vsb->lpVtbl->Release(vsb);
     ov_init(pd);
     /* graphics.antialiasing = off (the default) | smaa */
@@ -3260,8 +3301,13 @@ static void bb_resize(void)
     wait_for_gpu();
     for (u32 i = 0; i < FRAME_COUNT; i++)
         if (s_d3d.backbuffers[i]) { s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]); s_d3d.backbuffers[i] = NULL; }
-    if (s_fg_mode) {                     /* its size is the window's: made again at the next frame */
-        rsx_fsr3_fg_destroy();
+    if (s_up.ready) {
+        rsx_fsr3_up_destroy();
+        s_up.ready = 0;
+        s_up.jx = s_up.jy = s_up.cx = s_up.cy = 0.0f;
+    }
+    if (s_fg_mode || s_up.want) {        /* its size is the window's: made again at the next frame */
+        if (s_fg_mode) rsx_fsr3_fg_destroy();
         s_fg_ready = 0;
         for (int i = 0; i < 2; i++)
             if (s_fg.hud_out[i]) { s_fg.hud_out[i]->lpVtbl->Release(s_fg.hud_out[i]); s_fg.hud_out[i] = NULL; }
@@ -4225,6 +4271,89 @@ static void aa_finish(void)
  * off). FSR 1 only scales up; a back buffer no larger than the display takes
  * bilinear. Everything ends where the next frame expects it: the display
  * target and pp_tmp in COMMON, the swap chain's buffer in PRESENT. */
+/* The upscaler's output into the back buffer. Where the frame has a HUD, what the HUD changed in
+ * the 720p picture goes on top: t1 is the frame with it, t2 the picture without. */
+static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
+{
+    static const char hlsl[] =
+        "Texture2D up : register(t0);\n"
+        "Texture2D frame : register(t1);\n"
+        "Texture2D scene : register(t2);\n"
+        "SamplerState lin : register(s0);\n"
+        "SamplerState pnt : register(s1);\n"
+        "cbuffer pc : register(b0) { float4 p0; float4 p1; float4 p2; float4 p3; };\n"
+        "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+        "float4 ps(V i) : SV_TARGET {\n"
+        "  float3 c = up.SampleLevel(pnt, i.uv, 0).rgb;\n"
+        "  if (p0.x > 0.5) c += frame.SampleLevel(lin, i.uv, 0).rgb - scene.SampleLevel(lin, i.uv, 0).rgb;\n"
+        "  return float4(saturate(c), 1); }\n";
+    if (pp_root_create(3, &s_up.root) != 0) return -1;
+    ID3DBlob *ps = NULL, *err = NULL;
+    HRESULT hr = D3DCompile(hlsl, sizeof hlsl - 1, "up_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err);
+    if (err) { if (FAILED(hr)) printf("[D3D12] %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10); err->lpVtbl->Release(err); }
+    if (FAILED(hr)) return -1;
+    pd.pRootSignature = s_up.root;
+    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+    pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
+    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_up.pso);
+    ps->lpVtbl->Release(ps);
+    return FAILED(hr) ? -1 : 0;
+}
+
+static void up_draw(u32 table, int hud, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    D3D12_GPU_DESCRIPTOR_HANDLE srv;
+    s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &srv);
+    srv.ptr += table * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const float c[16] = { hud ? 1.0f : 0.0f };
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)s_d3d.bb_w, (float)s_d3d.bb_h, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)s_d3d.bb_w, (LONG)s_d3d.bb_h };
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_up.root);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.pp_srv_heap);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, srv);
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+    cl->lpVtbl->SetPipelineState(cl, s_up.pso);
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+}
+
+/* The frame through the upscaler and into the back buffer, left as a render target. 0 if it
+ * cannot take this one: not a scene, or the context not there. */
+static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv)
+{
+    if (!s_up.want || !s_fg.depth_ok || !s_fg.hud_out[0] || (s_fg.marked && !s_fg.copied) ||
+        s_d3d.bb_w < s_d3d.width || s_d3d.bb_h < s_d3d.height)
+        return 0;
+    if (!s_up.ready) {
+        /* graphics.sharpening on FSR's own scale: high is the 0.8 of AMD's sample. */
+        const float sharp = s_d3d.pp_stops < 0.0f ? -1.0f : 1.0f - s_d3d.pp_stops;
+        if (!rsx_fsr3_up_create(s_d3d.device, s_d3d.bb_w, s_d3d.bb_h, s_d3d.width, s_d3d.height, sharp)) {
+            s_up.want = 0;
+            return 0;
+        }
+        s_up.ready = 1;
+        printf("[D3D12] upscaler on: %ux%u from %ux%u%c", s_d3d.bb_w, s_d3d.bb_h, s_d3d.width, s_d3d.height, 10);
+    }
+    rsx_fsr3_frame f;
+    fg_desc(&f);
+    if (!rsx_fsr3_prepare(s_d3d.cmd_list, &f)) return 0;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    s_fg.hud_i ^= 1;
+    ID3D12Resource* out = s_fg.hud_out[s_fg.hud_i];
+    pp_barrier(out, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    rsx_fsr3_up_frame(s_d3d.cmd_list, &f, s_fg.copied ? s_fg.hud_src : disp, out, fg_ms(perf_now()));
+    pp_barrier(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    up_draw(PP_SLOT_UP(s_fg.hud_i, fi), s_fg.copied, bb_rtv);
+    s_fg.ready = 1;
+    return 1;
+}
+
 /* src (an SRV slot) through SMAA, when it is on, and the scaling into out, left as a
  * render target. SMAA's targets stay as they are until aa_finish. */
 static void pp_chain(u32 src, u32 table_e, u32 table_n, D3D12_CPU_DESCRIPTOR_HANDLE out_rtv,
@@ -4289,12 +4418,15 @@ static void present_to_backbuffer(u32 fi)
     ID3D12Resource* disp = s_d3d.render_targets[fi];
     ID3D12Resource* bb = s_d3d.backbuffers[fi];
 
-    fg_hudless(tmp_rtv);
     pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    pp_chain(fi, PP_SLOT_AA_E(fi), PP_SLOT_AA_N(fi), bb_rtv, tmp_rtv, bb, D3D12_RESOURCE_STATE_PRESENT);
-    fg_unmarked(bb);
+    const int up = up_run(fi, disp, bb, bb_rtv);
+    if (!up) {
+        fg_hudless(tmp_rtv);
+        pp_chain(fi, PP_SLOT_AA_E(fi), PP_SLOT_AA_N(fi), bb_rtv, tmp_rtv, bb, D3D12_RESOURCE_STATE_PRESENT);
+        fg_unmarked(bb);
+    }
     ov_draw(fi, bb_rtv);
-    if (s_d3d.aa_on) aa_finish();
+    if (s_d3d.aa_on && !up) aa_finish();
     pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     pp_barrier(disp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
@@ -5814,6 +5946,11 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
     int bias = (int)(filter & 0x1FFFu);
     if (bias & 0x1000) bias -= 0x2000;
     s->MipLODBias = (float)bias / 256.0f;
+    /* What the upscaler is given to work with: AMD's formula. Not on what is blended, marked by
+     * vp_sampler: those are drawn at their sample grid, a level finer than the title chose, and
+     * a level finer again is noise. */
+    if (s_up.want && s_d3d.bb_w && !(filter >> 31))
+        s->MipLODBias += log2f((float)s_d3d.width / (float)s_d3d.bb_w) - 1.0f;
     s->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     s->BorderColor[0] = (float)((border >> 16) & 0xFFu) / 255.0f;
     s->BorderColor[1] = (float)((border >> 8) & 0xFFu) / 255.0f;
@@ -5864,7 +6001,7 @@ static void vp_sampler_defaults(void)
 static int vp_sampler(const D3D12DrawRecord* dr, int u)
 {
     if (!dr->tex[u].set) return u == 0 ? 0 : 1;
-    const u32 k[4] = { dr->tex[u].addr & 0x000F0F0Fu, dr->tex[u].filter & 0x07071FFFu,
+    const u32 k[4] = { dr->tex[u].addr & 0x000F0F0Fu, (dr->tex[u].filter & 0x07071FFFu) | (s_up.want && dr->blend ? 1u << 31 : 0u),
                        dr->tex[u].ctrl0 & 0x70u, dr->tex[u].border };
     for (u32 i = 2; i < s_d3d.samp_n; i++)
         if (!memcmp(s_d3d.samp_key[i], k, sizeof k)) return (int)i;
@@ -8880,7 +9017,14 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
     /* The frame's first draw at the render's size through a perspective has its camera: a
      * shadow pass goes through the same constants at another size, a screen of 2D through
      * a flat matrix. */
-    if (s_fg_mode == 2 && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
+    if (s_up.ready && dr && dr->rt_w * 9u == dr->rt_h * 16u && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n &&
+        s_d3d.vp_vs[vs_idx].uses_cam) {
+        /* The upscaler's jitter, on what draws the scene at any of its sizes: a shadow atlas
+         * is not 16:9. */
+        vpx[4] += s_up.cx;
+        vpx[5] += s_up.cy;
+    }
+    if (FG_INPUTS() && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
         vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
         const float* m = c + s_fg.cam_reg * 4;
         if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) {
@@ -8891,7 +9035,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             s_fg.cam_ok = 1;
         }
     }
-    if (s_fg_mode == 2 && dr && s_fg.obj_n < FG_OBJ_MAX && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n &&
+    if (FG_INPUTS() && dr && s_fg.obj_n < FG_OBJ_MAX && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n &&
         s_d3d.vp_vs[vs_idx].uses_prev)
         s_fg.obj[s_fg.obj_n++] = slot;
     s_cbimg_ok = 1;
@@ -10025,9 +10169,18 @@ static int fg_targets(void)
         rd.Width = s_d3d.bb_w; rd.Height = s_d3d.bb_h;
         rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (s_up.want) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, read, NULL,
                 &IID_ID3D12Resource, (void**)&s_fg.hud_out[i])))
             return 0;
+        for (u32 fi = 0; s_up.want && fi < FRAME_COUNT; fi++) {
+            ID3D12Resource* const t[3] = { s_fg.hud_out[i], s_d3d.render_targets[fi], s_fg.hud_src };
+            for (u32 k = 0; k < 3; k++) {
+                D3D12_CPU_DESCRIPTOR_HANDLE hv = base;
+                hv.ptr += (PP_SLOT_UP(i, fi) + k) * inc;
+                dev->lpVtbl->CreateShaderResourceView(dev, t[k], NULL, hv);
+            }
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE h;
         s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &h);
         h.ptr += (FRAME_COUNT + 1 + i) * s_d3d.rtv_descriptor_size;
@@ -10053,7 +10206,7 @@ static void fg_copy_depth(int zi)
  * else of the draw pass changes: the surfaces go back to the states they were in. */
 static void fg_marker(const D3D12DrawRecord* dr)
 {
-    if (s_fg_mode != 2 || !s_fg.cam_ok || dr->zeta_off != s_fg.depth_off) return;
+    if (!FG_INPUTS() || !s_fg.cam_ok || dr->zeta_off != s_fg.depth_off) return;
     s_fg.marked = 1;
     const int ri = off_rt_find(dr->rt_off), zi = off_ds_find(dr->zeta_off);
     if (ri < 0 || zi < 0) return;
@@ -10078,7 +10231,7 @@ static void fg_marker(const D3D12DrawRecord* dr)
  * a HUD. */
 static void fg_unmarked(ID3D12Resource* bb)
 {
-    if (s_fg_mode != 2 || s_fg.marked || !s_fg.depth_ok) return;
+    if (!FG_INPUTS() || s_fg.marked || !s_fg.depth_ok) return;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     s_fg.hud_i ^= 1;
@@ -13101,7 +13254,7 @@ static ID3D12PipelineState* fg_obj_pso(int vs_idx)
  * that depth. The depth is the scene's at its end, so only what shows gets through. */
 static void fg_objects(void)
 {
-    if (s_fg_mode != 2 || !s_fg.cam_ok || !s_present_this_frame) { s_fg.obj_n = 0; return; }
+    if (!FG_INPUTS() || !s_fg.cam_ok || !s_present_this_frame) { s_fg.obj_n = 0; return; }
     if (!s_fg.marked) {
         const int zi = off_ds_find(s_fg.depth_off);
         if (zi < 0 || s_d3d.off_ds[zi].w != s_d3d.width || s_d3d.off_ds[zi].h != s_d3d.height || !fg_targets()) return;

@@ -25,12 +25,16 @@
 #include "../../third_party/fsr_api/api/include/dx12/ffx_api_dx12.h"
 #include "../../third_party/fsr_api/framegeneration/include/ffx_framegeneration.h"
 #include "../../third_party/fsr_api/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
+#include "../../third_party/fsr_api/upscalers/include/ffx_upscale.h"
 
 #include "rsx_fsr3.h"
 
 static ffxFunctions s_ffx;
 static ffxContext s_swap_ctx;   /* the proxy's */
 static ffxContext s_fg_ctx;     /* frame generation's */
+static ffxContext s_up_ctx;     /* the upscaler's */
+static float s_up_sharp;
+static int s_up_phases;
 static void* s_swap;
 static int s_generate;
 static unsigned s_dw, s_dh, s_rw, s_rh;
@@ -60,6 +64,9 @@ struct fsr3_camera {
 #define FSR3_FLOOR_BACK 2.0
 static fsr3_camera s_prev;
 static bool s_prev_ok;              /* the last frame was a scene */
+static fsr3_camera s_cam;           /* this frame's, from rsx_fsr3_prepare */
+static bool s_on, s_reset, s_prepared;
+static bool s_fg_was;               /* generation ran on the last frame */
 static double s_floor, s_rate_ms;   /* see fsr3_rate */
 static int s_rate_n, s_rate_streak;
 static bool s_under;
@@ -371,15 +378,85 @@ static bool fsr3_pose(const float cam[16], float z_scale, float z_offset, fsr3_c
     return true;
 }
 
+static int fsr3_targets(ID3D12Device* dev, unsigned render_w, unsigned render_h)
+{
+    s_dev = dev;
+    s_rw = render_w; s_rh = render_h;
+    if (!s_depth) s_depth = fsr3_target(dev, DXGI_FORMAT_R32_FLOAT, render_w, render_h);
+    if (!s_motion) s_motion = fsr3_target(dev, DXGI_FORMAT_R16G16_FLOAT, render_w, render_h);
+    return s_depth && s_motion && fsr3_inputs_init(dev);
+}
+
+int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
+                       unsigned render_w, unsigned render_h, float sharpness)
+{
+    ID3D12Device* dev = (ID3D12Device*)device;
+    if (!fsr3_targets(dev, render_w, render_h)) return 0;
+    ffxCreateContextDescUpscaleVersion ver{};
+    ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    ver.version = FFX_UPSCALER_VERSION;
+    ffxCreateBackendDX12Desc be{};
+    be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    be.header.pNext = &ver.header;
+    be.device = dev;
+    ffxCreateContextDescUpscale d{};
+    d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    d.header.pNext = &be.header;
+    /* The title's picture is finished: display-encoded, tone mapped, 8 bits. */
+    d.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    if (getenv("D3D12_FG_CHECK")) d.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+    d.maxRenderSize.width = render_w;
+    d.maxRenderSize.height = render_h;
+    d.maxUpscaleSize.width = display_w;
+    d.maxUpscaleSize.height = display_h;
+    d.fpMessage = fsr3_message;
+    const ffxReturnCode_t rc = s_ffx.CreateContext(&s_up_ctx, &d.header, nullptr);
+    if (rc != FFX_API_RETURN_OK) {
+        printf("[fsr3] upscaler: no context (%u)\n", (unsigned)rc);
+        s_up_ctx = nullptr;
+        return 0;
+    }
+    fsr3_version(&s_up_ctx, "upscaler");
+    ffxQueryDescUpscaleGetJitterPhaseCount q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
+    q.renderWidth = render_w;
+    q.displayWidth = display_w;
+    int32_t n = 0;
+    q.pOutPhaseCount = &n;
+    s_ffx.Query(&s_up_ctx, &q.header);
+    s_up_phases = n;
+    s_dw = display_w; s_dh = display_h;
+    s_up_sharp = sharpness;
+    s_prev_ok = false;
+    return 1;
+}
+
+void rsx_fsr3_up_destroy(void)
+{
+    if (!s_up_ctx) return;
+    s_ffx.DestroyContext(&s_up_ctx, nullptr);
+    s_up_ctx = nullptr;
+}
+
+void rsx_fsr3_up_jitter(unsigned frame, float* x, float* y)
+{
+    *x = *y = 0.0f;
+    if (!s_up_ctx || s_up_phases <= 0) return;
+    ffxQueryDescUpscaleGetJitterOffset q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;
+    q.index = (int32_t)(frame % (unsigned)s_up_phases);
+    q.phaseCount = s_up_phases;
+    q.pOutX = x;
+    q.pOutY = y;
+    s_ffx.Query(&s_up_ctx, &q.header);
+}
+
 int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsigned display_h,
                        unsigned render_w, unsigned render_h, int generate)
 {
     if (!s_swap_ctx) return 0;
     ID3D12Device* dev = (ID3D12Device*)device;
-    s_dev = dev;
-    if (!s_depth) s_depth = fsr3_target(dev, DXGI_FORMAT_R32_FLOAT, render_w, render_h);
-    if (!s_motion) s_motion = fsr3_target(dev, DXGI_FORMAT_R16G16_FLOAT, render_w, render_h);
-    if (!s_depth || !s_motion || !fsr3_inputs_init(dev)) return 0;
+    if (!fsr3_targets(dev, render_w, render_h)) return 0;
 
     ffxCreateContextDescFrameGenerationVersion ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
@@ -413,8 +490,8 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     s_swap = swap_chain;
     s_generate = generate;
     s_dw = display_w; s_dh = display_h;
-    s_rw = render_w; s_rh = render_h;
     s_prev_ok = false;
+    s_fg_was = false;
     return 1;
 }
 
@@ -475,13 +552,10 @@ static bool fsr3_cut(const fsr3_camera& a, const fsr3_camera& b)
     return turn < FSR3_CUT_COS || moved > FSR3_CUT_MOVE * a.znear || fabs(a.fov - b.fov) > FSR3_CUT_FOV * a.fov;
 }
 
-void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
+int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* f)
 {
-    if (!s_fg_ctx) return;
-    fsr3_rate(frame_ms);
     fsr3_camera cam;
-    bool on = s_generate && !s_under && f->scene && f->depth && f->hudless &&
-              fsr3_pose(f->cam, f->z_scale, f->z_offset, &cam);
+    bool on = f->scene && f->depth && fsr3_pose(f->cam, f->z_scale, f->z_offset, &cam);
     double inv[4][4];
     if (on && !m4_inverse(cam.m, inv)) on = false;
     const bool reset = on && (!s_prev_ok || fsr3_cut(cam, s_prev));
@@ -498,7 +572,64 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
          * projective map does not mind the scale. */
         fsr3_inputs((ID3D12GraphicsCommandList*)cmd_list, (ID3D12Resource*)f->depth,
                     reset ? nullptr : (ID3D12Resource*)f->objects, rep, f->z_scale, f->z_offset);
+        if (!s_prev_ok) {
+            static int told;
+            if (!told++)
+                printf("[fsr3] camera: near %.3f far %.1f fov %.1f at (%.1f %.1f %.1f)\n", cam.znear, cam.zfar,
+                       cam.fov * 57.29578, cam.pos[0], cam.pos[1], cam.pos[2]);
+        }
+        s_prev = cam;
+        s_cam = cam;
     }
+    s_on = on;
+    s_reset = reset;
+    s_prev_ok = on;
+    s_prepared = true;
+    return on;
+}
+
+void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* f, void* color, void* output, float frame_ms)
+{
+    if (!s_up_ctx || !s_on) return;
+    ffxDispatchDescUpscale d{};
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    d.commandList = cmd_list;
+    d.color = ffxApiGetResourceDX12((ID3D12Resource*)color, FFX_API_RESOURCE_STATE_PIXEL_READ);
+    d.depth = ffxApiGetResourceDX12(s_depth, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.motionVectors = ffxApiGetResourceDX12(s_motion, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.output = ffxApiGetResourceDX12((ID3D12Resource*)output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.jitterOffset.x = f->jitter_x;
+    d.jitterOffset.y = f->jitter_y;
+    d.motionVectorScale.x = (float)s_rw;
+    d.motionVectorScale.y = (float)s_rh;
+    d.renderSize.width = s_rw;
+    d.renderSize.height = s_rh;
+    d.upscaleSize.width = s_dw;
+    d.upscaleSize.height = s_dh;
+    d.enableSharpening = s_up_sharp >= 0.0f;
+    d.sharpness = s_up_sharp >= 0.0f ? s_up_sharp : 0.0f;
+    d.frameTimeDelta = frame_ms;
+    d.preExposure = 1.0f;
+    d.reset = s_reset;
+    d.cameraNear = (float)s_cam.znear;
+    d.cameraFar = (float)s_cam.zfar;
+    d.cameraFovAngleVertical = (float)s_cam.fov;
+    d.viewSpaceToMetersFactor = 1.0f;
+    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    const ffxReturnCode_t rc = s_ffx.Dispatch(&s_up_ctx, &d.header);
+    static int said;
+    if (rc != FFX_API_RETURN_OK && !said++)
+        fprintf(stderr, "[fsr3] upscale failed (%u)\n", (unsigned)rc);
+}
+
+void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
+{
+    if (!s_fg_ctx) return;
+    fsr3_rate(frame_ms);
+    if (s_generate && !s_prepared) rsx_fsr3_prepare(cmd_list, f);
+    s_prepared = false;
+    const bool on = s_generate && !s_under && s_on && f->hudless;
+    const bool reset = on && (s_reset || !s_fg_was);
     fsr3_configure(on, on ? f->hudless : nullptr);
     if (on) {
         ffxDispatchDescFrameGenerationPrepareV2 p{};
@@ -507,34 +638,29 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
         p.commandList = cmd_list;
         p.renderSize.width = s_rw;
         p.renderSize.height = s_rh;
+        p.jitterOffset.x = f->jitter_x;
+        p.jitterOffset.y = f->jitter_y;
         p.motionVectorScale.x = (float)s_rw;
         p.motionVectorScale.y = (float)s_rh;
         p.frameTimeDelta = frame_ms;
         p.reset = reset;
-        p.cameraNear = (float)cam.znear;
-        p.cameraFar = (float)cam.zfar;
-        p.cameraFovAngleVertical = (float)cam.fov;
+        p.cameraNear = (float)s_cam.znear;
+        p.cameraFar = (float)s_cam.zfar;
+        p.cameraFovAngleVertical = (float)s_cam.fov;
         p.depth = ffxApiGetResourceDX12(s_depth, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         p.motionVectors = ffxApiGetResourceDX12(s_motion, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         for (int i = 0; i < 3; i++) {
-            p.cameraPosition[i] = (float)cam.pos[i];
-            p.cameraUp[i] = (float)cam.up[i];
-            p.cameraRight[i] = (float)cam.right[i];
-            p.cameraForward[i] = (float)cam.fwd[i];
+            p.cameraPosition[i] = (float)s_cam.pos[i];
+            p.cameraUp[i] = (float)s_cam.up[i];
+            p.cameraRight[i] = (float)s_cam.right[i];
+            p.cameraForward[i] = (float)s_cam.fwd[i];
         }
         const ffxReturnCode_t rc = s_ffx.Dispatch(&s_fg_ctx, &p.header);
         static int said;
         if (rc != FFX_API_RETURN_OK && !said++)
             fprintf(stderr, "[fsr3] prepare failed (%u)\n", (unsigned)rc);
-        if (!s_prev_ok) {
-            static int told;
-            if (!told++)
-                printf("[fsr3] camera: near %.3f far %.1f fov %.1f at (%.1f %.1f %.1f)\n", cam.znear, cam.zfar,
-                       cam.fov * 57.29578, cam.pos[0], cam.pos[1], cam.pos[2]);
-        }
-        s_prev = cam;
     }
-    s_prev_ok = on;
+    s_fg_was = on;
     s_frame_id++;
 }
 

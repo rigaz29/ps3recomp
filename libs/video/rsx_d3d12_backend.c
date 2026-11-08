@@ -1198,6 +1198,10 @@ static ShProg** s_shp_list;         /* the programs in the order they came, s_sh
 static FILE*  s_shc_file;           /* the journal, appended to */
 static u64    s_shc_jid;            /* its id; 0 without one */
 static char   s_shc_path[1024];     /* the pack */
+static int    s_shc_ro;             /* another process keeps the store on disk: this one only reads it */
+static int    s_shc_fold_late;      /* the precompile packs the store once, at its end */
+static int    s_shc_old_pso;        /* <pack>.pso was read in (and goes with the next fold) */
+static const char* s_shc_why;       /* why shc_open wanted a fold; NULL: it did not */
 static int    s_shc_on = -1;
 static int    s_shc_dxc;            /* guest programs come from DXC, settled by shc_open */
 static SRWLOCK s_shc_lock = SRWLOCK_INIT;
@@ -1649,14 +1653,17 @@ typedef struct {
     u32 npipe;                      /* the first npipe of s_psoc_recs, which no one changes */
     u64 jid, jlen;                  /* the journal, and how long it was */
     int old_pso;                    /* <pack>.pso was read and goes */
+    int inline_;                    /* on the caller's thread (the precompile), not one of its own */
     char why[48];
 } ShFold;
 
 static DWORD WINAPI shc_fold(LPVOID arg)
 {
     ShFold* F = (ShFold*)arg;
-    ps3_thread_name("shader cache pack");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    if (!F->inline_) {
+        ps3_thread_name("shader cache pack");
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    }
     const double t0 = perf_now();
     size_t raw = 0, cz = 0;
     for (u32 i = 0; i < F->nprog; i++) raw += shr_size(16, F->progs[i]->len);
@@ -1734,8 +1741,9 @@ static DWORD WINAPI shc_fold(LPVOID arg)
     return 0;
 }
 
-/* A fold of the store as it is now, on its own thread. s_shc_lock held. */
-static void shc_fold_start(const char* why, int old_pso, u64 jlen)
+/* A fold of the store as it is now: on its own thread, or (wait) on this one,
+ * with s_shc_lock let go while it packs. s_shc_lock held. */
+static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
 {
     ShFold* F = (ShFold*)calloc(1, sizeof *F);
     if (!F) return;
@@ -1750,7 +1758,14 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen)
         F->jid = s_shc_file ? s_shc_jid : 0;
         F->jlen = s_shc_file ? jlen : 0;
         F->old_pso = old_pso;
+        F->inline_ = wait;
         snprintf(F->why, sizeof F->why, "%s", why);
+        if (wait) {
+            ReleaseSRWLockExclusive(&s_shc_lock);   /* shc_fold takes it to start the journal over */
+            shc_fold(F);
+            AcquireSRWLockExclusive(&s_shc_lock);
+            return;
+        }
         HANDLE t = CreateThread(NULL, 0, shc_fold, F, 0, NULL);
         if (t) { CloseHandle(t); return; }
     }
@@ -1790,6 +1805,26 @@ static void shc_open(void)
     char jp[1100], pp[1100];
     snprintf(jp, sizeof jp, "%s.journal", s_shc_path);
     snprintf(pp, sizeof pp, "%s.pso", s_shc_path);
+    /* One process at a time keeps the store on disk (the game, or the launcher's
+     * precompile): a named mutex per store, held for the process's life. Another
+     * process (a second game, the precompile while the game runs) reads it and
+     * keeps what it adds in memory: two writers would interleave the journal. */
+    {
+        char full[1100];
+        if (!GetFullPathNameA(s_shc_path, sizeof full, full, NULL)) snprintf(full, sizeof full, "%s", s_shc_path);
+        u64 h = 1469598103934665603ull;
+        for (const char* c = full; *c; c++) {
+            const u8 ch = (u8)(*c == '/' ? '\\' : (*c >= 'A' && *c <= 'Z') ? *c + 32 : *c);
+            h ^= ch; h *= 1099511628211ull;
+        }
+        char name[64];
+        snprintf(name, sizeof name, "Local\\ps3recomp-shader-cache-%016llx", (unsigned long long)h);
+        HANDLE m = CreateMutexA(NULL, FALSE, name);
+        if (!m || GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (m) CloseHandle(m);   /* not ours: the store is free again once its holder exits */
+            s_shc_ro = 1;
+        }
+    }
     const double t0 = perf_now();
     ShrLoad L;
     memset(&L, 0, sizeof L);
@@ -1846,15 +1881,17 @@ static void shc_open(void)
         if (id && id == ajid && ajlen >= 16 && ajlen <= n) jfrom = (size_t)ajlen;
         jend = jfrom + shr_read(b + jfrom, n - jfrom, 1, &L);
         if (jend == jfrom) free(b);   /* else it stays: the records are in it */
-        if (jend < n) {
-            FILE* f = fopen(jp, "r+b");
-            if (f) { _chsize_s(_fileno(f), (long long)jend); fclose(f); }
+        if (!s_shc_ro) {
+            if (jend < n) {
+                FILE* f = fopen(jp, "r+b");
+                if (f) { _chsize_s(_fileno(f), (long long)jend); fclose(f); }
+            }
+            s_shc_file = fopen(jp, "ab");
+            s_shc_jid = s_shc_file ? id : 0;
         }
-        s_shc_file = fopen(jp, "ab");
-        s_shc_jid = s_shc_file ? id : 0;
     } else {
         free(b);
-        shj_create(jp);
+        if (!s_shc_ro) shj_create(jp);
     }
     free(s_psr_map);
     s_psr_map = NULL; s_psr_map_cap = 0;
@@ -1863,8 +1900,11 @@ static void shc_open(void)
     printf("[d3d12] shader cache %s: %u programs for %u sources, %u pipelines; %.1f MB packed, %.1f MB of "
            "journal, read in %.0f ms (%u records dropped)%s%s%c", s_shc_path, s_shp_n, s_shc_n, s_psoc_nrecs,
            packed / 1048576.0, jlive / 1048576.0, (perf_now() - t0) * 1000.0, L.bad,
-           s_shc_file ? "" : " (cannot write it)", stuck ? " (a file of it cannot be read: not packed)" : "", 10);
-    if (why && !stuck) shc_fold_start(why, old_pso, (u64)jend);
+           s_shc_ro ? " (another process keeps it: read only)" : s_shc_file ? "" : " (cannot write it)",
+           stuck ? " (a file of it cannot be read: not packed)" : "", 10);
+    s_shc_old_pso = old_pso;
+    s_shc_why = stuck ? NULL : why;
+    if (why && !stuck && !s_shc_ro && !s_shc_fold_late) shc_fold_start(why, old_pso, (u64)jend, 0);
 }
 
 /* A guest program (entry "main") through the disk cache. */
@@ -2999,6 +3039,54 @@ static int pp_init(void);
 static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 
+/* The device (s_d3d.device), 0 on success. On a dual-GPU laptop a NULL adapter
+ * usually lands on the integrated GPU; explicitly pick the high-performance
+ * (discrete) adapter via IDXGIFactory6. Set CELLMARK_IGPU to force the
+ * low-power one (for A/B testing a suspected iGPU-driver stall). The game's
+ * start and the precompile (which must pick the same compiler) both come here. */
+static int d3d_device_create(IDXGIFactory4* factory)
+{
+    IDXGIFactory6* factory6 = NULL;
+    if (SUCCEEDED(factory->lpVtbl->QueryInterface(
+            factory, &IID_IDXGIFactory6, (void**)&factory6))) {
+        DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
+            ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
+            : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
+        IDXGIAdapter1* adapter = NULL;
+        for (UINT ai = 0; factory6->lpVtbl->EnumAdapterByGpuPreference(
+                 factory6, ai, pref, &IID_IDXGIAdapter1, (void**)&adapter)
+                 != DXGI_ERROR_NOT_FOUND; ai++) {
+            DXGI_ADAPTER_DESC1 ad;
+            adapter->lpVtbl->GetDesc1(adapter, &ad);
+            if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
+                    D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
+                    (void**)&s_d3d.device))) {
+                printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
+                       (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+                s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
+                if (FAILED(adapter->lpVtbl->QueryInterface(adapter, &IID_IDXGIAdapter3, (void**)&s_adapter3)))
+                    s_adapter3 = NULL;
+                adapter->lpVtbl->Release(adapter);
+                break;
+            }
+            adapter->lpVtbl->Release(adapter);
+            adapter = NULL;
+        }
+        factory6->lpVtbl->Release(factory6);
+    }
+    if (!s_d3d.device) {
+        const HRESULT hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
+                                             &IID_ID3D12Device, (void**)&s_d3d.device);
+        if (FAILED(hr)) {
+            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
+            return -1;
+        }
+        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+    }
+    return 0;
+}
+
 static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
@@ -3035,50 +3123,9 @@ static int init_d3d12(u32 width, u32 height)
         return -1;
     }
 
-    /* Create D3D12 device. On a dual-GPU laptop a NULL adapter usually lands on
-     * the integrated GPU; explicitly pick the high-performance (discrete)
-     * adapter via IDXGIFactory6. Set CELLMARK_IGPU to force the low-power one
-     * (for A/B testing a suspected iGPU-driver stall). */
-    {
-        IDXGIFactory6* factory6 = NULL;
-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
-                factory, &IID_IDXGIFactory6, (void**)&factory6))) {
-            DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
-                ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
-                : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
-            IDXGIAdapter1* adapter = NULL;
-            for (UINT ai = 0; factory6->lpVtbl->EnumAdapterByGpuPreference(
-                     factory6, ai, pref, &IID_IDXGIAdapter1, (void**)&adapter)
-                     != DXGI_ERROR_NOT_FOUND; ai++) {
-                DXGI_ADAPTER_DESC1 ad;
-                adapter->lpVtbl->GetDesc1(adapter, &ad);
-                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                    SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
-                        D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
-                        (void**)&s_d3d.device))) {
-                    printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
-                           (unsigned long long)(ad.DedicatedVideoMemory >> 20));
-                    s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
-                    if (FAILED(adapter->lpVtbl->QueryInterface(adapter, &IID_IDXGIAdapter3, (void**)&s_adapter3)))
-                        s_adapter3 = NULL;
-                    adapter->lpVtbl->Release(adapter);
-                    break;
-                }
-                adapter->lpVtbl->Release(adapter);
-                adapter = NULL;
-            }
-            factory6->lpVtbl->Release(factory6);
-        }
-    }
-    if (!s_d3d.device) {
-        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
-                               &IID_ID3D12Device, (void**)&s_d3d.device);
-        if (FAILED(hr)) {
-            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
-            factory->lpVtbl->Release(factory);
-            return -1;
-        }
-        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+    if (d3d_device_create(factory) != 0) {
+        factory->lpVtbl->Release(factory);
+        return -1;
     }
 
     /* Create command queue */
@@ -6538,13 +6585,12 @@ static ID3DBlob* vp_vs_ready(VPVSEntry* e)
 }
 
 /* The raw-fetch variant's source, malloc'ed, or NULL. */
-static char* vp_raw_text(const VPVSEntry* e, size_t* len)
+static char* vp_raw_text(const char* src, size_t* len)
 {
     static const char cb_end[] = "    float4 vp_posoffset;\n};\n";
     static const char v_last[] = "v[15]=input.a15;\n";
     static const char cb_raw[] = "    float4 vp_posoffset;\n    uint4 vp_fa[16];\n    float4 vp_fk[16];\n};\n";
     static const char in_raw[] = "struct VSInput { uint vid:SV_VertexID; };\n";
-    const char* src = e->hlsl;
     const char* in0 = strstr(src, "struct VSInput {");
     const char* in1 = in0 ? strstr(in0, "};\n") : NULL;
     const char* cb  = strstr(src, cb_end);
@@ -6600,6 +6646,156 @@ static char* vp_raw_text(const VPVSEntry* e, size_t* len)
     return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * Vertex programs compiled ahead of play (rsx_d3d12_precompile_vertex_programs)
+ *
+ * A vertex program's text depends on its code alone: where in the store the
+ * title loads it changed the text of none of the 102 that a session of God of
+ * War: Ascension's first level drew with, and its raw-fetch text is made from
+ * that one. So a port can find the title's vertex programs in its files and
+ * have both texts compiled into the shader cache before the title runs; none is
+ * then compiled in play, where a new one holds back the draws that need it (a
+ * raw-fetch text took 127-149 ms in DXC here). A fragment program's text also
+ * depends on the textures and state of its draws, which the files do not say.
+ * -----------------------------------------------------------------------*/
+typedef struct { char* src; size_t len; const char* name; } PcJob;
+static PcJob* s_pc_jobs;
+static LONG s_pc_n;
+static volatile LONG s_pc_next, s_pc_done, s_pc_failed;
+
+static DWORD WINAPI pc_worker(LPVOID arg)
+{
+    (void)arg;
+    ps3_thread_name("precompile");
+    for (;;) {
+        const LONG i = InterlockedIncrement(&s_pc_next) - 1;
+        if (i >= s_pc_n) break;
+        ID3DBlob* b = NULL;
+        ID3DBlob* e = NULL;
+        const HRESULT hr = d3d_compile_cached(s_pc_jobs[i].src, s_pc_jobs[i].len, s_pc_jobs[i].name, "vs_5_0", &b, &e);
+        if (FAILED(hr) || !b) InterlockedIncrement(&s_pc_failed);
+        if (b) b->lpVtbl->Release(b);
+        if (e) e->lpVtbl->Release(e);
+        InterlockedIncrement(&s_pc_done);
+    }
+    return 0;
+}
+
+int rsx_d3d12_precompile_open(char* why, size_t why_len)
+{
+    if (!s_d3d.device) {
+        IDXGIFactory4* f = NULL;
+        const int ok = SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&f)) && d3d_device_create(f) == 0;
+        if (f) f->lpVtbl->Release(f);
+        if (!ok) { snprintf(why, why_len, "no Direct3D 12 device"); return -1; }
+    }
+    AcquireSRWLockExclusive(&s_shc_lock);
+    s_shc_fold_late = 1;
+    if (s_shc_on < 0) shc_open();
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    if (!s_shc_on) { snprintf(why, why_len, "no shader cache in the settings (graphics.shader_cache)"); return -1; }
+    if (s_shc_ro) { snprintf(why, why_len, "the game has the shader cache open"); return -1; }
+    return 0;
+}
+
+int rsx_d3d12_precompile_vertex_programs(const uint8_t* const* ucode, const uint32_t* bytes, uint32_t n,
+                                         int threads, void (*progress)(uint32_t done, uint32_t total),
+                                         uint32_t stats[3], char* why, size_t why_len)
+{
+    extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+    extern void rsx_vp_set_branch_base(u32);
+    stats[0] = stats[1] = stats[2] = 0;
+    if (rsx_d3d12_precompile_open(why, why_len) != 0) return -1;
+
+    /* The texts, on this thread (the decompiler's branch base is one for all):
+     * each program's, at slot 0 as the title's draws had them, and its raw-fetch
+     * one, those the cache has and repeats passed over. */
+    const UINT flags = shc_flags();
+    static char hlsl[262144];
+    u32 maxb = 0;
+    for (u32 i = 0; i < n; i++) if (bytes[i] > maxb) maxb = bytes[i];
+    u32* words = (u32*)malloc((size_t)maxb + 16);
+    s_pc_jobs = (PcJob*)calloc((size_t)n * 2 + 1, sizeof *s_pc_jobs);
+    u32 kcap = 1024;
+    while (kcap < n * 4 + 16) kcap *= 2;
+    u64* keys = (u64*)calloc(kcap, sizeof *keys);   /* the batch's keys, for its repeats */
+    if (!words || !s_pc_jobs || !keys) {
+        free(words); free(s_pc_jobs); free(keys); s_pc_jobs = NULL;
+        snprintf(why, why_len, "out of memory");
+        return -1;
+    }
+    s_pc_n = 0;
+    for (u32 i = 0; i < n; i++) {
+        const u32 nw = bytes[i] / 4;
+        for (u32 w = 0; w < nw; w++) {
+            const uint8_t* p = ucode[i] + 4 * w;
+            words[w] = (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | (u32)p[3];
+        }
+        rsx_vp_set_branch_base(0);
+        if (rsx_vp_decompile((const u8*)words, nw * 4, hlsl, sizeof hlsl) <= 0) { stats[2]++; continue; }
+        size_t rl = 0;
+        char* raw = vp_raw_text(hlsl, &rl);
+        for (int k = 0; k < 2; k++) {
+            const char* s = k ? raw : hlsl;
+            const size_t l = k ? rl : strlen(hlsl);
+            if (!s) continue;
+            const u64 key = shc_key(s, l, "vs_5_0", flags) ^ (u64)l * 0x9E3779B97F4A7C15ull;
+            u32 slot = (u32)(key ^ (key >> 32)) & (kcap - 1);
+            while (keys[slot] && keys[slot] != key) slot = (slot + 1) & (kcap - 1);
+            if (keys[slot]) continue;   /* another program of the batch has this text */
+            keys[slot] = key ? key : 1;
+            AcquireSRWLockShared(&s_shc_lock);
+            const int have = s_shc_cap && shc_slot(shc_key(s, l, "vs_5_0", flags), (u32)l)->prog;
+            ReleaseSRWLockShared(&s_shc_lock);
+            if (have) { stats[1]++; continue; }
+            PcJob* j = &s_pc_jobs[s_pc_n++];
+            j->len = l;
+            j->name = k ? "guest_vp_raw" : "guest_vp2";
+            j->src = (char*)malloc(l + 1);
+            if (j->src) memcpy(j->src, s, l + 1);
+            else s_pc_n--;
+        }
+        free(raw);
+    }
+    free(words);
+    free(keys);
+
+    /* Compiled as a draw's would be (d3d_compile_cached), on the threads. */
+    const int nt = threads < 1 ? 1 : threads > 32 ? 32 : threads;
+    HANDLE th[32];
+    int nh = 0;
+    s_pc_next = s_pc_done = s_pc_failed = 0;
+    for (int t = 0; t < nt && s_pc_n; t++) {
+        HANDLE h = CreateThread(NULL, 0, pc_worker, NULL, 0, NULL);
+        if (h) th[nh++] = h;
+    }
+    if (nh) {
+        while (WaitForMultipleObjects((DWORD)nh, th, TRUE, 250) == WAIT_TIMEOUT)
+            if (progress) progress((u32)s_pc_done, (u32)s_pc_n);
+        for (int t = 0; t < nh; t++) CloseHandle(th[t]);
+    } else if (s_pc_n) {
+        pc_worker(NULL);
+    }
+    if (progress) progress((u32)s_pc_n, (u32)s_pc_n);
+    stats[0] = (u32)(s_pc_n - s_pc_failed);
+    stats[2] += (u32)s_pc_failed;
+    for (LONG i = 0; i < s_pc_n; i++) free(s_pc_jobs[i].src);
+    free(s_pc_jobs);
+    s_pc_jobs = NULL;
+
+    /* Packed, on this thread: what was compiled, and whatever the cache was
+     * waiting to pack (the files from before the store, a grown journal). */
+    AcquireSRWLockExclusive(&s_shc_lock);
+    if (stats[0] || s_shc_why) {
+        u64 jl = 0;
+        if (s_shc_file && fflush(s_shc_file) == 0 && _fseeki64(s_shc_file, 0, SEEK_END) == 0)
+            jl = (u64)_ftelli64(s_shc_file);
+        shc_fold_start(stats[0] ? "precompiled" : s_shc_why, s_shc_old_pso, jl, 1);
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    return 0;
+}
+
 static ID3DBlob* vp_vs_raw_locked(VPVSEntry* e)
 {
     if (e->vs_raw || e->raw_failed || !e->hlsl) return e->vs_raw;
@@ -6619,7 +6815,7 @@ static ID3DBlob* vp_vs_raw_locked(VPVSEntry* e)
     }
     e->raw_failed = 1;                      /* until it compiles */
     size_t o = 0;
-    char* out = vp_raw_text(e, &o);
+    char* out = vp_raw_text(e->hlsl, &o);
     if (!out) return NULL;
     ID3DBlob* vb = NULL; ID3DBlob* err = NULL;
     if (sj_workers() > 0) {
@@ -14075,7 +14271,7 @@ static ID3D12PipelineState* fg_obj_pso(int vs_idx)
         s_fg.obj_pso[i].tried = 1;
         s_fg.obj_pso[i].hash = e->hash;
         size_t n = 0;
-        char* raw = e->hlsl ? vp_raw_text(e, &n) : NULL;
+        char* raw = e->hlsl ? vp_raw_text(e->hlsl, &n) : NULL;
         const char* at = raw ? strstr(raw, "    VSOutput Out;\n") : NULL;
         if (!at) { free(raw); return NULL; }
         const int c = s_fg.cam_reg, p = s_fg.prev_reg, a = s_fg.prev_attr;

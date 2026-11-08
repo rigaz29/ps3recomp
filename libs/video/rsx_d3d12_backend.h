@@ -65,6 +65,23 @@ void rsx_d3d12_backend_fsr3_refuse(const char* why);
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 
+/* A precompile's start: a device for the compiler's choice, and the shader cache
+ * opened. -1 with why if it cannot be: before a port reads the title's files.
+ * rsx_d3d12_precompile_vertex_programs calls it too. */
+int rsx_d3d12_precompile_open(char* why, size_t why_len);
+
+/* Vertex programs into the shader cache ahead of play, without a window (a port's
+ * precompile). ucode[i] is a program as the title's files hold it: bytes[i] bytes,
+ * big-endian words, ending at its last instruction. Each one's text and its
+ * raw-fetch text are compiled as a draw would compile them, on `threads` threads,
+ * past those the cache has; the cache is packed at the end. progress(done, total)
+ * is called on this thread as it goes. stats: compiled, had already, failed.
+ * Returns 0, or -1 with why: no shader cache in the settings, no device, or the
+ * game holding the cache. Not with the backend running. */
+int rsx_d3d12_precompile_vertex_programs(const uint8_t* const* ucode, const uint32_t* bytes, uint32_t n,
+                                         int threads, void (*progress)(uint32_t done, uint32_t total),
+                                         uint32_t stats[3], char* why, size_t why_len);
+
 #ifdef __cplusplus
 }
 #endif

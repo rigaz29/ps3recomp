@@ -902,11 +902,16 @@ static int rsx_fp_decompile_internal2(
             &s0, input_src, persp, k, has_k, buffered, constant_slot,
             a, sizeof(a));
         /* SRC1 [21:19]: the first source's precision as it is read, after
-         * its abs and negate. 4 clamps it to [0, 1]: God of War: Ascension
-         * lights its menu's cloth and rocks with MUL h, r3.w, c where r3.w =
-         * N.L carries 4, and read as is, a negative N.L darkened them in black
+         * its abs and before its negate (RPCS3's GetSRC: abs, the clamp, then
+         * the negate). 4 clamps it to [0, 1]: God of War: Ascension lights
+         * its menu's cloth and rocks with MUL h, r3.w, c where r3.w = N.L
+         * carries 4, and read as is, a negative N.L darkened them in black
          * patches RPCS3 does not have (its translation clamps exactly these
-         * sources). 3 clamps it to [-1, 1]: the opening cinematic's LG2s of
+         * sources). Its brothel illusion weighs a gold sheen by
+         * smoothstep((0.5 - x) / (1 - x)) from ADDs of -x with 4; clamped
+         * after the negate, -x read 0 for every x and the whole room took a
+         * quarter of the sheen's (22.4, 16.0, 1.8), where RPCS3 has it dark
+         * purple. 3 clamps it to [-1, 1]: the opening cinematic's LG2s of
          * |h1.z| (RPCS3: log2(clamp(abs(h1.z), -1, 1))). 5 marks some NRMs,
          * left as they are (as RPCS3 does); no other value is seen in this
          * title, and one would be read as is and reported.
@@ -914,9 +919,12 @@ static int rsx_fp_decompile_internal2(
         if (!is_branch) {
             const u32 src_prec = (w2 >> 19) & 7u;
             if ((src_prec == 4u || src_prec == 3u) && rsx_fp_src_prec_on()) {
+                Src u = s0;
+                u.negate = 0;
+                emit_src(&u, input_src, persp, k, has_k, buffered, constant_slot, a, sizeof(a));
                 char t[sizeof a];
-                const int len = src_prec == 4u ? snprintf(t, sizeof t, "saturate(%s)", a)
-                                               : snprintf(t, sizeof t, "clamp(%s, -1.0, 1.0)", a);
+                const int len = src_prec == 4u ? snprintf(t, sizeof t, "%ssaturate(%s)", s0.negate ? "-" : "", a)
+                                               : snprintf(t, sizeof t, "%sclamp(%s, -1.0, 1.0)", s0.negate ? "-" : "", a);
                 if (len < 0 || (size_t)len >= sizeof t) return -1;
                 memcpy(a, t, (size_t)len + 1);
             } else if (src_prec != 0u && src_prec != 5u) {

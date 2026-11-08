@@ -631,6 +631,31 @@ int main(void)
         check_absent("gamma_dyn_no_fetch", hlsl, "_rsx_gamma");
     }
 
+    /* The first source's precision clamp (SRC1 [21:19]) comes after its abs
+     * and before its negate, as RPCS3 reads it: -r1 with 4 is -saturate(r1),
+     * never saturate(-r1), which is 0 for every positive r1. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);                          /* MOV r0, -r1 */
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u << 17) | EXEC_ALWAYS);
+        put_word(prog + 8, 4u << 19);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src_prec_sat_neg", hlsl, "-saturate((r[1]).xyzw)");
+        check_absent("src_prec_sat_neg_order", hlsl, "saturate(-(");
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u << 17) | (1u << 29) | EXEC_ALWAYS);   /* -|r1| */
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src_prec_sat_neg_abs", hlsl, "-saturate(abs((r[1]).xyzw))");
+        put_word(prog + 8, 3u << 19);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src_prec_clamp1_neg_abs", hlsl, "-clamp(abs((r[1]).xyzw), -1.0, 1.0)");
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | EXEC_ALWAYS);               /* r1 as it is */
+        put_word(prog + 8, 4u << 19);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src_prec_sat_plain", hlsl, "saturate((r[1]).xyzw)");
+        check_absent("src_prec_sat_plain_no_neg", hlsl, "-saturate(");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

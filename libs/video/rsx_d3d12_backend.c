@@ -736,8 +736,9 @@ typedef struct {
 
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
-/* RSX_RENDER_THREAD: see "The render thread". 0 off; 1 the walk goes on from
- * render_frame's reset; 2 from the end of the frame, its present included. */
+/* graphics.render_thread (RSX_RENDER_THREAD): see "The render thread". 0 off;
+ * 1 the walk goes on from render_frame's reset; 2 (on, the default) from the
+ * end of the frame, its present included. */
 static int s_rt_mode;
 static void rt_start(void);
 static void rt_stop(void);
@@ -9449,9 +9450,14 @@ static inline void off_bit_set(u64* s, u32 off) { const u32 b = off_bit(off); s[
 static u64 s_ort_bits[16];      /* the offsets of off_rt's slots; set as one is made, rebuilt each batch */
 static void ort_bits_rebuild(void)
 {
-    memset(s_ort_bits, 0, sizeof s_ort_bits);
+    /* Made aside and copied a word at a time: a lookup from another thread (the walk's
+     * DISP_RT_DBG print, with the render thread on) sees each word old or new, and both
+     * hold every live slot's offset. */
+    u64 b[16];
+    memset(b, 0, sizeof b);
     for (int i = 0; i < MAX_OFF_RTS; i++)
-        if (s_d3d.off_rt[i].off) off_bit_set(s_ort_bits, s_d3d.off_rt[i].off);
+        if (s_d3d.off_rt[i].off) off_bit_set(b, s_d3d.off_rt[i].off);
+    for (int w = 0; w < 16; w++) ((volatile u64*)s_ort_bits)[w] = b[w];
 }
 
 static int off_rt_find(u32 off)
@@ -17409,7 +17415,8 @@ static void rf_ahead(u32 upto, int wait_gpu)
 /* ---------------------------------------------------------------------------
  * The render thread
  * -----------------------------------------------------------------------*/
-/* RSX_RENDER_THREAD=1: the batch's recording, its submission and the presents
+/* graphics.render_thread (RSX_RENDER_THREAD): on (mode 2, the default), off,
+ * or a mode's number. The batch's recording, its submission and the presents
  * on a thread of their own, "rsx render", while the frame clock thread walks
  * the FIFO and captures the draws (their records and uploads).
  * - The walk publishes the records it is done with, all but the last (the next
@@ -17419,9 +17426,12 @@ static void rf_ahead(u32 upto, int wait_gpu)
  * - A present, or a render at a display clear, is handed to the render thread
  *   while the walk waits. The batch's state (records, segments, upload offsets,
  *   the parity) is not doubled: the walk goes on once render_frame has reset
- *   it, while the render thread submits and presents. RSX_RENDER_THREAD=2, a
+ *   it, while the render thread submits and presents (mode 1). Mode 2, a
  *   render at a clear and a capture (which reads the records after the reset)
  *   wait for all of it.
+ * - Texture uploads read guest memory in rf_prepass, on the render thread: in
+ *   mode 2 no later than the batch's end, the walk waiting there, as without
+ *   record-ahead.
  * - What else both touch: the vertex programs' entries (s_vs_lock), the base
  *   pipeline's build (rt_excl_begin), and the walker's table of ZPASS reports
  *   (a lock in cellGcmSys.c). The ZPASS and main-memory surface polls are the
@@ -17434,9 +17444,19 @@ static void rf_ahead(u32 upto, int wait_gpu)
  * from ~73% of a core to ~41%, the render thread takes ~34%, and the frame
  * rate falls ~3% (20.87 -> 20.18 flips/s, mode 2, two runs each): the SPU
  * workers set the frame, not this thread.
+ * 2026-11-08, mode 2 the default: the walk had come to bind at the gate with
+ * shadows on (98% of a core); it falls to ~50%, the render thread takes
+ * ~60%, and the gate goes 30.66/28.57 -> 33.65/32.65 flips/s (ABBA), the
+ * fight 32.20 -> 35.20 (one run each). The fight with shadows on is the PPU
+ * main thread's (95%): 27.82/30.01 -> 27.23/28.90, within its spread. Under
+ * frame generation's cap (FSR 3.1, VSync, 30 flips/s at 60 Hz) the fight
+ * is the same, 29.79 against 29.74 (three runs each).
  * Mode 1 put the GPU in a hang (DXGI_ERROR_DEVICE_HUNG) in two of four runs,
- * after ~2,000 and ~4,000 frames; not found yet. Modes 2 and 3 did not, in
- * four and two runs. Kept here for when the frame clock thread binds. */
+ * after ~2,000 and ~4,000 frames. A candidate, not tried: from the reset the
+ * walk writes the next batch into the upload halves (vp_parity) of the batch
+ * before, which the GPU may still be reading -- move_to_next_frame waits for
+ * that batch only after the present -- and the raw-fetch draws read through
+ * root views, unchecked. Modes 2 and 3 did not hang, in 25 and two runs. */
 static HANDLE s_rt_thread, s_rt_work_ev, s_rt_done_ev;
 static SRWLOCK s_rt_excl = SRWLOCK_INIT;   /* the render thread's while it works */
 static volatile LONG s_rt_pub;             /* records the walk is done with */
@@ -17578,13 +17598,22 @@ static void rt_excl_end(void)
     if (s_rt_mode > 0) ReleaseSRWLockExclusive(&s_rt_excl);
 }
 
+/* graphics.render_thread: on (mode 2), off, or a mode's number. */
+static int rt_mode_wanted(void)
+{
+    const char* s = ps3_settings_str("graphics", "render_thread", "RSX_RENDER_THREAD", "on");
+    if (!s || !*s) return 2;
+    if (ps3_settings_ieq(s, "off") || ps3_settings_ieq(s, "no") || ps3_settings_ieq(s, "false")) return 0;
+    if (ps3_settings_ieq(s, "on") || ps3_settings_ieq(s, "yes") || ps3_settings_ieq(s, "true")) return 2;
+    return atoi(s);
+}
+
 static void rt_start(void)
 {
-    const char* e = getenv("RSX_RENDER_THREAD");
-    const int m = e ? atoi(e) : 0;
+    const int m = rt_mode_wanted();
     if (m <= 0) return;
     if (!rf_ahead_on()) {
-        fprintf(stderr, "[D3D12] RSX_RENDER_THREAD needs record-ahead (D3D12_RECORD_AHEAD=1, no debug filter): off%c", 10);
+        fprintf(stderr, "[D3D12] the render thread needs record-ahead (D3D12_RECORD_AHEAD=1, no debug filter): off%c", 10);
         return;
     }
     s_rt_work_ev = CreateEventA(NULL, FALSE, FALSE, NULL);

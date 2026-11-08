@@ -32,6 +32,7 @@
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
  * `extern "C"` inside a function body is ill-formed in C++. */
 extern "C" void ydkj_host_bt(const char* tag);
+extern "C" void (*g_ps3_mark_hook)(const char* kind, const char* text);   /* sys_ppu_thread.c */
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -302,6 +303,7 @@ static void cellFsOpen(ppu_context* ctx)
         }
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
+    if (g_ps3_mark_hook) g_ps3_mark_hook("open", gpath);   /* found or not: the title got this far */
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;

@@ -205,6 +205,10 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Write what port 0 hands the title to a file, for PAD_REPLAY to play back
+ * (see cellPad.c). Call before the title's cellPadInit; once per process. */
+void cellPad_record_to(const char* path);
+
 /* For a port's settings window (Windows): the name [keyboard] uses for a
  * virtual-key code, or NULL when it has none. */
 const char* ps3_pad_key_name(int vk);

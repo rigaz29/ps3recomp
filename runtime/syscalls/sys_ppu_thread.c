@@ -44,6 +44,11 @@ static PPU_TLS int     s_exit_armed = 0;
                         * returns 0 on those threads). */
 #endif
 
+/* Points in the title's progress, for a pad recording to keep in step by
+ * (cellPad.c): each thread started here ("thread", its name) and each file
+ * opened (ppu_fs.cpp: "open", the guest path). NULL unless one is kept. */
+void (*g_ps3_mark_hook)(const char* kind, const char* text) = NULL;
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
@@ -538,6 +543,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority, (unsigned long long)flags);
+    if (g_ps3_mark_hook) g_ps3_mark_hook("thread", t->name);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */

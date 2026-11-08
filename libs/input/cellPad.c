@@ -978,6 +978,9 @@ static DWORD WINAPI pad_sampler(LPVOID unused)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+static void pad_rp_load(void);
+static int s_rp_on;
+
 s32 cellPadInit(u32 max_connect)
 {
     printf("[cellPad] Init(max_connect=%u)\n", max_connect);
@@ -1001,6 +1004,10 @@ s32 cellPadInit(u32 max_connect)
     pad_lock();
     pad_init_backend();
     pad_unlock();
+
+    /* PAD_RECORD and PAD_REPLAY, before the title's first read (see cellPad_record_to). */
+    { const char* e = getenv("PAD_RECORD"); if (e && *e) cellPad_record_to(e); }
+    if (s_rp_on < 0) pad_rp_load();
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
@@ -1045,6 +1052,323 @@ void cellPad_poll(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Recording what the title read from the pad, and playing it back
+ *
+ * cellPad_record_to(path), which the port calls for a session it logs, or
+ * PAD_RECORD=<file> writes what port 0 hands the title, a line each time it
+ * changes, each pause in the title's reads of 250 ms or more, and each file
+ * the title opens and thread it starts (g_ps3_mark_hook):
+ *
+ *   p <ms> <flips> <buttons> <rx> <ry> <lx> <ly> [<12 pressure bytes>]
+ *   g <ms> <flips> <pause>
+ *   m <ms> <flips> open <guest path> | thread <name>
+ *
+ * <ms> counts from the title's first read of port 0, <flips> is the guest's
+ * flip count, <buttons> is (DIGITAL2 << 8) | DIGITAL1 in hex, as PAD_SCRIPT and
+ * PAD_FILE take it. The pressure bytes are there while the title has them on
+ * (CELL_PAD_SETTING_PRESS_ON).
+ *
+ * PAD_REPLAY=<file> hands the title what a recording says in place of the host
+ * pad; PAD_SCRIPT, PAD_FILE and PAD_STICK still act on top of it. Played by the
+ * clock alone a recording goes astray at the first load that takes longer or
+ * shorter than it did. God of War: Ascension reads the pad all through a load,
+ * so a pause in its reads does not show one; the files it opens do. The playback
+ * runs on a clock of its own:
+ *   - each pause between reads counts as 250 ms at most, in the recording as in
+ *     this run: a frame that took a second moved the title on by one frame, not
+ *     by a second;
+ *   - the marks keep it from running ahead. It waits at a recorded mark until
+ *     this run has made it too (the same text, as many times); one this run makes
+ *     also passes the recorded marks before it, if it was recorded less than 10 s
+ *     ahead of the playback. It does not jump ahead when this run is the faster:
+ *     what the recording pressed then comes a little later, but all of it comes.
+ *     A mark that does not come in 5 s is passed over, with the others of the
+ *     next second, and its text is no longer waited for (streaming that differs
+ *     with where the camera looks).
+ * The playback holds the last report at the recording's end.
+ * -----------------------------------------------------------------------*/
+#define PAD_REC_N      18      /* button[2..19]: the digital words, the sticks, the pressure */
+#define PAD_REC_PAUSE  250     /* ms: a pause written down, and the most one counts for */
+
+/* The runtime's: called at each file the title opens and thread it starts (sys_ppu_thread.c). */
+extern void (*g_ps3_mark_hook)(const char* kind, const char* text);
+static void pad_mark(const char* kind, const char* text);
+
+static FILE* s_rec;
+static volatile char s_rec_lock;
+static unsigned long long s_rec_t0, s_rec_read, s_rec_flushed;
+static u16 s_rec_last[PAD_REC_N];
+static int s_rec_have;
+
+static void rec_lock(void)   { while (__atomic_test_and_set(&s_rec_lock, __ATOMIC_ACQUIRE)) pad_yield(); }
+static void rec_unlock(void) { __atomic_clear(&s_rec_lock, __ATOMIC_RELEASE); }
+
+void cellPad_record_to(const char* path)
+{
+    if (s_rec || !path || !*path) return;
+    s_rec = fopen(path, "w");
+    if (!s_rec) { printf("[cellPad] could not record the pad to %s\n", path); return; }
+    fprintf(s_rec, "# ps3recomp pad recording 1: p <ms> <flips> <buttons> <rx> <ry> <lx> <ly> "
+                   "[<12 pressure bytes>]; g <ms> <flips> <pause ms>; m <ms> <flips> open <path> | thread <name>\n");
+    g_ps3_mark_hook = pad_mark;
+    printf("[cellPad] recording the pad to %s\n", path);
+}
+
+/* A read of port 0: the recording's clock starts at the first, and a pause
+ * before one is written down. */
+static void pad_rec_read(unsigned long long now)
+{
+    rec_lock();
+    if (!s_rec_t0) {
+        s_rec_t0 = now;
+    } else if (now - s_rec_read >= PAD_REC_PAUSE) {
+        const unsigned ms = (unsigned)(now - s_rec_t0), pause = (unsigned)(now - s_rec_read);
+        fprintf(s_rec, "g %u %u %u\n", ms, cellGcm_flip_request_count(), pause);
+        if (pause >= 1000)
+            printf("[cellPad] the title read no pad for %.1f s, until %.1f s\n", pause / 1000.0, ms / 1000.0);
+    }
+    s_rec_read = now;
+    rec_unlock();
+}
+
+/* A report port 0 hands the title: written down when it differs from the last. */
+static void pad_rec_report(const u16* b, int press, unsigned long long now)
+{
+    u16 v[PAD_REC_N];
+    for (int i = 0; i < PAD_REC_N; i++) v[i] = (i < 6 || press) ? b[CELL_PAD_BTN_OFFSET_DIGITAL1 + i] : 0;
+    rec_lock();
+    if (!s_rec_t0 || now < s_rec_t0) { rec_unlock(); return; }
+    if (!s_rec_have || memcmp(v, s_rec_last, sizeof v)) {
+        memcpy(s_rec_last, v, sizeof v);
+        s_rec_have = 1;
+        fprintf(s_rec, "p %u %u %04X %u %u %u %u", (unsigned)(now - s_rec_t0), cellGcm_flip_request_count(),
+                (unsigned)(((v[1] & 0xFF) << 8) | (v[0] & 0xFF)), v[2], v[3], v[4], v[5]);
+        if (press)
+            for (int i = 6; i < PAD_REC_N; i++) fprintf(s_rec, " %u", v[i]);
+        fputc('\n', s_rec);
+    }
+    if (now - s_rec_flushed >= 1000) { fflush(s_rec); s_rec_flushed = now; }
+    rec_unlock();
+}
+
+typedef struct { unsigned ms; u16 v[PAD_REC_N]; } PadRpReport;   /* ms on the playback's clock */
+static PadRpReport* s_rp;
+static int s_rp_n, s_rp_i;
+static int s_rp_on = -1;
+static unsigned long long s_rp_clock, s_rp_read;
+static int s_rp_said_end;
+static volatile char s_rp_lock;
+
+/* The recorded marks, in order, and each text's marks in order: a mark this run
+ * makes is the recording's mark of the same text and count. */
+typedef struct { unsigned ms; int text; int got; } PadRpMark;   /* got: this run made it */
+typedef struct { unsigned h; char* s; int* at; int n, cap, seen, shaky; } PadRpText;
+static PadRpMark* s_rpm;
+static int s_rpm_n, s_rpm_next;
+static PadRpText* s_rpt;
+static unsigned s_rpt_cap;                 /* a power of two, open addressing */
+static unsigned long long s_rpm_hold;      /* since when the clock waits at s_rpm_next; 0: it does not */
+static int s_rpm_said;                     /* that wait was reported */
+
+static unsigned rpt_hash(const char* s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+/* A text's entry; with add, made if new. NULL when not there (or no room). */
+static PadRpText* rpt_find(const char* s, int add)
+{
+    if (!s_rpt_cap) return NULL;
+    const unsigned h = rpt_hash(s);
+    for (unsigned i = h & (s_rpt_cap - 1), k = 0; k < s_rpt_cap; i = (i + 1) & (s_rpt_cap - 1), k++) {
+        PadRpText* e = &s_rpt[i];
+        if (!e->s) {
+            if (!add) return NULL;
+            e->h = h;
+            e->s = (char*)malloc(strlen(s) + 1);
+            if (!e->s) return NULL;
+            strcpy(e->s, s);
+            return e;
+        }
+        if (e->h == h && !strcmp(e->s, s)) return e;
+    }
+    return NULL;
+}
+
+static void pad_mark(const char* kind, const char* text);
+
+static void pad_rp_load(void)
+{
+    s_rp_on = 0;
+    const char* path = getenv("PAD_REPLAY");
+    if (!path || !*path) return;
+    FILE* f = fopen(path, "r");
+    if (!f) { printf("[cellPad] PAD_REPLAY: cannot open %s\n", path); return; }
+    int cap = 4096, mcap = 1024;
+    s_rp = (PadRpReport*)malloc((size_t)cap * sizeof *s_rp);
+    s_rpm = (PadRpMark*)malloc((size_t)mcap * sizeof *s_rpm);
+    s_rpt_cap = 8192;
+    s_rpt = (PadRpText*)calloc(s_rpt_cap, sizeof *s_rpt);
+    unsigned long long cut = 0;   /* what the pauses' excess took off the clock so far */
+    char line[640];
+    while (s_rp && s_rpm && s_rpt && fgets(line, sizeof line, f)) {
+        unsigned a[19];
+        if (line[0] == 'g') {
+            if (sscanf(line + 1, "%u %u %u", &a[0], &a[1], &a[2]) != 3 || a[2] < PAD_REC_PAUSE) continue;
+            cut += a[2] - PAD_REC_PAUSE;
+        } else if (line[0] == 'm') {
+            int at = 0;
+            if (sscanf(line + 1, "%u %u %n", &a[0], &a[1], &at) != 2 || !at) continue;
+            char* s = line + 1 + at;
+            s[strcspn(s, "\r\n")] = 0;
+            PadRpText* e = rpt_find(s, 1);
+            if (!e) continue;
+            if (e->n == e->cap) {
+                int* n = (int*)realloc(e->at, (size_t)(e->cap = e->cap ? e->cap * 2 : 4) * sizeof *e->at);
+                if (!n) continue;
+                e->at = n;
+            }
+            if (s_rpm_n == mcap) {
+                PadRpMark* n = (PadRpMark*)realloc(s_rpm, (size_t)(mcap *= 2) * sizeof *s_rpm);
+                if (!n) break;
+                s_rpm = n;
+            }
+            e->at[e->n++] = s_rpm_n;
+            s_rpm[s_rpm_n].ms = a[0] > cut ? (unsigned)(a[0] - cut) : 0;
+            s_rpm[s_rpm_n].text = (int)(e - s_rpt);
+            s_rpm[s_rpm_n].got = 0;
+            s_rpm_n++;
+        } else if (line[0] == 'p') {
+            const int k = sscanf(line + 1, "%u %u %x %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                                 &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7], &a[8], &a[9],
+                                 &a[10], &a[11], &a[12], &a[13], &a[14], &a[15], &a[16], &a[17], &a[18]);
+            if (k < 7) continue;
+            if (s_rp_n == cap) {
+                PadRpReport* n = (PadRpReport*)realloc(s_rp, (size_t)(cap *= 2) * sizeof *s_rp);
+                if (!n) break;
+                s_rp = n;
+            }
+            PadRpReport* r = &s_rp[s_rp_n++];
+            memset(r, 0, sizeof *r);
+            r->ms = (unsigned)(a[0] - cut);
+            r->v[0] = (u16)(a[2] & 0xFF);
+            r->v[1] = (u16)((a[2] >> 8) & 0xFF);
+            for (int i = 0; i < 4; i++) r->v[2 + i] = (u16)a[3 + i];
+            for (int i = 7; i < k; i++) r->v[i - 1] = (u16)a[i];
+        }
+    }
+    fclose(f);
+    if (!s_rp_n) { printf("[cellPad] PAD_REPLAY: no reports in %s\n", path); return; }
+    s_rp_on = 1;
+    if (s_rpm_n) g_ps3_mark_hook = pad_mark;
+    printf("[cellPad] PAD_REPLAY: %d reports over %.1f s and %d marks from %s\n",
+           s_rp_n, s_rp[s_rp_n - 1].ms / 1000.0, s_rpm_n, path);
+    fflush(stdout);
+}
+
+/* A mark this run makes, in playback: the recording's of the same text and count. */
+static void pad_rp_mark(const char* key)
+{
+    while (__atomic_test_and_set(&s_rp_lock, __ATOMIC_ACQUIRE)) pad_yield();
+    PadRpText* e = rpt_find(key, 0);
+    const int k = e ? e->seen++ : 0;
+    const int j = e && k < e->n ? e->at[k] : -1;
+    if (j >= 0) {
+        s_rpm[j].got = 1;
+        if (j >= s_rpm_next && s_rpm[j].ms <= s_rp_clock + 10000) {
+            if (s_rpm_said && s_rpm_hold) {
+                printf("[cellPad] PAD_REPLAY: '%s' came after %.1f s\n", key, (pad_now_ms() - s_rpm_hold) / 1000.0);
+                fflush(stdout);
+            }
+            s_rpm_next = j + 1;
+            s_rpm_hold = 0;
+            s_rpm_said = 0;
+        }
+    }
+    __atomic_clear(&s_rp_lock, __ATOMIC_RELEASE);
+}
+
+/* g_ps3_mark_hook: a file the title opens, a thread it starts. Into the
+ * recording, and to the playback. */
+static void pad_mark(const char* kind, const char* text)
+{
+    char key[600];
+    snprintf(key, sizeof key, "%s %s", kind, text ? text : "");
+    for (char* c = key; *c; c++)
+        if (*c == '\r' || *c == '\n') *c = ' ';
+    if (s_rec) {
+        unsigned long long now = pad_now_ms();
+        rec_lock();
+        /* In a pause the playback counts as 250 ms, a mark is at most that far into it. */
+        if (s_rec_read && now > s_rec_read + PAD_REC_PAUSE) now = s_rec_read + PAD_REC_PAUSE;
+        fprintf(s_rec, "m %u %u %s\n", s_rec_t0 && now >= s_rec_t0 ? (unsigned)(now - s_rec_t0) : 0u,
+                cellGcm_flip_request_count(), key);
+        rec_unlock();
+    }
+    if (s_rp_on > 0) pad_rp_mark(key);
+}
+
+/* A read of port 0 in playback: moves the playback's clock on and gives the
+ * report the title gets now, NULL before the recording's first. */
+static const PadRpReport* pad_rp_step(unsigned long long now)
+{
+    while (__atomic_test_and_set(&s_rp_lock, __ATOMIC_ACQUIRE)) pad_yield();
+    const unsigned long long pause = s_rp_read ? now - s_rp_read : 0;
+    s_rp_read = now;
+    s_rp_clock += pause < PAD_REC_PAUSE ? pause : PAD_REC_PAUSE;
+    /* At a mark this run has not made yet: wait for it there. */
+    while (s_rpm_next < s_rpm_n && (s_rpm[s_rpm_next].got || s_rpt[s_rpm[s_rpm_next].text].shaky)) s_rpm_next++;
+    if (s_rpm_next < s_rpm_n && s_rp_clock >= s_rpm[s_rpm_next].ms) {
+        if (!s_rpm_hold) s_rpm_hold = now;
+        const PadRpMark* m = &s_rpm[s_rpm_next];
+        if (now - s_rpm_hold >= 5000) {
+            const unsigned at = m->ms;
+            int n = 0;
+            s_rpt[m->text].shaky = 1;
+            printf("[cellPad] PAD_REPLAY: '%s' did not come in 5 s", s_rpt[m->text].s);
+            while (s_rpm_next < s_rpm_n && s_rpm[s_rpm_next].ms <= at + 1000) { s_rpm_next++; n++; }
+            printf("; on without it and %d more, and no longer waiting for it\n", n - 1);
+            fflush(stdout);
+            s_rpm_hold = 0;
+            s_rpm_said = 0;
+        } else {
+            if (now - s_rpm_hold >= 3000 && !s_rpm_said) {
+                s_rpm_said = 1;
+                printf("[cellPad] PAD_REPLAY: waiting at %.1f s for '%s'\n", m->ms / 1000.0, s_rpt[m->text].s);
+                fflush(stdout);
+            }
+            s_rp_clock = m->ms;
+        }
+    }
+    while (s_rp_i + 1 < s_rp_n && s_rp[s_rp_i + 1].ms <= s_rp_clock) s_rp_i++;
+    const PadRpReport* r = s_rp_clock >= s_rp[0].ms ? &s_rp[s_rp_i] : NULL;
+    if (s_rp_i + 1 == s_rp_n && !s_rp_said_end && r) {
+        s_rp_said_end = 1;
+        printf("[cellPad] PAD_REPLAY: the recording's last report, at %.1f s on its clock\n", r->ms / 1000.0);
+        fflush(stdout);
+    }
+    __atomic_clear(&s_rp_lock, __ATOMIC_RELEASE);
+    return r;
+}
+
+/* A report from the playback into the host state the packet is made from. */
+static void pad_rp_apply(const PadRpReport* r, PadHostState* hs)
+{
+    hs->connected = 1;
+    hs->buttons = (u16)((r->v[1] << 8) | r->v[0]);
+    hs->analog_rx = (u8)r->v[2]; hs->analog_ry = (u8)r->v[3];
+    hs->analog_lx = (u8)r->v[4]; hs->analog_ly = (u8)r->v[5];
+    hs->press_right = (u8)r->v[6];     hs->press_left = (u8)r->v[7];
+    hs->press_up = (u8)r->v[8];        hs->press_down = (u8)r->v[9];
+    hs->press_triangle = (u8)r->v[10]; hs->press_circle = (u8)r->v[11];
+    hs->press_cross = (u8)r->v[12];    hs->press_square = (u8)r->v[13];
+    hs->press_l1 = (u8)r->v[14];       hs->press_r1 = (u8)r->v[15];
+    hs->trigger_l2 = (u8)r->v[16];     hs->trigger_r2 = (u8)r->v[17];
+}
+
 /* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
  * vm_write helpers from ppu_memory.h translate + byte-swap. (cellPad was
  * written for host pointers and was never actually invoked until its NIDs
@@ -1067,6 +1391,15 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 
     /* Poll fresh state */
     pad_poll_backend();
+
+    /* The recording and the playback (see cellPad_record_to): both count reads of port 0. */
+    const PadRpReport* replay = NULL;
+    unsigned long long read_ms = 0;
+    if (port_no == 0 && (s_rec || s_rp_on > 0)) {
+        read_ms = pad_now_ms();
+        if (s_rec) pad_rec_read(read_ms);
+        if (s_rp_on > 0) replay = pad_rp_step(read_ms);
+    }
 
     /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
      * GetData) -- if it's parked on a "press button" prompt after loading, no
@@ -1145,6 +1478,10 @@ skip_inject: ;
     PadHostState now = *hs;
     hs = &now;
     if (data->len) pad_take(port_no, hs);
+    if (s_rp_on > 0 && port_no == 0) {
+        if (replay) pad_rp_apply(replay, hs);
+        else        pad_host_release(hs);   /* before the recording's first report: nothing pressed */
+    }
     /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
      * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
      * whose button[0] is non-zero -- with len (8) there, every press was
@@ -1389,6 +1726,8 @@ emit:
      * attack firing once.
      *
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+    if (s_rec && read_ms && port_no == 0 && data->len > 0)
+        pad_rec_report(data->button, (s_port_setting[0] & CELL_PAD_SETTING_PRESS_ON) != 0, read_ms);
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */

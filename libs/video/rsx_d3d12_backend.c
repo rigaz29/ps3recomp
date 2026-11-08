@@ -2115,6 +2115,15 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
  * before. At the start the most recently used are built first: the first time
  * a session uses a pipeline it is noted, and the notes go onto the journal as
  * USED records every 10 s.
+ *
+ * The start's build runs on several threads, and the title waits for it
+ * before its first picture (graphics.pipeline_wait, on by default), so no
+ * pipeline the store has is built while the game is played. With the driver's
+ * own cache warm the fight bench's 6,143 take 1.02 s on one thread and 0.32 s
+ * on six, and the title starts 0.32 s later. Without the wait the build was
+ * over 1.1 s into the boot, long before the title, and a whole session
+ * (boot, menus, 140 s of the fight) queued one build, on the first logo; the
+ * wait is for when the driver compiles them all again, after an update.
  * -----------------------------------------------------------------------*/
 #define PSOC_VERSION   1u
 static struct PsocSlot { u64 key; ID3D12PipelineState* pso; u32 seen, pad; } *s_psoc;   /* open addressing, s_psoc_cap slots */
@@ -2421,28 +2430,48 @@ static void psoc_mem(double* priv, double* local, double* shared)
 static volatile LONG s_sj_inflight;
 static volatile LONG s_psoc_done, s_psoc_total;
 
-/* The thread that builds the file's pipelines. */
-static DWORD WINAPI psoc_thread(LPVOID arg)
+/* graphics.pipeline_wait (D3D12_PSO_CACHE_WAIT), on by default: the title
+ * waits, before its first picture, until the start's build is over. Read once. */
+static int psoc_wait_on(void)
 {
-    (void)arg;
-    ps3_thread_name("pipeline cache");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    const double t0 = perf_now();
-    double m0[3], m1[3];
-    psoc_mem(&m0[0], &m0[1], &m0[2]);
-    static D3D12_INPUT_ELEMENT_DESC il[16];
-    static char names[16][16];
-    u32* order = (u32*)malloc((size_t)s_psoc_nrecs * sizeof *order);
-    if (order) {
-        for (u32 r = 0; r < s_psoc_nrecs; r++) order[r] = r;
-        qsort(order, s_psoc_nrecs, sizeof *order, psoc_order);
+    static int v = -1;
+    if (v < 0) v = ps3_settings_bool("graphics", "pipeline_wait", "D3D12_PSO_CACHE_WAIT", 1);
+    return v;
+}
+
+/* The start's build: threads at once (D3D12_PSO_CACHE_THREADS, half the
+ * logical processors, at most 8), each taking the next pipeline in
+ * psoc_order's order until none is left or the table holds s_psoc_max. */
+static u32* s_psoc_order;
+static volatile LONG s_psoc_next;
+static HANDLE s_psoc_built_ev;          /* set when it is over */
+
+static int psoc_nthreads(void)
+{
+    const char* e = getenv("D3D12_PSO_CACHE_THREADS");
+    int n = e ? atoi(e) : 0;
+    if (n <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = (int)si.dwNumberOfProcessors / 2;
     }
-    const u32 total = s_psoc_nrecs < s_psoc_max ? s_psoc_nrecs : s_psoc_max;
-    InterlockedExchange(&s_psoc_done, 0);
-    InterlockedExchange(&s_psoc_total, (LONG)total);
-    for (u32 k = 0; k < s_psoc_nrecs && s_psoc_held < s_psoc_max; k++) {
-        InterlockedExchange(&s_psoc_done, (LONG)(s_psoc_held < total ? s_psoc_held : total));
-        const PsocRec* rec = &s_psoc_recs[order ? order[k] : k];
+    return n < 1 ? 1 : n > 8 ? 8 : n;
+}
+
+static DWORD WINAPI psoc_builder(LPVOID arg)
+{
+    const int k = (int)(intptr_t)arg;
+    if (k) {
+        ps3_thread_name("pipeline cache %d", k);
+        SetThreadPriority(GetCurrentThread(), psoc_wait_on() ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    D3D12_INPUT_ELEMENT_DESC il[16];
+    char names[16][16];
+    for (;;) {
+        const LONG n = InterlockedIncrement(&s_psoc_next) - 1;
+        if ((u32)n >= s_psoc_nrecs || s_psoc_held >= s_psoc_max) break;
+        InterlockedIncrement(&s_psoc_done);
+        const PsocRec* rec = &s_psoc_recs[s_psoc_order ? s_psoc_order[n] : (u32)n];
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
         int dbt = 0, known = 0;
         ID3D12PipelineState* have = psoc_find(rec->key, &known, 0);
@@ -2471,22 +2500,72 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
             InterlockedIncrement(&s_psoc_failed);
         }
     }
-    free(order);
+    return 0;
+}
+
+/* The start's build (arg: its threads, this one among them), then the
+ * session's uses onto the journal every 10 s, for the next start's order. */
+static DWORD WINAPI psoc_thread(LPVOID arg)
+{
+    const int nt = (int)(intptr_t)arg;
+    ps3_thread_name("pipeline cache");
+    SetThreadPriority(GetCurrentThread(), psoc_wait_on() ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+    const double t0 = perf_now();
+    double m0[3], m1[3];
+    psoc_mem(&m0[0], &m0[1], &m0[2]);
+    s_psoc_order = (u32*)malloc((size_t)s_psoc_nrecs * sizeof *s_psoc_order);
+    if (s_psoc_order) {
+        for (u32 r = 0; r < s_psoc_nrecs; r++) s_psoc_order[r] = r;
+        qsort(s_psoc_order, s_psoc_nrecs, sizeof *s_psoc_order, psoc_order);
+    }
+    InterlockedExchange(&s_psoc_done, 0);
+    InterlockedExchange(&s_psoc_total, (LONG)(s_psoc_nrecs < s_psoc_max ? s_psoc_nrecs : s_psoc_max));
+    HANDLE h[8];
+    int nh = 0;
+    for (int k = 1; k < nt && nh < 8; k++) {
+        HANDLE t = CreateThread(NULL, 0, psoc_builder, (LPVOID)(intptr_t)k, 0, NULL);
+        if (t) h[nh++] = t;
+    }
+    psoc_builder(NULL);
+    if (nh) WaitForMultipleObjects((DWORD)nh, h, TRUE, INFINITE);
+    for (int k = 0; k < nh; k++) CloseHandle(h[k]);
+    free(s_psoc_order);
+    s_psoc_order = NULL;
     InterlockedExchange(&s_psoc_total, 0);
     psoc_mem(&m1[0], &m1[1], &m1[2]);
-    fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms (%ld failed, %u held at most); "
-                    "memory while it ran: private %+.0f MB, GPU local %+.0f MB, shared %+.0f MB%c",
-            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, (long)s_psoc_failed, s_psoc_max,
-            m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2], 10);
-    /* Then the session's uses onto the journal, every 10 s, for the next start's order. */
+    fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms by %d threads (%ld failed, %u "
+                    "held at most); memory while it ran: private %+.0f MB, GPU local %+.0f MB, shared %+.0f MB%c",
+            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, nh + 1, (long)s_psoc_failed,
+            s_psoc_max, m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2], 10);
+    SetEvent(s_psoc_built_ev);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         Sleep(10000);
         psoc_flush_used();
     }
 }
 
-/* On the drain thread, at the title's first guest pipeline: the store's
- * pipelines into the table, built on a thread of their own. */
+static void rt_pump(void);
+static DWORD rt_wake_mask(void);
+
+/* The title, before its first picture, until the start's build is over: at
+ * most 30 s, the window's messages seen to meanwhile (without the render
+ * thread this thread owns the window). */
+static void psoc_hold(void)
+{
+    const double t0 = perf_now();
+    int over = 0;
+    while (!over && !s_d3d.window_closed && perf_now() - t0 < 30.0) {
+        const DWORD r = MsgWaitForMultipleObjects(1, &s_psoc_built_ev, FALSE, 50, rt_wake_mask());
+        if (r == WAIT_OBJECT_0) over = 1;
+        else if (r == WAIT_OBJECT_0 + 1) rt_pump();
+    }
+    fprintf(stderr, "[d3d12] pipeline cache: the title waited %.2f s for it%s%c", perf_now() - t0,
+            over ? "" : ", and went on without it", 10);
+}
+
+/* Where the title's first guest pipeline is asked for (the render thread, or
+ * the walk without it): the store's pipelines into the table, and their build. */
 static void psoc_start(void)
 {
     if (s_psoc_mode >= 0) return;
@@ -2508,10 +2587,16 @@ static void psoc_start(void)
     }
     ReleaseSRWLockExclusive(&s_psoc_lock);
     s_psoc_mode = 1;
-    fprintf(stderr, "[d3d12] pipeline cache: %u pipelines to build%c", s_psoc_nrecs, 10);
+    const int nt = psoc_nthreads();
+    fprintf(stderr, "[d3d12] pipeline cache: %u pipelines to build on %d threads%s%c", s_psoc_nrecs, nt,
+            s_psoc_nrecs && psoc_wait_on() ? ", the title waits for them" : "", 10);
     if (s_psoc_nrecs) {
-        HANDLE t = CreateThread(NULL, 0, psoc_thread, NULL, 0, NULL);
-        if (t) CloseHandle(t);
+        s_psoc_built_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+        HANDLE t = s_psoc_built_ev ? CreateThread(NULL, 0, psoc_thread, (LPVOID)(intptr_t)nt, 0, NULL) : NULL;
+        if (t) {
+            CloseHandle(t);
+            if (psoc_wait_on()) psoc_hold();
+        }
     }
 }
 
@@ -4584,7 +4669,8 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         if (ovi_on() && (jobs > 0 || ptot > 0)) {
             ovi_until = GetTickCount64() + 600;
             if (ptot > 0) {
-                const LONG pdone = InterlockedCompareExchange(&s_psoc_done, 0, 0);
+                LONG pdone = InterlockedCompareExchange(&s_psoc_done, 0, 0);
+                if (pdone > ptot) pdone = ptot;   /* the builders take a few past the end */
                 snprintf(ovi_text, sizeof ovi_text, "Building pipelines %ld / %ld", (long)pdone, (long)ptot);
                 ovi_frac = (float)pdone / (float)ptot;
             } else {

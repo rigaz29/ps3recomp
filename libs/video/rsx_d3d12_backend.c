@@ -797,6 +797,50 @@ static ID3D12Resource* s_screen_copy = NULL;
 static struct { ID3D12Resource* res; u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
 static int s_subvp_n = 0;
 
+/* Once, when a call finds the device gone: why, and with D3D12_DRED=1 what the GPU was
+ * doing and the address it faulted on. */
+static void device_lost_report(const char* where)
+{
+    static volatile LONG said = 0;
+    if (InterlockedExchange(&said, 1) || !s_d3d.device) return;
+    fprintf(stderr, "[D3D12] device lost, seen %s: reason 0x%08lX, frame %llu%c", where,
+            (unsigned long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device),
+            (unsigned long long)s_d3d.frame_count, 10);
+    ID3D12DeviceRemovedExtendedData* dr = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12DeviceRemovedExtendedData, (void**)&dr)) || !dr) {
+        fflush(stderr);
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc;
+    memset(&bc, 0, sizeof bc);
+    if (SUCCEEDED(dr->lpVtbl->GetAutoBreadcrumbsOutput(dr, &bc))) {
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+            const UINT32 last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (last >= n->BreadcrumbCount) continue;   /* the GPU got through this list */
+            fprintf(stderr, "[dred] list %p '%s' queue '%s': %u of %u ops done, around the stop:", (void*)n->pCommandList,
+                    n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "", n->pCommandQueueDebugNameA ? n->pCommandQueueDebugNameA : "",
+                    last, n->BreadcrumbCount);
+            const UINT32 from = last > 12 ? last - 12 : 0, to = last + 12 < n->BreadcrumbCount ? last + 12 : n->BreadcrumbCount;
+            for (UINT32 i = from; i < to; i++)
+                fprintf(stderr, "%s%u", i == last ? " >" : " ", (unsigned)n->pCommandHistory[i]);
+            fprintf(stderr, "%c", 10);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf;
+    memset(&pf, 0, sizeof pf);
+    if (SUCCEEDED(dr->lpVtbl->GetPageFaultAllocationOutput(dr, &pf))) {
+        fprintf(stderr, "[dred] page fault at GPU VA 0x%llX%c", (unsigned long long)pf.PageFaultVA, 10);
+        int k = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadExistingAllocationNode; a && k < 12; a = a->pNext, k++)
+            fprintf(stderr, "[dred]   there now: type %d '%s'%c", (int)a->AllocationType, a->ObjectNameA ? a->ObjectNameA : "", 10);
+        k = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadRecentFreedAllocationNode; a && k < 12; a = a->pNext, k++)
+            fprintf(stderr, "[dred]   freed there: type %d '%s'%c", (int)a->AllocationType, a->ObjectNameA ? a->ObjectNameA : "", 10);
+    }
+    dr->lpVtbl->Release(dr);
+    fflush(stderr);
+}
+
 static void subvp_note(u32 x, u32 y, u32 w, u32 h)
 {
     if (!w || !h || w > s_d3d.width || h > s_d3d.height) return;
@@ -2679,6 +2723,7 @@ static void sj_build(ShaderJob* j)
                      j->pd.PS.pShaderBytecode, (u32)j->pd.PS.BytecodeLength);
     }
     if (FAILED(j->hr)) {
+        if (j->hr == DXGI_ERROR_DEVICE_REMOVED) device_lost_report("building a pipeline");
         /* The driver refused it: what it was given. */
         const char* cb = strstr(j->src, "fp_constants[");
         char k[40];
@@ -3135,14 +3180,21 @@ static int rs_class(u32 w, u32 h)
     return s_rs != 1.0f && w == s_d3d.width && h == s_d3d.height;
 }
 
-/* A guest rectangle in the pixels of a target drawn sx, sy times larger. */
+/* A guest coordinate in the pixels of a target drawn f times larger. */
+static u32 rs_px(u32 v, float f)
+{
+    return (u32)((float)v * f + 0.5f);
+}
+
+/* A guest rectangle in the pixels of a target drawn sx, sy times larger. The factors are not
+ * exact: the slack keeps the target's own edge from rounding one pixel outward. */
 static void rs_rect(D3D12_RECT* r, float sx, float sy)
 {
     if (sx == 1.0f && sy == 1.0f) return;
-    r->left = (LONG)floorf((float)r->left * sx);
-    r->top = (LONG)floorf((float)r->top * sy);
-    r->right = (LONG)ceilf((float)r->right * sx);
-    r->bottom = (LONG)ceilf((float)r->bottom * sy);
+    r->left = (LONG)floorf((float)r->left * sx + 0.001f);
+    r->top = (LONG)floorf((float)r->top * sy + 0.001f);
+    r->right = (LONG)ceilf((float)r->right * sx - 0.001f);
+    r->bottom = (LONG)ceilf((float)r->bottom * sy - 0.001f);
 }
 
 /* The factors of what a pass draws into: its depth surface when it has no colour, else its colour
@@ -3157,6 +3209,16 @@ static void rs_target(int rt, int z, int depth_only, float* sx, float* sy)
 static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
+
+    if (getenv("D3D12_DRED")) {
+        ID3D12DeviceRemovedExtendedDataSettings* dred = NULL;
+        if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings, (void**)&dred)) && dred) {
+            dred->lpVtbl->SetAutoBreadcrumbsEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->lpVtbl->SetPageFaultEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->lpVtbl->Release(dred);
+            printf("[D3D12] DRED on%c", 10);
+        }
+    }
 
     /* Enable debug layer in debug builds */
     /* Debug layer: on in debug builds, or in any build when D3D12_DBG is set
@@ -8394,6 +8456,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                      pb->lpVtbl->GetBufferPointer(pb), (u32)pb->lpVtbl->GetBufferSize(pb));
         pb->lpVtbl->Release(pb);
         if (FAILED(hr)) {
+            if (hr == DXGI_ERROR_DEVICE_REMOVED) device_lost_report("building a pipeline");
             static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
             return NULL;
         }
@@ -12000,10 +12063,19 @@ static void blit_rt_copy(const D3D12DrawRecord* dr)
         return;
     }
     if (rs->sx != 1.0f || rs->sy != 1.0f) {
+        /* By the edges. A position and a size rounded apart reach one pixel past the
+         * target, and a box past its edge loses the device (DXGI_ERROR_INVALID_CALL). */
         const float fx = rs->sx, fy = rs->sy;
-        w = (u32)((float)w * fx + 0.5f); h = (u32)((float)h * fy + 0.5f);
-        sx = (u32)((float)sx * fx + 0.5f); sy = (u32)((float)sy * fy + 0.5f);
-        dx = (u32)((float)dx * fx + 0.5f); dy = (u32)((float)dy * fy + 0.5f);
+        u32 x1 = rs_px(sx + w, fx), y1 = rs_px(sy + h, fy), x2 = rs_px(dx + w, fx), y2 = rs_px(dy + h, fy);
+        sx = rs_px(sx, fx); sy = rs_px(sy, fy);
+        dx = rs_px(dx, fx); dy = rs_px(dy, fy);
+        if (x1 > rs->pw) x1 = rs->pw;
+        if (y1 > rs->ph) y1 = rs->ph;
+        if (x2 > rd->pw) x2 = rd->pw;
+        if (y2 > rd->ph) y2 = rd->ph;
+        w = x1 - sx < x2 - dx ? x1 - sx : x2 - dx;
+        h = y1 - sy < y2 - dy ? y1 - sy : y2 - dy;
+        if (!w || !h) return;
     }
     const D3D12_RESOURCE_STATES ss = rs->st, ds = rd->st;
     off_rt_transition(s, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -15124,6 +15196,7 @@ skip_dump_consider: ;
         { static int said = 0;
           if (FAILED(phr) && !said) {
               said = 1;
+              device_lost_report("at Present");
               fprintf(stderr, "[D3D12] Present failed hr=0x%08lX removed=0x%08lX at frame %llu (%u ops)\n",
                       (unsigned long)phr,
                       (unsigned long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device),

@@ -140,6 +140,20 @@ add_custom_command(
     VERBATIM)
 target_sources(ps3recomp_runtime PRIVATE "${SMAA_EMBED}")
 
+# Zstandard 1.5.7 (BSD, third_party/zstd): the D3D12 backend keeps its shader
+# cache in one zstd frame.
+if(WIN32)
+    file(GLOB ZSTD_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib/common/*.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib/compress/*.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib/decompress/*.c")
+    set_source_files_properties(${ZSTD_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w"                       # upstream code
+        COMPILE_DEFINITIONS "ZSTD_DISABLE_ASM=1")
+    target_sources(ps3recomp_runtime PRIVATE ${ZSTD_SOURCES})
+    target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib")
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

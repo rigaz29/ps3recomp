@@ -40,6 +40,10 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>     /* K32GetProcessMemoryInfo: what the pipeline cache's build costs */
+#include <io.h>        /* _chsize_s, _get_osfhandle: the shader cache's journal */
+#include <errno.h>
+#include "zstd.h"      /* third_party/zstd: the shader cache's pack */
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency.
  * initguid.h only turns DEFINE_GUID into a definition for headers included
@@ -1142,34 +1146,82 @@ static void fg_frame(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Compiled guest shaders on disk (D3D12_SHADER_CACHE=<file>)
+ * Compiled guest shaders on disk (graphics.shader_cache, D3D12_SHADER_CACHE)
  *
  * Guest vertex and fragment programs are decompiled to HLSL and compiled when
  * a draw first needs them, tens of milliseconds each, so a scene that brings
- * in new programs stops the drain for as long as they take. With
- * D3D12_SHADER_CACHE set, every compiled program is appended to that file
- * under a hash of its source and target, and the next run reads the file at
- * its first compile and skips the compiler for every program it has seen. A
- * damaged record ends the read, and the file is then rewritten from what was
- * read before it.
+ * in new programs stops the drain for as long as they take. With a cache file
+ * every compiled program is kept under a hash of its source and target, and
+ * the next run skips the compiler for every program it has seen. The guest
+ * pipelines made from them are kept with them (D3D12_PSO_CACHE, below).
  *
  * Programs come from DXC, or from D3DCompile (see shc_pick_compiler). D3D12
  * refuses a pipeline with one of each, so every program of a guest pipeline
- * comes from the same one, and DXC's are kept in a file of their own,
- * <shader cache>.dxil, with its pipelines in <shader cache>.dxil.pso.
+ * comes from the same one, and DXC's are kept apart, in <shader cache>.dxil.
+ *
+ * The store keeps each program once, under a hash of its bytes; the sources
+ * that compile to it and the pipelines made from it name it by that hash.
+ * On disk:
+ *  - <file>, the pack: the store as the last fold saw it, in one zstd frame
+ *    (level 19, long-distance matching, a window as long as the store). The
+ *    programs share most of their bytes: God of War: Ascension's 2,287
+ *    (28.4 MB) pack to 5.8 MB, where each alone compresses to two thirds.
+ *  - <file>.journal: what came after, one record appended for each program,
+ *    source or pipeline as it is made.
+ * Records, little-endian: a tag, the length of the rest (padded to 4), then
+ *    PROG  id, length, bytecode
+ *    SRCK  source key, source length, program id
+ *    PIPE  pipeline key, vertex and pixel program ids, the session that last
+ *          used it (its start, in seconds), its description's length and
+ *          the description (psoc_state_bytes)
+ *    USED  a session, the number of keys, the keys of the pipelines it used
+ *          (the journal only: a fold puts the session in their PIPE records)
+ * A fold, on a thread of its own at the lowest priority, packs the store
+ * again when the journal has grown past an eighth of the pack (4 MB at
+ * least) or the pack cannot be read, and the journal then starts over with
+ * what was added while it ran. A record cut short ends the read, and the
+ * journal is cut back to the records before it.
+ *
+ * Before the store, programs were kept whole in <file> (PS3RSHC2), and again,
+ * both of each pipeline's, in <file>.pso (GWPSOC01), which stopped taking
+ * pipelines at 6,143: the player's cache had grown to 83 MB, the fight
+ * bench's to 129 MB. Both are read once into the store; the fold replaces the
+ * first and deletes the second.
  * -----------------------------------------------------------------------*/
-typedef struct { u64 key; u32 srclen; ID3DBlob* blob; } ShaderCacheEntry;
-static ShaderCacheEntry* s_shc;     /* open addressing, s_shc_cap slots (a power of two) */
+typedef struct ShProg { u64 id; u32 len; u32 pad; const u8* p; } ShProg;
+typedef struct { u64 key; u32 srclen; ShProg* prog; } ShaderCacheEntry;
+static ShaderCacheEntry* s_shc;     /* source -> program: open addressing, s_shc_cap slots (a power of two) */
 static u32    s_shc_cap, s_shc_n;
-static FILE*  s_shc_file;
+static ShProg** s_shp;              /* id -> program: the same, s_shp_cap slots */
+static u32    s_shp_cap, s_shp_n;
+static ShProg** s_shp_list;         /* the programs in the order they came, s_shp_n of them */
+static FILE*  s_shc_file;           /* the journal, appended to */
+static u64    s_shc_jid;            /* its id; 0 without one */
+static char   s_shc_path[1024];     /* the pack */
 static int    s_shc_on = -1;
 static int    s_shc_dxc;            /* guest programs come from DXC, settled by shc_open */
 static SRWLOCK s_shc_lock = SRWLOCK_INIT;
 static u32    s_shc_stat_compiled, s_shc_stat_hits, s_shc_stat_pso;   /* PERF=1 report */
 static double s_shc_stat_compile_s, s_shc_stat_pso_s;
 /* 2: fragment programs read their constants from b1 again, so every one
- * compiled before is text no draw asks for; the file starts over. */
-static const char s_shc_magic[8] = { 'P', 'S', '3', 'R', 'S', 'H', 'C', '2' };
+ * compiled before is text no draw asks for; the file started over.
+ * 3: the store's pack. */
+static const char s_shc_magic[8]   = { 'P', 'S', '3', 'R', 'S', 'H', 'C', '3' };
+static const char s_shc_magic2[8]  = { 'P', 'S', '3', 'R', 'S', 'H', 'C', '2' };
+static const char s_shj_magic[8]   = { 'P', 'S', '3', 'R', 'S', 'H', 'J', '1' };
+static const char s_psoc_magic1[8] = { 'G', 'W', 'P', 'S', 'O', 'C', '0', '1' };
+/* The pack's header: magic, its size and 0 (u32), the store's size, the frame's size,
+ * the id of the journal it has the start of and how much of it (u64). */
+#define SHC_HDR   48u
+#define SHR_PROG  0x474F5250u       /* "PROG" */
+#define SHR_SRCK  0x4B435253u       /* "SRCK" */
+#define SHR_PIPE  0x45504950u       /* "PIPE" */
+#define SHR_USED  0x44455355u       /* "USED" */
+#define PSOC_STATE_MAX 2048u        /* a pipeline's description at most (psoc_state_bytes) */
+/* The pipelines the store had at the start, in order: built by psoc_thread. */
+typedef struct { u64 key, vs, ps; u32 used, stn; const u8* st; } PsocRec;
+static PsocRec* s_psoc_recs;
+static u32 s_psoc_nrecs, s_psoc_rcap;
 
 /* D3D12_SHADER_OPT=0|1|2|3|skip: the D3DCompile optimisation level for guest
  * programs (default 1, D3DCompile's own default). */
@@ -1213,53 +1265,496 @@ static u64 shc_key(const char* src, size_t len, const char* target, UINT flags)
 static ShaderCacheEntry* shc_slot(u64 key, u32 srclen)
 {
     u32 i = (u32)(key ^ (key >> 32)) & (s_shc_cap - 1);
-    while (s_shc[i].blob && !(s_shc[i].key == key && s_shc[i].srclen == srclen))
+    while (s_shc[i].prog && !(s_shc[i].key == key && s_shc[i].srclen == srclen))
         i = (i + 1) & (s_shc_cap - 1);
     return &s_shc[i];
 }
 
-/* Takes over the caller's reference to `blob`. Returns 0 if it was dropped. */
-static int shc_put(u64 key, u32 srclen, ID3DBlob* blob)
+/* The source's program; 1 if the source was new. s_shc_lock held. */
+static int shc_put(u64 key, u32 srclen, ShProg* prog)
 {
     if ((s_shc_n + 1) * 2 > s_shc_cap) {          /* keep the table under half full */
         const u32 old_cap = s_shc_cap;
         ShaderCacheEntry* old = s_shc;
         ShaderCacheEntry* t = (ShaderCacheEntry*)calloc(old_cap ? old_cap * 2 : 1024, sizeof *t);
-        if (!t) { blob->lpVtbl->Release(blob); return 0; }
+        if (!t) return 0;
         s_shc = t; s_shc_cap = old_cap ? old_cap * 2 : 1024;
         for (u32 i = 0; i < old_cap; i++)
-            if (old[i].blob) *shc_slot(old[i].key, old[i].srclen) = old[i];
+            if (old[i].prog) *shc_slot(old[i].key, old[i].srclen) = old[i];
         free(old);
     }
     ShaderCacheEntry* e = shc_slot(key, srclen);
-    if (e->blob) { blob->lpVtbl->Release(blob); return 0; }
-    e->key = key; e->srclen = srclen; e->blob = blob; s_shc_n++;
+    if (e->prog) return 0;
+    e->key = key; e->srclen = srclen; e->prog = prog; s_shc_n++;
     return 1;
 }
 
-static void shc_write(FILE* f, u64 key, u32 srclen, ID3DBlob* b)
+/* A program's id: FNV-1a 64 of its bytes, then of their length; never 0. */
+static u64 shp_hash(const void* p, size_t n)
 {
-    const u32 hdr[2] = { srclen, (u32)b->lpVtbl->GetBufferSize(b) };
-    fwrite(&key, 8, 1, f);
-    fwrite(hdr, 4, 2, f);
-    fwrite(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f);
+    const u8* b = (const u8*)p;
+    u64 h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    h ^= (u64)n; h *= 1099511628211ull;
+    return h ? h : 1;
 }
 
-/* A copy of a cached program, for the caller to own: the cache's own blobs
- * are never handed out. d3dcompiler_47 counts a blob's references without
- * atomics (ID3DBlob::Release is a plain load, decrement and store), and one
- * blob shared by the shader workers and the drain thread lost counts: freed
- * while the cache still held it, the next pipeline made from it was refused
- * (E_FAIL, its bytecode gone) and its release freed the block a second time.
- * God of War: Ascension's first level crashed with a corrupted heap in half
- * the runs, a few seconds in. */
-static ID3DBlob* shc_copy(ID3DBlob* b)
+static ShProg** shp_slot(u64 id)
+{
+    u32 i = (u32)(id ^ (id >> 32)) & (s_shp_cap - 1);
+    while (s_shp[i] && s_shp[i]->id != id) i = (i + 1) & (s_shp_cap - 1);
+    return &s_shp[i];
+}
+
+/* The program with this id, or NULL. Programs never move or go, so one found
+ * stays good after the lock is let go. s_shc_lock held (shared will do). */
+static ShProg* shp_get(u64 id)
+{
+    return s_shp_cap ? *shp_slot(id) : NULL;
+}
+
+/* The store's program with these bytes, added if it has none (*added): the
+ * bytes copied (own), or used where they are, in a buffer kept for the
+ * session. id: their hash if the caller has it, else 0. NULL when out of
+ * memory, or when the store has other bytes under that hash: never one
+ * program for another. s_shc_lock held. */
+static ShProg* shp_put(const void* p, u32 n, u64 id, int own, int* added)
+{
+    *added = 0;
+    if (!n) return NULL;
+    if (!id) id = shp_hash(p, n);
+    if ((s_shp_n + 1) * 2 > s_shp_cap) {          /* under half full; the list as long as half */
+        const u32 old_cap = s_shp_cap, cap = old_cap ? old_cap * 2 : 4096;
+        ShProg** t = (ShProg**)calloc(cap, sizeof *t);
+        ShProg** l = t ? (ShProg**)realloc(s_shp_list, (size_t)(cap / 2) * sizeof *l) : NULL;
+        if (!l) { free(t); return NULL; }
+        ShProg** old = s_shp;
+        s_shp = t; s_shp_cap = cap; s_shp_list = l;
+        for (u32 i = 0; i < old_cap; i++)
+            if (old[i]) *shp_slot(old[i]->id) = old[i];
+        free(old);
+    }
+    ShProg** s = shp_slot(id);
+    if (*s) return (*s)->len == n && !memcmp((*s)->p, p, n) ? *s : NULL;
+    ShProg* g = (ShProg*)malloc(sizeof *g + (own ? n : 0));
+    if (!g) return NULL;
+    g->id = id; g->len = n; g->pad = 0;
+    g->p = own ? (const u8*)memcpy(g + 1, p, n) : (const u8*)p;
+    *s = g;
+    s_shp_list[s_shp_n++] = g;
+    *added = 1;
+    return g;
+}
+
+/* A program's bytes in a blob for the caller to own: the store hands out no
+ * blob of its own. d3dcompiler_47 counts a blob's references without atomics
+ * (ID3DBlob::Release is a plain load, decrement and store), and one blob the
+ * cache shared with the shader workers and the drain thread lost counts:
+ * freed while the cache still held it, the next pipeline made from it was
+ * refused (E_FAIL, its bytecode gone) and its release freed the block a
+ * second time. God of War: Ascension's first level crashed with a corrupted
+ * heap in half the runs, a few seconds in. */
+static ID3DBlob* shp_blob(const ShProg* g)
 {
     ID3DBlob* c = NULL;
-    const SIZE_T n = b->lpVtbl->GetBufferSize(b);
-    if (FAILED(D3DCreateBlob(n, &c)) || !c) return NULL;
-    memcpy(c->lpVtbl->GetBufferPointer(c), b->lpVtbl->GetBufferPointer(b), n);
+    if (FAILED(D3DCreateBlob(g->len, &c)) || !c) return NULL;
+    memcpy(c->lpVtbl->GetBufferPointer(c), g->p, g->len);
     return c;
+}
+
+/* A record's size, and the record written to o: the tag, the length of the
+ * rest (a and b, padded to 4), a, b. */
+static u32 shr_size(u32 an, u32 bn) { return 8u + ((an + bn + 3u) & ~3u); }
+static u32 shr_fill(u8* o, u32 tag, const void* a, u32 an, const void* b, u32 bn)
+{
+    const u32 rest = (an + bn + 3u) & ~3u;
+    memcpy(o, &tag, 4); memcpy(o + 4, &rest, 4);
+    memcpy(o + 8, a, an);
+    if (bn) memcpy(o + 8 + an, b, bn);
+    memset(o + 8 + an + bn, 0, rest - an - bn);
+    return 8u + rest;
+}
+static void shr_prog(u32 h[4], const ShProg* g)
+{
+    h[0] = (u32)g->id; h[1] = (u32)(g->id >> 32); h[2] = g->len; h[3] = 0;
+}
+static void shr_srck(u32 h[6], u64 key, u32 srclen, u64 id)
+{
+    h[0] = (u32)key; h[1] = (u32)(key >> 32); h[2] = srclen; h[3] = 0;
+    h[4] = (u32)id; h[5] = (u32)(id >> 32);
+}
+static void shr_pipe(u32 h[8], const PsocRec* r)
+{
+    h[0] = (u32)r->key; h[1] = (u32)(r->key >> 32); h[2] = (u32)r->vs; h[3] = (u32)(r->vs >> 32);
+    h[4] = (u32)r->ps; h[5] = (u32)(r->ps >> 32); h[6] = r->used; h[7] = r->stn;
+}
+
+/* One record onto the journal, in one write. A write that fails ends the
+ * journal for the session; the next one cuts it back. s_shc_lock held. */
+static void shj_put(u32 tag, const void* a, u32 an, const void* b, u32 bn)
+{
+    if (!s_shc_file) return;
+    u8 buf[1024];
+    const u32 n = shr_size(an, bn);
+    u8* o = n <= sizeof buf ? buf : (u8*)malloc(n);
+    if (!o) return;
+    shr_fill(o, tag, a, an, b, bn);
+    if (fwrite(o, 1, n, s_shc_file) != n || fflush(s_shc_file) != 0) {
+        fclose(s_shc_file);
+        s_shc_file = NULL;
+    }
+    if (o != buf) free(o);
+}
+
+static void shj_prog(const ShProg* g)
+{
+    u32 h[4];
+    shr_prog(h, g);
+    shj_put(SHR_PROG, h, 16, g->p, g->len);
+}
+
+/* A compiled program into the store under its source, and onto the journal.
+ * s_shc_lock held. */
+static void shc_keep(u64 key, u32 srclen, ID3DBlob* b)
+{
+    int added = 0;
+    ShProg* g = shp_put(b->lpVtbl->GetBufferPointer(b), (u32)b->lpVtbl->GetBufferSize(b), 0, 1, &added);
+    if (!g) return;
+    if (added) shj_prog(g);
+    if (shc_put(key, srclen, g)) {
+        u32 h[6];
+        shr_srck(h, key, srclen, g->id);
+        shj_put(SHR_SRCK, h, 24, NULL, 0);
+    }
+}
+
+/* While the store is read: pipeline key -> its record + 1, to keep each once
+ * and to find it for a USED record. */
+static u32* s_psr_map;
+static u32  s_psr_map_cap;
+typedef struct { u32 progs, srcs, pipes, bad; } ShrLoad;
+
+static u32* psr_slot(u64 key)
+{
+    u32 i = (u32)(key ^ (key >> 29)) & (s_psr_map_cap - 1);
+    while (s_psr_map[i] && s_psoc_recs[s_psr_map[i] - 1].key != key) i = (i + 1) & (s_psr_map_cap - 1);
+    return &s_psr_map[i];
+}
+
+/* A pipeline read into s_psoc_recs, unless one with its key was. Its
+ * description copied (own), or used where it is, in a buffer kept for the
+ * session. */
+static int psr_add(u64 key, u64 vs, u64 ps, u32 used, const u8* st, u32 stn, int own)
+{
+    if (!key) return 0;
+    if ((s_psoc_nrecs + 1) * 2 > s_psr_map_cap) {
+        const u32 cap = s_psr_map_cap ? s_psr_map_cap * 2 : 8192;
+        u32* t = (u32*)calloc(cap, sizeof *t);
+        if (!t) return 0;
+        free(s_psr_map);
+        s_psr_map = t; s_psr_map_cap = cap;
+        for (u32 r = 0; r < s_psoc_nrecs; r++) *psr_slot(s_psoc_recs[r].key) = r + 1;
+    }
+    u32* m = psr_slot(key);
+    if (*m) return 0;
+    if (s_psoc_nrecs == s_psoc_rcap) {
+        const u32 cap = s_psoc_rcap ? s_psoc_rcap * 2 : 1024;
+        PsocRec* g = (PsocRec*)realloc(s_psoc_recs, (size_t)cap * sizeof *g);
+        if (!g) return 0;
+        s_psoc_recs = g; s_psoc_rcap = cap;
+    }
+    const u8* d = st;
+    if (own) {
+        u8* c = (u8*)malloc(stn);
+        if (!c) return 0;
+        d = (const u8*)memcpy(c, st, stn);
+    }
+    *m = s_psoc_nrecs + 1;
+    PsocRec* r = &s_psoc_recs[s_psoc_nrecs++];
+    r->key = key; r->vs = vs; r->ps = ps; r->used = used; r->stn = stn; r->st = d;
+    return 1;
+}
+
+/* The records of b[0, n) into the store; their bytes stay in b, kept for the
+ * session. check: a program's bytes must give its id (the journal has no
+ * checksum; the pack's frame has). Returns how far the records were whole. */
+static size_t shr_read(const u8* b, size_t n, int check, ShrLoad* L)
+{
+    size_t o = 0;
+    while (n - o >= 8) {
+        u32 tag, rest;
+        memcpy(&tag, b + o, 4); memcpy(&rest, b + o + 4, 4);
+        if ((rest & 3u) || rest > n - o - 8) break;
+        const u8* r = b + o + 8;
+        if (tag == SHR_PROG) {
+            u64 id; u32 len; int added = 0;
+            if (rest < 16) break;
+            memcpy(&id, r, 8); memcpy(&len, r + 8, 4);
+            if (!len || ((len + 3u) & ~3u) != rest - 16) break;
+            if (check && shp_hash(r + 16, len) != id) L->bad++;
+            else if (shp_put(r + 16, len, id, 0, &added)) L->progs += (u32)added;
+            else L->bad++;
+        } else if (tag == SHR_SRCK) {
+            u64 key, id; u32 srclen;
+            if (rest != 24) break;
+            memcpy(&key, r, 8); memcpy(&srclen, r + 8, 4); memcpy(&id, r + 16, 8);
+            ShProg* g = shp_get(id);
+            if (g) L->srcs += (u32)shc_put(key, srclen, g);
+            else L->bad++;
+        } else if (tag == SHR_PIPE) {
+            u64 h[3]; u32 used, stn;
+            if (rest < 32) break;
+            memcpy(h, r, 24); memcpy(&used, r + 24, 4); memcpy(&stn, r + 28, 4);
+            if (!stn || stn > PSOC_STATE_MAX || ((stn + 3u) & ~3u) != rest - 32) break;
+            if (shp_get(h[1]) && shp_get(h[2])) L->pipes += (u32)psr_add(h[0], h[1], h[2], used, r + 32, stn, 0);
+            else L->bad++;
+        } else if (tag == SHR_USED) {
+            u32 when, k;
+            if (rest < 8) break;
+            memcpy(&when, r, 4); memcpy(&k, r + 4, 4);
+            if ((u64)k * 8u != rest - 8u) break;
+            for (u32 j = 0; j < k && s_psr_map_cap; j++) {
+                u64 key;
+                memcpy(&key, r + 8 + (size_t)j * 8u, 8);
+                const u32 m = *psr_slot(key);
+                if (m && s_psoc_recs[m - 1].used < when) s_psoc_recs[m - 1].used = when;
+            }
+        }   /* a kind this build does not know: passed over */
+        o += 8u + rest;
+    }
+    return o;
+}
+
+/* PS3RSHC2, the programs before the store: key, source length, length, bytecode. */
+static void shl_programs(const u8* b, size_t n, ShrLoad* L)
+{
+    size_t o = 8;
+    while (n - o >= 16) {
+        u64 key; u32 h[2]; int added = 0;
+        memcpy(&key, b + o, 8); memcpy(h, b + o + 8, 8);
+        if (!h[1] || h[1] > (16u << 20) || h[1] > n - o - 16) break;
+        ShProg* g = shp_put(b + o + 16, h[1], 0, 1, &added);
+        if (g) { L->progs += (u32)added; L->srcs += (u32)shc_put(key, h[0], g); }
+        o += 16u + h[1];
+    }
+}
+
+/* GWPSOC01, the pipelines before the store: key, description, then each
+ * program as its length and bytecode. */
+static void shl_pipelines(const u8* b, size_t n, ShrLoad* L)
+{
+    size_t o = 8;
+    for (;;) {
+        u64 key; u32 stn, vsn, psn; int a1 = 0, a2 = 0;
+        if (n - o < 12) break;
+        memcpy(&key, b + o, 8); memcpy(&stn, b + o + 8, 4); o += 12;
+        if (!stn || stn > PSOC_STATE_MAX || stn > n - o) break;
+        const u8* st = b + o; o += stn;
+        if (n - o < 4) break;
+        memcpy(&vsn, b + o, 4); o += 4;
+        if (!vsn || vsn > (4u << 20) || vsn > n - o) break;
+        const u8* vs = b + o; o += vsn;
+        if (n - o < 4) break;
+        memcpy(&psn, b + o, 4); o += 4;
+        if (!psn || psn > (4u << 20) || psn > n - o) break;
+        const u8* ps = b + o; o += psn;
+        ShProg* v = shp_put(vs, vsn, 0, 1, &a1);
+        ShProg* p = shp_put(ps, psn, 0, 1, &a2);
+        L->progs += (u32)(a1 + a2);
+        if (v && p) L->pipes += (u32)psr_add(key, v->id, p->id, 0, st, stn, 1);
+        else L->bad++;
+    }
+}
+
+/* A whole file into *out (NULL when it is empty): 1. 0 when it is not there,
+ * -1 when it is but cannot be read (open elsewhere, out of memory): the store
+ * then neither folds nor journals, as either could lose what is in it. */
+static int shf_read(const char* path, u8** out, size_t* n)
+{
+    *out = NULL;
+    *n = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return errno == ENOENT ? 0 : -1;
+    int r = -1;
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        const long long sz = _ftelli64(f);
+        if (sz == 0) {
+            r = 1;
+        } else if (sz > 0 && sz < (1ll << 31) && _fseeki64(f, 0, SEEK_SET) == 0) {
+            u8* b = (u8*)malloc((size_t)sz);
+            if (b && fread(b, 1, (size_t)sz, f) == (size_t)sz) { *out = b; *n = (size_t)sz; r = 1; }
+            else free(b);
+        }
+    }
+    fclose(f);
+    return r;
+}
+
+static u64 shj_new_id(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    u64 x = (u64)c.QuadPart ^ ((u64)time(NULL) << 32) ^ ((u64)GetCurrentProcessId() << 12);
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33;
+    return x ? x : 1;
+}
+
+/* A new journal at path, open to append (s_shc_file, s_shc_jid). */
+static void shj_create(const char* path)
+{
+    const u64 id = shj_new_id();
+    s_shc_file = fopen(path, "wb");
+    if (s_shc_file && (fwrite(s_shj_magic, 1, 8, s_shc_file) != 8 || fwrite(&id, 8, 1, s_shc_file) != 1 ||
+                       fflush(s_shc_file) != 0)) {
+        fclose(s_shc_file);
+        s_shc_file = NULL;
+    }
+    s_shc_jid = s_shc_file ? id : 0;
+}
+
+/* After a fold: the journal again, under a new id, with only what was
+ * appended to it after the fold's snapshot (its first jlen bytes are in the
+ * pack now). If that fails the old one stays, and the next read starts after
+ * what the pack has of it. s_shc_lock held. */
+static void shj_restart(u64 jid, u64 jlen)
+{
+    if (!s_shc_file || s_shc_jid != jid || jlen < 16) return;
+    char jp[1100], tmp[1120];
+    snprintf(jp, sizeof jp, "%s.journal", s_shc_path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", jp);
+    fclose(s_shc_file);
+    s_shc_file = NULL;
+    size_t n = 0;
+    u8* b = NULL;
+    const u64 id = shj_new_id();
+    int ok = 0;
+    if (shf_read(jp, &b, &n) == 1 && b && n >= jlen) {
+        FILE* f = fopen(tmp, "wb");
+        ok = f && fwrite(s_shj_magic, 1, 8, f) == 8 && fwrite(&id, 8, 1, f) == 1 &&
+             fwrite(b + jlen, 1, n - (size_t)jlen, f) == n - (size_t)jlen && fflush(f) == 0;
+        if (f) fclose(f);
+        ok = ok && MoveFileExA(tmp, jp, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (!ok) DeleteFileA(tmp);
+    }
+    free(b);
+    if (ok) s_shc_jid = id;
+    s_shc_file = fopen(jp, "ab");
+    if (!s_shc_file) s_shc_jid = 0;
+}
+
+/* A fold: the store as it was when it began, packed. */
+typedef struct {
+    ShProg** progs; u32 nprog;
+    ShaderCacheEntry* srcs; u32 nsrc;
+    u32 npipe;                      /* the first npipe of s_psoc_recs, which no one changes */
+    u64 jid, jlen;                  /* the journal, and how long it was */
+    int old_pso;                    /* <pack>.pso was read and goes */
+    char why[48];
+} ShFold;
+
+static DWORD WINAPI shc_fold(LPVOID arg)
+{
+    ShFold* F = (ShFold*)arg;
+    ps3_thread_name("shader cache pack");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    const double t0 = perf_now();
+    size_t raw = 0, cz = 0;
+    for (u32 i = 0; i < F->nprog; i++) raw += shr_size(16, F->progs[i]->len);
+    raw += (size_t)F->nsrc * shr_size(24, 0);
+    for (u32 i = 0; i < F->npipe; i++) raw += shr_size(32, s_psoc_recs[i].stn);
+    const char* fail = NULL;
+    u8* pay = (u8*)malloc(raw ? raw : 1);
+    const size_t cap = ZSTD_compressBound(raw);
+    u8* out = pay ? (u8*)malloc(SHC_HDR + cap) : NULL;
+    if (!out) {
+        fail = "out of memory";
+    } else {
+        u8* o = pay;
+        for (u32 i = 0; i < F->nprog; i++) {
+            u32 h[4];
+            shr_prog(h, F->progs[i]);
+            o += shr_fill(o, SHR_PROG, h, 16, F->progs[i]->p, F->progs[i]->len);
+        }
+        for (u32 i = 0; i < F->nsrc; i++) {
+            u32 h[6];
+            shr_srck(h, F->srcs[i].key, F->srcs[i].srclen, F->srcs[i].prog->id);
+            o += shr_fill(o, SHR_SRCK, h, 24, NULL, 0);
+        }
+        for (u32 i = 0; i < F->npipe; i++) {
+            u32 h[8];
+            shr_pipe(h, &s_psoc_recs[i]);
+            o += shr_fill(o, SHR_PIPE, h, 32, s_psoc_recs[i].st, s_psoc_recs[i].stn);
+        }
+        ZSTD_CCtx* cc = ZSTD_createCCtx();
+        if (!cc) {
+            fail = "out of memory";
+        } else {
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, 19);
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_windowLog, 27);   /* cut to the store's size by zstd */
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_enableLongDistanceMatching, 1);
+            ZSTD_CCtx_setParameter(cc, ZSTD_c_checksumFlag, 1);
+            cz = ZSTD_compress2(cc, out + SHC_HDR, cap, pay, raw);
+            if (ZSTD_isError(cz)) fail = ZSTD_getErrorName(cz);
+            ZSTD_freeCCtx(cc);
+        }
+    }
+    free(pay);
+    if (!fail) {
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s.tmp", s_shc_path);
+        const u32 hs[2] = { SHC_HDR, 0 };
+        const u64 hd[4] = { (u64)raw, (u64)cz, F->jid, F->jlen };
+        memcpy(out, s_shc_magic, 8); memcpy(out + 8, hs, 8); memcpy(out + 16, hd, 32);
+        FILE* f = fopen(tmp, "wb");
+        int ok = f && fwrite(out, 1, SHC_HDR + cz, f) == SHC_HDR + cz && fflush(f) == 0 &&
+                 FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
+        if (f) fclose(f);
+        if (!ok) fail = "cannot write it";
+        else if (!MoveFileExA(tmp, s_shc_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            fail = "cannot put it in place";
+        if (fail) DeleteFileA(tmp);
+    }
+    free(out);
+    if (!fail) {
+        AcquireSRWLockExclusive(&s_shc_lock);
+        shj_restart(F->jid, F->jlen);
+        ReleaseSRWLockExclusive(&s_shc_lock);
+        if (F->old_pso) {
+            char p[1100];
+            snprintf(p, sizeof p, "%s.pso", s_shc_path);
+            DeleteFileA(p);
+        }
+        fprintf(stderr, "[d3d12] shader cache packed (%s): %u programs, %u sources, %u pipelines, "
+                        "%.1f MB in %.1f MB, %.1f s%c", F->why, F->nprog, F->nsrc, F->npipe,
+                raw / 1048576.0, (SHC_HDR + cz) / 1048576.0, perf_now() - t0, 10);
+    } else {
+        fprintf(stderr, "[d3d12] shader cache not packed (%s): %s%c", F->why, fail, 10);
+    }
+    free(F->progs); free(F->srcs); free(F);
+    return 0;
+}
+
+/* A fold of the store as it is now, on its own thread. s_shc_lock held. */
+static void shc_fold_start(const char* why, int old_pso, u64 jlen)
+{
+    ShFold* F = (ShFold*)calloc(1, sizeof *F);
+    if (!F) return;
+    F->progs = (ShProg**)malloc((size_t)(s_shp_n + 1) * sizeof *F->progs);
+    F->srcs = (ShaderCacheEntry*)malloc((size_t)(s_shc_n + 1) * sizeof *F->srcs);
+    if (F->progs && F->srcs) {
+        if (s_shp_n) memcpy(F->progs, s_shp_list, (size_t)s_shp_n * sizeof *F->progs);
+        F->nprog = s_shp_n;
+        for (u32 i = 0; i < s_shc_cap; i++)
+            if (s_shc[i].prog) F->srcs[F->nsrc++] = s_shc[i];
+        F->npipe = s_psoc_nrecs;
+        F->jid = s_shc_file ? s_shc_jid : 0;
+        F->jlen = s_shc_file ? jlen : 0;
+        F->old_pso = old_pso;
+        snprintf(F->why, sizeof F->why, "%s", why);
+        HANDLE t = CreateThread(NULL, 0, shc_fold, F, 0, NULL);
+        if (t) { CloseHandle(t); return; }
+    }
+    free(F->progs); free(F->srcs); free(F);
 }
 
 /* graphics.shader_compiler (D3D12_SHADER_COMPILER): dxc, or fxc for D3DCompile.
@@ -1282,45 +1777,94 @@ static void shc_pick_compiler(void)
     else     printf("[d3d12] guest shaders from DXC%c", 10);
 }
 
-/* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. */
+/* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. The
+ * store is read from the pack, the files from before it, and the journal
+ * from where the pack's part of it ends. s_shc_lock held. */
 static void shc_open(void)
 {
     shc_pick_compiler();
     const char* path = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
     s_shc_on = path && *path && strcmp(path, "0") != 0 && !ps3_settings_ieq(path, "off");
     if (!s_shc_on) return;
-    char dxil[1024];
-    if (s_shc_dxc) { snprintf(dxil, sizeof dxil, "%s.dxil", path); path = dxil; }
-    u32 loaded = 0;
-    int clean = 0;
-    FILE* f = fopen(path, "rb");
-    if (f) {
-        char magic[8];
-        if (fread(magic, 1, 8, f) == 8 && !memcmp(magic, s_shc_magic, 8)) {
-            for (;;) {
-                u64 key; u32 hdr[2]; ID3DBlob* b = NULL;
-                if (fread(&key, 8, 1, f) != 1) { clean = feof(f) != 0; break; }
-                if (fread(hdr, 4, 2, f) != 2 || !hdr[1] || hdr[1] > (16u << 20)) break;
-                if (FAILED(D3DCreateBlob(hdr[1], &b)) || !b) break;
-                if (fread(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f) != hdr[1]) { b->lpVtbl->Release(b); break; }
-                loaded += (u32)shc_put(key, hdr[0], b);
+    snprintf(s_shc_path, sizeof s_shc_path, "%s%s", path, s_shc_dxc ? ".dxil" : "");
+    char jp[1100], pp[1100];
+    snprintf(jp, sizeof jp, "%s.journal", s_shc_path);
+    snprintf(pp, sizeof pp, "%s.pso", s_shc_path);
+    const double t0 = perf_now();
+    ShrLoad L;
+    memset(&L, 0, sizeof L);
+    const char* why = NULL;           /* why the store is packed again; NULL: it is not */
+    int stuck = 0;                    /* a file of it is there but cannot be read: no fold */
+    u64 ajid = 0, ajlen = 0;          /* the journal the pack has the start of, and how much */
+    size_t raw = 0, packed = 0, n = 0;
+    u8* b = NULL;
+    int got = shf_read(s_shc_path, &b, &n);
+    stuck |= got < 0;
+    if (b && n >= SHC_HDR && !memcmp(b, s_shc_magic, 8)) {
+        u32 hs; u64 hd[4];
+        memcpy(&hs, b + 8, 4); memcpy(hd, b + 16, 32);
+        if (hs == SHC_HDR && hd[1] == n - SHC_HDR && hd[0] && hd[0] < (1ull << 31)) {
+            u8* pay = (u8*)malloc((size_t)hd[0]);
+            const size_t r = pay ? ZSTD_decompress(pay, (size_t)hd[0], b + SHC_HDR, (size_t)hd[1]) : 0;
+            if (!pay) {
+                stuck = 1;
+            } else if (!ZSTD_isError(r) && r == hd[0]) {
+                raw = (size_t)hd[0]; packed = n;
+                ajid = hd[2]; ajlen = hd[3];
+                if (shr_read(pay, raw, 0, &L) != raw) why = "a pack cut short";
+                /* pay stays: the programs and descriptions are in it */
+            } else {
+                free(pay);
+                why = "a damaged pack";
             }
+        } else {
+            why = "a damaged pack";
         }
-        fclose(f);
+    } else if (b && n >= 8 && !memcmp(b, s_shc_magic2, 8)) {
+        shl_programs(b, n, &L);
+        why = "programs kept before the store";
+    } else if (got > 0) {
+        why = "a pack of another kind";
     }
-    if (clean) {
-        s_shc_file = fopen(path, "ab");
-    } else {                     /* new, foreign or damaged: write it again from memory */
-        s_shc_file = fopen(path, "wb");
-        if (s_shc_file) {
-            fwrite(s_shc_magic, 1, 8, s_shc_file);
-            for (u32 i = 0; i < s_shc_cap; i++)
-                if (s_shc[i].blob) shc_write(s_shc_file, s_shc[i].key, s_shc[i].srclen, s_shc[i].blob);
-            fflush(s_shc_file);
+    free(b);
+    got = shf_read(pp, &b, &n);
+    stuck |= got < 0;
+    const int old_pso = b && n >= 8 && !memcmp(b, s_psoc_magic1, 8);
+    if (old_pso) {
+        shl_pipelines(b, n, &L);
+        if (!why) why = "pipelines kept before the store";
+    }
+    free(b);
+    /* The journal, from the end of what the pack has of it, cut back to its last whole record. */
+    got = shf_read(jp, &b, &n);
+    size_t jfrom = 16, jend = 16;
+    if (got < 0) {
+        stuck = 1;                    /* left alone, and nothing kept on disk this session */
+    } else if (b && n >= 16 && !memcmp(b, s_shj_magic, 8)) {
+        u64 id;
+        memcpy(&id, b + 8, 8);
+        if (id && id == ajid && ajlen >= 16 && ajlen <= n) jfrom = (size_t)ajlen;
+        jend = jfrom + shr_read(b + jfrom, n - jfrom, 1, &L);
+        if (jend == jfrom) free(b);   /* else it stays: the records are in it */
+        if (jend < n) {
+            FILE* f = fopen(jp, "r+b");
+            if (f) { _chsize_s(_fileno(f), (long long)jend); fclose(f); }
         }
+        s_shc_file = fopen(jp, "ab");
+        s_shc_jid = s_shc_file ? id : 0;
+    } else {
+        free(b);
+        shj_create(jp);
     }
-    printf("[d3d12] shader cache %s: %u programs%s%c", path, loaded,
-           s_shc_file ? "" : " (cannot write it)", 10);
+    free(s_psr_map);
+    s_psr_map = NULL; s_psr_map_cap = 0;
+    const size_t jlive = jend - jfrom;
+    if (!why && jlive >= (4u << 20) && jlive >= raw / 8) why = "the journal has grown";
+    printf("[d3d12] shader cache %s: %u programs for %u sources, %u pipelines; %.1f MB packed, %.1f MB of "
+           "journal, read in %.0f ms (%u records dropped)%s%s%c", s_shc_path, s_shp_n, s_shc_n, s_psoc_nrecs,
+           packed / 1048576.0, jlive / 1048576.0, (perf_now() - t0) * 1000.0, L.bad,
+           s_shc_file ? "" : " (cannot write it)", stuck ? " (a file of it cannot be read: not packed)" : "", 10);
+    if (why && !stuck) shc_fold_start(why, old_pso, (u64)jend);
 }
 
 /* A guest program (entry "main") through the disk cache. */
@@ -1334,7 +1878,7 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     if (s_shc_on) {
         key = shc_key(src, len, target, flags);
         ShaderCacheEntry* e = s_shc_cap ? shc_slot(key, (u32)len) : NULL;
-        ID3DBlob* c = e && e->blob ? shc_copy(e->blob) : NULL;
+        ID3DBlob* c = e && e->prog ? shp_blob(e->prog) : NULL;
         if (c) {
             *out = c;
             if (err) *err = NULL;
@@ -1372,13 +1916,8 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
     AcquireSRWLockExclusive(&s_shc_lock);
     s_shc_stat_compiled++;
     s_shc_stat_compile_s += dt;
-    if (s_shc_on && SUCCEEDED(hr) && *out) {
-        ID3DBlob* c = shc_copy(*out);
-        if (c && shc_put(key, (u32)len, c) && s_shc_file) {
-            shc_write(s_shc_file, key, (u32)len, c);
-            fflush(s_shc_file);
-        }
-    }
+    if (s_shc_on && SUCCEEDED(hr) && *out)
+        shc_keep(key, (u32)len, *out);
     ReleaseSRWLockExclusive(&s_shc_lock);
     return hr;
 }
@@ -1391,7 +1930,7 @@ static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
     if (s_shc_on < 0) shc_open();
     if (s_shc_on && s_shc_cap) {
         ShaderCacheEntry* e = shc_slot(shc_key(src, len, target, shc_flags()), (u32)len);
-        if (e->blob && (b = shc_copy(e->blob)) != NULL)
+        if (e->prog && (b = shp_blob(e->prog)) != NULL)
             s_shc_stat_hits++;
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
@@ -1421,7 +1960,7 @@ typedef struct ShaderJob {
     char* src; size_t len;          /* HLSL, owned */
     const char* name; const char* target;
     void* vs;                       /* pipeline jobs: the vertex shader's bytecode, a copy
-                                     * (no blob is shared between threads: shc_copy) */
+                                     * (no blob is shared between threads: shp_blob) */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;   /* pipeline jobs: all but the pixel shader */
     HRESULT hr;
     ID3DBlob* blob;                 /* the compiled program */
@@ -1560,27 +2099,33 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
  * Ascension's first fight built 409 of them, ~1.15 ms each, in bursts of 10-30
  * when something appeared for the first time, and skipped up to 1,562 of a
  * frame's 3,678 draws; every session built them all again. Now each pipeline
- * built is appended to <shader cache>.pso: its key (a hash of its pixel
- * shader's HLSL, its vertex shader and the rest of its description), that
- * description, and both shaders' bytecode. The next session builds them all on
- * a thread of its own from the title's first pipeline on, long before a
- * fight, and a draw finds its pipeline by the key, built. The description is
- * written field by field, so struct padding never reaches the key.
- * D3D12_PSO_CACHE=0: off. The file follows graphics.shader_cache.
+ * built goes into the shader cache's store (a PIPE record): its key (a hash of
+ * its pixel shader's HLSL, its vertex shader and the rest of its description),
+ * that description, and its two programs by their ids. The next session
+ * builds them all on a thread of its own from the title's first pipeline on,
+ * long before a fight, and a draw finds its pipeline by the key, built. The
+ * description is written field by field, so struct padding never reaches the
+ * key. D3D12_PSO_CACHE=0: off. It needs graphics.shader_cache.
+ *
+ * The store keeps every pipeline; the table it used to be read into stopped
+ * taking them at 6,143. Built, they cost memory: the fight bench's 6,143 took
+ * 373 MB more while they were built, and the fight peaked 281 MB above a run
+ * that built one. So the table holds at most 8,192 built (D3D12_PSO_CACHE_MAX);
+ * past that a draw's build is kept only by the draw's own pipeline cache, as
+ * before. At the start the most recently used are built first: the first time
+ * a session uses a pipeline it is noted, and the notes go onto the journal as
+ * USED records every 10 s.
  * -----------------------------------------------------------------------*/
 #define PSOC_VERSION   1u
-#define PSOC_SLOTS     8192u             /* a power of two */
-#define PSOC_STATE_MAX 2048u
-static const char s_psoc_magic[8] = { 'G', 'W', 'P', 'S', 'O', 'C', '0', '1' };
-static struct { u64 key; ID3D12PipelineState* pso; } s_psoc[PSOC_SLOTS];
-static u32 s_psoc_n;
+static struct PsocSlot { u64 key; ID3D12PipelineState* pso; u32 seen, pad; } *s_psoc;   /* open addressing, s_psoc_cap slots */
+static u32 s_psoc_cap, s_psoc_n;
+static u32 s_psoc_held, s_psoc_max = 8192;   /* built pipelines held, and the most it holds */
+static u32 s_psoc_now;                        /* this session: its start, as PIPE and USED records have it */
+static u64* s_psoc_used;                      /* keys first used this session, for the next USED record */
+static u32 s_psoc_nused, s_psoc_used_cap;
 static SRWLOCK s_psoc_lock = SRWLOCK_INIT;
-static FILE* s_psoc_out;
 static int s_psoc_mode = -1;             /* -1 not started, 0 off, 1 on */
 static volatile LONG s_psoc_hits, s_psoc_added, s_psoc_built, s_psoc_failed;
-typedef struct { u64 key; u32 stn, vsn, psn; u8* st; u8* vs; u8* ps; } PsocRec;
-static PsocRec* s_psoc_recs;
-static u32 s_psoc_nrecs;
 
 static u64 psoc_fnv(u64 h, const void* p, size_t n)
 {
@@ -1721,51 +2266,153 @@ static u64 psoc_key(const char* hlsl, size_t hn, const void* vs, size_t vn, cons
     return psoc_fnv(h, st, stn);
 }
 
-/* The slot of key, or of the empty place it would go; s_psoc_lock held. */
+/* The slot of key, or of the empty place it would go; s_psoc_lock held, s_psoc_cap > 0. */
 static u32 psoc_slot(u64 key)
 {
-    u32 i = (u32)(key ^ (key >> 29)) & (PSOC_SLOTS - 1u);
-    while (s_psoc[i].key && s_psoc[i].key != key) i = (i + 1u) & (PSOC_SLOTS - 1u);
+    u32 i = (u32)(key ^ (key >> 29)) & (s_psoc_cap - 1u);
+    while (s_psoc[i].key && s_psoc[i].key != key) i = (i + 1u) & (s_psoc_cap - 1u);
     return i;
 }
 
+/* Room for one more key, the table at most three quarters full; 0 when out of
+ * memory. s_psoc_lock held exclusive. */
+static int psoc_room(void)
+{
+    if ((s_psoc_n + 1u) * 4u <= s_psoc_cap * 3u) return 1;
+    const u32 old_cap = s_psoc_cap, cap = old_cap ? old_cap * 2u : 8192u;
+    struct PsocSlot* t = (struct PsocSlot*)calloc(cap, sizeof *t);
+    if (!t) return 0;
+    struct PsocSlot* old = s_psoc;
+    s_psoc = t; s_psoc_cap = cap;
+    for (u32 i = 0; i < old_cap; i++)
+        if (old[i].key) s_psoc[psoc_slot(old[i].key)] = old[i];
+    free(old);
+    return 1;
+}
+
+/* The slot's first use this session, noted for a USED record. s_psoc_lock held exclusive. */
+static void psoc_note(u32 i)
+{
+    if (s_psoc[i].seen) return;
+    s_psoc[i].seen = 1;
+    if (s_psoc_nused == s_psoc_used_cap) {
+        const u32 cap = s_psoc_used_cap ? s_psoc_used_cap * 2 : 1024;
+        u64* t = (u64*)realloc(s_psoc_used, (size_t)cap * sizeof *t);
+        if (!t) return;
+        s_psoc_used = t; s_psoc_used_cap = cap;
+    }
+    s_psoc_used[s_psoc_nused++] = s_psoc[i].key;
+}
+
 /* The built pipeline of key, with a reference for the caller; NULL when none
- * is built (yet). *known: the key is in the file or was added this session. */
-static ID3D12PipelineState* psoc_find(u64 key, int* known)
+ * is built (yet). *known: the key is in the store or was added this session.
+ * use: a draw asks for it (not the cache's own build). */
+static ID3D12PipelineState* psoc_find(u64 key, int* known, int use)
 {
     ID3D12PipelineState* p = NULL;
+    int note = 0;
+    *known = 0;
     AcquireSRWLockShared(&s_psoc_lock);
-    const u32 i = psoc_slot(key);
-    *known = s_psoc[i].key == key;
-    if (*known && s_psoc[i].pso) { p = s_psoc[i].pso; p->lpVtbl->AddRef(p); }
+    if (s_psoc_cap) {
+        const u32 i = psoc_slot(key);
+        *known = s_psoc[i].key == key;
+        if (*known && s_psoc[i].pso) {
+            p = s_psoc[i].pso; p->lpVtbl->AddRef(p);
+            note = use && !s_psoc[i].seen;
+        }
+    }
     ReleaseSRWLockShared(&s_psoc_lock);
+    if (note) {
+        AcquireSRWLockExclusive(&s_psoc_lock);
+        psoc_note(psoc_slot(key));
+        ReleaseSRWLockExclusive(&s_psoc_lock);
+    }
     if (p) InterlockedIncrement(&s_psoc_hits);
     return p;
 }
 
-/* A pipeline built for key: kept (one reference), and appended to the file
- * unless the file already has it. */
+/* A pipeline built for a draw: held (one reference) while the table holds
+ * fewer than s_psoc_max, and into the store unless it has it: its programs
+ * (which it has unless they came from elsewhere) and a PIPE record. The two
+ * locks are never held together. */
 static void psoc_add(u64 key, ID3D12PipelineState* pso, const u8* st, u32 stn,
                      const void* vs, u32 vsn, const void* ps, u32 psn)
 {
     if (s_psoc_mode != 1 || !pso || !key) return;
+    int fresh = 0;
     AcquireSRWLockExclusive(&s_psoc_lock);
-    const u32 i = psoc_slot(key);
-    if (s_psoc[i].key != key) {
-        if (s_psoc_n + 1u < PSOC_SLOTS * 3u / 4u) {
-            s_psoc[i].key = key; s_psoc_n++;
-            pso->lpVtbl->AddRef(pso); s_psoc[i].pso = pso;
-            if (s_psoc_out && fwrite(&key, 8, 1, s_psoc_out) == 1 && fwrite(&stn, 4, 1, s_psoc_out) == 1 &&
-                fwrite(st, 1, stn, s_psoc_out) == stn && fwrite(&vsn, 4, 1, s_psoc_out) == 1 &&
-                fwrite(vs, 1, vsn, s_psoc_out) == vsn && fwrite(&psn, 4, 1, s_psoc_out) == 1 &&
-                fwrite(ps, 1, psn, s_psoc_out) == psn)
-                fflush(s_psoc_out);
-            InterlockedIncrement(&s_psoc_added);
+    if (psoc_room()) {
+        const u32 i = psoc_slot(key);
+        if (s_psoc[i].key != key) {
+            s_psoc[i].key = key; s_psoc[i].seen = 1; s_psoc_n++;   /* its PIPE record has this session */
+            fresh = 1;
+        } else {
+            psoc_note(i);
         }
-    } else if (!s_psoc[i].pso) {
-        pso->lpVtbl->AddRef(pso); s_psoc[i].pso = pso;
+        if (!s_psoc[i].pso && s_psoc_held < s_psoc_max) {
+            pso->lpVtbl->AddRef(pso); s_psoc[i].pso = pso; s_psoc_held++;
+        }
     }
     ReleaseSRWLockExclusive(&s_psoc_lock);
+    if (!fresh) return;
+    AcquireSRWLockExclusive(&s_shc_lock);
+    int a1 = 0, a2 = 0;
+    ShProg* v = shp_put(vs, vsn, 0, 1, &a1);
+    ShProg* p = v ? shp_put(ps, psn, 0, 1, &a2) : NULL;
+    if (a1) shj_prog(v);
+    if (a2) shj_prog(p);
+    if (v && p) {
+        PsocRec r;
+        u32 h[8];
+        r.key = key; r.vs = v->id; r.ps = p->id; r.used = s_psoc_now; r.stn = stn; r.st = st;
+        shr_pipe(h, &r);
+        shj_put(SHR_PIPE, h, 32, st, stn);
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    InterlockedIncrement(&s_psoc_added);
+}
+
+/* The uses noted since the last call onto the journal, as one USED record. */
+static void psoc_flush_used(void)
+{
+    AcquireSRWLockExclusive(&s_psoc_lock);
+    u64* keys = s_psoc_used;
+    const u32 n = s_psoc_nused;
+    s_psoc_used = NULL; s_psoc_nused = s_psoc_used_cap = 0;
+    ReleaseSRWLockExclusive(&s_psoc_lock);
+    if (n) {
+        const u32 h[2] = { s_psoc_now, n };
+        AcquireSRWLockExclusive(&s_shc_lock);
+        shj_put(SHR_USED, h, 8, keys, n * 8u);
+        ReleaseSRWLockExclusive(&s_shc_lock);
+    }
+    free(keys);
+}
+
+/* The order of the start's build: the session that used it last, the latest
+ * first; then the order the store has them in. */
+static int psoc_order(const void* a, const void* b)
+{
+    const u32 x = *(const u32*)a, y = *(const u32*)b;
+    const u32 ux = s_psoc_recs[x].used, uy = s_psoc_recs[y].used;
+    if (ux != uy) return ux > uy ? -1 : 1;
+    return x < y ? -1 : x > y;
+}
+
+/* The process's private bytes, and the GPU's local and shared memory in use, in MB. */
+static void psoc_mem(double* priv, double* local, double* shared)
+{
+    PROCESS_MEMORY_COUNTERS_EX m;
+    DXGI_QUERY_VIDEO_MEMORY_INFO vl, vs;
+    memset(&m, 0, sizeof m); memset(&vl, 0, sizeof vl); memset(&vs, 0, sizeof vs);
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&m, sizeof m);
+    if (s_adapter3) {
+        s_adapter3->lpVtbl->QueryVideoMemoryInfo(s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vl);
+        s_adapter3->lpVtbl->QueryVideoMemoryInfo(s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vs);
+    }
+    *priv = m.PrivateUsage / 1048576.0;
+    *local = vl.CurrentUsage / 1048576.0;
+    *shared = vs.CurrentUsage / 1048576.0;
 }
 
 /* The shader build indicator's sources (ovi_*, with the overlay): guest shader jobs
@@ -1781,99 +2428,87 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
     ps3_thread_name("pipeline cache");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     const double t0 = perf_now();
+    double m0[3], m1[3];
+    psoc_mem(&m0[0], &m0[1], &m0[2]);
     static D3D12_INPUT_ELEMENT_DESC il[16];
     static char names[16][16];
+    u32* order = (u32*)malloc((size_t)s_psoc_nrecs * sizeof *order);
+    if (order) {
+        for (u32 r = 0; r < s_psoc_nrecs; r++) order[r] = r;
+        qsort(order, s_psoc_nrecs, sizeof *order, psoc_order);
+    }
+    const u32 total = s_psoc_nrecs < s_psoc_max ? s_psoc_nrecs : s_psoc_max;
     InterlockedExchange(&s_psoc_done, 0);
-    InterlockedExchange(&s_psoc_total, (LONG)s_psoc_nrecs);
-    for (u32 r = 0; r < s_psoc_nrecs; r++) {
-        InterlockedExchange(&s_psoc_done, (LONG)r);
-        PsocRec* rec = &s_psoc_recs[r];
+    InterlockedExchange(&s_psoc_total, (LONG)total);
+    for (u32 k = 0; k < s_psoc_nrecs && s_psoc_held < s_psoc_max; k++) {
+        InterlockedExchange(&s_psoc_done, (LONG)(s_psoc_held < total ? s_psoc_held : total));
+        const PsocRec* rec = &s_psoc_recs[order ? order[k] : k];
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
         int dbt = 0, known = 0;
-        ID3D12PipelineState* have = psoc_find(rec->key, &known);
-        if (have) { have->lpVtbl->Release(have); goto next; }   /* a draw's build got there first */
-        if (!psoc_state_read(rec->st, rec->stn, &pd, il, names, &dbt)) { InterlockedIncrement(&s_psoc_failed); goto next; }
-        pd.VS.pShaderBytecode = rec->vs; pd.VS.BytecodeLength = rec->vsn;
-        pd.PS.pShaderBytecode = rec->ps; pd.PS.BytecodeLength = rec->psn;
+        ID3D12PipelineState* have = psoc_find(rec->key, &known, 0);
+        if (have) { have->lpVtbl->Release(have); continue; }   /* a draw's build got there first */
+        AcquireSRWLockShared(&s_shc_lock);
+        const ShProg* vs = shp_get(rec->vs);
+        const ShProg* ps = shp_get(rec->ps);
+        ReleaseSRWLockShared(&s_shc_lock);
+        if (!vs || !ps || !psoc_state_read(rec->st, rec->stn, &pd, il, names, &dbt)) {
+            InterlockedIncrement(&s_psoc_failed);
+            continue;
+        }
+        pd.VS.pShaderBytecode = vs->p; pd.VS.BytecodeLength = vs->len;
+        pd.PS.pShaderBytecode = ps->p; pd.PS.BytecodeLength = ps->len;
         ID3D12PipelineState* pso = NULL;
         if (SUCCEEDED(guest_pso_create(&pd, dbt, &pso)) && pso) {
             AcquireSRWLockExclusive(&s_psoc_lock);
             const u32 i = psoc_slot(rec->key);
-            if (s_psoc[i].key == rec->key && !s_psoc[i].pso) { s_psoc[i].pso = pso; pso = NULL; }
+            if (s_psoc[i].key == rec->key && !s_psoc[i].pso && s_psoc_held < s_psoc_max) {
+                s_psoc[i].pso = pso; pso = NULL; s_psoc_held++;
+            }
             ReleaseSRWLockExclusive(&s_psoc_lock);
             if (pso) pso->lpVtbl->Release(pso);
             InterlockedIncrement(&s_psoc_built);
         } else {
             InterlockedIncrement(&s_psoc_failed);
         }
-    next:
-        free(rec->st); rec->st = rec->vs = rec->ps = NULL;
     }
+    free(order);
     InterlockedExchange(&s_psoc_total, 0);
-    fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms (%ld failed)%c",
-            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, (long)s_psoc_failed, 10);
-    free(s_psoc_recs); s_psoc_recs = NULL;
-    return 0;
+    psoc_mem(&m1[0], &m1[1], &m1[2]);
+    fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms (%ld failed, %u held at most); "
+                    "memory while it ran: private %+.0f MB, GPU local %+.0f MB, shared %+.0f MB%c",
+            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, (long)s_psoc_failed, s_psoc_max,
+            m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2], 10);
+    /* Then the session's uses onto the journal, every 10 s, for the next start's order. */
+    for (;;) {
+        Sleep(10000);
+        psoc_flush_used();
+    }
 }
 
-/* On the drain thread, at the title's first guest pipeline: read the file,
- * build its pipelines on a thread, and open it to append the new ones. */
+/* On the drain thread, at the title's first guest pipeline: the store's
+ * pipelines into the table, built on a thread of their own. */
 static void psoc_start(void)
 {
     if (s_psoc_mode >= 0) return;
     s_psoc_mode = 0;
     const char* e = getenv("D3D12_PSO_CACHE");
-    if ((e && !atoi(e)) || !s_shc_on || !s_d3d.vp_root_sig) return;
-    const char* sc = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
-    if (!sc || !*sc) return;
-    char path[1024];
-    snprintf(path, sizeof path, "%s%s.pso", sc, s_shc_dxc ? ".dxil" : "");
+    if ((e && !atoi(e)) || !s_d3d.vp_root_sig) return;
+    AcquireSRWLockExclusive(&s_shc_lock);
+    if (s_shc_on < 0) shc_open();
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    if (!s_shc_on) return;
     dbt_ready();   /* a depth-bounds pipeline needs it, and it is made on this thread */
-    u32 cap = 0;
-    FILE* f = fopen(path, "rb");
-    int good = 0;
-    if (f) {
-        char magic[8];
-        if (fread(magic, 1, 8, f) == 8 && !memcmp(magic, s_psoc_magic, 8)) {
-            good = 1;
-            for (;;) {
-                PsocRec rec; memset(&rec, 0, sizeof rec);
-                if (fread(&rec.key, 8, 1, f) != 1) break;
-                if (fread(&rec.stn, 4, 1, f) != 1 || !rec.stn || rec.stn > PSOC_STATE_MAX) { good = 0; break; }
-                u8 st[PSOC_STATE_MAX];
-                if (fread(st, 1, rec.stn, f) != rec.stn) { good = 0; break; }
-                u32 vsn, psn;
-                if (fread(&vsn, 4, 1, f) != 1 || !vsn || vsn > (4u << 20)) { good = 0; break; }
-                u8* vs = (u8*)malloc(vsn);
-                if (!vs || fread(vs, 1, vsn, f) != vsn) { free(vs); good = 0; break; }
-                if (fread(&psn, 4, 1, f) != 1 || !psn || psn > (4u << 20)) { free(vs); good = 0; break; }
-                u8* all = (u8*)malloc((size_t)rec.stn + vsn + psn);
-                if (!all || fread(all + rec.stn + vsn, 1, psn, f) != psn) { free(all); free(vs); good = 0; break; }
-                memcpy(all, st, rec.stn);
-                memcpy(all + rec.stn, vs, vsn);
-                free(vs);
-                rec.st = all; rec.vs = all + rec.stn; rec.ps = all + rec.stn + vsn;
-                rec.vsn = vsn; rec.psn = psn;
-                if (s_psoc_nrecs == cap) {
-                    cap = cap ? cap * 2u : 256u;
-                    PsocRec* g = (PsocRec*)realloc(s_psoc_recs, cap * sizeof *g);
-                    if (!g) { free(all); break; }
-                    s_psoc_recs = g;
-                }
-                const u32 i = psoc_slot(rec.key);
-                if (s_psoc[i].key == rec.key || s_psoc_n + 1u >= PSOC_SLOTS * 3u / 4u) { free(all); continue; }
-                s_psoc[i].key = rec.key; s_psoc_n++;
-                s_psoc_recs[s_psoc_nrecs++] = rec;
-            }
-        }
-        fclose(f);
+    const char* mx = getenv("D3D12_PSO_CACHE_MAX");
+    if (mx && atoi(mx) > 0) s_psoc_max = (u32)atoi(mx);
+    s_psoc_now = (u32)time(NULL);
+    AcquireSRWLockExclusive(&s_psoc_lock);
+    for (u32 r = 0; r < s_psoc_nrecs && psoc_room(); r++) {
+        const u32 i = psoc_slot(s_psoc_recs[r].key);
+        if (!s_psoc[i].key) { s_psoc[i].key = s_psoc_recs[r].key; s_psoc_n++; }
     }
-    /* A file this build cannot read (another version, cut short) starts over. */
-    s_psoc_out = fopen(path, good ? "ab" : "wb");
-    if (s_psoc_out && !good) { fwrite(s_psoc_magic, 1, 8, s_psoc_out); fflush(s_psoc_out); }
+    ReleaseSRWLockExclusive(&s_psoc_lock);
     s_psoc_mode = 1;
-    fprintf(stderr, "[d3d12] pipeline cache %s: %u pipelines to build%s%c", path, s_psoc_nrecs,
-            good ? "" : " (a new file)", 10);
+    fprintf(stderr, "[d3d12] pipeline cache: %u pipelines to build%c", s_psoc_nrecs, 10);
     if (s_psoc_nrecs) {
         HANDLE t = CreateThread(NULL, 0, psoc_thread, NULL, 0, NULL);
         if (t) CloseHandle(t);
@@ -7379,7 +8014,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (s_psoc_mode == 1 && (pstn = psoc_state_bytes(&pd, (int)(ext & 1u), pst)) != 0) {
         int known = 0;
         psokey = psoc_key(hlsl, strlen(hlsl), pd.VS.pShaderBytecode, pd.VS.BytecodeLength, pst, pstn);
-        pso = psoc_find(psokey, &known);
+        pso = psoc_find(psokey, &known, 1);
     }
     if (pso) {
         if (pb) pb->lpVtbl->Release(pb);
@@ -14754,7 +15389,7 @@ static DWORD WINAPI vpass_compile(LPVOID arg)
     if (s_shc_on < 0) shc_open();
     if (s_shc_on && s_shc_cap) {
         ShaderCacheEntry* e = shc_slot(key, (u32)len);
-        if (e->blob) s_vpass_cs = shc_copy(e->blob);
+        if (e->prog) s_vpass_cs = shp_blob(e->prog);
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
     if (s_vpass_cs) {
@@ -14772,13 +15407,7 @@ static DWORD WINAPI vpass_compile(LPVOID arg)
     }
     if (SUCCEEDED(s_vpass_chr) && s_vpass_cs) {
         AcquireSRWLockExclusive(&s_shc_lock);
-        if (s_shc_on) {
-            ID3DBlob* c = shc_copy(s_vpass_cs);
-            if (c && shc_put(key, (u32)len, c) && s_shc_file) {
-                shc_write(s_shc_file, key, (u32)len, c);
-                fflush(s_shc_file);
-            }
-        }
+        if (s_shc_on) shc_keep(key, (u32)len, s_vpass_cs);
         ReleaseSRWLockExclusive(&s_shc_lock);
     }
     return 0;

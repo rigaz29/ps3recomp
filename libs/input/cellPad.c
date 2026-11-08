@@ -1078,14 +1078,17 @@ void cellPad_poll(void)
  *   - each pause between reads counts as 250 ms at most, in the recording as in
  *     this run: a frame that took a second moved the title on by one frame, not
  *     by a second;
- *   - the marks keep it from running ahead. It waits at a recorded mark until
- *     this run has made it too (the same text, as many times); one this run makes
- *     also passes the recorded marks before it, if it was recorded less than 10 s
- *     ahead of the playback. It does not jump ahead when this run is the faster:
- *     what the recording pressed then comes a little later, but all of it comes.
- *     A mark that does not come in 5 s is passed over, with the others of the
- *     next second, and its text is no longer waited for (streaming that differs
- *     with where the camera looks).
+ *   - the marks keep it from running ahead. Where the recording had nothing
+ *     pressed (a load, a menu coming up), it waits at a recorded mark, with nothing
+ *     pressed, until this run has made it too (the same text, as many times); one
+ *     this run makes also passes the recorded marks before it, if it was recorded
+ *     less than 10 s ahead of the playback. A mark met while the recording was
+ *     being played is not waited for: streaming comes when it comes, and holding
+ *     a stick through the wait walked the player off the route. It does not jump
+ *     ahead when this run is the faster: what the recording pressed then comes a
+ *     little later, but all of it comes. A mark that does not come in 5 s is
+ *     passed over, with the others of the next second, and its text is no longer
+ *     waited for.
  * The playback holds the last report at the recording's end.
  * -----------------------------------------------------------------------*/
 #define PAD_REC_N      18      /* button[2..19]: the digital words, the sticks, the pressure */
@@ -1311,20 +1314,49 @@ static void pad_mark(const char* kind, const char* text)
     if (s_rp_on > 0) pad_rp_mark(key);
 }
 
+/* Whether the recording had nothing pressed at ms on its clock: no button, the
+ * sticks at rest. */
+static int pad_rp_idle_at(unsigned ms)
+{
+    if (ms < s_rp[0].ms) return 1;
+    int lo = 0, hi = s_rp_n - 1;
+    while (lo < hi) {   /* the last report at or before ms */
+        const int mid = (lo + hi + 1) / 2;
+        if (s_rp[mid].ms <= ms) lo = mid; else hi = mid - 1;
+    }
+    const u16* v = s_rp[lo].v;
+    if (v[0] || v[1]) return 0;
+    for (int i = 2; i < 6; i++)
+        if (v[i] + 12 < 128 || v[i] > 128 + 12) return 0;
+    return 1;
+}
+
 /* A read of port 0 in playback: moves the playback's clock on and gives the
- * report the title gets now, NULL before the recording's first. */
+ * report the title gets now, NULL before the recording's first and while it
+ * waits at a mark. */
 static const PadRpReport* pad_rp_step(unsigned long long now)
 {
     while (__atomic_test_and_set(&s_rp_lock, __ATOMIC_ACQUIRE)) pad_yield();
     const unsigned long long pause = s_rp_read ? now - s_rp_read : 0;
     s_rp_read = now;
     s_rp_clock += pause < PAD_REC_PAUSE ? pause : PAD_REC_PAUSE;
-    /* At a mark this run has not made yet: wait for it there. */
+    /* At a mark this run has not made yet, where the recording had nothing pressed (a load, a
+     * menu coming up): wait for it there, with nothing pressed. One met while the recording was
+     * being played is passed: streaming comes when it comes, and holding a stick that long walked
+     * the player off the route. */
     while (s_rpm_next < s_rpm_n && (s_rpm[s_rpm_next].got || s_rpt[s_rpm[s_rpm_next].text].shaky)) s_rpm_next++;
+    if (s_rpm_next < s_rpm_n && s_rp_clock >= s_rpm[s_rpm_next].ms && !pad_rp_idle_at(s_rpm[s_rpm_next].ms)) {
+        while (s_rpm_next < s_rpm_n && s_rpm[s_rpm_next].ms <= s_rp_clock) s_rpm_next++;
+        s_rpm_hold = 0;
+        s_rpm_said = 0;
+    }
+    int waiting = 0;
     if (s_rpm_next < s_rpm_n && s_rp_clock >= s_rpm[s_rpm_next].ms) {
         if (!s_rpm_hold) s_rpm_hold = now;
         const PadRpMark* m = &s_rpm[s_rpm_next];
+        waiting = 1;
         if (now - s_rpm_hold >= 5000) {
+            waiting = 0;
             const unsigned at = m->ms;
             int n = 0;
             s_rpt[m->text].shaky = 1;
@@ -1344,7 +1376,7 @@ static const PadRpReport* pad_rp_step(unsigned long long now)
         }
     }
     while (s_rp_i + 1 < s_rp_n && s_rp[s_rp_i + 1].ms <= s_rp_clock) s_rp_i++;
-    const PadRpReport* r = s_rp_clock >= s_rp[0].ms ? &s_rp[s_rp_i] : NULL;
+    const PadRpReport* r = s_rp_clock >= s_rp[0].ms && !waiting ? &s_rp[s_rp_i] : NULL;
     if (s_rp_i + 1 == s_rp_n && !s_rp_said_end && r) {
         s_rp_said_end = 1;
         printf("[cellPad] PAD_REPLAY: the recording's last report, at %.1f s on its clock\n", r->ms / 1000.0);

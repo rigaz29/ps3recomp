@@ -2145,8 +2145,11 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CLOSE:
+        /* With the render thread on, the window stays until the process ends:
+         * that thread may be presenting into it. The main loop ends the
+         * process on window_closed either way. */
         s_d3d.window_closed = 1;
-        DestroyWindow(hwnd);
+        if (s_rt_mode <= 0) DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -2181,7 +2184,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!(lp & (1 << 30))) InterlockedExchange(&s_shot_pending, 1);
         } else if (wp == VK_ESCAPE && d3d12_esc_quits()) {
             s_d3d.window_closed = 1;
-            DestroyWindow(hwnd);
+            if (s_rt_mode <= 0) DestroyWindow(hwnd);   /* as WM_CLOSE */
         }
         return 0;
     }
@@ -17533,14 +17536,33 @@ static DWORD WINAPI rt_main(LPVOID arg)
     return 0;
 }
 
-/* The walk: wait until *v reaches seq, answering what other threads send to
- * the window meanwhile (it is this thread's; a present may send to it). */
+/* The walk, waiting on the render thread. The window is this thread's: it
+ * takes all of the window's messages meanwhile and waits for input too, as a
+ * window's thread should while another one presents. A thread blocked in a
+ * wait for sent messages alone, its queue unread for 5 s (a PeekMessage on an
+ * empty queue does not count), is a hung one to Windows: over the borderless
+ * window the taskbar and the pointer came up every ~5.5 s, the window ghosted.
+ * A WM_QUIT goes back for the main loop's pump, and from then on only sent
+ * messages are taken here. */
+static int s_rt_wm_quit;
+static void rt_pump(void)
+{
+    MSG m;
+    if (s_rt_wm_quit) { PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE); return; }
+    while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); s_rt_wm_quit = 1; return; }
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+}
+static DWORD rt_wake_mask(void) { return s_rt_wm_quit ? QS_SENDMESSAGE : QS_ALLINPUT; }
+
+/* The walk: wait until *v reaches seq. */
 static void rt_wait(volatile LONG* v, LONG seq)
 {
     while ((LONG)(rt_get(v) - seq) < 0) {
-        MSG m;
-        PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-        MsgWaitForMultipleObjects(1, &s_rt_done_ev, FALSE, 50, QS_SENDMESSAGE);
+        rt_pump();
+        MsgWaitForMultipleObjects(1, &s_rt_done_ev, FALSE, 50, rt_wake_mask());
     }
 }
 
@@ -17588,9 +17610,8 @@ static void rt_excl_begin(void)
 {
     if (s_rt_mode <= 0) return;
     while (!TryAcquireSRWLockExclusive(&s_rt_excl)) {
-        MSG m;
-        PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-        MsgWaitForMultipleObjects(0, NULL, FALSE, 1, QS_SENDMESSAGE);
+        rt_pump();
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 1, rt_wake_mask());
     }
 }
 static void rt_excl_end(void)

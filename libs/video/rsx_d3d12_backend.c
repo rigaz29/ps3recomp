@@ -14626,6 +14626,8 @@ static rsx_kept* kept_find(const rsx_state* st, u32* io)
     return NULL;
 }
 
+static HANDLE s_vpass_cthread;              /* the pass's program being compiled (vpass_compile) */
+static DWORD WINAPI vpass_compile(LPVOID arg);
 void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
                                void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n))
 {
@@ -14641,6 +14643,8 @@ void rsx_d3d12_vertex_pass_set(const char* hlsl, u32 stride, u32 max_record,
     MemoryBarrier();
     InterlockedExchange(&s_vpass.set, 1);
     fprintf(stderr, "[vtx-lit] vertex pass set: stride %u, records up to %u bytes%c", stride, max_record, 10);
+    s_vpass_cthread = CreateThread(NULL, 0, vpass_compile, NULL, 0, NULL);
+    if (s_vpass_cthread) SetThreadPriority(s_vpass_cthread, THREAD_PRIORITY_BELOW_NORMAL);
 }
 
 /* From any thread (an SPU worker's job): the record for n vertexes at io; it replaces the one there
@@ -14727,6 +14731,59 @@ static int vpass_draw_lit(void)
     return d;
 }
 
+/* The pass's program, compiled on a thread of its own from the moment the pass is set (a low
+ * priority one): with God of War: Ascension's skinned position done the SPU's way in integer
+ * operations, FXC takes ~5.6 s over it (1.5 s before), which the frame clock thread would otherwise
+ * wait out at the pass's first use. */
+static ID3DBlob* s_vpass_cs;
+static HRESULT s_vpass_chr;
+static char s_vpass_cerr[1024];
+static double s_vpass_cdt;
+static int s_vpass_cached;
+/* Through the shader cache file (graphics.shader_cache) too, keyed apart from the guest programs:
+ * compiled the first time, read back after. */
+static DWORD WINAPI vpass_compile(LPVOID arg)
+{
+    (void)arg;
+    const char* src = s_vpass.hlsl;
+    const size_t len = strlen(src);
+    const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    const u64 key = shc_key(src, len, "cs_5_0", flags | 0x80000000u);
+    const double t0 = perf_now();
+    AcquireSRWLockExclusive(&s_shc_lock);
+    if (s_shc_on < 0) shc_open();
+    if (s_shc_on && s_shc_cap) {
+        ShaderCacheEntry* e = shc_slot(key, (u32)len);
+        if (e->blob) s_vpass_cs = shc_copy(e->blob);
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    if (s_vpass_cs) {
+        s_vpass_chr = S_OK;
+        s_vpass_cached = 1;
+        s_vpass_cdt = perf_now() - t0;
+        return 0;
+    }
+    ID3DBlob* err = NULL;
+    s_vpass_chr = D3DCompile(src, len, "vertex_pass", NULL, NULL, "main", "cs_5_0", flags, 0, &s_vpass_cs, &err);
+    s_vpass_cdt = perf_now() - t0;
+    if (err) {
+        snprintf(s_vpass_cerr, sizeof s_vpass_cerr, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
+        err->lpVtbl->Release(err);
+    }
+    if (SUCCEEDED(s_vpass_chr) && s_vpass_cs) {
+        AcquireSRWLockExclusive(&s_shc_lock);
+        if (s_shc_on) {
+            ID3DBlob* c = shc_copy(s_vpass_cs);
+            if (c && shc_put(key, (u32)len, c) && s_shc_file) {
+                shc_write(s_shc_file, key, (u32)len, c);
+                fflush(s_shc_file);
+            }
+        }
+        ReleaseSRWLockExclusive(&s_shc_lock);
+    }
+    return 0;
+}
+
 /* The compute pipeline, the buffers and the command list, on first use (the frame clock thread). */
 static int vpass_build(void)
 {
@@ -14735,15 +14792,31 @@ static int vpass_build(void)
     if (!s_vpass.hlsl || !s_d3d.device) return 0;
     ID3D12Device* dev = s_d3d.device;
     ID3DBlob *cs = NULL, *err = NULL, *sig = NULL;
-    HRESULT hr = D3DCompile(s_vpass.hlsl, strlen(s_vpass.hlsl), "vertex_pass", NULL, NULL, "main", "cs_5_0",
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
-    if (FAILED(hr)) {
-        fprintf(stderr, "[vtx-lit] the vertex pass did not compile (0x%08lX): %s%c", hr,
-                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "", 10);
-        if (err) err->lpVtbl->Release(err);
+    HRESULT hr;
+    if (s_vpass_cthread) {
+        const double t0 = perf_now();
+        WaitForSingleObject(s_vpass_cthread, INFINITE);
+        CloseHandle(s_vpass_cthread);
+        s_vpass_cthread = NULL;
+        hr = s_vpass_chr;
+        cs = s_vpass_cs;
+        s_vpass_cs = NULL;
+        fprintf(stderr, "[vtx-lit] the vertex pass %s in %.1f s, waited for %.2f s%c",
+                s_vpass_cached ? "read from the shader cache" : "compiled", s_vpass_cdt, perf_now() - t0, 10);
+    } else {
+        hr = D3DCompile(s_vpass.hlsl, strlen(s_vpass.hlsl), "vertex_pass", NULL, NULL, "main", "cs_5_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
+        if (err) {
+            snprintf(s_vpass_cerr, sizeof s_vpass_cerr, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
+            err->lpVtbl->Release(err);
+            err = NULL;
+        }
+    }
+    if (FAILED(hr) || !cs) {
+        fprintf(stderr, "[vtx-lit] the vertex pass did not compile (0x%08lX): %s%c", hr, s_vpass_cerr, 10);
+        if (cs) cs->lpVtbl->Release(cs);
         return 0;
     }
-    if (err) { err->lpVtbl->Release(err); err = NULL; }
     D3D12_ROOT_PARAMETER rp[4];
     memset(rp, 0, sizeof rp);
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[0].Descriptor.ShaderRegister = 0;

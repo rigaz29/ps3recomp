@@ -2810,6 +2810,14 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
  * the caller trusts, and the damage surfaces far away as a "vtable used as an
  * object" or a double-allocated heap block. Reports the target once each. */
 static void ps3_indirect_call_impl(ppu_context* ctx);
+/* Set by runtime/diag/missed_code.c while it records: a call that found no lifted function, with a
+ * caller and the first instruction there. Only what could be code of the executable. */
+extern "C" { void (*g_ppu_missed_hook)(uint32_t addr, uint32_t lr, uint32_t word) = nullptr; }
+static void ppu_note_missed(uint32_t addr, uint32_t lr)
+{
+    if (g_ppu_missed_hook && !(addr & 3u) && addr >= 0x10000u && addr < 0x10000000u)
+        g_ppu_missed_hook(addr, lr, vm_read32(addr));
+}
 /* The impl declares these at block scope; outside an extern "C" function that
  * would give them C++ linkage, so pin it here. */
 extern "C" uint32_t ps3_hle_count(void);
@@ -3291,6 +3299,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             return;
         }
     }
+    ppu_note_missed((uint32_t)ctx->ctr, (uint32_t)ctx->lr);
     /* Stuck-loop guard: a divergence (e.g. an object with a null function
      * pointer) can make the game spin on the same unresolved target forever.
      * Detect a long run of identical unresolved targets and bail so the run
@@ -3501,7 +3510,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
  * continue (the result is undefined, but it won't crash the link). */
 extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 {
-    (void)ctx;
+    ppu_note_missed((uint32_t)addr, (uint32_t)ctx->lr);
     static int logged = 0;
     if (logged < 20) {
         fprintf(stderr, "[ppu] call to unlifted function 0x%08X\n", (uint32_t)addr);

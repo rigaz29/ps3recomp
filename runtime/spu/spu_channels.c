@@ -2837,10 +2837,14 @@ static int spu_overlay_get_kept_code(const spu_context* ctx, unsigned slot, uint
     return 1;
 }
 
+/* Set by runtime/diag/missed_code.c while it records: every GET, to name what streamed code came in. */
+void (*g_spu_missed_get)(const void* ctx, uint32_t ea, uint32_t lsa, uint32_t size);
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     SPU_JS_ADD(SPU_JS_NOTE_GET, 1);
+    if (g_spu_missed_get) g_spu_missed_get(ctx, ea, lsa, size);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
     /* Only a GET into a page that holds a resident span can end or change one
      * (resident_pages); for the others, most of a job's GETs, the slots are not read. */

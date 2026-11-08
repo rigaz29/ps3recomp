@@ -613,6 +613,17 @@ what still runs interpreted, set `SPU_INTERP_STATS=<seconds>`: the interpreter
 then prints, once per that many seconds, its step rate and the six busiest
 1 KB local-store pages by image id.
 
+To keep that as a list instead of a log, call `ps3_missed_code_to("<file>")`
+(`ps3emu/missed_code.h`) once, before the title's threads start. The run then
+writes down each interpreter entry, the GET that brought that code in, and each
+PPU call that found no lifted function, adding to what earlier runs left there.
+`tools/missed_code.py --profile <file> --elf <ELF>` sorts the rows into what the
+lifters read: further entries of a job module (`--jobmods-manifest`,
+`--jobmods-extra`), new or further position-independent pieces (`--pic-list`),
+and PPU functions (`--functions`, `--ppu-extra`). `--apply` writes those lists.
+Each row holds the bytes at its entry, and a profile from another build of the
+title is refused.
+
 ---
 
 ## Phase 12: Testing and Polish

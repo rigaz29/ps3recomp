@@ -545,9 +545,25 @@ static void bysig_add(const uint32_t sig[4], uint64_t steps)
     __atomic_store_n(&s_printing, 0, __ATOMIC_RELEASE);
 }
 
+/* The image that owns the code at pc: a resident code region's, else the context's. */
+static int interp_owner(const spu_context* ctx, uint32_t pc)
+{
+    int owner = ctx->image_id;
+    for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
+        if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+            pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+            owner = ctx->resident_code[s].image_id;
+    return owner;
+}
+
+/* Set by runtime/diag/missed_code.c while it records: each run says where it starts, and its steps
+ * go to the counter handed back. */
+volatile long long* (*g_spu_missed_entry)(const void* ctx, uint32_t pc, int owner, const uint32_t sig[4]);
+
 static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
-    if (!bysig_secs()) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    volatile long long* (*const missed)(const void*, uint32_t, int, const uint32_t[4]) = g_spu_missed_entry;
+    if (!bysig_secs() && !missed) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
     const uint32_t pc = start_lsa & 0x3FFFC;
     uint32_t sig[4] = {0, 0, 0, 0};
     for (int k = 0; k < 4; k++) {
@@ -555,11 +571,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         sig[k] = ((uint32_t)ctx->ls[a] << 24) | ((uint32_t)ctx->ls[a + 1] << 16) |
                  ((uint32_t)ctx->ls[a + 2] << 8) | ctx->ls[a + 3];
     }
+    /* Asked before the run: the run's own GETs and code changes come after this entry. */
+    volatile long long* const missed_steps = missed ? missed(ctx, pc, interp_owner(ctx, pc), sig) : NULL;
     const uint64_t s0 = t_bysig_total, saved = t_bysig_child;
     t_bysig_child = 0;
     const uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
     const uint64_t incl = t_bysig_total - s0;
-    bysig_add(sig, incl - t_bysig_child);
+    if (bysig_secs()) bysig_add(sig, incl - t_bysig_child);
+    if (missed_steps) __atomic_fetch_add(missed_steps, (long long)(incl - t_bysig_child), __ATOMIC_RELAXED);
     t_bysig_child = saved + incl;
     return r;
 }
@@ -569,12 +588,8 @@ static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, 
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
-        uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
-        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
-            if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
-                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
-                owner = ctx->resident_code[s].image_id;
-        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, pc);
+        uint32_t pc = start_lsa & 0x3FFFC;
+        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, interp_owner(ctx, pc), pc);
     }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;

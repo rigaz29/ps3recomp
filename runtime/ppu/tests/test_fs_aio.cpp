@@ -28,6 +28,7 @@ void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+extern "C" { void (*g_ps3_mark_hook)(const char*, const char*) = nullptr; }
 
 static uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, vm_base + a, 4); return __builtin_bswap32(v); }
 static uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, vm_base + a, 8); return __builtin_bswap64(v); }

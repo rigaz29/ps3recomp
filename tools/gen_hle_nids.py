@@ -71,11 +71,20 @@ def main():
                     help="Register EVERY PRX module compiled into the runtime "
                          "(the canonical invocation -- can't silently drop a "
                          "library the way a hand-typed list can).")
+    ap.add_argument("--skip", action="append", default=[], metavar="MODULE",
+                    help="With --all: leave this module out of the table, so its code "
+                         "is not linked. Only for a library the title does not import.")
     ap.add_argument("--out", default="ppu_hle_nids.cpp")
     args = ap.parse_args()
 
+    if args.skip and not args.all:
+        ap.error("--skip needs --all")
     if args.all:
-        args.libs = discover_all() + list(args.libs)
+        found = discover_all()
+        unknown = [s for s in args.skip if s not in found]
+        if unknown:
+            ap.error("--skip names no module: " + ", ".join(unknown))
+        args.libs = [n for n in found if n not in args.skip] + list(args.libs)
     if not args.libs:
         ap.error("no modules given; pass module names or --all")
 

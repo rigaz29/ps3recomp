@@ -41,6 +41,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>     /* K32GetProcessMemoryInfo: what the pipeline cache's build costs */
+#include <intrin.h>    /* __cpuid: the CPU's name in the stats panel */
 #include <io.h>        /* _chsize_s, _get_osfhandle: the shader cache's journal */
 #include <errno.h>
 #include "zstd.h"      /* third_party/zstd: the shader cache's pack */
@@ -951,6 +952,7 @@ static unsigned s_hl_miss_n, s_hl_upbuf_n, s_hl_rt_n, s_hl_waits_n;
 static double s_hl_gpu_ms[4];
 static double s_hl_miss_s, s_hl_upbuf_s, s_hl_rt_s, s_hl_waits_s;
 static IDXGIAdapter3* s_adapter3;   /* local memory use and budget, for the hitch log */
+static char s_ovs_gpu_name[64];     /* the adapter's name, for the stats panel */
 static int perf_on(void)
 {
     static int v = -1;
@@ -3129,6 +3131,8 @@ static int d3d_device_create(IDXGIFactory4* factory)
                 printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
                        (unsigned long long)(ad.DedicatedVideoMemory >> 20));
                 s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
+                for (int ni = 0; ni < (int)sizeof s_ovs_gpu_name - 1 && ad.Description[ni]; ni++)
+                    s_ovs_gpu_name[ni] = (char)(ad.Description[ni] < 128 ? ad.Description[ni] : '?');
                 /* An integrated GPU's textures are in the PC's memory: the little it
                  * has of its own says nothing about what fits. */
                 { D3D12_FEATURE_DATA_ARCHITECTURE arch;
@@ -4379,8 +4383,8 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
 #define OV_W   640
 #define OV_ROWS_H 96   /* the two text rows: the frame rate (unused with the panel), the message */
 #define OV_ROW 48      /* one item a row */
-#define OVS_W  320     /* the stats panel's region, below the rows */
-#define OVS_H  416
+#define OVS_W  640     /* the stats panel's region, below the rows */
+#define OVS_H  736
 #define OVI_H  96      /* the shader build indicator's band, below the panel's region */
 #define OV_H   (OV_ROWS_H + OVS_H + OVI_H)
 
@@ -4406,10 +4410,10 @@ static int d3d12_show_fps(void)
     return v;
 }
 
-/* The stats panel (display.show_fps = overlay), top left: the frame rate, the
- * frame time, how busy the CPU, the GPU and the guest's processors are, and a
- * graph of the last frames' times with a line at 30 frames a second.
- * - CPU: the process, of all the machine's logical processors.
+/* The stats panel (display.show_fps = overlay), top right: how busy the GPU, the CPU and the guest's
+ * processors are, video memory and RAM, the frame rate and frame times, a graph of the last frames'
+ * times, the GPU and CPU, how the picture is made, and a line of the game's own.
+ * - CPU: the whole machine.
  * - PPU, SPU, RSX: the host threads the runtime names "ppu main"; "spurs ..."
  *   and "spu ..." (six of them make 100%, as the PS3's six SPUs); "frame
  *   clock" (the FIFO walk, the recording and the present). A thread of its own
@@ -4423,6 +4427,10 @@ static int s_ovs_ft_i;                  /* its next slot */
 static volatile LONG s_ovs_pct[4];      /* CPU, PPU, SPU, RSX: percent x10, from the sampler */
 static double s_ovs_fps, s_ovs_ms, s_ovs_gpu;   /* the presenting thread's, every half second */
 static double s_ovs_gpu_ms;             /* the GPU time of the frames read since */
+static volatile LONG s_ovs_vram_mb, s_ovs_ram_mb, s_ovs_ram_total_mb;   /* from the sampler */
+static int (*s_ovs_line)(char* out, int max);   /* the game's line at the panel's foot */
+
+void rsx_d3d12_backend_overlay_line(int (*fn)(char* out, int max)) { s_ovs_line = fn; }
 static int ovs_on(void) { return d3d12_show_fps() == 2; }
 
 static ULONGLONG ovs_ft64(FILETIME f) { return ((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime; }
@@ -4449,7 +4457,7 @@ static int ovs_group(HANDLE h)
 /* The PPU, SPU and RSX threads, found by a snapshot of the system's threads every
  * OVS_FIND ticks: on a desktop with a browser open that snapshot holds thousands of
  * threads, and taken every half second it cost ~16% of a core. Their handles stay open
- * and each half second reads their times; the process total is GetProcessTimes. */
+ * and each half second reads their times; the machine's total is GetSystemTimes. */
 #define OVS_FIND 10
 static DWORD WINAPI ovs_sampler(LPVOID arg)
 {
@@ -4460,13 +4468,11 @@ static DWORD WINAPI ovs_sampler(LPVOID arg)
     static ULONGLONG th_cpu[MAXT];
     static signed char th_grp[MAXT];
     int n = 0, tick = 0;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    const double ncpu = si.dwNumberOfProcessors ? (double)si.dwNumberOfProcessors : 1.0;
     const DWORD pid = GetCurrentProcessId();
     FILETIME c, e, k, u;
-    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
-    ULONGLONG proc0 = ovs_ft64(k) + ovs_ft64(u), wall0 = GetTickCount64();
+    ULONGLONG wall0 = GetTickCount64();
+    FILETIME si0, sk0, su0;
+    GetSystemTimes(&si0, &sk0, &su0);
     for (;; tick++) {
         Sleep(500);
         ULONGLONG d[5] = { 0, 0, 0, 0, 0 };   /* by ovs_group: 4 is the render thread */
@@ -4509,18 +4515,34 @@ static DWORD WINAPI ovs_sampler(LPVOID arg)
                 CloseHandle(snap);
             }
         }
-        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
-        const ULONGLONG proc = ovs_ft64(k) + ovs_ft64(u), wall = GetTickCount64();
+        FILETIME si1, sk1, su1;
+        double machine = 0.0;
+        if (GetSystemTimes(&si1, &sk1, &su1)) {
+            const ULONGLONG idle = ovs_ft64(si1) - ovs_ft64(si0);
+            const ULONGLONG all = ovs_ft64(sk1) - ovs_ft64(sk0) + ovs_ft64(su1) - ovs_ft64(su0);   /* kernel time holds the idle */
+            if (all > idle) machine = (double)(all - idle) * 100.0 / (double)all;
+            si0 = si1; sk0 = sk1; su0 = su1;
+        }
+        const ULONGLONG wall = GetTickCount64();
         const double win = (double)(wall - wall0) * 1e4;   /* 100 ns units */
         if (win > 0) {
-            const double pct[4] = { (double)(proc - proc0) * 100.0 / (win * ncpu), (double)d[1] * 100.0 / win,
-                                    (double)d[2] * 100.0 / (win * 6.0),
+            const double pct[4] = { machine, (double)d[1] * 100.0 / win, (double)d[2] * 100.0 / (win * 6.0),
                                     (double)(d[3] > d[4] ? d[3] : d[4]) * 100.0 / win };   /* the busier RSX thread */
             for (int i = 0; i < 4; i++)
                 InterlockedExchange(&s_ovs_pct[i], (LONG)((pct[i] < 0 ? 0 : pct[i] > 100 ? 100 : pct[i]) * 10.0 + 0.5));
         }
-        proc0 = proc;
         wall0 = wall;
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms)) {
+            InterlockedExchange(&s_ovs_ram_mb, (LONG)((ms.ullTotalPhys - ms.ullAvailPhys) >> 20));
+            InterlockedExchange(&s_ovs_ram_total_mb, (LONG)(ms.ullTotalPhys >> 20));
+        }
+        if (s_adapter3) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO vm;
+            if (SUCCEEDED(s_adapter3->lpVtbl->QueryVideoMemoryInfo(s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm)))
+                InterlockedExchange(&s_ovs_vram_mb, (LONG)(vm.CurrentUsage >> 20));
+        }
     }
     return 0;
 }
@@ -4611,127 +4633,319 @@ static void ov_render(unsigned char* dst, const char* const item[2], u32 font_px
     }
 }
 
-/* The stats panel into premultiplied RGBA at dst (rows OV_W * 4 apart), at
- * most OVS_W x OVS_H; its size comes back in *pw, *ph. GDI draws the text and
- * the graph white, for their coverage; each is then coloured by the box it is
- * in, over a rounded box of 80% near-black. */
+/* The stats panel into premultiplied RGBA at dst (rows OV_W * 4 apart), at most OVS_W x OVS_H; its size comes back in
+ * *pw, *ph. GDI draws the text white at twice the size, for its coverage, which keeps the letters evenly spaced at small
+ * sizes; each piece is then coloured by the box it is in, over a rounded box of dark glass that is worked out once. The
+ * text changes four times a second and the graph every call. A thread of its own paints it, into two images in turn; the
+ * presenting thread only copies the last one finished. Painted there it took 3 ms a call, up to 11. */
 typedef struct { int x0, y0, x1, y1; u32 rgb; } OvsBox;
-static void ov_render_panel(unsigned char* dst, u32 font_px, u32* pw, u32* ph)
+static CRITICAL_SECTION s_ovs_lock;     /* over the next three */
+static const u32* s_ovs_front;          /* the last finished image, OVS_W wide */
+static int s_ovs_fw, s_ovs_fh;          /* its size */
+static volatile LONG s_ovs_font;        /* the size of text the presenting thread wants */
+#define OVS_ROWS 6
+#define OVS_LINES 5
+
+static float ovs_rbox(float px, float py, float x0, float y0, float x1, float y1, float rad)
+{
+    const float cx = px < x0 + rad ? x0 + rad : (px > x1 - rad ? x1 - rad : px);
+    const float cy = py < y0 + rad ? y0 + rad : (py > y1 - rad ? y1 - rad : py);
+    const float a = rad + 0.5f - sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
+    return a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a;
+}
+
+/* One string in the double-size bitmap; x, y, h and max_x are the panel's own pixels. */
+static void ovs_put(HDC dc, int x, int y, int h, int max_x, const char* s)
+{
+    const int n = (int)strlen(s);
+    SIZE z;
+    RECT rc;
+    if (!n) return;
+    GetTextExtentPoint32A(dc, s, n, &z);
+    rc.left = x * 2; rc.top = y * 2; rc.right = max_x * 2; rc.bottom = (y + h) * 2;
+    ExtTextOutA(dc, x * 2, y * 2 + (h * 2 - z.cy) / 2, ETO_CLIPPED, &rc, s, n, NULL);
+}
+
+/* How wide a string is in the panel's own pixels. */
+static int ovs_width(HDC dc, const char* s)
+{
+    SIZE z;
+    GetTextExtentPoint32A(dc, s, (int)strlen(s), &z);
+    return z.cx / 2 + 1;
+}
+
+/* A name from the hardware without its trademarks and what follows the model. */
+static void ovs_tidy(char* s)
+{
+    static const char* const marks[] = { "(R)", "(TM)", "(r)", "(tm)" };
+    for (int i = 0; i < 4; i++) {
+        const size_t n = strlen(marks[i]);
+        for (char* p; (p = strstr(s, marks[i])) != NULL; ) memmove(p, p + n, strlen(p + n) + 1);
+    }
+    char* p = strstr(s, " with ");
+    if (p) *p = 0;
+    p = strstr(s, " CPU @");
+    if (p) *p = 0;
+    p = strstr(s, "-Core Processor");
+    if (p) {
+        while (p > s && p[-1] != ' ') p--;
+        *p = 0;
+    }
+    for (size_t n = strlen(s); n && s[n - 1] == ' '; n--) s[n - 1] = 0;
+}
+
+static const char* ovs_cpu_name(void)
+{
+    static char name[49];
+    if (!name[0]) {
+        int r[4];
+        __cpuid(r, (int)0x80000000);
+        if ((unsigned)r[0] >= 0x80000004u) {
+            for (int i = 0; i < 3; i++) {
+                __cpuid(r, (int)(0x80000002u + (unsigned)i));
+                memcpy(name + i * 16, r, 16);
+            }
+            name[48] = 0;
+            const char* p = name;
+            while (*p == ' ') p++;
+            memmove(name, p, strlen(p) + 1);
+            ovs_tidy(name);
+        }
+    }
+    return name;
+}
+
+/* The title's own MLAA runs unless its patch turns it off. */
+static int ovs_mlaa(void)
+{
+    static int v = -1;
+    if (v < 0) v = !ps3_settings_bool("patches", "disable_mlaa", NULL, 1);
+    return v;
+}
+
+/* The panel's lines under the graph, but for the game's own. */
+static void ovs_lines(char line[OVS_LINES][96])
+{
+    snprintf(line[0], sizeof line[0], "%s", s_ovs_gpu_name);
+    ovs_tidy(line[0]);
+    snprintf(line[1], sizeof line[1], "%s", ovs_cpu_name());
+    snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s",
+             s_up.want ? "FSR 3.1" : s_d3d.pp_mode == 2 ? "FSR 1" : s_d3d.pp_mode == 1 ? "Sharp" : "Off",
+             s_fg_mode == 2 ? " + FG" : "", s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
+    snprintf(line[3], sizeof line[3], "%u x %u -> %u x %u", s_d3d.pw, s_d3d.ph, s_d3d.bb_w, s_d3d.bb_h);
+}
+
+static void ov_render_panel(u32 font_px)
 {
     static HDC dc;
-    static u32* bits;
-    static HFONT f_lab, f_val;
+    static u32* bits, *bg, *pair[2];   /* GDI's text, double size; the empty panel; the panel's two images (RGBA, premultiplied) */
+    static int back;
+    static unsigned char* cov, *gcov;  /* the text's coverage; the graph's, over its own box */
+    static HFONT font;
     static u32 f_size;
-    *pw = *ph = 0;
+    static int W, H, pad, top, rh, lh, ly, gx0, gy0, gx1, gy1, x1, x2, x3, nlines;
+    static ULONGLONG text_at;
+    static OvsBox box[OVS_ROWS + OVS_LINES];
+    static int nb;
     if (!dc) {
         BITMAPINFO bi;
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-        bi.bmiHeader.biWidth = OVS_W;
-        bi.bmiHeader.biHeight = -OVS_H;   /* top-down */
+        bi.bmiHeader.biWidth = OVS_W * 2;
+        bi.bmiHeader.biHeight = -(OVS_H * 2);   /* top-down */
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         dc = CreateCompatibleDC(NULL);
         HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0) : NULL;
-        if (!bmp || !bits) { if (dc) DeleteDC(dc); dc = NULL; return; }
+        bg = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
+        pair[0] = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
+        pair[1] = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
+        cov = (unsigned char*)malloc((size_t)OVS_W * OVS_H);
+        gcov = (unsigned char*)malloc((size_t)OVS_W * OVS_H);
+        if (!bmp || !bits || !bg || !pair[0] || !pair[1] || !cov || !gcov) { if (dc) DeleteDC(dc); dc = NULL; return; }
         SelectObject(dc, bmp);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
     }
+    const int F = (int)font_px;
     if (f_size != font_px) {
-        if (f_lab) DeleteObject(f_lab);
-        if (f_val) DeleteObject(f_val);
-        f_lab = CreateFontA(-(int)(font_px * 9 / 10), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                            DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-        f_val = CreateFontA(-(int)font_px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                            FIXED_PITCH | FF_MODERN, "Consolas");
+        SelectObject(dc, GetStockObject(SYSTEM_FONT));
+        if (font) DeleteObject(font);
+        font = CreateFontA(-F * 2, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        SelectObject(dc, font);
+        nlines = s_ovs_line ? OVS_LINES : OVS_LINES - 1;
+        pad = F * 3 / 2;
+        top = F * 4 / 3;
+        rh = F * 3 / 2;
+        lh = F * 2;
+        x1 = pad + F * 33 / 10;
+        x2 = x1 + F * 39 / 10;
+        x3 = x2 + F * 5;
+        {
+            /* as wide as what it holds: the longest line, or the row with three values */
+            char line[OVS_LINES][96];
+            ovs_lines(line);
+            snprintf(line[4], sizeof line[4], "X -9999.9   Y -9999.9   Z -9999.9");
+            int inner = x3 - pad + ovs_width(dc, "RSX 100%");
+            for (int l = 0; l < nlines; l++)
+                if (ovs_width(dc, line[l]) > inner) inner = ovs_width(dc, line[l]);
+            W = pad + inner + pad;
+        }
+        gx0 = pad;
+        gx1 = W - pad;
+        gy0 = top + OVS_ROWS * rh + F / 2;
+        gy1 = gy0 + F * 5 / 2;
+        ly = gy1 + F * 3 / 4;
+        H = ly + nlines * lh + F * 2 / 3;
+        if (W > OVS_W) W = OVS_W;
+        if (H > OVS_H) H = OVS_H;
+        const float glass[3] = { 18.0f, 24.0f, 24.0f }, well[3] = { 14.0f, 22.0f, 16.0f };
+        const float rad = (float)F * 0.8f, wrad = (float)F * 0.4f;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+                const float a0 = ovs_rbox(px, py, 0.0f, 0.0f, (float)W, (float)H, rad) * 0.72f;
+                const float a1 = ovs_rbox(px, py, (float)gx0, (float)gy0, (float)gx1, (float)gy1, wrad) * 0.62f;
+                const float a = a1 + a0 * (1.0f - a1);
+                u32 p = (u32)(a * 255.0f + 0.5f) << 24;
+                for (int ch = 0; ch < 3; ch++)
+                    p |= (u32)(well[ch] * a1 + glass[ch] * a0 * (1.0f - a1) + 0.5f) << (8 * ch);
+                bg[(size_t)y * OVS_W + (size_t)x] = p;
+            }
+        }
         f_size = font_px;
+        text_at = 0;
     }
-    static const char* const lab[7] = { "FPS", "MS", "CPU", "GPU", "PPU", "SPU", "RSX" };
-    static const u32 col[7] = { 0x4ADE80, 0xFBBF24, 0x22D3EE, 0xF87171, 0x60A5FA, 0xA78BFA, 0xF472B6 };
-    char val[7][16];
-    snprintf(val[0], sizeof val[0], "%.1f", s_ovs_fps);
-    snprintf(val[1], sizeof val[1], "%.1f", s_ovs_ms);
-    snprintf(val[2], sizeof val[2], "%ld%%", (long)((s_ovs_pct[0] + 5) / 10));
-    snprintf(val[3], sizeof val[3], "%.0f%%", s_ovs_gpu);
-    snprintf(val[4], sizeof val[4], "%ld%%", (long)((s_ovs_pct[1] + 5) / 10));
-    snprintf(val[5], sizeof val[5], "%ld%%", (long)((s_ovs_pct[2] + 5) / 10));
-    snprintf(val[6], sizeof val[6], "%ld%%", (long)((s_ovs_pct[3] + 5) / 10));
 
-    memset(bits, 0, (size_t)OVS_W * OVS_H * 4);
-    const int pad = (int)font_px * 2 / 3, rh = (int)font_px * 4 / 3, gh = (int)font_px * 2;
-    SIZE sl, sv, s1;
-    SelectObject(dc, f_lab);
-    GetTextExtentPoint32A(dc, "RSX", 3, &sl);
-    SelectObject(dc, f_val);
-    GetTextExtentPoint32A(dc, "100.0", 5, &sv);
-    int W = pad + sl.cx + (int)font_px + sv.cx + pad;
-    int H = pad + 7 * rh + pad / 2 + gh + pad;
-    if (W > OVS_W) W = OVS_W;
-    if (H > OVS_H) H = OVS_H;
-    OvsBox box[16];
-    int nb = 0;
-    for (int r = 0; r < 7; r++) {
-        const int y = pad + r * rh;
-        SelectObject(dc, f_lab);
-        GetTextExtentPoint32A(dc, lab[r], (int)strlen(lab[r]), &s1);
-        TextOutA(dc, pad, y + (rh - s1.cy) / 2, lab[r], (int)strlen(lab[r]));
-        box[nb].x0 = pad; box[nb].y0 = y; box[nb].x1 = pad + s1.cx + 1; box[nb].y1 = y + rh; box[nb].rgb = col[r]; nb++;
-        SelectObject(dc, f_val);
-        GetTextExtentPoint32A(dc, val[r], (int)strlen(val[r]), &s1);
-        TextOutA(dc, W - pad - s1.cx, y + (rh - s1.cy) / 2, val[r], (int)strlen(val[r]));
-    }
-    /* The graph: the last OVS_HIST frame times, 0 to 66.7 ms (15 frames a
-     * second) bottom to top, oldest left. */
-    const int gx0 = pad, gx1 = W - pad, gy0 = pad + 7 * rh + pad / 2, gy1 = gy0 + gh;
-    POINT pts[OVS_HIST];
-    for (int i = 0; i < OVS_HIST; i++) {
-        float ft = s_ovs_ft[(s_ovs_ft_i + i) % OVS_HIST] / 66.7f;
-        if (ft > 1.0f) ft = 1.0f;
-        if (ft < 0.0f) ft = 0.0f;
-        pts[i].x = gx0 + (gx1 - gx0) * i / (OVS_HIST - 1);
-        pts[i].y = gy1 - (int)(ft * (float)(gy1 - gy0));
-    }
-    HPEN pen = CreatePen(PS_SOLID, font_px >= 18 ? 2 : 1, RGB(255, 255, 255));
-    HGDIOBJ old = SelectObject(dc, pen);
-    Polyline(dc, pts, OVS_HIST);
-    SelectObject(dc, old);
-    DeleteObject(pen);
-    box[nb].x0 = gx0 - 2; box[nb].y0 = gy0 - 2; box[nb].x1 = gx1 + 2; box[nb].y1 = gy1 + 2; box[nb].rgb = 0x4ADE80; nb++;
-    const int ref_y = gy1 - (int)(0.5f * (float)(gy1 - gy0));   /* 33.3 ms: 30 frames a second */
-    GdiFlush();
-
-    const float rad = (float)font_px * 0.5f, bg_a = 0.80f;
-    const float bg_c[3] = { 12.0f / 255.0f, 14.0f / 255.0f, 20.0f / 255.0f };
-    for (int y = 0; y < H; y++) {
-        unsigned char* o = dst + (size_t)y * OV_W * 4;
-        for (int x = 0; x < W; x++, o += 4) {
-            /* the rounded box's coverage at the pixel's centre */
-            const float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            const float cx = px < rad ? rad : (px > (float)W - rad ? (float)W - rad : px);
-            const float cy = py < rad ? rad : (py > (float)H - rad ? (float)H - rad : py);
-            float a = rad + 0.5f - sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
-            a = (a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a) * bg_a;
-            const u32 p = bits[(size_t)y * OVS_W + (size_t)x];
-            u32 cv = p & 0xFF;
-            if (((p >> 8) & 0xFF) > cv) cv = (p >> 8) & 0xFF;
-            if (((p >> 16) & 0xFF) > cv) cv = (p >> 16) & 0xFF;
-            float cov = (float)cv / 255.0f;
-            u32 rgb = 0xF5F5F5;
-            for (int b = 0; b < nb; b++)
-                if (x >= box[b].x0 && x < box[b].x1 && y >= box[b].y0 && y < box[b].y1) { rgb = box[b].rgb; break; }
-            if (y == ref_y && x >= gx0 && x < gx1 && cov < 0.30f) { cov = 0.30f; rgb = 0xF5F5F5; }
-            const float t[3] = { (float)((rgb >> 16) & 0xFF) / 255.0f, (float)((rgb >> 8) & 0xFF) / 255.0f,
-                                 (float)(rgb & 0xFF) / 255.0f };
-            for (int ch = 0; ch < 3; ch++)
-                o[ch] = (unsigned char)((t[ch] * cov + bg_c[ch] * a * (1.0f - cov)) * 255.0f + 0.5f);
-            o[3] = (unsigned char)((cov + a * (1.0f - cov)) * 255.0f + 0.5f);
+    const ULONGLONG now = GetTickCount64();
+    const int full = now - text_at >= 250;
+    if (full) {
+        text_at = now;
+        memset(bits, 0, (size_t)OVS_W * 2 * H * 2 * 4);
+        static const char* const lab[OVS_ROWS] = { "GPU", "VRAM", "CPU", "RAM", "PPU", "FPS" };
+        static const u32 col[OVS_ROWS] = { 0xA4D65A, 0xA4D65A, 0x42AEE6, 0xD877C4, 0xEBAA3C, 0xE6EAE6 };
+        char v[OVS_ROWS][3][24];
+        memset(v, 0, sizeof v);
+        snprintf(v[0][0], sizeof v[0][0], "%.0f%%", s_ovs_gpu);
+        snprintf(v[1][0], sizeof v[1][0], "%.2f GB", (double)s_ovs_vram_mb / 1024.0);
+        if (s_vram_mb) snprintf(v[1][1], sizeof v[1][1], "/ %.2f GB", (double)s_vram_mb / 1024.0);
+        snprintf(v[2][0], sizeof v[2][0], "%ld%%", (long)((s_ovs_pct[0] + 5) / 10));
+        snprintf(v[3][0], sizeof v[3][0], "%.1f GB", (double)s_ovs_ram_mb / 1024.0);
+        snprintf(v[3][1], sizeof v[3][1], "/ %.1f GB", (double)s_ovs_ram_total_mb / 1024.0);
+        snprintf(v[4][0], sizeof v[4][0], "%ld%%", (long)((s_ovs_pct[1] + 5) / 10));
+        snprintf(v[4][1], sizeof v[4][1], "SPU %ld%%", (long)((s_ovs_pct[2] + 5) / 10));
+        snprintf(v[4][2], sizeof v[4][2], "RSX %ld%%", (long)((s_ovs_pct[3] + 5) / 10));
+        snprintf(v[5][0], sizeof v[5][0], "%.0f", s_ovs_fps);
+        snprintf(v[5][1], sizeof v[5][1], "%.1f ms", s_ovs_ms);
+        nb = 0;
+        for (int r = 0; r < OVS_ROWS; r++) {
+            const int y = top + r * rh;
+            ovs_put(dc, pad, y, rh, x1, lab[r]);
+            box[nb].x0 = pad; box[nb].y0 = y; box[nb].x1 = x1; box[nb].y1 = y + rh; box[nb].rgb = col[r]; nb++;
+            ovs_put(dc, x1, y, rh, x2, v[r][0]);
+            ovs_put(dc, x2, y, rh, x3, v[r][1]);
+            ovs_put(dc, x3, y, rh, W - pad, v[r][2]);
+        }
+        char line[OVS_LINES][96];
+        ovs_lines(line);
+        line[4][0] = 0;
+        if (s_ovs_line && s_ovs_line(line[4], (int)sizeof line[4]) <= 0) line[4][0] = 0;
+        for (int l = 0; l < nlines; l++) {
+            const int y = ly + l * lh;
+            ovs_put(dc, pad, y, lh, W - pad, line[l]);
+            if (l < 4) { box[nb].x0 = pad; box[nb].y0 = y; box[nb].x1 = W - pad; box[nb].y1 = y + lh; box[nb].rgb = 0x98A29C; nb++; }
+        }
+        GdiFlush();
+        for (int y = 0; y < H; y++) {
+            const u32* a = bits + (size_t)y * 2 * OVS_W * 2, *b = a + OVS_W * 2;
+            unsigned char* o = cov + (size_t)y * OVS_W;
+            for (int x = 0; x < W; x++)
+                o[x] = (unsigned char)(((a[x * 2] & 0xFF) + (a[x * 2 + 1] & 0xFF) + (b[x * 2] & 0xFF) + (b[x * 2 + 1] & 0xFF) + 2) >> 2);
         }
     }
-    *pw = (u32)W;
-    *ph = (u32)H;
+    /* The graph: the last OVS_HIST frame times, 0 to 66.7 ms (15 frames a second) bottom to top, oldest left, a line
+     * F / 12 thick, each pixel covered by what of the line's span crosses it. */
+    const int gw = gx1 - gx0, gh = gy1 - gy0, in = F / 3;
+    memset(gcov, 0, (size_t)gw * gh);
+    {
+        float v[OVS_HIST];
+        for (int i = 0; i < OVS_HIST; i++) {
+            float ft = s_ovs_ft[(s_ovs_ft_i + i) % OVS_HIST] / 66.7f;
+            if (ft > 1.0f) ft = 1.0f;
+            if (ft < 0.0f) ft = 0.0f;
+            v[i] = (float)(gh - in) - ft * (float)(gh - 2 * in);
+        }
+        const int ax = in, bx = gw - in;
+        const float hw = (float)F / 24.0f;
+        float y0 = v[0];
+        for (int x = ax; x < bx; x++) {
+            const float t = (float)(x + 1 - ax) * (float)(OVS_HIST - 1) / (float)(bx - ax);
+            const int i = t >= (float)(OVS_HIST - 1) ? OVS_HIST - 2 : (int)t;
+            const float y1 = v[i] + (v[i + 1] - v[i]) * (t - (float)i);
+            const float lo = (y0 < y1 ? y0 : y1) - hw, hi = (y0 > y1 ? y0 : y1) + hw;
+            int a = (int)floorf(lo), b = (int)floorf(hi);
+            if (a < 0) a = 0;
+            if (b >= gh) b = gh - 1;
+            for (int y = a; y <= b; y++) {
+                const float top_ = (float)y > lo ? (float)y : lo, bot_ = (float)(y + 1) < hi ? (float)(y + 1) : hi;
+                const float c = bot_ - top_;
+                if (c > 0.0f) gcov[(size_t)y * gw + (size_t)x] = (unsigned char)((c > 1.0f ? 1.0f : c) * 255.0f + 0.5f);
+            }
+            y0 = y1;
+        }
+    }
+
+    u32* const img = pair[back];
+    for (int y = 0; y < H; y++) {
+        const unsigned char* s = cov + (size_t)y * OVS_W;
+        const u32* b = bg + (size_t)y * OVS_W;
+        u32* o = img + (size_t)y * OVS_W;
+        const int graph = y >= gy0 && y < gy1;
+        for (int x = 0; x < W; x++) {
+            const u32 cv = graph && x >= gx0 && x < gx1 ? gcov[(size_t)(y - gy0) * gw + (size_t)(x - gx0)] : s[x];
+            if (!cv) { o[x] = b[x]; continue; }
+            u32 rgb = 0xE6EAE6;
+            for (int i = 0; i < nb; i++)
+                if (x >= box[i].x0 && x < box[i].x1 && y >= box[i].y0 && y < box[i].y1) { rgb = box[i].rgb; break; }
+            const u32 inv = 255 - cv, p = b[x];
+            const u32 cr = (((rgb >> 16) & 0xFF) * cv + (p & 0xFF) * inv + 127) / 255;
+            const u32 cg = (((rgb >> 8) & 0xFF) * cv + ((p >> 8) & 0xFF) * inv + 127) / 255;
+            const u32 cb = ((rgb & 0xFF) * cv + ((p >> 16) & 0xFF) * inv + 127) / 255;
+            const u32 ca = cv + ((p >> 24) * inv + 127) / 255;
+            o[x] = cr | (cg << 8) | (cb << 16) | (ca << 24);
+        }
+    }
+    EnterCriticalSection(&s_ovs_lock);
+    s_ovs_front = img;
+    s_ovs_fw = W;
+    s_ovs_fh = H;
+    LeaveCriticalSection(&s_ovs_lock);
+    back ^= 1;
+}
+
+/* The presenting thread's part: the last finished image into dst (rows OV_W * 4 apart). */
+static void ovs_copy(unsigned char* dst, u32* pw, u32* ph)
+{
+    *pw = *ph = 0;
+    EnterCriticalSection(&s_ovs_lock);
+    if (s_ovs_front) {
+        for (int y = 0; y < s_ovs_fh; y++)
+            memcpy(dst + (size_t)y * OV_W * 4, s_ovs_front + (size_t)y * OVS_W, (size_t)s_ovs_fw * 4);
+        *pw = (u32)s_ovs_fw;
+        *ph = (u32)s_ovs_fh;
+    }
+    LeaveCriticalSection(&s_ovs_lock);
+}
+
+static DWORD WINAPI ovs_painter(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        Sleep(100);
+        const LONG font = InterlockedCompareExchange(&s_ovs_font, 0, 0);
+        if (font) ov_render_panel((u32)font);
+    }
 }
 
 /* The overlay's items over the back buffer at rtv, after the scaling pass. */
@@ -4883,6 +5097,7 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     u32 pfont = s_d3d.bb_h / 60;
     if (pfont < 12) pfont = 12;
     if (pfont > 28) pfont = 28;
+    if (panel) InterlockedExchange(&s_ovs_font, (LONG)pfont);
     static char shown[2][64];
     static u32 shown_px, w[2], pw, ph;
     static ULONGLONG panel_at;
@@ -4899,7 +5114,7 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         whole = 1;
         ov_render(s_d3d.ov_up_ptr[fi], item, font_px, w);
         if (panel) {
-            ov_render_panel(s_d3d.ov_up_ptr[fi] + (size_t)OV_ROWS_H * OV_W * 4, pfont, &pw, &ph);
+            ovs_copy(s_d3d.ov_up_ptr[fi] + (size_t)OV_ROWS_H * OV_W * 4, &pw, &ph);
             panel_at = now;
         }
         snprintf(shown[0], sizeof shown[0], "%s", item[0] ? item[0] : "");
@@ -4977,8 +5192,8 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
     }
     if (panel && pw && ph) {
-        /* the panel in the top left corner, a texel to a pixel */
-        const float x = (float)pfont, y = (float)pfont;
+        /* the panel in the top right corner, a texel to a pixel */
+        const float x = bw - (float)pfont - (float)pw, y = (float)pfont;
         const float c[16] = {
             x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
             (x + (float)pw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)ph) / bh * 2.0f,
@@ -5053,15 +5268,21 @@ static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
     if (vsb) vsb->lpVtbl->Release(vsb);
     if (psb) psb->lpVtbl->Release(psb);
     if (FAILED(hr)) { printf("[D3D12] overlay unavailable (0x%08lX)\n", hr); s_d3d.ov_pso = NULL; }
-    if (s_d3d.ov_pso && ovs_on()) {
-        HANDLE t = CreateThread(NULL, 0, ovs_sampler, NULL, 0, NULL);
-        if (t) {
-            typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
-            const set_desc_fn set_desc = (set_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                                                            "SetThreadDescription");
-            if (set_desc) set_desc(t, L"overlay stats");
-            SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
-            CloseHandle(t);
+    static int started;
+    if (s_d3d.ov_pso && ovs_on() && !started) {
+        started = 1;
+        InitializeCriticalSection(&s_ovs_lock);
+        typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+        const set_desc_fn set_desc = (set_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                                        "SetThreadDescription");
+        const struct { LPTHREAD_START_ROUTINE fn; const wchar_t* name; } th[2] = {
+            { ovs_sampler, L"overlay stats" }, { ovs_painter, L"overlay panel" } };
+        for (int i = 0; i < 2; i++) {
+            HANDLE h = CreateThread(NULL, 0, th[i].fn, NULL, 0, NULL);
+            if (!h) continue;
+            if (set_desc) set_desc(h, th[i].name);
+            SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(h);
         }
     }
 }

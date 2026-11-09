@@ -56,6 +56,9 @@ int rsx_d3d12_backend_generating(void);
  * for none. Before rsx_d3d12_backend_init. */
 void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 
+/* A line of the game's own at the foot of the stats panel: fn writes it and returns its length, 0 for none. */
+void rsx_d3d12_backend_overlay_line(int (*fn)(char* out, int max));
+
 /* The refresh rate of the display the window opened on, 0 if Windows cannot say. */
 double rsx_d3d12_backend_refresh_hz(void);
 

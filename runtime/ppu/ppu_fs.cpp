@@ -172,7 +172,7 @@ static void host_path(char* out, size_t cap, const char* guest)
      * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
     if (strncmp(guest, "/dev_flash/", 11) == 0) {
         const char* fw = getenv("PS3_DEV_FLASH");
-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+        if (!fw || !*fw) fw = "dev_flash";
         snprintf(out, cap, "%s/%s", fw, guest + 11);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;

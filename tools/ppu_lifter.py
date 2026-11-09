@@ -20,6 +20,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
+import ppu_dead_saves
 import ppu_lazy_flags
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1143,8 @@ class PPULifter:
 
     def __init__(self, prefix: str = "", weak_emit: bool = False):
         self.lazy_flags = ""        # --lazy-flags: "", "on" or "check"
+        self.dead_saves = ""        # --dead-saves: "", "on" or "poison"
+        self._ds_done = False
         self._lf = None
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
@@ -4114,6 +4117,15 @@ class PPULifter:
 
     def _lf_prepare(self, emit_funcs, func_by_addr, sorted_addrs, addr_index) -> None:
         """--lazy-flags: what every function reads before writing, along its tail calls."""
+        if self.dead_saves and not self._ds_done:
+            self._ds_done = True
+            tails = {}
+            for f in emit_funcs:
+                tail = self._fallthrough_line(f, func_by_addr, sorted_addrs, addr_index, False)
+                if tail:
+                    tails[f.name] = tail
+            done, why = ppu_dead_saves.apply(emit_funcs, self.dead_saves, tails)
+            print(f"  dead saves ({self.dead_saves}): {dict(done)}; kept {sum(why.values())}: {dict(why)}", flush=True)
         self._lf = None
         if not self.lazy_flags:
             return
@@ -4141,6 +4153,8 @@ class PPULifter:
             if self.lazy_flags == "check":
                 lines.append("#define PPU_LF_CHECK 1")
             lines.append(ppu_lazy_flags.HEADER)
+        if self.dead_saves:
+            lines.append(ppu_dead_saves.HEADER)
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx PPU_NOESC);")
@@ -5234,6 +5248,9 @@ def main() -> None:
     parser.add_argument("--lazy-flags", choices=("off", "on", "check"), default="off",
                         help="the volatile CR fields and XER[CA] in locals of each function "
                              "(ppu_lazy_flags.py); check keeps the exact accesses too and compares")
+    parser.add_argument("--dead-saves", choices=("off", "on", "poison"), default="off",
+                        help="no guest stores for register saves nothing reads, in each function "
+                             "(ppu_dead_saves.py); poison writes a poison value there instead")
     parser.add_argument("--insn-patches", metavar="FILE", default=None,
                         help="JSON list of instruction patches to lift as "
                              "run-time switches: each {addr, orig, new, guard} "
@@ -5676,6 +5693,7 @@ def main() -> None:
 
     lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
     lifter.lazy_flags = "" if args.lazy_flags == "off" else args.lazy_flags
+    lifter.dead_saves = "" if args.dead_saves == "off" else args.dead_saves
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has

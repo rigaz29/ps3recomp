@@ -18,7 +18,11 @@
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
+#ifdef PS3RECOMP_NO_DECRYPT
+static inline uint8_t* sdata_decrypt(const uint8_t*, size_t, size_t*) { return nullptr; }
+#else
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

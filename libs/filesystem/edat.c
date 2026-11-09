@@ -25,6 +25,19 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifdef PS3RECOMP_NO_DECRYPT
+
+/* Built without decryption (the option in CMakeLists.txt): no keys in the binary
+ * and no cache files beside the game's. An encrypted file reaches the guest as it
+ * is, which is what happens when a decryption fails. */
+int edat_is_npd(const char* host_path) { (void)host_path; return 0; }
+int edat_decrypt_file(const char* in_path, const char* out_path) { (void)in_path; (void)out_path; return -1; }
+const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }
+int edat_selftest(void) { return 0; }
+
+#else /* PS3RECOMP_NO_DECRYPT */
+
 /* ---------------------------------------------------------------------------
  * AES-128
  * -----------------------------------------------------------------------*/
@@ -686,3 +699,5 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
     if (edat_decrypt_file(host_path, buf) != 0) return host_path;
     return buf;
 }
+
+#endif /* PS3RECOMP_NO_DECRYPT */

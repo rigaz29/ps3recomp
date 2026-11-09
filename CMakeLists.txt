@@ -21,6 +21,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 
+# Leaves the EDAT/SDATA decryption and its keys out of the binary; an encrypted file
+# then reaches the guest as it is. A port compiles runtime/ppu/ppu_fs.cpp itself, so
+# it sets the same definition on that file.
+option(PS3RECOMP_NO_DECRYPT "Build without EDAT/SDATA decryption or its keys" OFF)
+if(PS3RECOMP_NO_DECRYPT)
+    set_source_files_properties(libs/filesystem/edat.c runtime/ppu/ppu_fs.cpp
+                                PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_NO_DECRYPT)
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------

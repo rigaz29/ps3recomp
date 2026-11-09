@@ -3102,15 +3102,18 @@ static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 
 /* The device (s_d3d.device), 0 on success. On a dual-GPU laptop a NULL adapter
  * usually lands on the integrated GPU; explicitly pick the high-performance
- * (discrete) adapter via IDXGIFactory6. Set CELLMARK_IGPU to force the
- * low-power one (for A/B testing a suspected iGPU-driver stall). The game's
- * start and the precompile (which must pick the same compiler) both come here. */
+ * (discrete) adapter via IDXGIFactory6. graphics.gpu = integrated (D3D12_GPU)
+ * takes the low-power one instead, as CELLMARK_IGPU does (for A/B testing a
+ * suspected iGPU-driver stall). A launcher that shows the choice asks Windows
+ * the same way. The game's start and the precompile (which must pick the same
+ * compiler) both come here. */
 static int d3d_device_create(IDXGIFactory4* factory)
 {
     IDXGIFactory6* factory6 = NULL;
     if (SUCCEEDED(factory->lpVtbl->QueryInterface(
             factory, &IID_IDXGIFactory6, (void**)&factory6))) {
-        DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
+        DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU") ||
+                                   ps3_settings_ieq(ps3_settings_str("graphics", "gpu", "D3D12_GPU", "discrete"), "integrated")
             ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
             : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
         IDXGIAdapter1* adapter = NULL;
@@ -3126,6 +3129,12 @@ static int d3d_device_create(IDXGIFactory4* factory)
                 printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
                        (unsigned long long)(ad.DedicatedVideoMemory >> 20));
                 s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
+                /* An integrated GPU's textures are in the PC's memory: the little it
+                 * has of its own says nothing about what fits. */
+                { D3D12_FEATURE_DATA_ARCHITECTURE arch;
+                  memset(&arch, 0, sizeof arch);
+                  if (SUCCEEDED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch)) && arch.UMA)
+                      s_vram_mb = (u32)((ad.DedicatedVideoMemory + ad.SharedSystemMemory) >> 20); }
                 if (FAILED(adapter->lpVtbl->QueryInterface(adapter, &IID_IDXGIAdapter3, (void**)&s_adapter3)))
                     s_adapter3 = NULL;
                 adapter->lpVtbl->Release(adapter);
@@ -8955,7 +8964,8 @@ static void vp_tex_drop(VPTexSlot* t)
 }
 
 /* TEX_CACHE_MB=<n>: what the cached textures may take. Default: a third of the
- * adapter's dedicated VRAM within 256-2048 MB, 512 MB when that is not known. */
+ * adapter's VRAM (an integrated GPU's: with the memory it shares) within
+ * 256-2048 MB, 512 MB when that is not known. */
 static u64 vp_tex_budget(void)
 {
     static u64 b;

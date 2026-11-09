@@ -5683,9 +5683,19 @@ static int shot_png(ID3D12Resource* buf, u32 w, u32 h, u32 pitch)
     D3D12_RANGE wr = {0, 0};
     buf->lpVtbl->Unmap(buf, 0, &wr);
 
+    /* Beside the settings, where replacing the program's folder does not reach them. */
     char dir[MAX_PATH], path[MAX_PATH + 96];
-    DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
-    char* slash = n && n < sizeof dir ? strrchr(dir, '\\') : NULL;
+    const char* settings = ps3_settings_path();
+    char* slash = NULL;
+    if (settings && *settings) {
+        snprintf(dir, sizeof dir, "%s", settings);
+        slash = strrchr(dir, '\\');
+        if (!slash) slash = strrchr(dir, '/');
+    }
+    if (!slash) {
+        DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+        slash = n && n < sizeof dir ? strrchr(dir, '\\') : NULL;
+    }
     if (slash) slash[1] = 0; else dir[0] = 0;
     strncat(dir, "screenshots", sizeof dir - strlen(dir) - 1);
     CreateDirectoryA(dir, NULL);

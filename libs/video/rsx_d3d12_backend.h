@@ -59,6 +59,9 @@ void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 /* A line of the game's own at the foot of the stats panel: fn writes it and returns its length, 0 for none. */
 void rsx_d3d12_backend_overlay_line(int (*fn)(char* out, int max));
 
+/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the screen is wider. */
+float rsx_d3d12_backend_wide_ratio(void);
+
 /* The refresh rate of the display the window opened on, 0 if Windows cannot say. */
 double rsx_d3d12_backend_refresh_hz(void);
 

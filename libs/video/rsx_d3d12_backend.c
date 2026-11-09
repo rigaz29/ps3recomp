@@ -266,6 +266,7 @@ typedef struct {
     /* A colour target in main memory (rec_mwb): its offset (0 = none), pitch,
      * clip and SET_SURFACE_FORMAT, for the write-back at the batch's end. */
     u32   mwb_off, mwb_pitch, mwb_w, mwb_h, mwb_fmt;
+    u8    wide_cam;     /* display.ultrawide: draws the scene through the title's camera */
 } D3D12DrawRecord;
 /* An indexed run (upload_tris_vp_ix) may take the next batch; cleared with the records. */
 static int s_ix_run_valid;
@@ -409,6 +410,14 @@ typedef struct {
  * own view stays at its size: a write-back to main memory is point-sampled down and occlusion
  * counts are divided. At 1 every path and every program is what it was. */
 static float s_rs = 1.0f;
+/* display.ultrawide: the picture as much wider than the title's 16:9 as the screen is. Targets the size of the display are
+ * drawn that much wider while the guest goes on seeing its own size, and the port widens the title's cameras to match. Its
+ * 2D comes through those cameras too, and its movies take the aspect from the same setting, so they keep their shape in
+ * the 16:9 in the middle by themselves. A frame with no 3D scene has black bars beside that (present_to_backbuffer). */
+static float s_wide = 1.0f;
+static int s_wide_3d;                   /* recording: this frame has drawn through the title's camera */
+static int s_wide_scene;                /* replay: the same */
+#define RS_ON (s_rs != 1.0f || s_wide != 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
  * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
  * earlier one already have: made anew there, those draws sample the old one through the views they
@@ -846,7 +855,7 @@ static void subvp_note(u32 x, u32 y, u32 w, u32 h)
 {
     if (!w || !h || w > s_d3d.width || h > s_d3d.height) return;
     if (w == s_d3d.width && h == s_d3d.height) return;      /* full-screen pass */
-    if (s_rs != 1.0f) return;                                /* its copies are in guest pixels */
+    if (RS_ON) return;                                       /* its copies are in guest pixels */
     for (int i = 0; i < s_subvp_n; i++)
         if (s_subvp[i].w == w && s_subvp[i].h == h) { s_subvp[i].x = x; s_subvp[i].y = y; return; }
     if (s_subvp_n >= SUBVP_SLOTS) return;
@@ -1102,6 +1111,7 @@ static void fg_start(void)
     const char* m = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
     const int mode = ps3_settings_ieq(m, "on") ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
     if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
+    if (rsx_d3d12_backend_wide_ratio() != 1.0f) s_fg.prev_reg = -1;   /* 21:9: it left noise on Kratos in close-ups; cause not found */
     if (!mode) return;
     if (s_fsr3_refused) {
         printf("[D3D12] frame generation: off, %s%c", s_fsr3_refused, 10);
@@ -2920,6 +2930,27 @@ static void ov_toast(const char* msg);
  * resizes the swap chain to it after its next Present (bb_resize). */
 static volatile LONG s_view_w, s_view_h;
 
+/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the screen is wider. */
+float rsx_d3d12_backend_wide_ratio(void)
+{
+    static float r = -1.0f;
+    if (r < 0.0f) {
+        float v = 1.0f;
+        if (ps3_settings_bool("display", "ultrawide", "D3D12_ULTRAWIDE", 0)) {
+            int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN), ww = 0, wh = 0;
+            const char* ws = ps3_settings_str("display", "window_size", NULL, NULL);
+            if (!ps3_settings_ieq(ps3_settings_str("display", "mode", NULL, "windowed"), "borderless") &&
+                ws && sscanf(ws, "%dx%d", &ww, &wh) == 2 && ww > 0 && wh > 0) {
+                w = ww;
+                h = wh;
+            }
+            if (w > 0 && h > 0 && (float)w / (float)h / (16.0f / 9.0f) > 1.02f) v = (float)w / (float)h / (16.0f / 9.0f);
+        }
+        r = v;
+    }
+    return r;
+}
+
 static void d3d12_place_view(HWND hwnd)
 {
     RECT rc;
@@ -2928,6 +2959,12 @@ static void d3d12_place_view(HWND hwnd)
     if (cw <= 0 || ch <= 0) return;
     LONG w = cw, h = (LONG)((long long)cw * s_d3d.height / s_d3d.width);
     if (h > ch) { h = ch; w = (LONG)((long long)ch * s_d3d.width / s_d3d.height); }
+    const float wide = rsx_d3d12_backend_wide_ratio();
+    if (wide != 1.0f) {
+        w = cw;
+        h = (LONG)((double)cw * s_d3d.height / ((double)s_d3d.width * wide) + 0.5);
+        if (h > ch) { h = ch; w = (LONG)((double)ch * s_d3d.width * wide / s_d3d.height + 0.5); }
+    }
     MoveWindow(s_d3d.view, (cw - w) / 2, (ch - h) / 2, w, h, TRUE);
     InterlockedExchange(&s_view_w, w);
     InterlockedExchange(&s_view_h, h);
@@ -3171,7 +3208,8 @@ static void rs_init(void)
         if (!ps3_settings_ieq(v, "1")) printf("[D3D12] render scale: 1, FP_CONSTBUF=0 has no way to divide WPOS%c", 10);
         return;
     }
-    const float fit_w = (float)s_d3d.bb_w / (float)s_d3d.width, fit_h = (float)s_d3d.bb_h / (float)s_d3d.height;
+    s_wide = rsx_d3d12_backend_wide_ratio();
+    const float fit_w = (float)s_d3d.bb_w / ((float)s_d3d.width * s_wide), fit_h = (float)s_d3d.bb_h / (float)s_d3d.height;
     const float fit = fit_w < fit_h ? fit_w : fit_h;
     float s = ps3_settings_ieq(v, "native") ? fit : (float)atof(v);
     if (!(s >= 1.0f)) s = 1.0f;
@@ -3182,15 +3220,15 @@ static void rs_init(void)
         s = fit < 1.0f ? 1.0f : fit;
     }
     s_rs = s;
-    s_d3d.pw = (u32)((float)s_d3d.width * s + 0.5f);
+    s_d3d.pw = (u32)((float)s_d3d.width * s * s_wide + 0.5f);
     s_d3d.ph = (u32)((float)s_d3d.height * s + 0.5f);
-    if (s != 1.0f) printf("[D3D12] internal resolution: %ux%u (%.3gx %ux%u)%c", s_d3d.pw, s_d3d.ph, s, s_d3d.width, s_d3d.height, 10);
+    if (RS_ON) printf("[D3D12] internal resolution: %ux%u (%.3gx %ux%u)%c", s_d3d.pw, s_d3d.ph, s, s_d3d.width, s_d3d.height, 10);
 }
 
 /* Whether a surface of this guest size is drawn larger. */
 static int rs_class(u32 w, u32 h)
 {
-    return s_rs != 1.0f && w == s_d3d.width && h == s_d3d.height;
+    return RS_ON && w == s_d3d.width && h == s_d3d.height;
 }
 
 /* A guest coordinate in the pixels of a target drawn f times larger. */
@@ -4301,7 +4339,7 @@ static void bb_resize(void)
     if (!w || !h) return;
     /* FSR 3 takes no render larger than the display: a view made smaller than the render
      * keeps a swap chain that big, and the flip stretches it down. */
-    if (s_rs != 1.0f && (s_fg_mode || s_up.want)) {
+    if (RS_ON && (s_fg_mode || s_up.want)) {
         if (w < s_d3d.pw) w = s_d3d.pw;
         if (h < s_d3d.ph) h = s_d3d.ph;
     }
@@ -5646,6 +5684,19 @@ static void present_to_backbuffer(u32 fi)
     ID3D12Resource* disp = s_d3d.render_targets[fi];
     ID3D12Resource* bb = s_d3d.backbuffers[fi];
 
+    if (s_wide != 1.0f && !s_wide_scene) {
+        const LONG side = (LONG)(((float)s_d3d.pw - (float)s_d3d.pw / s_wide) * 0.5f);
+        const D3D12_RECT bars[2] = { { 0, 0, side, (LONG)s_d3d.ph },
+                                     { (LONG)s_d3d.pw - side, 0, (LONG)s_d3d.pw, (LONG)s_d3d.ph } };
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+        s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv);
+        rtv.ptr += fi * s_d3d.rtv_descriptor_size;
+        pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rtv, black, 2, bars);
+        pp_barrier(disp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    }
+    s_wide_scene = 0;
     pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     const int up = up_run(fi, disp, bb, bb_rtv);
     if (!up) {
@@ -6800,6 +6851,22 @@ static int vp_get_vs(const rsx_state* st)
             memcpy(at, repl, m);
             memset(at + m, ' ', n - m);
             at += n;
+        }
+    }
+    /* display.ultrawide, the screen's edges: the title keeps its 2D inside the 16:9 in the middle, so a fade, a backdrop
+     * or a cutscene's bars would stop there with the scene going on beside them. A flat vertex at or past that edge goes
+     * as far past the screen's when the draw asks for it (vp_posoffset.w, vp_record_cb); inside the 16:9 nothing moves. */
+    if (s_wide != 1.0f) {
+        static const char anchor[] = "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
+        char add[256];
+        const int n = snprintf(add, sizeof add,
+                               " if (vp_posoffset.w != 0.0 && abs(_p.w - 1.0) < 0.001 && abs(Out.pos.x) >= %f && abs(Out.pos.x) < 0.999)"
+                               " Out.pos.x *= %f;", 1.0f / s_wide - 0.002f, s_wide);
+        char* at = strstr(hlsl, anchor);
+        if (at && n > 0 && n < (int)sizeof add && strlen(hlsl) + (size_t)n < sizeof hlsl) {
+            at += sizeof anchor - 1;
+            memmove(at + n, at, strlen(at) + 1);
+            memcpy(at, add, (size_t)n);
         }
     }
     /* A worker builds it unless the disk cache has it (D3D12_ASYNC_SHADERS);
@@ -8311,7 +8378,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     }
     /* Internal resolution: WPOS back in guest pixels by the target's own factor, which replay
      * puts in fp_alpha.w. Only when it is on, so that at 1 every program is the text it was. */
-    if (buffered && s_rs != 1.0f)
+    if (buffered && s_wide != 1.0f) {
+        /* A target drawn wider has -1/sy in fp_alpha.w; x is then that much further. */
+        char wp[256];
+        snprintf(wp, sizeof wp, "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? %.7f : 1.0) + fp_alpha.z, (fp_alpha.y != 0.0 ? "
+                 "fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + fp_alpha.z,", 1.0f / s_wide);
+        hlsl_replace_all(hlsl, sizeof hlsl,
+                         "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,", wp);
+    } else if (buffered && s_rs != 1.0f)
         hlsl_replace_all(hlsl, sizeof hlsl,
                          "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,",
                          "float4((p).x * fp_alpha.w + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * fp_alpha.w : "
@@ -10447,6 +10521,14 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         vpx[4] += s_up.cx;
         vpx[5] += s_up.cy;
     }
+    if (s_wide != 1.0f && dr) {
+        if (dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
+            vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
+            const float* m = c + s_fg.cam_reg * 4;
+            if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) { s_wide_3d = 1; dr->wide_cam = 1; }
+        }
+        if (s_wide_3d && (dr->rt_off & DISP_RT_TAG)) vpx[7] = 1.0f;   /* over a scene: see "the screen's edges" */
+    }
     if (FG_INPUTS() && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
         vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
         const float* m = c + s_fg.cam_reg * 4;
@@ -12208,6 +12290,7 @@ static unsigned s_fo_batch, s_fo_dropped, s_fo_failed;
 static void d3d12_flip_observed(u32 buffer_id)
 {
     static int on = -1;
+    s_wide_3d = 0;
     guest_peek_poke();
     if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
     extern u32 cellGcm_display_buffer_offset(u32 id);
@@ -13000,7 +13083,7 @@ static void zq_deliver(u32 fi)
                 u64 sum = 0;
                 for (u32 i = r->q0; i < r->q1; i++) sum += q[i];
                 /* A draw covers s*s the samples the title counts on: visible stays visible. */
-                if (s_rs != 1.0f && sum) { sum = (u64)((double)sum / (double)(s_rs * s_rs)); if (!sum) sum = 1; }
+                if (RS_ON && sum) { sum = (u64)((double)sum / (double)(s_rs * s_rs * s_wide)); if (!sum) sum = 1; }
                 const u32 c = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)sum;
                 cellGcm_zpass_result(r->ea, c, r->seq);
                 s_zq_stat[c ? 1 : 2]++;
@@ -13061,7 +13144,7 @@ static void zq_read(void)
  * records drew is copied into this frame's readback buffer; when the batch's
  * fence has passed, the pixels are written to guest memory. */
 #define MWB_MAX    8
-#define MWB_BYTES  ((u64)(8u << 20) * (u32)ceilf(s_rs * s_rs))
+#define MWB_BYTES  ((u64)(8u << 20) * (u32)ceilf(s_rs * s_rs * s_wide))
 typedef struct { u32 off, pitch, w, h, fmt, row_pitch; u64 buf_off; u32 pw, ph; float sx, sy; } MwbEntry;
 static ID3D12Resource* s_mwb_rb[FRAME_COUNT];
 static MwbEntry s_mwb[FRAME_COUNT][MWB_MAX];
@@ -14221,6 +14304,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     continue;
                 }
                 if (dr->zq_op) { zq_op_replay(dr); continue; }
+                if (dr->wide_cam) s_wide_scene = 1;
                 if (dr->is_clear && dr->clear_mask == 1u && (dr->rt_off & DISP_RT_TAG)) fg_marker(dr);
                 if (!dr->is_clear) zq_before_draw();
                 /* The targets and depth surface this draw binds (as the retarget
@@ -14600,10 +14684,10 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         ts[_u * 4 + 2] = (float)dr_gamma_mask(dr, _u);
                         ts[_u * 4 + 3] = 0.0f;
                     }
-                    if (s_rs != 1.0f) {
+                    if (RS_ON) {
                         float rx, ry;
                         rs_target(cur_rt, cur_z, cur_nc, &rx, &ry);
-                        ts[FPCB_ALPHA * 4 + 3] = 1.0f / rx;
+                        ts[FPCB_ALPHA * 4 + 3] = rx != ry ? -1.0f / ry : 1.0f / rx;
                     }
                 }
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,

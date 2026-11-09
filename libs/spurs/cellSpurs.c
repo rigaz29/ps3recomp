@@ -274,28 +274,32 @@ extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
  * at boot in 1 run of ~4). Raw accesses inside: vm_write16 would take the
  * same (non-recursive) lock. The end notifies reserving SPUs, under the lock
  * as spu_coh_notify_write expects. */
-extern void spu_lockline_lock(void);
-extern void spu_lockline_unlock(void);
+extern void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
+extern void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
 extern int  spu_coh_is_reserved(uint32_t);
 extern void spu_coh_notify_write(uint32_t);
 static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
 static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
-/* A plain store, for use under spu_lockline_lock: vm_write32 takes that lock
+/* A plain store, for use under the line's lock: vm_write32 takes that lock
  * itself when an SPU holds a reservation on the line, and it is not recursive. */
 static inline void ef_w32(uint32_t a, u32 v)
 {
     uint8_t* p = vm_base + a;
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
 }
+/* The line's lock: every field the two sides share, of an event flag or of the
+ * SPURS instance's workload state, lies in the structure's first 128 bytes. */
+static inline void ef_line_begin(uint32_t ea) { spu_lockline_lock_ea(ea & ~127u, 128u); }
+static inline void ef_line_abort(uint32_t ea) { spu_lockline_unlock_ea(ea & ~127u, 128u); }
 static inline void ef_line_end(uint32_t ea)
 {
     if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
-    spu_lockline_unlock();
+    ef_line_abort(ea);
 }
 
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
-    spu_lockline_lock();
+    ef_line_begin(ea);
     u16 events        = ef_r16(ea + EF_EVENTS);
     u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
                               ~ef_r16(ea + EF_SPU_PENDING_RECV));
@@ -1788,7 +1792,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
         if (!s_workloads[i].in_use) {
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
-            spu_lockline_lock();
+            ef_line_begin(spurs_ea);
             vm_base[spurs_ea + wkl_ready_off(i)] = 0;
             wkl_count_set(spurs_ea, SPURS_WKL_CURCONT, i, si->is2, 0);
             ef_w16(spurs_ea + wkl_signal_off(i),
@@ -2002,7 +2006,7 @@ s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set)
     if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid)))
         return CELL_SPURS_CORE_ERROR_SRCH;
     s32 rc = CELL_OK;
-    spu_lockline_lock();
+    ef_line_begin(ea);
     u8 receiver = vm_read8(ea + SPURS_WKL_FLAG_RECV);
     if (is_set ? receiver != 0xFF : receiver != wid) {
         rc = is_set ? CELL_SPURS_CORE_ERROR_BUSY : CELL_SPURS_CORE_ERROR_PERM;
@@ -2416,7 +2420,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
-        spu_lockline_lock();
+        ef_line_begin(slot->ea);
         wkl_count_set(slot->ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
@@ -2704,7 +2708,7 @@ static void spurs_take(struct SpursInst* si, struct SpursPmSlot* slot, u32 wid, 
 {
     const u32 ea = si->ea;
     WklPm* const pm = spurs_resolve_pm(wid);
-    spu_lockline_lock();
+    ef_line_begin(ea);
     const u32 ready = vm_read8(ea + wkl_ready_off(wid));
     const u32 signal = vm_read16(ea + wkl_signal_off(wid));
     if (ready && rr) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
@@ -2725,7 +2729,7 @@ static void spurs_take(struct SpursInst* si, struct SpursPmSlot* slot, u32 wid, 
           slot->boosted = b;
       } }
     si->active[wid]++;
-    spu_lockline_lock();
+    ef_line_begin(ea);
     wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
     ef_line_end(ea);
     if (dispatch_prof_secs()) {
@@ -2831,7 +2835,7 @@ static uint64_t spurs_kernel_poll(uint32_t ea, uint32_t sn, uint32_t cur)
     u32 status = 0;
     if (pick == cur) {
         const u32 cont = si->active[cur] ? si->active[cur] - 1u : 0u;
-        spu_lockline_lock();
+        ef_line_begin(ea);
         const u32 ready = vm_read8(ea + wkl_ready_off(cur));
         const u32 signal = vm_read16(ea + wkl_signal_off(cur));
         const int receiver = vm_read8(ea + SPURS_WKL_FLAG_RECV) == cur;
@@ -3003,13 +3007,13 @@ static s32 spurs_ready_exchange(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
-    spu_lockline_lock();
+    ef_line_begin(si->ea);
     u8 previous = vm_read8(si->ea + wkl_ready_off(wid));
     if (!conditional || previous == compare) {
         vm_base[si->ea + wkl_ready_off(wid)] = (u8)value;
         s_workloads[wid].readyCount = value;
         ef_line_end(si->ea);
-    } else spu_lockline_unlock();
+    } else ef_line_abort(si->ea);
     vm_write32((u32)(uintptr_t)old, previous);
     spurs_api_unlock(si);
     return CELL_OK;
@@ -3030,7 +3034,7 @@ void spurs_signal_workload(u32 spurs_ea, u32 wid)
 {
     struct SpursInst* si = spurs_inst_find(spurs_ea);
     if (!si || wid >= SPURS_MAX_WID) return;
-    spu_lockline_lock();
+    ef_line_begin(spurs_ea);
     const u32 a = spurs_ea + wkl_signal_off(wid);
     ef_w16(a, (u16)(vm_read16(a) | wkl_signal_bit(wid)));
     ef_line_end(spurs_ea);
@@ -3253,7 +3257,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
         /* Clear from the CURRENT word: bits an SPU set since `current` was
          * read must survive. */
-        spu_lockline_lock();
+        ef_line_begin(ea);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -3297,7 +3301,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
-        spu_lockline_lock();
+        ef_line_begin(ea);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -3317,7 +3321,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    spu_lockline_lock();
+    ef_line_begin(ea);
     ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
     ef_line_end(ea);
     ef_unlock(sync);

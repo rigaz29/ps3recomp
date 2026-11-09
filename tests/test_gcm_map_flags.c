@@ -12,6 +12,8 @@ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; abort(); }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; abort(); }
 
 static void reset_maps(void) {
     memset(s_io_mappings,0,sizeof(s_io_mappings));s_io_mapping_count=0;

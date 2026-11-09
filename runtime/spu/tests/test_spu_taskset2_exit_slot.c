@@ -12,6 +12,8 @@
 uint8_t* vm_base;
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;

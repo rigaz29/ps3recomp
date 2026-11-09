@@ -271,11 +271,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * cannot detect that a peer's reservation was lost. Issuer exclusion
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
-        spu_lockline_lock();
+        spu_lockline_lock_ea((uint32_t)ea, size);
         memset(vm_base + (uint32_t)ea, 0, size);
         for (uint32_t offset = 0; offset < size; offset += 128u)
             spu_coh_notify_write_except((uint32_t)ea + offset, spu);
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea((uint32_t)ea, size);
         return 0;
     }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
@@ -819,8 +819,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
             extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
+            extern void spu_lockline_lock_ea(uint32_t, uint32_t);
+            extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             if (spu_dma_diag()) spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
@@ -843,7 +843,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
-                spu_lockline_lock();
+                spu_lockline_lock_ea(a0, a1 + 128u - a0);
                 i = 0;
                 for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
@@ -856,22 +856,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     }
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_ea(a0, a1 + 128u - a0);
             } else if (span_reserved) {
-                spu_lockline_lock();
+                spu_lockline_lock_ea(a0, a1 + 128u - a0);
                 spu_put_bytes(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_ea(a0, a1 + 128u - a0);
             } else {
                 spu_put_bytes(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
+                        spu_lockline_lock_ea(a, 128u);
                         spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                        spu_lockline_unlock_ea(a, 128u);
                     }
                     if (a == a1) break;
                 }

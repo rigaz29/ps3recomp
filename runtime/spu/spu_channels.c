@@ -742,6 +742,22 @@ static void spu_llar_backoff(spu_context* ctx, uint32_t ea)
     t_last = ps3_ft_now();
 }
 
+/* A GETLLAR re-issued millions of times on one line is an SPU spin-wait that
+ * nobody is releasing: say so once per line. */
+static inline void spu_llar_spin_note(spu_context* ctx, uint32_t ea)
+{
+    static SPU_THREAD_LOCAL uint32_t t_ea;
+    static SPU_THREAD_LOCAL unsigned long t_n;
+    if (ea != t_ea) { t_ea = ea; t_n = 0; }
+    else if (++t_n == 4000000) {
+        const uint8_t* m = vm_base + ea;
+        fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
+                        " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+    }
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 /* SPU_SIG_TRACE=<ea>[,<ea>...] (hex, up to 8): 128-byte lines to follow --
  * a taskset (its signalled bitset is at +0x40), a barrier, a control block.
@@ -942,7 +958,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * spu_coh_reserve_fast). Anything else takes the lock as before. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
         if (!llar_fast) {
-            spu_lockline_lock();
+            spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
             /* Tell the PPU store paths this line is live, so a store into it goes
              * through the lock and raises SPU_EVENT_LR here instead of landing
              * unannounced. Nothing else about this transaction changes. */
@@ -988,16 +1004,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
          * without a per-function probe. */
-        { static SPU_THREAD_LOCAL uint32_t t_ea; static SPU_THREAD_LOCAL unsigned long t_n;
-          if (ea != t_ea) { t_ea = ea; t_n = 0; }
-          else if (++t_n == 4000000) {
-              const uint8_t* m = vm_base + ea;
-              fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
-                              " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                      ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
-                      m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
-          } }
-        if (!llar_fast) spu_lockline_unlock();
+        spu_llar_spin_note(ctx, ea);
+        if (!llar_fast) spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -1066,7 +1074,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               g_spu_putllc_count++;
               if ((ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++;
           } }
-        spu_lockline_lock();
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
@@ -1156,7 +1164,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -1166,7 +1174,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);       /* unconditional store, head last */
@@ -1177,7 +1185,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         if (PS3_FT_ON()) ps3_ft_line_note(ea & ~127u, spu_ft_who(ctx));
@@ -1254,6 +1262,72 @@ static int spu_chan_diag(void)
 
 static SPU_CH_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
 
+/* The atomics' own diagnostics, as spu_chan_diag is for the channels: 0 while
+ * none of them is set. SPU_ATOM_LEAN=0 also makes it 1, for an A/B. */
+#define SPU_ATOM_LEAN_DEFAULT 1
+static int spu_atom_diag(void)
+{
+    static SPU_DIAG_LINE struct { int v; char pad[60]; } s_line = { -1, { 0 } };
+    int v = s_line.v;
+    if (v < 0) {
+        const char* e = getenv("SPU_ATOM_LEAN");
+        v = !(e ? atoi(e) : SPU_ATOM_LEAN_DEFAULT) ||
+            getenv("SPU_POLLTRACE") || getenv("SPU_ATOMTRACE") || getenv("YDKJ_CRI_CHAIN") ||
+            getenv("SPU_ATOM_EA") || getenv("SPU_LLARWATCH") || getenv("SPU_PUTLLC_WHY") ||
+            getenv("SPU_SIG_TRACE") || getenv("SPU_LOCKGUARD");
+        s_line.v = v;
+    }
+    return v;
+}
+
+/* GETLLAR and PUTLLC without spu_wrch_full's frame: eight pushes, two saved XMM
+ * registers and the security cookie, plus the knob checks of its dispatch and of
+ * spu_mfc_atomic. The same transactions as spu_mfc_atomic in the same order.
+ * Anything it does not cover returns 0 and takes that path. */
+static SPU_CH_NOINLINE int spu_atomic_lean(spu_context* ctx, uint32_t cmd)
+{
+    extern uint32_t g_barrier_sync_watch;
+    if (spu_atom_diag() || g_barrier_sync_watch || (void*)ctx == g_spurs_pm_trace_ctx || PS3_FT_ON())
+        return 0;
+    const uint32_t ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) return 0;
+    uint8_t* ls = &ctx->ls[ctx->mfc_lsa & SPU_LS_MASK];
+    uint8_t* mem = vm_base + ea;
+    if (cmd == MFC_GETLLAR_CMD) {
+        spu_llar_backoff(ctx, ea);
+        yz_lockstep_tick(ctx);
+        const int fast = spu_coh_reserve_fast(ctx, ea);
+        if (!fast) {
+            spu_lockline_lock_ea(ea, MFC_ATOMIC_LINE);
+            spu_coh_reserve(ctx, ea);
+        }
+        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* one read of the line: see spu_mfc_atomic */
+        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
+        if (!fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }
+        ctx->atomic_stat = 4;
+        ctx->dbg_getllar++;
+        spu_llar_spin_note(ctx, ea);
+        if (!fast) spu_lockline_unlock_ea(ea, MFC_ATOMIC_LINE);
+        return 1;
+    }
+    spu_lockline_lock_ea(ea, MFC_ATOMIC_LINE);
+    const int won = ctx->resv_valid && ctx->resv_ea == ea &&
+                    memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0;
+    if (won) {
+        spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);       /* head last */
+        ctx->resv_valid = 0;                           /* no self-LR from the notify */
+        spu_coh_notify_write(ea);
+    }
+    ctx->atomic_stat = won ? 0 : 1;
+    ctx->resv_valid = 0;                               /* reservation consumed */
+    spu_lockline_unlock_ea(ea, MFC_ATOMIC_LINE);
+    if (won) {
+        spu_taskset_line_committed(ea);
+        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea);
+    }
+    return 1;
+}
+
 /* The MFC address, size, tag and tag-mask channels, five of the six channel writes of a DMA,
  * are each a store into the context (the one spu_wrch_full makes). With no channel diagnostic
  * on they are made here, without that function's frame. */
@@ -1271,6 +1345,12 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         default:        ctx->mfc_tag_mask = v;   return;   /* MFC_WrTagMask */
         }
     }
+#ifndef PS3_SPU_JOBCAP
+    if (channel == MFC_Cmd && !spu_chan_diag()) {
+        const uint32_t v = value._u32[0];
+        if ((v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD) && spu_atomic_lean(ctx, v)) return;
+    }
+#endif
     spu_wrch_full(ctx, channel, value);
 }
 

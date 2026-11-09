@@ -69,16 +69,16 @@ static uint32_t sync_watch(void){ static int64_t v=-2; if(v==-2){const char*e=ge
  * short and the next SPU waiter spins forever (GH3: Havok's integrate task
  * on 0x110C1540, mid intro movie). Change the word the way ppu_stwcx32 does:
  * under the lock, then tell any reserving SPU its line moved. */
-extern void spu_lockline_lock(void);
-extern void spu_lockline_unlock(void);
+extern void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
+extern void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
 extern int  spu_coh_is_reserved(uint32_t ea);
 extern void spu_coh_notify_write(uint32_t ea);
 static int sync_cas(CellSyncMutex* m, uint32_t ea, uint32_t* expected, uint32_t desired)
 {
-    spu_lockline_lock();
+    spu_lockline_lock_ea(ea, 4u);
     int ok = atomic_compare_exchange_strong(&m->lock, expected, desired);
     if (ok && spu_coh_is_reserved(ea)) spu_coh_notify_write(ea);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(ea, 4u);
     return ok;
 }
 
@@ -90,10 +90,10 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
     SYNC_WATCH_LOG("INIT", _ea, mutex);
-    spu_lockline_lock();
+    spu_lockline_lock_ea(_ea, 4u);
     atomic_store(&mutex->lock, 0);   /* m_freed = m_order = 0 -> free */
     if (spu_coh_is_reserved(_ea)) spu_coh_notify_write(_ea);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(_ea, 4u);
     return CELL_OK;
 }
 
@@ -420,7 +420,7 @@ typedef int (*sq_op)(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos);
 static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
 {
     uint32_t depth = vm_read32(q + 0x0C);
-    spu_lockline_lock();
+    spu_lockline_lock_ea(q, 8u);
     uint32_t x0 = vm_read32(q), x4 = vm_read32(q + 4);
     int ok = op(&x0, &x4, depth, pos);
     if (ok) {
@@ -428,17 +428,17 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
         memcpy(vm_ptr8(q), raw, 8);
         if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
     }
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(q, 8u);
     return ok;
 }
 
 static void sq_and(uint32_t q, uint32_t m0, uint32_t m4)
 {
-    spu_lockline_lock();
+    spu_lockline_lock_ea(q, 8u);
     uint32_t raw[2] = { ps3_bswap32(vm_read32(q) & m0), ps3_bswap32(vm_read32(q + 4) & m4) };
     memcpy(vm_ptr8(q), raw, 8);
     if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(q, 8u);
 }
 
 static int sq_push_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)

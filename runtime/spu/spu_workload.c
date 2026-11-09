@@ -568,18 +568,18 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
 {
     extern uint8_t* vm_base;
     if (task >= 128 || !spu_taskset_is_v2(taskset_ea)) return;
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_lockline_lock_ea(uint32_t, uint32_t); extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     const uint32_t ea = taskset_ea + 0x1980 + 16u * task;
     uint8_t* e = vm_base + ea;
-    spu_lockline_lock();   /* a joining SPU may hold a reservation on this line */
+    spu_lockline_lock_ea(ea, 16u);   /* a joining SPU may hold a reservation on this line */
     memset(e, 0, 16);
     if (exited) {
         e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
         e[15] = 0x12;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
     }
     spu_coh_notify_write(ea);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(ea, 16u);
 }
 
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
@@ -1369,7 +1369,7 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
  * and drop every reservation on the line. */
 static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
 {
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_lockline_lock_ea(uint32_t, uint32_t); extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     extern uint8_t* vm_base;
     /* Raw guest bytes, not vm_read32/vm_write32: vm_write32 takes the lock-line
@@ -1378,12 +1378,12 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
     const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
     const uint32_t mask = (1u << 31) >> (taskId % 32u);
     uint8_t* p = vm_base + word;
-    spu_lockline_lock();
+    spu_lockline_lock_ea(word, 4u);
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
     v = set ? (v | mask) : (v & ~mask);
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
     spu_coh_notify_write(word);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(word, 4u);
 }
 
 /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by

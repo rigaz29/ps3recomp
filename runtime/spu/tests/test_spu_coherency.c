@@ -421,10 +421,92 @@ static void test_many_contexts(void)
 }
 
 /* ===========================================================================
+ * The stripes: what each lock call holds
+ * ===========================================================================*/
+static int stripe_held(uint32_t ea)
+{
+    const unsigned i = (ea >> 7) & spu_ll_mask();
+#if defined(_MSC_VER)
+    return g_ll[i].v != 0;
+#elif defined(_WIN32)
+    if (atomic_flag_test_and_set(&g_ll[i])) return 1;
+    atomic_flag_clear(&g_ll[i]);
+    return 0;
+#else
+    if (pthread_mutex_trylock(&g_ll[i])) return 1;
+    pthread_mutex_unlock(&g_ll[i]);
+    return 0;
+#endif
+}
+
+static int stripes_held(void)
+{
+    int n = 0;
+    for (uint32_t i = 0; i < SPU_LL_NSTRIPE; i++) n += stripe_held(i << 7);
+    return n;
+}
+
+static void test_stripes(void)
+{
+    TEST("a store's lock holds its own line's stripe and no other");
+    spu_lockline_lock_ea(LINE_A + 8u, 4u);
+    CHECK(stripe_held(LINE_A));
+    CHECK(stripes_held() == 1);
+    TEST("...which lets a store to another line go ahead at the same time");
+    spu_lockline_lock_ea(LINE_B, 4u);
+    CHECK(stripes_held() == 2);
+    spu_lockline_unlock_ea(LINE_B, 4u);
+    spu_lockline_unlock_ea(LINE_A + 8u, 4u);
+    CHECK(stripes_held() == 0);
+
+    TEST("two lines 64 apart share a stripe");
+    spu_lockline_lock_ea(LINE_A, 128u);
+    CHECK(stripe_held(LINE_A + 64u * 128u));
+    spu_lockline_unlock_ea(LINE_A, 128u);
+
+    TEST("a store across a line boundary holds both lines");
+    spu_lockline_lock_ea(LINE_A + 124u, 8u);
+    CHECK(stripe_held(LINE_A) && stripe_held(LINE_A + 128u));
+    CHECK(stripes_held() == 2);
+    spu_lockline_unlock_ea(LINE_A + 124u, 8u);
+    CHECK(stripes_held() == 0);
+
+    TEST("a range of 64 lines holds every stripe");
+    spu_lockline_lock_ea(LINE_A, 64u * 128u);
+    CHECK(stripes_held() == (int)SPU_LL_NSTRIPE);
+    spu_lockline_unlock_ea(LINE_A, 64u * 128u);
+    CHECK(stripes_held() == 0);
+
+    TEST("a range of 63 lines leaves one stripe free");
+    spu_lockline_lock_ea(LINE_A, 63u * 128u);
+    CHECK(stripes_held() == (int)SPU_LL_NSTRIPE - 1);
+    spu_lockline_unlock_ea(LINE_A, 63u * 128u);
+
+    TEST("the end of the address space does not wrap");
+    spu_lockline_lock_ea(0xFFFFFFC0u, 128u);
+    CHECK(stripes_held() == 2);
+    spu_lockline_unlock_ea(0xFFFFFFC0u, 128u);
+    CHECK(stripes_held() == 0);
+
+    TEST("the whole lock holds every stripe, and releases them");
+    spu_lockline_lock();
+    CHECK(stripes_held() == (int)SPU_LL_NSTRIPE);
+    spu_lockline_unlock();
+    CHECK(stripes_held() == 0);
+
+    TEST("the same bitmap byte, marked for two lines, keeps both");
+    spu_coh_reserve(NULL, LINE_C + 128u);
+    spu_coh_reserve(NULL, LINE_C + 256u);
+    CHECK(spu_coh_is_reserved(LINE_C + 128u) && spu_coh_is_reserved(LINE_C + 256u));
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
 int main(void)
 {
+    s_ll_mask = (int)SPU_LL_NSTRIPE - 1;   /* on the stripes whatever the default */
+    test_stripes();
     test_bitmap();
     test_ppu_store_raises_lr();
     test_no_false_raise();

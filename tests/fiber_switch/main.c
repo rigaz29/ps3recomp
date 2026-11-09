@@ -54,6 +54,8 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_lockline_lock(void)   { }
 void spu_lockline_unlock(void) { }
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 
 static uint32_t g_bump = 4096;   /* keep guest address 0 invalid */

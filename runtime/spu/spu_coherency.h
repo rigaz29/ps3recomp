@@ -36,15 +36,20 @@ extern "C" {
 /* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
-/* The lock-line lock. One process-wide spinlock serializing every lock-line
- * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
- * compare-and-commit, and a PPU store or stwcx to a line some SPU has
- * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
+/* The lock-line lock: spinlocks, one per (line % 64), serializing every
+ * lock-line transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and
+ * PUTLLC compare-and-commit, and a PPU store or stwcx to a line some SPU has
+ * reserved. The critical sections are two 128-byte memcpy and a memcmp.
+ *
+ * spu_lockline_lock_ea takes what [ea, ea + len) needs; spu_lockline_lock takes
+ * everything, for the paths that are not about one line. Neither nests. */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
- * reservation holder. Called from the SPU's GETLLAR with the lock held.
+ * reservation holder. Called from the SPU's GETLLAR holding the line's stripe.
  *
  * Lines are marked and never unmarked. A line the SPURS kernel reserves is
  * reserved again microseconds later, so unmarking would buy nothing; a stale
@@ -65,7 +70,7 @@ int spu_coh_is_reserved(uint32_t addr);
  * whose live reservation covers it, drop that reservation, and wake the host
  * thread in case it is parked in `rdch SPU_RdEventStat`.
  *
- * Expects the lock-line lock held, so that the store this is reporting and the
+ * Expects the line's stripe held, so that the store this is reporting and the
  * reservation state it clears are seen by an SPU's PUTLLC as one transaction. */
 void spu_coh_notify_write(uint32_t ea);
 /* Remove a context from the reserving set. MUST be called before a

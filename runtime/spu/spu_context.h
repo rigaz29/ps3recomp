@@ -912,7 +912,15 @@ void spu_resident_pages_rebuild(spu_context* ctx);
 
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */
+#ifdef PS3_GAME_MODULE
+/* In the game's DLL (the port's PORT_GAME_MODULE) the slot stays in the program, and a DLL cannot name another
+ * module's thread-local: it is found the way the compiler finds one, from the thread's array of blocks. */
+extern uint64_t g_module_tls_index, g_module_tramp_off;
+unsigned __int64 __readgsqword(unsigned long);
+#define g_spu_trampoline_fn (*(void (**)(spu_context*))(((char**)__readgsqword(0x58))[g_module_tls_index] + g_module_tramp_off))
+#else
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+#endif
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
@@ -1063,7 +1071,11 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
  * too (spu_drain.c). */
 extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
+#ifdef PS3_GAME_MODULE
+extern uint8_t* g_spu_stack_reset_hint;          /* spu_channels.c's, by (entry >> 2) & 1023 */
+#else
 extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
+#endif
 void spu_direct_init(void);
 #if defined(__clang__) && defined(__has_attribute)
 #  if __has_attribute(musttail)

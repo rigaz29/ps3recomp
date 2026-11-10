@@ -30,6 +30,13 @@ typedef struct spu_irq_frame {
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+#ifdef PS3_GAME_MODULE_HOST
+/* The game's DLL holds the resolver through a jump of its own, so to it the resolver has another address. */
+void* g_spu_resolver_alias;
+#define SPU_IS_RESOLVER(fn) ((fn) == spu_indirect_branch || (void*)(fn) == g_spu_resolver_alias)
+#else
+#define SPU_IS_RESOLVER(fn) ((fn) == spu_indirect_branch)
+#endif
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
@@ -586,7 +593,7 @@ static __attribute__((noinline)) void spu_drain_call_full(spu_context* ctx, uint
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
     for (;;) {
         while (*tramp) {
-            if (*tramp == spu_indirect_branch &&
+            if (SPU_IS_RESOLVER(*tramp) &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 *tramp = 0;
                 SPU_DRAIN_POP_IRQ();

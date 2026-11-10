@@ -8,6 +8,7 @@
 #ifndef PS3RECOMP_CELL_PAD_H
 #define PS3RECOMP_CELL_PAD_H
 
+#include <stddef.h>
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 
@@ -212,6 +213,11 @@ void cellPad_record_to(const char* path);
 /* For a port's settings window (Windows): the name [keyboard] uses for a
  * virtual-key code, or NULL when it has none. */
 const char* ps3_pad_key_name(int vk);
+
+/* For a port's settings window (Windows): how many controllers there are, and
+ * in out the first one's name and what reads it ("... (XInput)", "... (SDL3)"),
+ * as input.api = api would have it (NULL: as the setting has it). Only looks. */
+int ps3_pad_host_describe(const char* api, char* out, size_t n);
 
 #ifdef __cplusplus
 }

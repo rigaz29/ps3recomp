@@ -191,6 +191,16 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # SDL3's include folder: cellPad then reads, beside XInput, the controllers XInput does not (DualShock 4,
+    # DualSense, Switch, DirectInput pads) through SDL3.dll, which it loads at run time from the program's folder.
+    # Nothing is linked: the exe starts without SDL3.dll and its controllers are then XInput's alone.
+    set(PS3RECOMP_SDL3_INCLUDE_DIR "" CACHE PATH "SDL3's include folder, for cellPad's SDL3 beside XInput (Windows)")
+    if(PS3RECOMP_SDL3_INCLUDE_DIR)
+        set(_pad "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c")
+        set_property(SOURCE "${_pad}" APPEND PROPERTY INCLUDE_DIRECTORIES "${PS3RECOMP_SDL3_INCLUDE_DIR}")
+        set_property(SOURCE "${_pad}" APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_SDL3)
+        message(STATUS "  SDL3:         ${PS3RECOMP_SDL3_INCLUDE_DIR} (controllers beside XInput)")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required

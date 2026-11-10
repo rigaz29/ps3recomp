@@ -67,6 +67,7 @@ static bool s_prev_ok;              /* the last frame was a scene */
 static fsr3_camera s_cam;           /* this frame's, from rsx_fsr3_prepare */
 static bool s_on, s_reset, s_prepared;
 static bool s_fg_was;               /* generation ran on the last frame */
+static bool s_fg_told;              /* the context has been told once whether to generate */
 static double s_floor, s_rate_ms;   /* see fsr3_rate */
 static int s_rate_n, s_rate_streak;
 static bool s_under;
@@ -492,6 +493,7 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     s_dw = display_w; s_dh = display_h;
     s_prev_ok = false;
     s_fg_was = false;
+    s_fg_told = false;
     return 1;
 }
 
@@ -630,7 +632,12 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
     s_prepared = false;
     const bool on = s_generate && !s_under && s_on && f->hudless;
     const bool reset = on && (s_reset || !s_fg_was);
-    fsr3_configure(on, on ? f->hudless : nullptr);
+    /* While it generates, every frame is configured, with its id and its picture without the HUD, as AMD's sample does.
+     * While it does not (logos, menus, a rate under the floor), only the frame that turns it off is, and the first:
+     * disabling it is the path whose race the swap chain's 3.1.7 fixed, and a session that froze at the boot logos had
+     * it disabled on every one of its frames, its GPU queue stopped behind the swap chain (2026-11-10). */
+    if (on || s_fg_was || !s_fg_told) fsr3_configure(on, on ? f->hudless : nullptr);
+    s_fg_told = true;
     if (on) {
         ffxDispatchDescFrameGenerationPrepareV2 p{};
         p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;

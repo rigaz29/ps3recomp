@@ -37,6 +37,10 @@ static inline uint8_t* sdata_decrypt(const uint8_t*, size_t, size_t*) { return n
  * `extern "C"` inside a function body is ill-formed in C++. */
 extern "C" void ydkj_host_bt(const char* tag);
 extern "C" void (*g_ps3_mark_hook)(const char* kind, const char* text);   /* sys_ppu_thread.c */
+/* Called when cellFsOpen cannot open a file, after its log line, with the title's path and the host's. A port sets it
+ * to stop a title that cannot go on without that file, rather than let it run into whatever it does next with the
+ * error. NULL: not called. */
+extern "C" { void (*g_ps3_open_failed_hook)(const char* guest_path, const char* host_path) = nullptr; }
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -310,6 +314,7 @@ static void cellFsOpen(ppu_context* ctx)
     if (g_ps3_mark_hook) g_ps3_mark_hook("open", gpath);   /* found or not: the title got this far */
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+        if (g_ps3_open_failed_hook) g_ps3_open_failed_hook(gpath, hpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)

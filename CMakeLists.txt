@@ -472,6 +472,10 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    # PS3_MODS_ROOT, the mod folder the three path translators ask first.
+    add_executable(test_vfs_mods tests/test_vfs_mods.c)
+    target_include_directories(test_vfs_mods PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
+    add_test(NAME vfs_mods COMMAND test_vfs_mods)
 
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.

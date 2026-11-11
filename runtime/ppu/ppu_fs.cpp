@@ -16,6 +16,7 @@
 #define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
+#include "../syscalls/vfs_mods.h"   /* PS3_MODS_ROOT */
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #ifdef PS3RECOMP_NO_DECRYPT
@@ -141,6 +142,7 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
+    if (ps3_vfs_mod_path(guest, out, cap)) return;   /* PS3_MODS_ROOT (vfs_mods.h) */
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from

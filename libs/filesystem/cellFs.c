@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "../../runtime/syscalls/vfs_mods.h"   /* PS3_MODS_ROOT */
 #include "ps3emu/log_first.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
@@ -136,6 +137,14 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 
     if (!ps3_path || !host_buf || buf_size == 0)
         return -1;
+
+    /* A file in the mod folder first (PS3_MODS_ROOT, vfs_mods.h). */
+    if (ps3_vfs_mod_path(ps3_path, host_buf, buf_size)) {
+#ifdef _WIN32
+        for (char* p = host_buf; *p; p++) if (*p == '/') *p = '\\';
+#endif
+        return 0;
+    }
 
     /* Find longest matching prefix */
     int best = -1;

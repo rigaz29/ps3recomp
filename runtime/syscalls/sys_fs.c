@@ -3,6 +3,7 @@
  */
 
 #include "sys_fs.h"
+#include "vfs_mods.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include <string.h>
@@ -156,6 +157,12 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
         const char* env = getenv("PS3_VFS_ROOT");
         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+    }
+
+    /* A file in the mod folder first (PS3_MODS_ROOT, vfs_mods.h). */
+    if (host_path_size > 0 && ps3_vfs_mod_path(ps3_path, host_path, (size_t)host_path_size)) {
+        fs_normalize_sep(host_path);
+        return;
     }
 
     /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there

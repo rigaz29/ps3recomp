@@ -29,7 +29,7 @@ def make_elf():
     seg[PPU - VADDR:PPU - VADDR + 0x40] = struct.pack(">I", 0x60000000) * 0x10
     # Each entry the profile names is told apart by its bytes.
     for ea, tag in ((PIECE + 0x10, 1), (PIECE + 0x20, 2), (BRA_PIECE + 0x10, 3), (MODULE + 0x80, 4), (MODULE + 0xC4, 5),
-                    (LISTED + 0x10, 6), (LISTED + 0x20, 7), (PIECE + 0x400, 8)):
+                    (LISTED + 0x10, 6), (LISTED + 0x20, 7), (PIECE + 0x400, 8), (MODULE + 0xF8, 9)):
         seg[ea - VADDR:ea - VADDR + 4] = struct.pack(">I", 0x40800000 | tag)
     head = bytearray(0x40)
     head[:6] = b"\x7fELF\x02\x02"
@@ -82,7 +82,8 @@ def test_tool():
                 spu(seg, BRA_PIECE, 0x10, 0x40, 2, 0x6010, 9000),          # tied to an address
                 spu(seg, PIECE + 0x400, 0, 0x20, 2, 0x7000, 10),           # too few steps
                 spu(seg, MODULE, 0x80, 0x100, 2, 0x4080, 3000),            # a module, by where it came from
-                spu(seg, MODULE, 0xC4, 0x100, 200, 0x40C4, 300),           # past what was lifted of it
+                spu(seg, MODULE, 0xC4, 0x100, 200, 0x40C4, 300),           # past what was lifted of it, in its image
+                spu(seg, MODULE, 0xF8, 0x100, 200, 0x40F8, 200),           # its 16 bytes not all in the image
                 spu(seg, LISTED, 0x10, 0x40, 400, 0x8010, 800),            # listed, and interpreted still
                 spu(seg, LISTED, 0x20, 0x40, 400, 0x8020, 700),            # a further entry of a listed piece
                 spu(seg, LISTED, 0x10, 0x40, 2, 0x9010, 0),                # given straight back
@@ -95,9 +96,10 @@ def test_tool():
         out = tool(common).stdout
         assert json.loads(pieces.read_text()) == before and not ppu_extra.exists(), "wrote without --apply"
         assert profile.exists()
-        for want in ("new piece 0x11000, 128 bytes, entry 0x10 and 0x20", "jobmod_x: new entries 0x4080",
+        for want in ("new piece 0x11000, 128 bytes, entry 0x10 and 0x20",
+                     "jobmod_x: new entries 0x4080 0x40C4; 1 past its code_end, which moves out to them",
                      "piece 0x14000: new entries 0x20", "new PPU function 0x00015010", "absolute branch",
-                     "too few steps", "outside the code that was lifted", "no GET known",
+                     "too few steps", "jobmod_x 0x40F8: outside the module (its image ends at 0x4100)", "no GET known",
                      "piece 0x14000 entry 0x10", "the instruction differs"):
             assert want in out, (want, out)
         print("PASS: every kind of row goes where it belongs")
@@ -107,7 +109,7 @@ def test_tool():
         assert [p["ea"] for p in now] == [hx(PIECE), hx(LISTED), hx(0x1F000)], now
         assert now[0] == {"ea": hx(PIECE), "size": 0x80, "entry": "0x10", "entries": ["0x20"]}, now[0]
         assert now[1]["entries"] == ["0x20"], now[1]
-        assert json.loads(extra.read_text()) == {"jobmod_x": ["0x4080"]}
+        assert json.loads(extra.read_text()) == {"jobmod_x": ["0x4080", "0x40C4"]}
         assert [e["addr"] for e in json.loads(ppu_extra.read_text())] == ["0x00015010"]
         assert not profile.exists() and (t / "profile.txt.applied").exists()
         print("PASS: --apply writes the lists and sets the profile aside")

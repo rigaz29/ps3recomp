@@ -6,7 +6,10 @@ the SPU code that ran in the interpreter and the PPU calls that found no lifted
 function. This reads that profile against the executable and sorts each row:
 
   - an entry inside a lifted job module: an extra function of that module
-    (lift_jobmods.py --extra-funcs);
+    (lift_jobmods.py --extra-funcs). One past the module's code_end but in its
+    image too: code reached only through a pointer, which the lift's walk of
+    direct branches stopped short of. As an extra function it seeds that walk,
+    so the lift's end moves out to it (module_code_end);
   - an entry inside a listed position-independent piece: a further entry of it;
   - code a GET brought out of the executable, in no listed piece: a new piece
     (lift_spu_pic.py --list), the GET being its extent;
@@ -126,6 +129,7 @@ class Plan:
         self.new_pieces = []        # [{"ea", "size", "entry", "entries"?, "steps"}]
         self.piece_entries = {}     # piece index -> {entry offset: steps}
         self.module_entries = {}    # module name -> {LS address: steps}
+        self.past_end = set()       # (module name, LS address): an entry past the module's code_end
         self.ppu_new = []           # ppu rows
         self.still = []             # (what, steps): listed, and interpreted all the same
         self.report = []            # (what, steps): left alone, and why
@@ -166,9 +170,12 @@ def sort_spu(rows, segs, pieces, manifest, extra, min_steps):
             continue
         m, pc = module_at(manifest, r)
         if m:
-            if not JOBMOD_CODE_MIN <= pc < m["code_end"]:
-                plan.report.append(("%s 0x%X: outside the code that was lifted (it ends at 0x%X)"
-                                    % (m["name"], pc, m["code_end"]), r["steps"]))
+            # Past code_end is the module's own code still, when its image holds the row's bytes there: the
+            # module's code that only a pointer reaches (God of War: Ascension's jobmod_9b03908f93a9_e77C8
+            # ran 0xB914-0xF1BC so, interpreted, past a code_end of 0xB90C).
+            if not JOBMOD_CODE_MIN <= pc <= m["base"] + m["size"] - 16:
+                plan.report.append(("%s 0x%X: outside the module (its image ends at 0x%X)"
+                                    % (m["name"], pc, m["base"] + m["size"]), r["steps"]))
             elif read_ea(segs, m["ea"] + pc - m["base"], 16) != r["sig"]:
                 plan.report.append(("%s 0x%X: bytes differ from the module" % (m["name"], pc), r["steps"]))
             elif pc in extra.get(m["name"], []):
@@ -176,6 +183,8 @@ def sort_spu(rows, segs, pieces, manifest, extra, min_steps):
             else:
                 d = plan.module_entries.setdefault(m["name"], {})
                 d[pc] = d.get(pc, 0) + r["steps"]
+                if pc >= m["code_end"]:
+                    plan.past_end.add((m["name"], pc))
             continue
         if at is None:
             plan.report.append(("no GET known: pc=0x%05X owner=%d" % (r["pc"], r["owner"]), r["steps"]))
@@ -318,7 +327,10 @@ def main():
     for i, ents in sorted(plan.piece_entries.items()):
         print("  piece %s: new entries %s" % (pieces[i]["ea"], " ".join(hx(e) for e in sorted(ents))))
     for name, ents in sorted(plan.module_entries.items()):
-        print("  %s: new entries %s" % (name, " ".join(hx(a) for a in sorted(ents))))
+        past = sorted(a for a in ents if (name, a) in plan.past_end)
+        print("  %s: new entries %s%s" % (name, " ".join(hx(a) for a in sorted(ents)),
+                                          "; %d past its code_end, which moves out to them" % len(past)
+                                          if past else ""))
     for r in plan.ppu_new:
         print("  new PPU function 0x%08X, called from 0x%08X" % (r["addr"], r["lr"]))
     for title, rows in (("listed, and interpreted all the same", plan.still), ("left alone", plan.report)):

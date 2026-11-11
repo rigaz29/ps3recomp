@@ -6,6 +6,7 @@
  */
 
 #include "cellAvconfExt.h"
+#include "../audio/cellAudio.h"             /* cellAudio_output_channels: what the host output takes */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
 #include "../../runtime/ppu/ppu_context.h"  /* the float argument of SetGamma is in f1 */
 #include <stdlib.h>
@@ -44,9 +45,12 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
      * This call returns the MAX channel count available for (type, fs). Under-reporting
      * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
      * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
-     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
+     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console.
+     * 5.1 at least (A/B: was 8), 7.1 when the host output is 7.1 (cellAudio_output_channels):
+     * a title that sizes its mix by this answer then fills all eight channels. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
+        if (fs & CELL_AUDIO_OUT_FS_48KHZ)
+            return cellAudio_output_channels() >= 8 ? CELL_AUDIO_OUT_CHNUM_8 : CELL_AUDIO_OUT_CHNUM_6;
         return CELL_AUDIO_OUT_CHNUM_2;
     }
 
@@ -121,7 +125,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+    config->channel = (u8)cellAudio_output_channels();   /* 2, 6 or 8: the host output's */
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
 
     return CELL_OK;
@@ -150,7 +154,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);                                  /* no down-mixer  */
     vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 9, (u8)cellAudio_output_channels());      /* 2, 6 or 8: the host output's */
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
     vm_write32(ea + 12, 0);
@@ -218,7 +222,14 @@ float cellAvconfExt_display_gamma(void)
  * the title queries availability separately. NID 0x4692AB35. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    (void)option; (void)waitForEvent;
+    /* CellAudioOutConfiguration { u8 channel; u8 encoder; u8 reserved[10]; u32 downMixer; }:
+     * what the title asks for, for the log -- the host output is set by the PC's settings. */
+    const uint32_t ea = (uint32_t)(uintptr_t)config;
+    if (ea)
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, %u channels, encoder %u, down-mixer %u) -> ok\n",
+               audioOut, vm_read8(ea), vm_read8(ea + 1), vm_read32(ea + 12));
+    else
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
     return 0;
 }

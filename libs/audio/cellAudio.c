@@ -10,6 +10,16 @@
  *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
  *
  * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
+ *
+ * WASAPI, shared mode, as every APO (equalizers, loudness, virtual surround) expects:
+ *   PS3_AUDIO_CHANNELS  auto (the default device's own layout), stereo, 5.1 or 7.1: the stream's channels.
+ *                       A title's 7.1 port goes to 7.1 and 5.1 as it is (audio_mix.h); Windows folds a
+ *                       layout the device lacks down to the one it has.
+ *   PS3_AUDIO_RAW=1     raw: past the effects, where the device has a raw path.
+ *   PS3_AUDIO_CATEGORY=0  no stream category; by default the stream is AudioCategory_GameEffects.
+ *   PS3_AUDIO_REOPEN=0  stay with the device the stream started on; by default a change of the default
+ *                       output device, or the loss of it, opens the new default one.
+ *   PS3_AUDIO_REOPEN_AT=<s>  open the device again at that second, as a change of device would (a test).
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
@@ -22,6 +32,7 @@
 #include <math.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#include "audio_mix.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -52,6 +63,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <windows.h>
+  #include <mmreg.h>
   #include <mmdeviceapi.h>
   #include <audioclient.h>
   #include <process.h>
@@ -75,6 +87,22 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
+  DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient2,        0x726778CD,0xF60A,0x4EDA,0x82,0xDE,0xE4,0x76,0x10,0xCD,0x78,0xAA);
+  DEFINE_AUDIO_GUID(ps3r_IID_IMMNotificationClient,0x7991EEC9,0x7E89,0x4D85,0x83,0x90,0x6C,0x70,0x3C,0xEC,0x60,0xC0);
+  DEFINE_AUDIO_GUID(ps3r_IID_IUnknown,             0x00000000,0x0000,0x0000,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
+  DEFINE_AUDIO_GUID(ps3r_SUBTYPE_IEEE_FLOAT,       0x00000003,0x0000,0x0010,0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71);
+  static const PROPERTYKEY ps3r_PKEY_Device_FriendlyName =
+      { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
+  static const PROPERTYKEY ps3r_PKEY_RawProcessingSupported =
+      { { 0x8943B373, 0x388C, 0x4395, { 0xB5, 0x57, 0xBC, 0x6D, 0xBA, 0xFF, 0xAF, 0xDB } }, 2 };
+  /* The speakers of each layout (ksmedia.h's KSAUDIO_SPEAKER_*): the interleaved order is the bits' order. */
+  #define PS3R_SPK_STEREO        0x003u   /* FL FR */
+  #define PS3R_SPK_5POINT1_BACK  0x03Fu   /* FL FR FC LFE BL BR */
+  #define PS3R_SPK_5POINT1_SIDE  0x60Fu   /* FL FR FC LFE SL SR */
+  #define PS3R_SPK_7POINT1       0x63Fu   /* FL FR FC LFE BL BR SL SR */
+  #ifndef STGM_READ
+    #define STGM_READ 0x00000000L
+  #endif
 
   /* Map to the names used in the code */
   #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
@@ -155,8 +183,10 @@ static int           s_mix_thread_live = 0;
 #endif
 static mutex_t       s_audio_mutex;
 
-/* Output mix buffer (stereo, one block worth) */
-static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+/* Output mix buffer: one block, interleaved in the output's s_out_ch channels (2, 6 or 8; audio_mix.h's order).
+ * Only the mixing thread changes s_out_ch, between blocks, when it opens a device. */
+static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 8];
+static u32   s_out_ch = 2;
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -227,145 +257,331 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+/* SDL's stream is stereo. */
+u32 cellAudio_output_channels(void) { return 2; }
+
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
 
+static IMMDeviceEnumerator* s_wasapi_enum   = NULL;
 static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+/* Set when the default output device changes (the notification client below), or when the stream is lost
+ * (AUDCLNT_E_DEVICE_INVALIDATED: the device unplugged, disabled or given another format): the mixing thread
+ * then opens the default device again (PS3_AUDIO_REOPEN, on by default). Without it the stream stayed on a
+ * device that was gone and the game went silent until it was restarted. */
+static volatile LONG        s_wasapi_reopen = 0;
+static int                  s_wasapi_notifying = 0;
 
-static int audio_backend_init(void)
+/* PS3_AUDIO_CHANNELS: 0 for auto (the device's own layout), else 2, 6 or 8. */
+static u32 audio_channels_wanted(void)
 {
-    HRESULT hr;
+    const char* e = getenv("PS3_AUDIO_CHANNELS");
+    if (!e || !*e || !_stricmp(e, "auto")) return 0;
+    if (!_stricmp(e, "stereo") || !strcmp(e, "2")) return 2;
+    if (!strcmp(e, "5.1") || !strcmp(e, "6")) return 6;
+    if (!strcmp(e, "7.1") || !strcmp(e, "8")) return 8;
+    static int said;
+    if (!said++) fprintf(stderr, "[cellAudio] PS3_AUDIO_CHANNELS=%s is not auto, stereo, 5.1 or 7.1: auto\n", e);
+    return 0;
+}
 
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
-        return -1;
+static int audio_env_on(const char* name, int def)
+{
+    const char* e = getenv(name);
+    if (!e || !*e) return def;
+    return strcmp(e, "0") != 0 && _stricmp(e, "off") != 0;
+}
+
+/* What auto takes for a device of ch channels: 7.1, 5.1 or stereo. */
+static u32 audio_channels_for(u32 ch) { return ch >= 8 ? 8 : ch >= 6 ? 6 : 2; }
+
+/* A device's mix format: its channels and their speakers. */
+static void wasapi_device_layout(IMMDevice* dev, u32* ch, DWORD* mask)
+{
+    *ch = 2;
+    *mask = PS3R_SPK_STEREO;
+    IAudioClient* c = NULL;
+    if (FAILED(dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&c)) || !c) return;
+    WAVEFORMATEX* mix = NULL;
+    if (SUCCEEDED(c->lpVtbl->GetMixFormat(c, &mix)) && mix) {
+        *ch = mix->nChannels;
+        if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix->cbSize >= 22)
+            *mask = ((const WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask;
+        CoTaskMemFree(mix);
     }
+    c->lpVtbl->Release(c);
+}
 
-    IMMDeviceEnumerator* enumerator = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                          &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
-        return -1;
+/* A device's name, for the log, and whether it has a raw path (no effects at all). */
+static void wasapi_device_info(IMMDevice* dev, char* name, int cap, int* raw)
+{
+    name[0] = 0;
+    *raw = 0;
+    IPropertyStore* ps = NULL;
+    if (FAILED(dev->lpVtbl->OpenPropertyStore(dev, STGM_READ, &ps)) || !ps) return;
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &ps3r_PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
+        WideCharToMultiByte(CP_UTF8, 0, v.pwszVal, -1, name, cap, NULL, NULL);
+    PropVariantClear(&v);
+    PropVariantInit(&v);
+    if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &ps3r_PKEY_RawProcessingSupported, &v)) && v.vt == VT_BOOL)
+        *raw = v.boolVal != VARIANT_FALSE;
+    PropVariantClear(&v);
+    ps->lpVtbl->Release(ps);
+}
+
+/* The stream: float at 48 kHz in ch channels. Stereo keeps the plain format it always had. */
+static void wasapi_format(WAVEFORMATEXTENSIBLE* f, u32 ch, DWORD mask)
+{
+    memset(f, 0, sizeof *f);
+    f->Format.wFormatTag      = ch == 2 ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_EXTENSIBLE;
+    f->Format.nChannels       = (WORD)ch;
+    f->Format.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
+    f->Format.wBitsPerSample  = 32;
+    f->Format.nBlockAlign     = (WORD)(ch * 4);
+    f->Format.nAvgBytesPerSec = CELL_AUDIO_SAMPLE_RATE * ch * 4;
+    if (ch != 2) {
+        f->Format.cbSize = 22;
+        f->Samples.wValidBitsPerSample = 32;
+        f->dwChannelMask = mask;
+        f->SubFormat = ps3r_SUBTYPE_IEEE_FLOAT;
     }
+}
 
-    IMMDevice* device = NULL;
-    hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender,
-                                                      eConsole, &device);
-    enumerator->lpVtbl->Release(enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
-        return -1;
+/* Before Initialize: the stream's category, a game's (AudioCategory_GameEffects: its whole mix, not the
+ * background music GameMedia is), so Windows and the audio suites that pick a profile by it treat it as a
+ * game; and raw, past the effects. Bit 0: the category set, bit 1: raw taken. */
+static int wasapi_properties(IAudioClient* c, int category, int raw)
+{
+    if (!category && !raw) return 0;
+    IAudioClient2* c2 = NULL;
+    if (FAILED(c->lpVtbl->QueryInterface(c, &ps3r_IID_IAudioClient2, (void**)&c2)) || !c2) return 0;
+    AudioClientProperties p;
+    memset(&p, 0, sizeof p);
+    p.cbSize = sizeof p;
+    p.bIsOffload = FALSE;
+    p.eCategory = category ? AudioCategory_GameEffects : AudioCategory_Other;
+    p.Options = raw ? AUDCLNT_STREAMOPTIONS_RAW : AUDCLNT_STREAMOPTIONS_NONE;
+    HRESULT hr = c2->lpVtbl->SetClientProperties(c2, &p);
+    if (FAILED(hr) && raw) {
+        p.Options = AUDCLNT_STREAMOPTIONS_NONE;
+        raw = 0;
+        hr = c2->lpVtbl->SetClientProperties(c2, &p);
     }
+    c2->lpVtbl->Release(c2);
+    return SUCCEEDED(hr) ? (category ? 1 : 0) | (raw ? 2 : 0) : 0;
+}
 
-    hr = device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_ALL,
-                                   NULL, (void**)&s_wasapi_client);
-    device->lpVtbl->Release(device);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to activate audio client: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    WAVEFORMATEX wfx;
-    wfx.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
-    wfx.wBitsPerSample  = 32;
-    wfx.nBlockAlign     = wfx.nChannels * (wfx.wBitsPerSample / 8);
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-    wfx.cbSize          = 0;
-
-    /* Event-driven, 60 ms by default (PS3_AUDIO_BUF_MS). The old 20 ms ran
-     * dry whenever the mixing thread lost the CPU for a moment -- with every
-     * core busy running SPU/PPU code that was often, and each time is an
-     * audible stutter (Bink cutscenes most of all). */
-    REFERENCE_TIME buf_duration = 600000; /* 60 ms in 100 ns units */
-    { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
-      if (ms >= 10 && ms <= 500) buf_duration = (REFERENCE_TIME)ms * 10000; }
-    s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-
-    /* Shared mode only takes the device's own mix format unless the stream
-     * asks the audio engine to convert: on a device not running 48 kHz stereo
-     * float (a 44.1 kHz or 5.1 output) Initialize failed with
-     * AUDCLNT_E_UNSUPPORTED_FORMAT and every title ran silent. */
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
 #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
 #endif
 #ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
 #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
 #endif
+
+/* One try at a stream on dev, in ch channels; on success it is the backend's. */
+static HRESULT wasapi_try(IMMDevice* dev, u32 ch, DWORD mask, int category, int raw, int* props)
+{
+    IAudioClient* c = NULL;
+    HRESULT hr = dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&c);
+    if (FAILED(hr) || !c) return FAILED(hr) ? hr : E_FAIL;
+    *props = wasapi_properties(c, category, raw);
+
+    WAVEFORMATEXTENSIBLE f;
+    wasapi_format(&f, ch, mask);
+    /* Event-driven, 60 ms by default (PS3_AUDIO_BUF_MS). The old 20 ms ran dry whenever the mixing thread
+     * lost the CPU for a moment -- with every core busy running SPU/PPU code that was often, and each time is
+     * an audible stutter (Bink cutscenes most of all). */
+    REFERENCE_TIME dur = 600000;   /* 60 ms in 100 ns units */
+    { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
+      if (ms >= 10 && ms <= 500) dur = (REFERENCE_TIME)ms * 10000; }
+    /* Shared mode only takes the device's own mix format unless the stream asks the audio engine to convert:
+     * on a device not running 48 kHz stereo float (a 44.1 kHz or 5.1 output) Initialize failed with
+     * AUDCLNT_E_UNSUPPORTED_FORMAT and every title ran silent. The conversion also folds a layout the device
+     * lacks down to the one it has: 7.1 to a laptop's stereo. */
     const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    hr = s_wasapi_client->lpVtbl->Initialize(
-        s_wasapi_client,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
-        buf_duration, 0, &wfx, NULL);
-
+    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    hr = c->lpVtbl->Initialize(c, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
+                               dur, 0, &f.Format, NULL);
     if (FAILED(hr)) {
-        /* Fallback: try without event callback */
-        hr = s_wasapi_client->lpVtbl->Initialize(
-            s_wasapi_client,
-            AUDCLNT_SHAREMODE_SHARED,
-            convert, buf_duration, 0, &wfx, NULL);
-        if (FAILED(hr)) {
-            printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-            s_wasapi_client = NULL;
-            CloseHandle(s_wasapi_event);
-            s_wasapi_event = NULL;
-            return -1;
-        }
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
+        /* Fallback: without the event callback */
+        hr = c->lpVtbl->Initialize(c, AUDCLNT_SHAREMODE_SHARED, convert, dur, 0, &f.Format, NULL);
+        if (ev) CloseHandle(ev);
+        ev = NULL;
     } else {
-        s_wasapi_client->lpVtbl->SetEventHandle(s_wasapi_client, s_wasapi_event);
+        c->lpVtbl->SetEventHandle(c, ev);
     }
-
-    s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
-
-    hr = s_wasapi_client->lpVtbl->GetService(
-        s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
+    IAudioRenderClient* rc = NULL;
+    if (SUCCEEDED(hr)) hr = c->lpVtbl->GetService(c, &IID_IAudioRenderClient, (void**)&rc);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
+        if (ev) CloseHandle(ev);
+        c->lpVtbl->Release(c);
+        return hr;
+    }
+    UINT32 frames = 0;
+    c->lpVtbl->GetBufferSize(c, &frames);
+    s_wasapi_client = c;
+    s_wasapi_render = rc;
+    s_wasapi_event = ev;
+    s_wasapi_buf_frames = frames;
+    s_out_ch = ch;
+    c->lpVtbl->Start(c);
+    return S_OK;
+}
+
+static void wasapi_close(void)
+{
+    if (s_wasapi_client) s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
+    if (s_wasapi_render) { s_wasapi_render->lpVtbl->Release(s_wasapi_render); s_wasapi_render = NULL; }
+    if (s_wasapi_client) { s_wasapi_client->lpVtbl->Release(s_wasapi_client); s_wasapi_client = NULL; }
+    if (s_wasapi_event) { CloseHandle(s_wasapi_event); s_wasapi_event = NULL; }
+    s_wasapi_buf_frames = 0;
+}
+
+/* The default output device's stream, in the layout PS3_AUDIO_CHANNELS asks for, else the device's own. A
+ * multichannel stream the device refuses falls back to stereo. why: the log's word. 0 on success. */
+static int wasapi_open(const char* why)
+{
+    if (!s_wasapi_enum) return -1;
+    IMMDevice* dev = NULL;
+    HRESULT hr = s_wasapi_enum->lpVtbl->GetDefaultAudioEndpoint(s_wasapi_enum, eRender, eConsole, &dev);
+    if (FAILED(hr) || !dev) {
+        printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
         return -1;
     }
+    char name[200];
+    int raw_ok = 0;
+    wasapi_device_info(dev, name, (int)sizeof name, &raw_ok);
+    u32 dev_ch;
+    DWORD dev_mask;
+    wasapi_device_layout(dev, &dev_ch, &dev_mask);
+    const u32 want = audio_channels_wanted();
+    u32 ch = want ? want : audio_channels_for(dev_ch);
+    DWORD mask = ch == 8 ? PS3R_SPK_7POINT1
+               : ch == 6 ? (dev_mask == PS3R_SPK_5POINT1_BACK ? PS3R_SPK_5POINT1_BACK : PS3R_SPK_5POINT1_SIDE)
+               : PS3R_SPK_STEREO;
+    const int category = audio_env_on("PS3_AUDIO_CATEGORY", 1);
+    const int raw = audio_env_on("PS3_AUDIO_RAW", 0);
+    int props = 0;
+    hr = wasapi_try(dev, ch, mask, category, raw && raw_ok, &props);
+    if (FAILED(hr) && ch != 2) {
+        fprintf(stderr, "[cellAudio] WASAPI: a %u-channel stream refused (0x%08lX), stereo instead\n", ch,
+                (unsigned long)hr);
+        ch = 2;
+        mask = PS3R_SPK_STEREO;
+        hr = wasapi_try(dev, ch, mask, category, raw && raw_ok, &props);
+    }
+    dev->lpVtbl->Release(dev);
+    if (FAILED(hr)) {
+        printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
+        return -1;
+    }
+    const char* fx = props & 2 ? "raw, past the effects"
+                   : !raw ? "the effects on"
+                   : raw_ok ? "raw refused, the effects stay"
+                   : "raw asked, but the device has no raw path: the effects stay";
+    fprintf(stderr, "[cellAudio] WASAPI %s: \"%s\", %u channels (speakers 0x%lX); the stream %s, 48 kHz float, "
+                    "%u frames; category %s; %s\n",
+            why, name, dev_ch, (unsigned long)dev_mask, ch == 8 ? "7.1" : ch == 6 ? "5.1" : "stereo",
+            s_wasapi_buf_frames, props & 1 ? "game" : "none", fx);
+    return 0;
+}
 
-    s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+/* The notification client: the console role's default render device changed. Windows calls it on a thread
+ * of its own; it only sets the flag the mixing thread reads. A static object: AddRef and Release count
+ * nothing. */
+static HRESULT STDMETHODCALLTYPE nc_query(IMMNotificationClient* self, REFIID riid, void** out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(riid, &ps3r_IID_IUnknown) || IsEqualGUID(riid, &ps3r_IID_IMMNotificationClient)) {
+        *out = self;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE nc_ref(IMMNotificationClient* self) { (void)self; return 1; }
+static HRESULT STDMETHODCALLTYPE nc_state(IMMNotificationClient* self, LPCWSTR id, DWORD state)
+{
+    (void)self; (void)id; (void)state;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE nc_device(IMMNotificationClient* self, LPCWSTR id)
+{
+    (void)self; (void)id;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE nc_default(IMMNotificationClient* self, EDataFlow flow, ERole role, LPCWSTR id)
+{
+    (void)self; (void)id;
+    if (flow == eRender && role == eConsole) InterlockedExchange(&s_wasapi_reopen, 1);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE nc_prop(IMMNotificationClient* self, LPCWSTR id, const PROPERTYKEY key)
+{
+    (void)self; (void)id; (void)key;
+    return S_OK;
+}
+static IMMNotificationClientVtbl s_nc_vtbl = { nc_query, nc_ref, nc_ref, nc_state, nc_device, nc_device,
+                                               nc_default, nc_prop };
+static IMMNotificationClient s_nc = { &s_nc_vtbl };
+
+static int audio_backend_init(void)
+{
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
+        return -1;
+    }
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator, (void**)&s_wasapi_enum);
+    if (FAILED(hr) || !s_wasapi_enum) {
+        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
+        s_wasapi_enum = NULL;
+        return -1;
+    }
+    if (audio_env_on("PS3_AUDIO_REOPEN", 1) &&
+        SUCCEEDED(s_wasapi_enum->lpVtbl->RegisterEndpointNotificationCallback(s_wasapi_enum, &s_nc)))
+        s_wasapi_notifying = 1;
+    if (wasapi_open("opened") != 0) {
+        /* No output device yet: the mixing thread tries again every second, as for a lost one. */
+        InterlockedExchange(&s_wasapi_reopen, 1);
+        return -1;
+    }
     return 0;
 }
 
 static void audio_backend_shutdown(void)
 {
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
-    }
-    if (s_wasapi_render) {
-        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
-        s_wasapi_render = NULL;
-    }
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
-    }
-    if (s_wasapi_event) {
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
+    wasapi_close();
+    if (s_wasapi_enum) {
+        if (s_wasapi_notifying)
+            s_wasapi_enum->lpVtbl->UnregisterEndpointNotificationCallback(s_wasapi_enum, &s_nc);
+        s_wasapi_notifying = 0;
+        s_wasapi_enum->lpVtbl->Release(s_wasapi_enum);
+        s_wasapi_enum = NULL;
     }
 }
 
-static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+/* A lost device's errors: the mixing thread opens the default one again. */
+static void wasapi_note_error(HRESULT hr)
+{
+    if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING)
+        InterlockedExchange(&s_wasapi_reopen, 1);
+}
+
+static void audio_backend_submit(const float* samples, u32 num_samples)
 {
     if (!s_wasapi_render) return;
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr)) { wasapi_note_error(hr); return; }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
@@ -375,7 +591,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         /* PS3_MUTE=1: silence at the device, nothing else changes -- the
          * title still gets a working cellAudio and the device still paces
@@ -383,9 +599,11 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
          * path. For unattended runs. */
         static int mute = -1;
         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
+        memcpy(buf, samples, num_samples * s_out_ch * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+    } else if (FAILED(hr)) {
+        wasapi_note_error(hr);
     }
 }
 
@@ -397,7 +615,8 @@ static int audio_backend_room(void)
     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
-         * change, sleep, ...): pace on the clock rather than spin. */
+         * change, sleep, ...): pace on the clock until it is open again. */
+        wasapi_note_error(hr);
         static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
@@ -412,6 +631,36 @@ static void audio_backend_wait(void)
     else Sleep(1);
 }
 
+u32 cellAudio_output_channels(void)
+{
+    if (s_wasapi_client) return s_out_ch;
+    /* Before the stream: what it will be. cellAudioOut is asked from the title's own threads, before
+     * cellAudioInit; COM for the question alone. */
+    static u32 probed = 0;
+    if (!probed) {
+        const u32 want = audio_channels_wanted();
+        u32 ch = 2;
+        if (!want) {
+            const HRESULT hi = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+            IMMDeviceEnumerator* en = NULL;
+            if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                           &IID_IMMDeviceEnumerator, (void**)&en)) && en) {
+                IMMDevice* dev = NULL;
+                if (SUCCEEDED(en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev)) && dev) {
+                    u32 dch;
+                    DWORD dmask;
+                    wasapi_device_layout(dev, &dch, &dmask);
+                    ch = audio_channels_for(dch);
+                    dev->lpVtbl->Release(dev);
+                }
+                en->lpVtbl->Release(en);
+            }
+            if (SUCCEEDED(hi)) CoUninitialize();
+        }
+        probed = want ? want : ch;
+    }
+    return probed;
+}
 
 #endif /* AUDIO_BACKEND_WASAPI */
 
@@ -420,20 +669,11 @@ static void audio_backend_wait(void)
  * -----------------------------------------------------------------------*/
 
 /* Guest PCM is BIG-ENDIAN float32; the port buffer is a raw vm_base view, so
- * every sample must be byte-swapped before use. Reading it as a host float
- * turned the whole mix into denormal noise -- silence after clipping (LBP
- * had a verified end-to-end pipeline with no audible output). */
-static inline float ld_be_f32(const float* p)
-{
-    u32 v;
-    memcpy(&v, p, 4);
-    v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
-    float f;
-    memcpy(&f, &v, 4);
-    return f;
-}
+ * every sample must be byte-swapped before use (audio_be_f32, audio_mix.h).
+ * Reading it as a host float turned the whole mix into denormal noise --
+ * silence after clipping (LBP had a verified end-to-end pipeline with no
+ * audible output). */
 
-/* Mix one block from all active ports into s_mix_buffer (stereo float) */
 /* AUDIO_RATE's ring counters, over the running ports: blocks read all zero
  * inside sound (a run of at most AUDIO_GAP_MAX between blocks with data -- the
  * producer was late, not quiet), blocks written after they were read (seen
@@ -441,6 +681,10 @@ static inline float ld_be_f32(const float* p)
  * already held data (0-3, 3 = 3 or more). */
 #define AUDIO_GAP_MAX 4
 static unsigned s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[4];
+/* And the level of each channel: of the 8-channel ports as the title writes them (its order: L R C LFE, the
+ * surrounds, the rears), and of the output as it goes to the device (its layout's order), sums of squares. */
+static double s_ar_port_sq[8], s_ar_out_sq[8];
+static unsigned long long s_ar_port_n, s_ar_out_n;
 
 static int audio_block_has_data(const float* b, u32 nch)
 {
@@ -462,6 +706,14 @@ static void audio_ring_note(int p, const AudioPortSlot* port, const float* src, 
     while (lead < 3 && lead + 1 < nblock &&
            audio_block_has_data(port->buffer + ((r + lead + 1) % nblock) * bsz, nch)) lead++;
     s_ar_lead[lead]++;
+    if (nch == 8) {
+        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+            for (u32 c = 0; c < 8; c++) {
+                const double v = audio_be_f32(&src[s * 8 + c]);
+                s_ar_port_sq[c] += v * v;
+            }
+        s_ar_port_n += CELL_AUDIO_BLOCK_SAMPLES;
+    }
     if (!audio_block_has_data(src, nch)) { zrun[p]++; return; }
     if (sound[p] && zrun[p] > 0 && zrun[p] <= AUDIO_GAP_MAX) { s_ar_gaps++; s_ar_gap_blocks += zrun[p]; }
     zrun[p] = 0; sound[p] = 1;
@@ -474,8 +726,10 @@ static int audio_rate_on(void)
     return on;
 }
 
+/* Mix one block from all active ports into s_mix_buffer, in the output's channels */
 static void audio_mix_one_block(void)
 {
+    const u32 out_ch = s_out_ch;
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
@@ -533,31 +787,8 @@ static void audio_mix_one_block(void)
                         p, (unsigned long long)port->read_index, block_idx, map);
             } } }
 
-        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-            float left, right;
-            if (nch >= 2) {
-                left  = ld_be_f32(&src[s * nch + 0]) * level;
-                right = ld_be_f32(&src[s * nch + 1]) * level;
-            } else {
-                /* Mono: duplicate to both channels */
-                left = right = ld_be_f32(&src[s]) * level;
-            }
-
-            /* If 7.1, mix center and other channels into stereo */
-            if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
-            }
-
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
-        }
+        /* Mono to both front channels; a 7.1 port to 7.1 or 5.1 as it is, or to stereo (audio_mix.h). */
+        audio_mix_port(s_mix_buffer, out_ch, src, nch, CELL_AUDIO_BLOCK_SAMPLES, level);
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
@@ -575,7 +806,7 @@ static void audio_mix_one_block(void)
     mutex_unlock(&s_audio_mutex);
 
     /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * out_ch; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
     }
@@ -675,7 +906,43 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     long long pace_t0 = 0;              /* when block 0 of the paced clock was due */
     unsigned long long pace_k = 0;      /* blocks taken on it */
     if (pace_ms) fprintf(stderr, "[cellAudio] a block every 5.33 ms, device queue kept near %d ms%c", pace_ms, 10);
+#if AUDIO_BACKEND_WASAPI
+    /* This thread opens the device again when it changes or is lost: COM for it here. */
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    const int reopen_on = audio_env_on("PS3_AUDIO_REOPEN", 1);
+    ULONGLONG reopen_retry = 0, reopen_test = 0;
+    unsigned reopen_fails = 0;
+    { const char* e = getenv("PS3_AUDIO_REOPEN_AT");
+      if (e && atoi(e) > 0) reopen_test = GetTickCount64() + (ULONGLONG)atoi(e) * 1000; }
+#endif
     while (s_mix_thread_running) {
+#if AUDIO_BACKEND_WASAPI
+        if (reopen_test && GetTickCount64() >= reopen_test) {
+            reopen_test = 0;
+            fprintf(stderr, "[cellAudio] PS3_AUDIO_REOPEN_AT: opening the device again, as a change of device would\n");
+            InterlockedExchange(&s_wasapi_reopen, 1);
+        }
+        if (s_wasapi_reopen && reopen_on && GetTickCount64() >= reopen_retry) {
+            /* Between blocks: the stream, its channels and the pacing start again on the new device. */
+            InterlockedExchange(&s_wasapi_reopen, 0);
+            const u32 was = s_out_ch;
+            wasapi_close();
+            if (wasapi_open("opened again") == 0) {
+                reopen_fails = 0;
+                pace_t0 = 0;
+                pace_k = 0;
+                blocks = 0;
+                QueryPerformanceCounter(&q0);
+                if (s_out_ch != was && getenv("AUDIO_WAV"))
+                    fprintf(stderr, "[cellAudio] AUDIO_WAV: %u channels from here on\n", s_out_ch);
+            } else {
+                InterlockedExchange(&s_wasapi_reopen, 1);
+                reopen_retry = GetTickCount64() + 1000;
+                if (reopen_fails++ < 3)
+                    fprintf(stderr, "[cellAudio] no output device to open: trying again every second\n");
+            }
+        }
+#endif
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
         if (pace_ms && room >= 0) {
@@ -726,22 +993,31 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
         { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
           if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_ch; i++) {
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+        /* AUDIO_WAV=<file>: append the final mix as raw f32le 48 kHz in the
+         * output's channels, which the log gives (ffmpeg -f f32le -ar 48000
+         * -ac <channels> -i <file>). */
         { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+          if (_wf == (FILE*)-1) {
+              const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL;
+              if (_wf) fprintf(stderr, "[cellAudio] AUDIO_WAV: f32le, 48 kHz, %u channels\n", s_out_ch); }
+          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * s_out_ch, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_ch; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
+            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+                for (u32 c = 0; c < s_out_ch; c++) {
+                    const double v = s_mix_buffer[s * s_out_ch + c];
+                    s_ar_out_sq[c] += v * v;
+                }
+            s_ar_out_n += CELL_AUDIO_BLOCK_SAMPLES;
             if (now - t0 >= 5000) {
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
@@ -755,6 +1031,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                                 "taken right after the one before %.0f%%%c",
                         s_ar_gaps, s_ar_gap_blocks, s_ar_late, s_ar_lead[0], s_ar_lead[1], s_ar_lead[2], s_ar_lead[3],
                         n ? 100.0 * s_ar_quick / n : 0.0, 10);
+                /* The level of each channel (rms): what the title's 8-channel ports hold, what goes out. */
+                { char pl[160] = "none", ol[160] = "";
+                  if (s_ar_port_n) {
+                      const double k = 1.0 / (double)s_ar_port_n;
+                      snprintf(pl, sizeof pl, "L %.4f R %.4f C %.4f LFE %.4f SL %.4f SR %.4f RL %.4f RR %.4f",
+                               sqrt(s_ar_port_sq[0] * k), sqrt(s_ar_port_sq[1] * k), sqrt(s_ar_port_sq[2] * k),
+                               sqrt(s_ar_port_sq[3] * k), sqrt(s_ar_port_sq[4] * k), sqrt(s_ar_port_sq[5] * k),
+                               sqrt(s_ar_port_sq[6] * k), sqrt(s_ar_port_sq[7] * k)); }
+                  for (u32 c = 0, at = 0; c < s_out_ch && s_ar_out_n && at < sizeof ol - 12; c++)
+                      at += (u32)snprintf(ol + at, sizeof ol - at, "%s%.4f", c ? " " : "",
+                                          sqrt(s_ar_out_sq[c] / (double)s_ar_out_n));
+                  fprintf(stderr, "[audio-chan] the 8-channel ports, rms: %s; the output, %u channels: %s\n",
+                          pl, s_out_ch, ol);
+                  memset(s_ar_port_sq, 0, sizeof s_ar_port_sq);
+                  memset(s_ar_out_sq, 0, sizeof s_ar_out_sq);
+                  s_ar_port_n = s_ar_out_n = 0; }
                 s_ar_gaps = s_ar_gap_blocks = s_ar_late = s_ar_quick = 0;
                 memset(s_ar_lead, 0, sizeof s_ar_lead);
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }

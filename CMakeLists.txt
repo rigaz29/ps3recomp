@@ -476,6 +476,13 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_vfs_mods tests/test_vfs_mods.c)
     target_include_directories(test_vfs_mods PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
     add_test(NAME vfs_mods COMMAND test_vfs_mods)
+    # libs/audio/audio_mix.h: a cellAudio port into a stereo, 5.1 or 7.1 output.
+    add_executable(test_audio_mix tests/test_audio_mix.c)
+    target_include_directories(test_audio_mix PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio")
+    if(UNIX)
+        target_link_libraries(test_audio_mix PRIVATE m)
+    endif()
+    add_test(NAME audio_mix COMMAND test_audio_mix)
 
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.

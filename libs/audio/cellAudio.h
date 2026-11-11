@@ -115,6 +115,11 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 /* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
+/* Not a PS3 call: the channels the host output takes, 2, 6 or 8 -- the open stream's, or before
+ * cellAudioInit what it will be (PS3_AUDIO_CHANNELS, else the default device's layout). cellAudioOut's
+ * answers follow it (libs/misc/cellAvconfExt.c). */
+u32 cellAudio_output_channels(void);
+
 #ifdef __cplusplus
 }
 #endif

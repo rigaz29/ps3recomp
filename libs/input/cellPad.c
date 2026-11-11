@@ -514,7 +514,7 @@ static void pad_poll_keyboard(void)
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          printf("[cellPad] keyboard fallback active on port 0 (no controller there)\n");
           fflush(stdout); } }
 }
 #endif
@@ -590,6 +590,10 @@ static void pad_fill(PadHostState* hs, u16 btns, short lx, short ly, short rx, s
     hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
 }
 
+/* Which XInput slots had a controller at the last look: its coming and going is in the log, as SDL3's is. A pad that
+ * drops off the USB bus reads as unplugged here, and a log that does not say so leaves it to guesses. */
+static int s_xi_seen[PAD_MAX_HOST_PORTS];
+
 static void pad_poll_xinput(void)
 {
     const unsigned long long now = pad_now_ms();
@@ -604,10 +608,18 @@ static void pad_poll_xinput(void)
         DWORD result = p_xi_get_state ? p_xi_get_state((DWORD)i, &state)
                                       : ERROR_DEVICE_NOT_CONNECTED;
         if (result != ERROR_SUCCESS) {
+            if (s_xi_seen[i]) {
+                s_xi_seen[i] = 0;
+                printf("[cellPad] XInput controller on port %d disconnected\n", i);
+            }
             pad_host_release(&s_host_state[i]);
             s_pad_empty_until[i] = now + PAD_EMPTY_RECHECK_MS
                                  + (unsigned long long)i * (PAD_EMPTY_RECHECK_MS / PAD_MAX_HOST_PORTS);
             continue;
+        }
+        if (!s_xi_seen[i]) {
+            s_xi_seen[i] = 1;
+            printf("[cellPad] XInput controller connected on port %d\n", i);
         }
         s_pad_empty_until[i] = 0;
 

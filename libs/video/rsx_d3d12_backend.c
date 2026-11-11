@@ -4022,6 +4022,15 @@ static void wait_for_gpu_at(int line)
 #define wait_for_gpu() wait_for_gpu_at(__LINE__)
 
 static u64 s_fence_last;   /* the last value signalled on the queue */
+/* The fence's completed value + 1 when a wait for the GPU last ran out, 0 for never: the freeze watch tells a GPU that
+ * stopped from a title that stopped (rsx_d3d12_backend_gpu_stuck). */
+static volatile u64 s_stuck_fence;
+
+int rsx_d3d12_backend_gpu_stuck(void)
+{
+    const u64 at = s_stuck_fence;
+    return at && s_d3d.fence && s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) + 1 <= at;
+}
 /* fence_values[fi] is the next value to signal for the frame index: a wait signals it, and leaves the
  * one after it for the batch it sits in, which move_to_next_frame signals after the batch. The wait
  * used to take the one after and leave it there: the batch then signalled the wait's own value
@@ -4056,10 +4065,12 @@ static void wait_for_gpu_once(void)
             if (WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT)
                 return;
             HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+            const u64 got = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+            s_stuck_fence = got + 1;
             printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
                    2 * (tries + 1),
                    (unsigned long long)v,
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+                   (unsigned long long)got,
                    (long)rr);
             fflush(stdout);
             if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
@@ -5729,9 +5740,11 @@ static void move_to_next_frame(void)
             s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
         if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
             HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+            const u64 got = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+            s_stuck_fence = got + 1;
             printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
                    (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+                   (unsigned long long)got,
                    (long)rr);
         }
     }
@@ -19342,6 +19355,7 @@ void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 int rsx_d3d12_backend_generating(void) { return 0; }
+int rsx_d3d12_backend_gpu_stuck(void) { return 0; }
 double rsx_d3d12_backend_refresh_hz(void) { return 0.0; }
 void rsx_d3d12_backend_record_ahead(void) {}
 void rsx_d3d12_register_vertex_ring(u32 io_offset, u32 size) { (void)io_offset; (void)size; }

@@ -50,6 +50,9 @@ int rsx_d3d12_backend_pump_messages(void);
  * half the display's rate, and the frame clock caps it. */
 int rsx_d3d12_backend_generating(void);
 
+/* 1 if the GPU's queue has stopped: a wait for it ran out, and its fence has not moved since. */
+int rsx_d3d12_backend_gpu_stuck(void);
+
 /* The first of the four vertex constants that hold the title's world-to-clip matrix, which
  * frame generation needs. The title's draws of what moves: prev_reg, last frame's matrix, the
  * same way, read only by them, and prev_attr, the attribute with a vertex's last position; -1

@@ -3066,6 +3066,10 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);   /* the bars */
+    /* The program's own icon, resource 1, when it has one (a port's resource script); Windows' own otherwise. */
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
+    wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                   GetSystemMetrics(SM_CYSMICON), 0);
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
     wc.lpfnWndProc = d3d12_view_wndproc;

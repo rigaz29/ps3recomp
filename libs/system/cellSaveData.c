@@ -1410,11 +1410,19 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
-    dirName = savedata_host_str(dirName);
+    const char* dir = savedata_host_str(dirName);
     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
-           version, dirName ? dirName : "<null>");
+           version, dir ? dir : "<null>");
 
-    /* Delegate to the non-_2 entry, which marshals. This used to call
+    /* The non-_2 entry translates dirName from a guest address itself, so it
+     * gets the guest's address, not the host pointer. Given the host pointer it
+     * translated it again: where the guest's memory was reserved below 4 GB,
+     * that pointer read as a guest address too, the name came out empty, and
+     * every save went into the save root itself, with no folder of its own --
+     * God of War: Ascension's profile and settings mixed together there, and
+     * neither found again (Ascension-R issue #10, a Ryzen 7 8700F).
+     *
+     * Delegate to the non-_2 entry, which marshals. This used to call
      * savedata_execute(), which invokes funcStat as a HOST function pointer
      * with HOST struct addresses -- but funcStat is a guest OPD and the structs
      * must live in guest memory, so the callback wrote nothing the caller could

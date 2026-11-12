@@ -28,6 +28,9 @@
 #include "../../third_party/fsr_api/upscalers/include/ffx_upscale.h"
 
 #include "rsx_fsr3.h"
+#ifdef PS3RECOMP_ANR
+#include "rsx_anr.h"
+#endif
 
 static ffxFunctions s_ffx;
 static ffxContext s_swap_ctx;   /* the proxy's */
@@ -71,6 +74,9 @@ static bool s_fg_told;              /* the context has been told once whether to
 static double s_floor, s_rate_ms;   /* see fsr3_rate */
 static int s_rate_n, s_rate_streak;
 static bool s_under;
+#ifdef PS3RECOMP_ANR
+static bool s_anr;                  /* ANR FG makes the generated frames: rsx_fsr3_fg_anr */
+#endif
 
 int rsx_fsr3_available(void)
 {
@@ -497,6 +503,70 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     return 1;
 }
 
+#ifdef PS3RECOMP_ANR
+static rsx_anr_frame s_anr_in;      /* this frame's, for the swap chain's callback at its Present */
+
+static D3D12_RESOURCE_STATES fsr3_d3d12_state(uint32_t s)
+{
+    D3D12_RESOURCE_STATES d = D3D12_RESOURCE_STATE_COMMON;     /* PRESENT as well */
+    if (s & FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) d |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (s & FFX_API_RESOURCE_STATE_COMPUTE_READ) d |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (s & FFX_API_RESOURCE_STATE_PIXEL_READ) d |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (s & FFX_API_RESOURCE_STATE_COPY_SRC) d |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (s & FFX_API_RESOURCE_STATE_COPY_DEST) d |= D3D12_RESOURCE_STATE_COPY_DEST;
+    if (s & FFX_API_RESOURCE_STATE_INDIRECT_ARGUMENT) d |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    if (s & FFX_API_RESOURCE_STATE_RENDER_TARGET) d |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+    return d;
+}
+
+/* The swap chain asks for the generated frame from its Present, on the thread that presents, and
+ * runs the list on the game's queue right after the frame's own (FidelityFX SDK 1.1.4,
+ * dispatchInterpolationCommands): the frame's depth and motion are still there. */
+static ffxReturnCode_t fsr3_anr_generate(ffxDispatchDescFrameGeneration* p, void*)
+{
+    rsx_anr_frame f = s_anr_in;
+    f.backbuffer = (ID3D12Resource*)p->presentColor.resource;
+    f.backbuffer_state = fsr3_d3d12_state(p->presentColor.state);
+    f.output = (ID3D12Resource*)p->outputs[0].resource;
+    f.output_state = fsr3_d3d12_state(p->outputs[0].state);
+    f.reset = f.reset || p->reset;
+    rsx_anr_generate((ID3D12GraphicsCommandList*)p->commandList, &f);
+    if (!rsx_anr_usable()) {
+        /* FSR's own from the next frame, configured and prepared as usual, from a reset. */
+        s_anr = false;
+        s_fg_was = false;
+        printf("[fsr3] ANR stopped: FSR 3.1's own frame generation from the next frame\n");
+    }
+    return FFX_API_RETURN_OK;
+}
+
+/* What the callback reads: this frame's, taken while the frame is recorded. */
+static void fsr3_anr_inputs(const rsx_fsr3_frame* f, bool reset)
+{
+    rsx_anr_frame& a = s_anr_in;
+    memset(&a, 0, sizeof a);
+    a.hudless = (ID3D12Resource*)f->hudless;
+    a.depth = s_depth;
+    a.motion = s_motion;
+    a.display_w = s_dw;
+    a.display_h = s_dh;
+    a.render_w = s_rw;
+    a.render_h = s_rh;
+    a.jitter_x = f->jitter_x;
+    a.jitter_y = f->jitter_y;
+    a.znear = (float)s_cam.znear;
+    a.zfar = (float)s_cam.zfar;
+    a.fov = (float)s_cam.fov;
+    for (int i = 0; i < 3; i++) {
+        a.pos[i] = (float)s_cam.pos[i];
+        a.up[i] = (float)s_cam.up[i];
+        a.right[i] = (float)s_cam.right[i];
+        a.fwd[i] = (float)s_cam.fwd[i];
+    }
+    a.reset = reset;
+}
+#endif
+
 static void fsr3_configure(bool enabled, void* hudless)
 {
     ffxConfigureDescFrameGeneration c{};
@@ -505,6 +575,9 @@ static void fsr3_configure(bool enabled, void* hudless)
     c.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* ctx) -> ffxReturnCode_t {
         return s_ffx.Dispatch((ffxContext*)ctx, &params->header);
     };
+#ifdef PS3RECOMP_ANR
+    if (s_anr) c.frameGenerationCallback = fsr3_anr_generate;
+#endif
     c.frameGenerationCallbackUserContext = &s_fg_ctx;
     c.frameGenerationEnabled = enabled;
     if (hudless) c.HUDLessColor = ffxApiGetResourceDX12((ID3D12Resource*)hudless, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
@@ -518,6 +591,9 @@ void rsx_fsr3_fg_destroy(void)
 {
     if (!s_fg_ctx) return;
     fsr3_configure(false, nullptr);
+#ifdef PS3RECOMP_ANR
+    rsx_anr_release();
+#endif
     s_ffx.DestroyContext(&s_fg_ctx, nullptr);
     s_fg_ctx = nullptr;
 }
@@ -526,6 +602,19 @@ void rsx_fsr3_fg_destroy(void)
  * those in a row to change: over the floor by a margin to come back, as generation costs some
  * of the rate it is judged on. */
 void rsx_fsr3_fg_floor(double fps) { s_floor = fps; }
+
+int rsx_fsr3_fg_anr(const char* dll)
+{
+#ifdef PS3RECOMP_ANR
+    if (!s_fg_ctx || !s_dev) return 0;
+    s_anr = rsx_anr_open(s_dev, dll) != 0;
+    return s_anr;
+#else
+    (void)dll;
+    printf("[fsr3] ANR: not in this build (PS3RECOMP_ANR)\n");
+    return 0;
+#endif
+}
 
 static void fsr3_rate(float frame_ms)
 {
@@ -638,6 +727,10 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
      * it disabled on every one of its frames, its GPU queue stopped behind the swap chain (2026-11-10). */
     if (on || s_fg_was || !s_fg_told) fsr3_configure(on, on ? f->hudless : nullptr);
     s_fg_told = true;
+#ifdef PS3RECOMP_ANR
+    if (on && s_anr) fsr3_anr_inputs(f, reset);
+    else
+#endif
     if (on) {
         ffxDispatchDescFrameGenerationPrepareV2 p{};
         p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;

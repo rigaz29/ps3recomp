@@ -67,6 +67,10 @@ void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* frame, void* color,
 /* Frames a second under which frames are shown as they are, until it recovers. 0: never. */
 void rsx_fsr3_fg_floor(double fps);
 
+/* ANR FG (experimental, PS3RECOMP_ANR): its DLL makes the generated frames in place of FSR's, and
+ * the same swap chain presents and paces them. After rsx_fsr3_fg_create; 1 if it is used. */
+int rsx_fsr3_fg_anr(const char* dll);
+
 #ifdef __cplusplus
 }
 #endif

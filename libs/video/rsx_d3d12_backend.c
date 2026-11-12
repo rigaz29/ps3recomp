@@ -1045,6 +1045,8 @@ static void rdoc_request(void)
 
 /* graphics.frame_generation (D3D12_FRAME_GENERATION): off, on, or passthrough, which
  * is the proxy swapchain and its threads with nothing generated, to measure them.
+ * anr (experimental): on, with ANR FG's DLL (graphics.anr_dll, D3D12_ANR_DLL) making
+ * the generated frames in FSR's place; FSR's own where it cannot (rsx_anr.cpp).
  * The swap chain goes behind the proxy before anything asks it for a buffer; the
  * context waits for the first frame, when the window's size is known. */
 #define FG_OBJ_MAX   1024      /* draws of what moves in a frame */
@@ -1052,6 +1054,7 @@ static void rdoc_request(void)
 #define FG_OBJ_NONE  60000.0f  /* in the target, where nothing moves */
 #define FG_OBJ_BIAS  (-64)     /* their depth against the scene's, from another program's arithmetic */
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
+static int s_fg_anr;        /* frame_generation = anr */
 /* graphics.scaling = fsr3: FSR's upscaler on scene frames, FSR 1 on the rest. */
 static struct {
     int want;                   /* asked for, and the DLLs are there */
@@ -1109,7 +1112,8 @@ void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr)
 static void fg_start(void)
 {
     const char* m = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
-    const int mode = ps3_settings_ieq(m, "on") ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
+    s_fg_anr = ps3_settings_ieq(m, "anr");
+    const int mode = ps3_settings_ieq(m, "on") || s_fg_anr ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
     if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
     if (rsx_d3d12_backend_wide_ratio() != 1.0f) s_fg.prev_reg = -1;   /* 21:9: it left noise on Kratos in close-ups; cause not found */
     if (!mode) return;
@@ -1196,6 +1200,9 @@ static void fg_frame(void)
             s_fg_mode = 0;
             return;
         }
+        if (s_fg_anr && s_fg_mode == 2 &&
+            !rsx_fsr3_fg_anr(ps3_settings_str("graphics", "anr_dll", "D3D12_ANR_DLL", "anr\\nvngx_dlssg.dll")))
+            printf("[D3D12] frame generation: no ANR, FSR 3.1's own%c", 10);
         printf("[D3D12] frame generation %s: %ux%u from %ux%u%c", s_fg_mode == 2 ? "on" : "passthrough",
                s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, 10);
     }

@@ -163,6 +163,48 @@ if(WIN32)
     target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib")
 endif()
 
+# ANR FG (experimental): Apex Neural Rendering's frame generation through its DLSS-G (NGX)
+# interface, in FSR 3.1's swap chain (libs/video/rsx_anr.cpp). Its DLL is the player's own and is
+# never kept here. NVIDIA's NGX headers (NVIDIA RTX SDK license) are downloaded from NVIDIA's DLSS
+# repository into the build directory: whoever builds with this takes that license.
+option(PS3RECOMP_ANR "ANR frame generation, experimental (downloads NVIDIA's NGX headers)" OFF)
+if(WIN32 AND PS3RECOMP_ANR)
+    set(NGX_DIR "${CMAKE_CURRENT_BINARY_DIR}/ngx/include")
+    set(NGX_URL "https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.16/include")
+    # Windows' own curl, which checks the certificate against Windows' store: a CMake built with
+    # OpenSSL (WinLibs') may have no CA list to check it with.
+    find_program(NGX_CURL curl PATHS "$ENV{SystemRoot}/System32" NO_DEFAULT_PATH REQUIRED)
+    file(MAKE_DIRECTORY "${NGX_DIR}")
+    foreach(entry IN ITEMS
+            "nvsdk_ngx_defs.h=ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e"
+            "nvsdk_ngx_params.h=943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
+            "nvsdk_ngx_defs_dlssg.h=c29765ab9e0125f9d724ae9811cc2abe03738d17486ec8eee80d78a1504549e1")
+        string(REPLACE "=" ";" entry "${entry}")
+        list(GET entry 0 name)
+        list(GET entry 1 sha)
+        set(have "")
+        if(EXISTS "${NGX_DIR}/${name}")
+            file(SHA256 "${NGX_DIR}/${name}" have)
+        endif()
+        if(NOT have STREQUAL sha)
+            execute_process(COMMAND "${NGX_CURL}" -sSfL --proto =https -o "${NGX_DIR}/${name}" "${NGX_URL}/${name}"
+                            RESULT_VARIABLE got ERROR_VARIABLE why)
+            set(have "")
+            if(got EQUAL 0)
+                file(SHA256 "${NGX_DIR}/${name}" have)
+            endif()
+            if(NOT have STREQUAL sha)
+                file(REMOVE "${NGX_DIR}/${name}")
+                message(FATAL_ERROR "PS3RECOMP_ANR: ${NGX_URL}/${name}: curl ${got} ${why}, SHA-256 '${have}' where ${sha}")
+            endif()
+        endif()
+    endforeach()
+    target_sources(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_anr.cpp")
+    target_include_directories(ps3recomp_runtime PRIVATE "${NGX_DIR}")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ANR=1)
+    message(STATUS "ANR frame generation: on (NGX headers in ${NGX_DIR})")
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

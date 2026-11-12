@@ -1395,6 +1395,24 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     spu_lockline_unlock();
 }
 
+/* Whether n bytes at a local-memory offset are inside local memory. The RSX
+ * reaches local memory through a DMA object whose limit is its size: a copy
+ * past that faults there and writes nothing. Here the effective address would
+ * go on, into the PPU stacks at 0xD0000000 and, past 4 GB, around into main
+ * memory. God of War: Ascension's CopyLocalMemory, handed a negative size by a
+ * damaged block of its VRAM manager, copied 16 MB at a time that way, over the
+ * game's own function descriptors. A main-memory side (local 0) is not looked
+ * at. */
+static int gcm_local_span(int local, u64 off, u64 n)
+{
+    if (!local || off + n <= s_config.localSize) return 1;
+    static int said;
+    if (PS3_LOG_FIRST(said, 4))
+        printf("[NV3089] a copy past the end of local memory left out: offset 0x%llX, %llu bytes\n",
+               (unsigned long long)off, (unsigned long long)n);
+    return 0;
+}
+
 /* Set by a renderer that keeps what it draws on the GPU (the D3D12 backend):
  * told of each unscaled 32-bit copy out of a display buffer, in FIFO order,
  * before the guest-memory copy, which moves only what the CPU side holds. The
@@ -1523,6 +1541,12 @@ static void nv3089_blit(void)
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
+        /* the last texel read, and the whole swizzled surface */
+        const u64 ylast = (nv3089_origin(v0b) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20;
+        const u64 xlast = (nv3089_origin(u0b) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20;
+        if (!gcm_local_span(sl, (u64)s_nv3089.in_off + ylast * in_pitch + xlast * 4u, 4) ||
+            !gcm_local_span(1, s_nv309e.offset, (u64)out_w * out_h * 4u))
+            return;
         nv3089_engine_read(in_pitch, out_w, out_h);
         /* Copy words verbatim through raw pointers rather than vm_read32/
          * vm_write32: this moves ~500k pixels per blit and several blits run per
@@ -1614,8 +1638,13 @@ static void nv3089_blit(void)
             for (u32 y = 0; y < out_h; y++) {
                 const u32 dy = out_y + y;
                 if (dy < cy0 || dy >= cy1) continue;
-                const u64 sa = (u64)src + (u64)(sy0 + y) * in_pitch + (u64)(sx0 + xa) * bpp;
-                const u64 da = (u64)dst + (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
+                const u64 so = (u64)(sy0 + y) * in_pitch + (u64)(sx0 + xa) * bpp;   /* from each side's start */
+                const u64 dof = (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
+                if (!gcm_local_span(src_local, (u64)s_nv3089.in_off + so, n) ||
+                    !gcm_local_span(dst_local, (u64)s_gcm2d.dst_offset + dof, n))
+                    continue;
+                const u64 sa = (u64)src + so;
+                const u64 da = (u64)dst + dof;
                 if (sa + n > 0x100000000ull || da + n > 0x100000000ull) continue;
                 gcm_row_copy((u32)da, (u32)sa, n);
             }
@@ -1631,6 +1660,9 @@ static void nv3089_blit(void)
             if (dx < cx0 || dx >= cx1) continue;
             u64 su = nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx;
             u32 sx = (u32)(su >> 20);
+            if (!gcm_local_span(src_local, (u64)s_nv3089.in_off + (u64)sy * in_pitch + (u64)sx * bpp, bpp) ||
+                !gcm_local_span(dst_local, (u64)s_gcm2d.dst_offset + (u64)dy * dst_pitch + (u64)dx * bpp, bpp))
+                continue;
             u32 s = src + sy * in_pitch + sx * bpp;
             u32 d = dst + dy * dst_pitch + dx * bpp;
             if (bpp == 4)      vm_write32(d, vm_read32(s));

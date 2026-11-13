@@ -141,6 +141,15 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
                     ("%08X" % B_EA, "%X" % (B_CODE_END - BASE), "201")],
           "verified region per EA with span == code_end - 0x4000")
     check("spu_overlay_register_sig" not in reg, "engine mode does not register by signature")
+    check(not list((tmp / "out").glob("_tmp*.elf")), "no temporary ELF is left")
+
+    # --jobs: modules lifted at once give the same files, in the same order.
+    run("--engine-elf", str(tmp / "engine.elf"), "--out", str(tmp / "out2"),
+        "--symbol-prefix", "synth", "--jobs", "2", env=env)
+    rels = ["jobmods_manifest.json", "jobmods_register.c"] + [m["name"] + "/spu_recomp.c" for m in manifest]
+    check(all((tmp / "out2" / r).read_bytes() == (tmp / "out" / r).read_bytes() for r in rels),
+          "--jobs 2 lifts the same files as one at a time")
+    check(not list((tmp / "out2").glob("_tmp*.elf")), "--jobs 2 leaves no temporary ELF")
     for img, raw, end in ((200, A, A_CODE_END), (201, B, B_CODE_END)):
         arr = re.search(r"static const uint8_t code_%d\[(\d+)\] = \{([^}]*)\}" % img, reg)
         got = bytes(int(x, 16) for x in re.findall(r"0x([0-9A-F]{2})", arr.group(2))) if arr else b""

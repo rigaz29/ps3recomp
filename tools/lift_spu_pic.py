@@ -30,9 +30,10 @@ keeps after its code (what its lqr loads read) is left out of the lift.
 
 usage:
   python tools/lift_spu_pic.py --elf <PPU ELF> --list <pieces.json> --out <dir>
-                               [--register <file.c>] [--symbol-prefix NAME]
+                               [--register <file.c>] [--symbol-prefix NAME] [--jobs N]
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -74,7 +75,15 @@ def pool_start(raw):
     return lo
 
 
-def lift_piece(raw, name, entries, outdir, tmp_elf, prefix):
+def lift_piece(raw, name, entries, outdir, tmp_elf, prefix, log=None):
+    """Lift one piece into <outdir>/<name>/. With `log`, a list, what it would print goes there as
+    (stream, line) pairs instead, for main to print in the list's order."""
+    def say(line, stream=None):
+        if log is None:
+            print(line, file=stream or sys.stdout)
+        else:
+            log.append((stream, line))
+
     end = pool_start(raw)
     if any(e >= end for e in entries):
         sys.exit(f"{name}: an entry is in the constant pool (0x{end:X})")
@@ -88,7 +97,7 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix):
         cmd += ["--extra-funcs", ",".join(hex(LIFT_BASE + e) for e in entries[1:])]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
+        say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
         return None
     funcs = unsup = 0
     for line in r.stdout.splitlines():
@@ -97,8 +106,8 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix):
             funcs = int(t.split()[0])
         if "unsupported instruction(s)" in t:
             unsup = int(t.split()[0])
-    print(f"  {name:24} {len(raw):5d} bytes, code 0x{end:X}, funcs={funcs:2d} unsup={unsup}"
-          + ("  <-- UNSUPPORTED" if unsup else ""))
+    say(f"  {name:24} {len(raw):5d} bytes, code 0x{end:X}, funcs={funcs:2d} unsup={unsup}"
+        + ("  <-- UNSUPPORTED" if unsup else ""))
     return {"funcs": funcs, "unsup": unsup, "code_end": end}
 
 
@@ -184,6 +193,8 @@ def main():
     ap.add_argument("--out", required=True, help="output directory, one subdirectory per piece")
     ap.add_argument("--register", default=None, help="registration TU (default <out>/pic_register.c)")
     ap.add_argument("--symbol-prefix", default="port")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="lift N pieces at a time, each a spu_lifter.py process of its own (default 1)")
     ap.add_argument("--float-spec", type=int, default=0, metavar="N",
                     help="Pass --float-spec N to spu_lifter.py: a speculative float body for "
                          "each function with no store, channel op, call or internal branch "
@@ -208,7 +219,6 @@ def main():
     segs = elf_load_segments(open(args.elf, "rb").read())
     listed = json.load(open(args.list))
     os.makedirs(args.out, exist_ok=True)
-    tmp_elf = os.path.join(args.out, "_piece.elf")
     by_content = {}
     order = []
     for item in listed:
@@ -230,15 +240,27 @@ def main():
         order.append(p)
 
     print(f"{len(listed)} pieces, {len(order)} distinct; lifting at 0x{LIFT_BASE:X}")
+
+    def lift_one(p):
+        log, tmp_elf = [], os.path.join(args.out, f"_piece_{p['name']}.elf")
+        try:
+            return lift_piece(p["raw"], p["name"], p["entries"], args.out, tmp_elf, p["prefix"], log), log
+        finally:
+            if os.path.exists(tmp_elf):
+                os.remove(tmp_elf)
+
+    # --jobs: each piece is a spu_lifter.py process of its own; what is printed keeps the list's order.
     failed = 0
-    for p in order:
-        r = lift_piece(p["raw"], p["name"], p["entries"], args.out, tmp_elf, p["prefix"])
-        if r is None or r["unsup"]:
-            failed += 1
-        else:
-            p["code_end"] = r["code_end"]
-    if os.path.exists(tmp_elf):
-        os.remove(tmp_elf)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        running = [ex.submit(lift_one, p) for p in order]
+        for p, lifting in zip(order, running):
+            r, log = lifting.result()
+            for stream, line in log:
+                print(line, file=stream or sys.stdout)
+            if r is None or r["unsup"]:
+                failed += 1
+            else:
+                p["code_end"] = r["code_end"]
     if failed:
         sys.exit(f"{failed} piece(s) failed or have unsupported instructions")
     manifest = [{"name": p["name"], "image": p["image"], "eas": [hex(e) for e in p["eas"]],

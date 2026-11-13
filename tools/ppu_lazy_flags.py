@@ -82,6 +82,8 @@ _RETURN = re.compile(r"\breturn;")
 
 def line_flags(s):
     """(uses, defs) of one line as masks, or None for a form this pass does not know."""
+    if "ctx->cr" not in s and "ctx->xer" not in s:
+        return 0, 0                 # every form below names one of them; four lines in five name neither
     uses = defs = 0
     t = s
     for m in _W_FIELD.finditer(t):
@@ -339,6 +341,9 @@ def _sub_exits(s, program):
 
 
 def _lazy_line(s, program):
+    if "ctx->cr" not in s and "ctx->xer" not in s:
+        # nothing below but the tail call matches a line without them, as in line_flags
+        return _sub_exits(s, program) if "g_trampoline_fn" in s else s
     s = _sub_reads(s)
     s = _sub_writes(s, False)
     s = _R_MFCR.sub(lambda m: "= PPU_LF_CR()%s;" % (m.group(1) or ""), s)

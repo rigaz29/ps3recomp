@@ -41,7 +41,7 @@ Usage:
   python tools/lift_jobmods.py --jobmods <port>/spu/jobmods                                --out     <port>/spu                                --register <port>/spu/jobmods_register.c
   python tools/lift_jobmods.py --engine-elf <port>/EBOOT.elf                                --out     <port>/spu
 """
-import argparse, glob, hashlib, json, os, struct, subprocess, sys
+import argparse, concurrent.futures, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
 
@@ -260,11 +260,19 @@ def module_seeds(raw, base=BASE, name=None):
 
 
 def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
-                base=BASE, patches=None):
+                base=BASE, patches=None, log=None):
     """Lift one module image at `base` into <outdir>/<name>/. Returns its
     manifest entry, or None if the lifter failed. `base` is the LS address the
     module is linked for -- module_base() reads it out of the header, and it is
-    not always BASE."""
+    not always BASE. With `log`, a list, what it would print goes there as
+    (stream, line) pairs instead: a caller lifting several modules at once
+    prints each module's lines together, in its own order."""
+    def say(line, stream=None):
+        if log is None:
+            print(line, file=stream or sys.stdout)
+        else:
+            log.append((stream, line))
+
     entry_off = struct.unpack_from(">I", raw, 0x10)[0]
     entry = base + entry_off
     prefix = f"{name}_"
@@ -286,7 +294,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         cmd += ["--merge-chunks"]
     cmd += LIFTER_ARGS
     if patches:                            # --insn-patches: this module's
-        pfile = os.path.join(outdir, "_insn_patches.json")
+        pfile = os.path.join(outdir, f"_insn_patches_{name}.json")
         with open(pfile, "w") as f:
             json.dump({"patches": patches}, f, indent=1)
         cmd += ["--insn-patches", pfile]
@@ -297,11 +305,11 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         cmd += ["--extra-funcs", ",".join(inside)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
+        say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
         return None
     for line in r.stdout.splitlines():     # --insn-patches: what landed, what did not
         if "insn patch" in line:
-            print(f"  {name}: {line.strip()}")
+            say(f"  {name}: {line.strip()}")
     # parse stats from lifter stdout
     funcs = unsup = 0
     for line in r.stdout.splitlines():
@@ -311,7 +319,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         if "unsupported instruction(s)" in s:
             unsup = int(s.split()[0])
     flag = "  <-- UNSUPPORTED" if unsup else ""
-    print(f"  {name:40} funcs={funcs:3} unsup={unsup:3} entry=0x{entry:X}{flag}")
+    say(f"  {name:40} funcs={funcs:3} unsup={unsup:3} entry=0x{entry:X}{flag}")
     return {
         "name": name, "prefix": prefix, "base": base, "entry": entry,
         "entry_off": entry_off, "sig": sig.hex(), "size": len(raw),
@@ -390,6 +398,9 @@ def main():
                     help="--engine-elf: leave the module whose header is at EA (hex) "
                          "unlifted, so it runs in the interpreter. Repeatable. For a "
                          "module whose lift misbehaves, until that is fixed.")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="--engine-elf: lift N modules at a time, each a spu_lifter.py process "
+                         "of its own (default 1).")
     ap.add_argument("--merge-chunks", action="store_true",
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
@@ -496,24 +507,42 @@ def lift_engine_elf(args, register_c):
         name = f"jobmod_{hashlib.sha1(raw).hexdigest()[:12]}_e{entry_off:04X}"
         by_name.setdefault(name, (raw, []))[1].append(ea)
     os.makedirs(args.out, exist_ok=True)
-    manifest, code = [], {}
-    tmp_elf = os.path.join(args.out, "_tmp.elf")
+    todo = []
     for name, (raw, eas) in sorted(by_name.items(), key=lambda kv: kv[1][1][0]):
         code_end = module_code_end(raw, name)
         if code_end is None:
             print(f"  SKIP {name}: no reachable code", file=sys.stderr)
             continue
-        m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks and name not in MERGE_SKIP, code_end,
-                        patches=INSN_PATCHES.get(name))
-        if m and name in INSN_PATCHES:
-            INSN_PATCHES_DONE.add(name)
-        if not m:
-            continue
-        m.update(ea=eas[0], eas=eas, code_end=code_end)
-        code[name] = raw[0x30:code_end - BASE]
-        manifest.append(m)
-    if os.path.exists(tmp_elf):
-        os.remove(tmp_elf)
+        todo.append((name, raw, eas, code_end))
+
+    def lift_one(item):
+        name, raw, _eas, code_end = item
+        log, tmp_elf = [], os.path.join(args.out, f"_tmp_{name}.elf")
+        try:
+            m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks and name not in MERGE_SKIP, code_end,
+                            patches=INSN_PATCHES.get(name), log=log)
+        finally:
+            if os.path.exists(tmp_elf):
+                os.remove(tmp_elf)
+        return m, log
+
+    # --jobs: each module is a spu_lifter.py process of its own, so that many run at once, the
+    # largest code first, so that a small one is the last to end. The manifest and what is
+    # printed keep the EA order, whatever the order the lifts end in.
+    manifest, code = [], {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        running = {t[0]: ex.submit(lift_one, t) for t in sorted(todo, key=lambda t: t[3] - BASE, reverse=True)}
+        for name, raw, eas, code_end in todo:
+            m, log = running[name].result()
+            for stream, line in log:
+                print(line, file=stream or sys.stdout)
+            if m and name in INSN_PATCHES:
+                INSN_PATCHES_DONE.add(name)
+            if not m:
+                continue
+            m.update(ea=eas[0], eas=eas, code_end=code_end)
+            code[name] = raw[0x30:code_end - BASE]
+            manifest.append(m)
     with open(os.path.join(args.out, "jobmods_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     emit_register_verified(manifest, code, register_c, args.symbol_prefix)

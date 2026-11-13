@@ -98,6 +98,7 @@ with tempfile.TemporaryDirectory(prefix="lift-spu-pic-") as tmp:
     check(re.search(r"spu_overlay_register_pic_region\(0x%08Xu, 0x30000u, %du, %d, &seg, 1\)"
                     % (PIECE_EA, len(PIECE), IMAGE), reg) is not None,
           "registered under its EA with the whole piece as its span")
+    check(not list((tmp / "out").glob("_piece*.elf")), "no temporary ELF is left")
 
     if os.name == "nt":
         print("SKIP runtime adoption: fixture requires the POSIX compiler/linker")

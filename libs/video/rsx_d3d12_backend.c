@@ -293,7 +293,8 @@ static struct {
     u32 stride, max_rec;
     void (*cpu)(const void* rec, const u8* src, u8* dst, u32 n);
     volatile LONG set;
-    int state;                              /* 0 not built yet, 1 ready, -1 failed */
+    int state;                              /* 0 not built yet (or its program not compiled yet), 1 ready, -1 failed */
+    double cpu_since;                       /* the first draw lit on the CPU while its program was compiled */
     ID3D12RootSignature* rs;
     ID3D12PipelineState* pso;
     ID3D12Resource* lit;                    /* default heap: two halves of lit_half, by vp_parity */
@@ -16202,25 +16203,41 @@ static int vpass_draw_lit(void)
 
 /* The pass's program, compiled on a thread of its own from the moment the pass is set (a low
  * priority one): with God of War: Ascension's skinned position done the SPU's way in integer
- * operations, FXC takes ~5.6 s over it (1.5 s before), which the frame clock thread would otherwise
- * wait out at the pass's first use. */
+ * operations, FXC takes ~5.6 s over it (1.5 s before). Nothing waits for it: until it is there,
+ * vpass_build says no and the CPU lights the pass's draws (vpass_segment's vpass_cpu_copy). Under
+ * Proton, D3DCompile is Wine's, on vkd3d-shader, and it was still at this program after a minute
+ * while the frame clock thread waited for it (issue #12). */
 static ID3DBlob* s_vpass_cs;
 static HRESULT s_vpass_chr;
 static char s_vpass_cerr[1024];
 static double s_vpass_cdt;
 static int s_vpass_cached;
-/* Through the shader cache file (graphics.shader_cache) too, keyed apart from the guest programs:
- * compiled the first time, read back after. */
-static DWORD WINAPI vpass_compile(LPVOID arg)
+static int s_vpass_dxc;                     /* the program is DXC's, at shader model 6.0 */
+static volatile LONG s_vpass_cdone;         /* vpass_compile's thread has done its work */
+/* Which compiler makes it. D3DCompile, which the check (VTX_LIT_CHECK) finds the nearer to the SPU: at
+ * the temple 94.5% of the lit F16 values the same, against DXC's 86%, both within 0.004. Under Wine,
+ * DXC: 0.7 s there, when the guest programs come from it. VTX_LIT_COMPILER=dxc or fxc chooses. After
+ * shc_pick_compiler. */
+static int vpass_dxc_wanted(void)
 {
-    (void)arg;
+    const char* c = getenv("VTX_LIT_COMPILER");
+    if (!s_shc_dxc || (c && ps3_settings_ieq(c, "fxc"))) return 0;
+    if (c && ps3_settings_ieq(c, "dxc")) return 1;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    return nt && GetProcAddress(nt, "wine_get_version") != NULL;   /* Wine's ntdll has it, Windows' not */
+}
+/* Through the shader cache file (graphics.shader_cache) too, keyed apart from the guest programs and
+ * DXC's apart from D3DCompile's: compiled the first time, read back after. */
+static void vpass_compile_now(void)
+{
     const char* src = s_vpass.hlsl;
     const size_t len = strlen(src);
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
-    const u64 key = shc_key(src, len, "cs_5_0", flags | 0x80000000u);
     const double t0 = perf_now();
     AcquireSRWLockExclusive(&s_shc_lock);
     if (s_shc_on < 0) shc_open();
+    s_vpass_dxc = vpass_dxc_wanted();
+    const u64 key = shc_key(src, len, s_vpass_dxc ? "cs_6_0" : "cs_5_0", flags | 0x80000000u);
     if (s_shc_on && s_shc_cap) {
         ShaderCacheEntry* e = shc_slot(key, (u32)len);
         if (e->prog) s_vpass_cs = shp_blob(e->prog);
@@ -16230,10 +16247,11 @@ static DWORD WINAPI vpass_compile(LPVOID arg)
         s_vpass_chr = S_OK;
         s_vpass_cached = 1;
         s_vpass_cdt = perf_now() - t0;
-        return 0;
+        return;
     }
     ID3DBlob* err = NULL;
-    s_vpass_chr = D3DCompile(src, len, "vertex_pass", NULL, NULL, "main", "cs_5_0", flags, 0, &s_vpass_cs, &err);
+    s_vpass_chr = s_vpass_dxc ? rsx_dxc_compile(src, len, "cs_5_0", shc_dxc_level(flags), &s_vpass_cs, &err)
+                              : D3DCompile(src, len, "vertex_pass", NULL, NULL, "main", "cs_5_0", flags, 0, &s_vpass_cs, &err);
     s_vpass_cdt = perf_now() - t0;
     if (err) {
         snprintf(s_vpass_cerr, sizeof s_vpass_cerr, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
@@ -16244,37 +16262,45 @@ static DWORD WINAPI vpass_compile(LPVOID arg)
         if (s_shc_on) shc_keep(key, (u32)len, s_vpass_cs);
         ReleaseSRWLockExclusive(&s_shc_lock);
     }
+}
+static DWORD WINAPI vpass_compile(LPVOID arg)
+{
+    (void)arg;
+    vpass_compile_now();
+    InterlockedExchange(&s_vpass_cdone, 1);
     return 0;
 }
 
-/* The compute pipeline, the buffers and the command list, on first use (the frame clock thread). */
+/* The compute pipeline, the buffers and the command list, on first use (the frame clock thread).
+ * While the program is still being compiled it says no, and is asked again at the next draw. */
 static int vpass_build(void)
 {
     if (s_vpass.state) return s_vpass.state > 0;
+    if (s_vpass_cthread && !InterlockedCompareExchange(&s_vpass_cdone, 0, 0)) {
+        if (!s_vpass.cpu_since) {
+            s_vpass.cpu_since = perf_now();
+            fprintf(stderr, "[vtx-lit] the vertex pass is not compiled yet: the CPU lights its draws until it is%c", 10);
+        }
+        return 0;
+    }
     s_vpass.state = -1;
     if (!s_vpass.hlsl || !s_d3d.device) return 0;
     ID3D12Device* dev = s_d3d.device;
     ID3DBlob *cs = NULL, *err = NULL, *sig = NULL;
     HRESULT hr;
     if (s_vpass_cthread) {
-        const double t0 = perf_now();
-        WaitForSingleObject(s_vpass_cthread, INFINITE);
+        WaitForSingleObject(s_vpass_cthread, INFINITE);   /* it has done its work: s_vpass_cdone */
         CloseHandle(s_vpass_cthread);
         s_vpass_cthread = NULL;
-        hr = s_vpass_chr;
-        cs = s_vpass_cs;
-        s_vpass_cs = NULL;
-        fprintf(stderr, "[vtx-lit] the vertex pass %s in %.1f s, waited for %.2f s%c",
-                s_vpass_cached ? "read from the shader cache" : "compiled", s_vpass_cdt, perf_now() - t0, 10);
     } else {
-        hr = D3DCompile(s_vpass.hlsl, strlen(s_vpass.hlsl), "vertex_pass", NULL, NULL, "main", "cs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
-        if (err) {
-            snprintf(s_vpass_cerr, sizeof s_vpass_cerr, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
-            err->lpVtbl->Release(err);
-            err = NULL;
-        }
+        vpass_compile_now();                               /* no thread for it: here, waited for */
     }
+    hr = s_vpass_chr;
+    cs = s_vpass_cs;
+    s_vpass_cs = NULL;
+    fprintf(stderr, "[vtx-lit] the vertex pass %s in %.1f s; the CPU lit its draws for %.1f s before it%c",
+            s_vpass_cached ? "read from the shader cache" : s_vpass_dxc ? "compiled by DXC" : "compiled by D3DCompile",
+            s_vpass_cdt, s_vpass.cpu_since > 0.0 ? perf_now() - s_vpass.cpu_since : 0.0, 10);
     if (FAILED(hr) || !cs) {
         fprintf(stderr, "[vtx-lit] the vertex pass did not compile (0x%08lX): %s%c", hr, s_vpass_cerr, 10);
         if (cs) cs->lpVtbl->Release(cs);

@@ -148,7 +148,7 @@ HRESULT rsx_dxc_compile(const char* src, size_t len, const char* target, const w
         if (FAILED(hr)) { cc = NULL; return hr; }
     }
     LPCWSTR args[] = {
-        L"-T", target[0] == 'v' ? L"vs_6_0" : L"ps_6_0", L"-E", L"main", level,
+        L"-T", target[0] == 'v' ? L"vs_6_0" : target[0] == 'c' ? L"cs_6_0" : L"ps_6_0", L"-E", L"main", level,
         L"-HV", L"2018", L"-Gis", L"-Qstrip_reflect", L"-Wno-everything",
     };
     size_t n = len;

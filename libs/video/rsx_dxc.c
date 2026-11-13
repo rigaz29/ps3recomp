@@ -1,5 +1,5 @@
 /*
- * ps3recomp - guest shaders through DXC
+ * ps3recomp - guest shaders through DXC, and under Wine the port's own (rsx_compile_own, below)
  *
  * A guest program met for the first time costs D3DCompile 126 ms on average,
  * up to a second, and the draws that use it wait for it: nearly all of a new
@@ -136,8 +136,9 @@ static char* dxc_split_samplers(const char* src, size_t len, size_t* out_len)
     return o;
 }
 
-HRESULT rsx_dxc_compile(const char* src, size_t len, const char* target, const wchar_t* level,
-                        ID3DBlob** out, ID3DBlob** err)
+/* entry and target as D3DCompile takes them: the target's stage (vs_5_0's vs) at shader model 6.0. */
+static HRESULT dxc_compile(const char* src, size_t len, const char* entry, const char* target, const wchar_t* level,
+                           ID3DBlob** out, ID3DBlob** err)
 {
     static __declspec(thread) DxcCompiler* cc;   /* an instance takes one compile at a time */
     *out = NULL;
@@ -147,8 +148,13 @@ HRESULT rsx_dxc_compile(const char* src, size_t len, const char* target, const w
         const HRESULT hr = s_create(&s_clsid_compiler, &s_iid_compiler3, (void**)&cc);
         if (FAILED(hr)) { cc = NULL; return hr; }
     }
+    wchar_t went[64], wtarget[8] = L"ps_6_0";
+    size_t k = 0;
+    for (; entry[k] && k + 1 < sizeof went / sizeof went[0]; k++) went[k] = (wchar_t)(unsigned char)entry[k];
+    went[k] = 0;
+    if (target[0] && target[1]) { wtarget[0] = (wchar_t)target[0]; wtarget[1] = (wchar_t)target[1]; }
     LPCWSTR args[] = {
-        L"-T", target[0] == 'v' ? L"vs_6_0" : target[0] == 'c' ? L"cs_6_0" : L"ps_6_0", L"-E", L"main", level,
+        L"-T", wtarget, L"-E", went, level,
         L"-HV", L"2018", L"-Gis", L"-Qstrip_reflect", L"-Wno-everything",
     };
     size_t n = len;
@@ -171,6 +177,150 @@ HRESULT rsx_dxc_compile(const char* src, size_t len, const char* target, const w
     }
     r->lpVtbl->Release(r);
     return st;
+}
+
+HRESULT rsx_dxc_compile(const char* src, size_t len, const char* target, const wchar_t* level,
+                        ID3DBlob** out, ID3DBlob** err)
+{
+    return dxc_compile(src, len, "main", target, level, out, err);
+}
+
+/* ---- the port's own programs -------------------------------------------------------------------
+ * Under Wine, D3DCompile is Wine's own, on vkd3d-shader. It did not finish the vertex pass's program
+ * in a minute (issue 12 of Ascension-R), and what it makes of the rest is not looked at here. There
+ * the backend has DXC compile them (rsx_own_dxc_set), as it does the guest programs. */
+static int s_own_dxc;
+
+void rsx_own_dxc_set(int on) { s_own_dxc = on; }
+int rsx_own_dxc(void) { return s_own_dxc; }
+
+const char* rsx_wine_version(void)
+{
+    static int tried;
+    static const char* v;
+    if (!tried) {
+        tried = 1;
+        typedef const char* (CDECL* WineVersionFn)(void);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        WineVersionFn f = nt ? (WineVersionFn)(void*)GetProcAddress(nt, "wine_get_version") : NULL;
+        v = f ? f() : NULL;
+        if (f && !v) v = "?";
+    }
+    return v;
+}
+
+typedef struct { char* p; size_t n, cap; int bad; } DxcText;
+
+static void dxc_text_add(DxcText* t, const char* s, size_t n)
+{
+    if (t->bad || !n) return;
+    if (t->n + n + 1 > t->cap) {
+        size_t cap = t->cap ? t->cap : 4096;
+        while (cap < t->n + n + 1) cap *= 2;
+        char* p = (char*)realloc(t->p, cap);
+        if (!p) { t->bad = 1; return; }
+        t->p = p;
+        t->cap = cap;
+    }
+    memcpy(t->p + t->n, s, n);
+    t->n += n;
+    t->p[t->n] = 0;
+}
+
+/* src with each #include line that inc opens replaced by the file, so DXC gets one text, as
+ * D3DCompile reads it. A line the handler does not open stays, and DXC says so. */
+static void dxc_flatten(DxcText* t, const char* s, size_t n, ID3DInclude* inc, int depth)
+{
+    size_t i = 0;
+    while (i < n) {
+        size_t e = i;
+        while (e < n && s[e] != '\n') e++;
+        const size_t next = e < n ? e + 1 : e;
+        const char* q = s + i;
+        const char* end = s + e;
+        int done = 0;
+        while (q < end && (*q == ' ' || *q == '\t')) q++;
+        if (inc && depth < 8 && q < end && *q == '#') {
+            q++;
+            while (q < end && (*q == ' ' || *q == '\t')) q++;
+            if (end - q > 7 && !memcmp(q, "include", 7)) {
+                q += 7;
+                while (q < end && (*q == ' ' || *q == '\t')) q++;
+                if (q < end && (*q == '"' || *q == '<')) {
+                    const char close = *q == '"' ? '"' : '>';
+                    const char* nm = ++q;
+                    while (q < end && *q != close) q++;
+                    char name[MAX_PATH];
+                    LPCVOID data = NULL;
+                    UINT bytes = 0;
+                    if (q < end && (size_t)(q - nm) < sizeof name) {
+                        memcpy(name, nm, (size_t)(q - nm));
+                        name[q - nm] = 0;
+                        if (SUCCEEDED(inc->lpVtbl->Open(inc, close == '"' ? D3D_INCLUDE_LOCAL : D3D_INCLUDE_SYSTEM,
+                                                        name, NULL, &data, &bytes)) && data) {
+                            dxc_flatten(t, (const char*)data, bytes, inc, depth + 1);
+                            dxc_text_add(t, "\n", 1);
+                            inc->lpVtbl->Close(inc, data);
+                            done = 1;
+                        }
+                    }
+                }
+            }
+        }
+        if (!done) dxc_text_add(t, s + i, next - i);
+        i = next;
+    }
+}
+
+static HRESULT own_compile(LPCVOID src, SIZE_T len, LPCSTR name, const D3D_SHADER_MACRO* defines, ID3DInclude* include,
+                           LPCSTR entry, LPCSTR target, UINT flags1, UINT flags2, ID3DBlob** out, ID3DBlob** err);
+
+/* A program that took 100 ms or more is said, the first 24: where the time of a start went. */
+HRESULT rsx_compile_own(LPCVOID src, SIZE_T len, LPCSTR name, const D3D_SHADER_MACRO* defines, ID3DInclude* include,
+                        LPCSTR entry, LPCSTR target, UINT flags1, UINT flags2, ID3DBlob** out, ID3DBlob** err)
+{
+    LARGE_INTEGER f, a, b;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    const HRESULT hr = own_compile(src, len, name, defines, include, entry, target, flags1, flags2, out, err);
+    QueryPerformanceCounter(&b);
+    const double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+    static volatile LONG said;
+    if (ms >= 100.0 && InterlockedIncrement(&said) <= 24)
+        printf("[d3d12] slow own shader compile: %s %s (%s, %s) took %.0f ms%c", name ? name : "?", entry, target,
+               s_own_dxc ? "DXC" : "D3DCompile", ms, 10);
+    return hr;
+}
+
+static HRESULT own_compile(LPCVOID src, SIZE_T len, LPCSTR name, const D3D_SHADER_MACRO* defines, ID3DInclude* include,
+                           LPCSTR entry, LPCSTR target, UINT flags1, UINT flags2, ID3DBlob** out, ID3DBlob** err)
+{
+    if (!s_own_dxc)
+        return D3DCompile(src, len, name, defines, include, entry, target, flags1, flags2, out, err);
+    DxcText t = { NULL, 0, 0, 0 };
+    for (const D3D_SHADER_MACRO* d = defines; d && d->Name; d++) {
+        dxc_text_add(&t, "#define ", 8);
+        dxc_text_add(&t, d->Name, strlen(d->Name));
+        dxc_text_add(&t, " ", 1);
+        if (d->Definition) dxc_text_add(&t, d->Definition, strlen(d->Definition));
+        dxc_text_add(&t, "\n", 1);
+    }
+    dxc_flatten(&t, (const char*)src, len, include, 0);
+    if (t.bad || !t.p) {
+        free(t.p);
+        *out = NULL;
+        if (err) *err = NULL;
+        return E_OUTOFMEMORY;
+    }
+    /* D3DCompile's optimisation levels: 0 is bit 14, 3 bit 15, 2 both, 1 neither */
+    const UINT lv = flags1 & (D3DCOMPILE_OPTIMIZATION_LEVEL0 | D3DCOMPILE_OPTIMIZATION_LEVEL3);
+    const wchar_t* level = (flags1 & D3DCOMPILE_SKIP_OPTIMIZATION) ? L"-Od"
+                         : lv == D3DCOMPILE_OPTIMIZATION_LEVEL0   ? L"-O0"
+                         : lv == D3DCOMPILE_OPTIMIZATION_LEVEL2   ? L"-O2"
+                         : lv == D3DCOMPILE_OPTIMIZATION_LEVEL3   ? L"-O3" : L"-O1";
+    const HRESULT hr = dxc_compile(t.p, t.n, entry, target, level, out, err);
+    free(t.p);
+    return hr;
 }
 
 #endif /* _WIN32 */

@@ -2,7 +2,8 @@
  * ps3recomp - SMAA 1x for the D3D12 presentation pass
  *
  * SMAA (third_party/smaa, MIT), unchanged: SMAA.hlsl is compiled here with
- * D3DCompile, served from the copy the build embeds in the library, and
+ * D3DCompile (or DXC, rsx_compile_own), served from the copy the build embeds
+ * in the library, and
  * AreaTex.h and SearchTex.h, its lookup textures, are compiled in. SMAA.hlsl
  * is used through SMAA_CUSTOM_SL, so its two samplers can be given the
  * registers of the presentation pass's static samplers. The backend
@@ -18,6 +19,7 @@
 #include <string.h>
 
 #include "rsx_smaa.h"
+#include "rsx_dxc.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -112,8 +114,8 @@ void* rsx_smaa_compile(int pass, int vs)
     if (pass < 0 || pass > 2) return NULL;
     const char* entry = vs ? vs_entry[pass] : ps_entry[pass];
     ID3DBlob *code = NULL, *err = NULL;
-    const HRESULT hr = D3DCompile(s_src, sizeof s_src - 1, "smaa", NULL, &s_smaa_include, entry,
-                                  vs ? "vs_5_0" : "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    const HRESULT hr = rsx_compile_own(s_src, sizeof s_src - 1, "smaa", NULL, &s_smaa_include, entry,
+                                       vs ? "vs_5_0" : "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (FAILED(hr)) {
         printf("[D3D12] SMAA %s: %s\n", entry, err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "compile failed");
         if (code) code->lpVtbl->Release(code);

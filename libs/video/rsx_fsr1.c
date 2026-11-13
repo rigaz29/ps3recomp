@@ -4,8 +4,8 @@
  * EASU (the edge-adaptive upscale) and RCAS (the sharpening pass) come from
  * AMD's FSR 1 headers, unchanged (third_party/fidelityfx_fsr1, MIT). Their
  * constants are computed here with the headers' own CPU code, and their
- * shaders are compiled here, with the two headers served to D3DCompile from
- * the copies the build embeds in the library. The backend
+ * shaders are compiled here, with the two headers served to D3DCompile (or DXC,
+ * rsx_compile_own) from the copies the build embeds in the library. The backend
  * (rsx_d3d12_backend.c) owns the pipelines and runs the passes.
  */
 #ifdef _WIN32
@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "rsx_fsr1.h"
+#include "rsx_dxc.h"
 
 /* The headers' CPU half: FsrEasuCon and FsrRcasCon. */
 #if defined(__clang__)
@@ -109,8 +110,8 @@ void* rsx_fsr1_compile(int pass)
     memcpy(src, s_head, sizeof s_head - 1);
     memcpy(src + sizeof s_head - 1, body, strlen(body) + 1);
     ID3DBlob *code = NULL, *err = NULL;
-    const HRESULT hr = D3DCompile(src, n, pass ? "fsr1_rcas" : "fsr1_easu", NULL, &s_fsr1_include,
-                                  "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    const HRESULT hr = rsx_compile_own(src, n, pass ? "fsr1_rcas" : "fsr1_easu", NULL, &s_fsr1_include,
+                                       "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     free(src);
     if (FAILED(hr)) {
         printf("[D3D12] FSR 1 %s: %s\n", pass ? "RCAS" : "EASU",

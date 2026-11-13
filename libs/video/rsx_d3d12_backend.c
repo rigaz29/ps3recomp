@@ -1847,22 +1847,38 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
 
 /* graphics.shader_compiler (D3D12_SHADER_COMPILER): dxc, or fxc for D3DCompile.
  * DXC needs its DLLs beside the exe and shader model 6 from the driver; without
- * either the programs come from D3DCompile, as with fxc. */
+ * either the programs come from D3DCompile, as with fxc.
+ * The port's own programs (rsx_compile_own) come from D3DCompile, but under Wine,
+ * where D3DCompile is vkd3d-shader's, from DXC when the guest programs do (issue 12
+ * of Ascension-R). D3D12_OWN_SHADER_COMPILER=dxc or fxc chooses. Once, when the
+ * device is made, before the first of them. */
+static int s_dxc_usable;   /* DXC's DLLs and shader model 6 */
 static void shc_pick_compiler(void)
 {
+    static int picked;
+    if (picked) return;
+    picked = 1;
     const char* c = ps3_settings_str("graphics", "shader_compiler", "D3D12_SHADER_COMPILER", "dxc");
+    const char* own = getenv("D3D12_OWN_SHADER_COMPILER");
     D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
-    const char* why = NULL;
-    if (ps3_settings_ieq(c, "fxc"))
-        why = "the setting";
-    else if (FAILED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)) ||
-             sm.HighestShaderModel < D3D_SHADER_MODEL_6_0)
-        why = "no shader model 6 here";
-    else if (!rsx_dxc_available())
-        why = "no dxcompiler.dll and dxil.dll beside the exe";
+    const int sm6 = SUCCEEDED(s_d3d.device->lpVtbl->CheckFeatureSupport(s_d3d.device, D3D12_FEATURE_SHADER_MODEL,
+                                                                         &sm, sizeof sm)) &&
+                    sm.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
+    /* its DLLs are loaded only where something may use them */
+    const int fxc = ps3_settings_ieq(c, "fxc");
+    s_dxc_usable = sm6 && (!fxc || own || getenv("VTX_LIT_COMPILER")) && rsx_dxc_available();
+    const char* why = fxc ? "the setting" : !sm6 ? "no shader model 6 here"
+                    : !s_dxc_usable ? "no dxcompiler.dll and dxil.dll beside the exe" : NULL;
     s_shc_dxc = !why;
     if (why) printf("[d3d12] guest shaders from D3DCompile: %s%c", why, 10);
     else     printf("[d3d12] guest shaders from DXC%c", 10);
+
+    const char* wine = rsx_wine_version();
+    const int own_dxc = s_dxc_usable && (own ? ps3_settings_ieq(own, "dxc") : wine && s_shc_dxc);
+    rsx_own_dxc_set(own_dxc);
+    if (own || wine)
+        printf("[d3d12] the port's own shaders from %s%s%s%s%c", own_dxc ? "DXC" : "D3DCompile",
+               own ? " (D3D12_OWN_SHADER_COMPILER)" : "", wine ? ", on Wine " : "", wine ? wine : "", 10);
 }
 
 /* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. The
@@ -3312,6 +3328,7 @@ static int init_d3d12(u32 width, u32 height)
         factory->lpVtbl->Release(factory);
         return -1;
     }
+    shc_pick_compiler();   /* which compiler makes the programs, before the first of them */
 
     /* Create command queue */
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
@@ -3626,16 +3643,16 @@ static int init_d3d12(u32 width, u32 height)
         ID3DBlob* ps_blob = NULL;
         ID3DBlob* err = NULL;
 
-        hr = D3DCompile(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
-                        "main", "vs_5_0", 0, 0, &vs_blob, &err);
+        hr = rsx_compile_own(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
+                             "main", "vs_5_0", 0, 0, &vs_blob, &err);
         if (FAILED(hr)) {
             printf("[D3D12] VS compile failed: %s\n",
                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
             if (err) err->lpVtbl->Release(err);
         }
 
-        hr = D3DCompile(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
-                        "main", "ps_5_0", 0, 0, &ps_blob, &err);
+        hr = rsx_compile_own(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
+                             "main", "ps_5_0", 0, 0, &ps_blob, &err);
         if (FAILED(hr)) {
             printf("[D3D12] PS compile failed: %s\n",
                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
@@ -3735,9 +3752,9 @@ static int init_d3d12(u32 width, u32 height)
                 "  return float4(i.col.rgb, i.col.a * cov); }\n";
 
             ID3DBlob *vtb = NULL, *ptb = NULL, *e2 = NULL;
-            hr = D3DCompile(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
+            hr = rsx_compile_own(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
             if (FAILED(hr)) printf("[D3D12] VS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
-            hr = D3DCompile(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
+            hr = rsx_compile_own(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
             if (FAILED(hr)) printf("[D3D12] PS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
 
             if (vtb && ptb) {
@@ -4247,10 +4264,10 @@ static int pp_init(void)
         "  }\n"
         "  return float4(src.SampleLevel(lin, uv, 0).rgb, 1); }\n";
     ID3DBlob *vsb = NULL, *psb = NULL;
-    hr = D3DCompile(hlsl, sizeof hlsl - 1, "present_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
+    hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "present_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
     if (SUCCEEDED(hr)) {
         if (err) { err->lpVtbl->Release(err); err = NULL; }
-        hr = D3DCompile(hlsl, sizeof hlsl - 1, "present_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
+        hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "present_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
     }
     if (FAILED(hr)) {
         printf("[D3D12] ERROR: presentation shader: %s\n", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
@@ -5303,9 +5320,9 @@ static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
         "  o.pos = float4(lerp(dst.xy, dst.zw, t), 0, 1); o.uv = lerp(src_uv.xy, src_uv.zw, t); return o; }\n"
         "float4 ps(V i) : SV_TARGET { return tex.SampleLevel(pnt, i.uv, 0); }\n";
     ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(hlsl, sizeof hlsl - 1, "overlay_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
+    HRESULT hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "overlay_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
     if (err) { err->lpVtbl->Release(err); err = NULL; }
-    if (SUCCEEDED(hr)) hr = D3DCompile(hlsl, sizeof hlsl - 1, "overlay_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
+    if (SUCCEEDED(hr)) hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "overlay_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
     if (err) err->lpVtbl->Release(err);
     if (SUCCEEDED(hr)) {
         pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
@@ -5571,7 +5588,7 @@ static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
         "  return float4(saturate(c), 1); }\n";
     if (pp_root_create(3, &s_up.root) != 0) return -1;
     ID3DBlob *ps = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(hlsl, sizeof hlsl - 1, "up_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err);
+    HRESULT hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "up_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err);
     if (err) { if (FAILED(hr)) printf("[D3D12] %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10); err->lpVtbl->Release(err); }
     if (FAILED(hr)) return -1;
     pd.pRootSignature = s_up.root;
@@ -11925,8 +11942,8 @@ static int dsconv_init(void)
         "    return float4((d >> 8) & 255u, d & 255u, s & 255u, d >> 16) / 255.0;\n"
         "}\n";
     ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
-    if (FAILED(D3DCompile(vs, sizeof vs - 1, "dsconv_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
-        FAILED(D3DCompile(ps, sizeof ps - 1, "dsconv_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
+    if (FAILED(rsx_compile_own(vs, sizeof vs - 1, "dsconv_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+        FAILED(rsx_compile_own(ps, sizeof ps - 1, "dsconv_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
         printf("[D3D12] depth copy shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
         return 0;
     }
@@ -12027,8 +12044,8 @@ static int y16_init(void)
         "    return float4(f16tof32((b.a << 8) | b.r), f16tof32((b.g << 8) | b.b), 0, 1);\n"
         "}\n";
     ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
-    if (FAILED(D3DCompile(vs, sizeof vs - 1, "y16_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
-        FAILED(D3DCompile(ps, sizeof ps - 1, "y16_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
+    if (FAILED(rsx_compile_own(vs, sizeof vs - 1, "y16_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+        FAILED(rsx_compile_own(ps, sizeof ps - 1, "y16_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
         printf("[D3D12] Y16 copy shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
         return 0;
     }
@@ -16214,17 +16231,16 @@ static double s_vpass_cdt;
 static int s_vpass_cached;
 static int s_vpass_dxc;                     /* the program is DXC's, at shader model 6.0 */
 static volatile LONG s_vpass_cdone;         /* vpass_compile's thread has done its work */
-/* Which compiler makes it. D3DCompile, which the check (VTX_LIT_CHECK) finds the nearer to the SPU: at
- * the temple 94.5% of the lit F16 values the same, against DXC's 86%, both within 0.004. Under Wine,
- * DXC: 0.7 s there, when the guest programs come from it. VTX_LIT_COMPILER=dxc or fxc chooses. After
- * shc_pick_compiler. */
+/* Which compiler makes it: the one of the port's own programs (shc_pick_compiler). D3DCompile, which
+ * the check (VTX_LIT_CHECK) finds the nearer to the SPU: at the temple 94.5% of the lit F16 values the
+ * same, against DXC's 86%, both within 0.004. Under Wine, DXC: 0.7 s here. VTX_LIT_COMPILER=dxc or fxc
+ * chooses for this one alone. */
 static int vpass_dxc_wanted(void)
 {
     const char* c = getenv("VTX_LIT_COMPILER");
-    if (!s_shc_dxc || (c && ps3_settings_ieq(c, "fxc"))) return 0;
-    if (c && ps3_settings_ieq(c, "dxc")) return 1;
-    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-    return nt && GetProcAddress(nt, "wine_get_version") != NULL;   /* Wine's ntdll has it, Windows' not */
+    if (c && ps3_settings_ieq(c, "fxc")) return 0;
+    if (c && ps3_settings_ieq(c, "dxc")) return s_dxc_usable;
+    return rsx_own_dxc();
 }
 /* Through the shader cache file (graphics.shader_cache) too, keyed apart from the guest programs and
  * DXC's apart from D3DCompile's: compiled the first time, read back after. */

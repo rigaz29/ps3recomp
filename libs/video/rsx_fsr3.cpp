@@ -28,6 +28,7 @@
 #include "../../third_party/fsr_api/upscalers/include/ffx_upscale.h"
 
 #include "rsx_fsr3.h"
+#include "rsx_dxc.h"
 
 static ffxFunctions s_ffx;
 static ffxContext s_swap_ctx;   /* the proxy's */
@@ -206,7 +207,8 @@ static int fsr3_inputs_init(ID3D12Device* dev)
     if (s_in_pso) return 1;
     ID3DBlob* cs = nullptr;
     ID3DBlob* err = nullptr;
-    if (FAILED(D3DCompile(s_in_hlsl, sizeof s_in_hlsl - 1, "fsr3_inputs", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) {
+    if (FAILED(rsx_compile_own(s_in_hlsl, sizeof s_in_hlsl - 1, "fsr3_inputs", nullptr, nullptr, "main", "cs_5_0", 0, 0,
+                               &cs, &err))) {
         printf("[fsr3] inputs' pass: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
         return 0;
     }

@@ -452,9 +452,12 @@ typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
-    u32 csum[TEX_CSUM_PARTS];   /* sparse checksum of the source bytes last uploaded */
-    u32 csum_bytes;     /* the bytes it covers */
+    u32 csum[TEX_CSUM_PARTS];   /* sparse checksum of the source bytes last uploaded, taken before
+                                 * they were read */
+    u32 csum_bytes;     /* the bytes it covers: every level, face and slice the upload read */
     u8  csum_next;      /* the part to compare next */
+    u8  again;          /* uploaded again at its next bind, whatever the checksum: its bytes
+                         * changed while they were read, or F9 dropped the cache */
     int cube;           /* its shape (tex_shape_*): 0 a 2D image, 1 a 6-face cube
                          * sampled as TextureCube, else a volume (Texture3D)
                          * of the depth above bit 8 */
@@ -2941,6 +2944,7 @@ static u32    s_lock_n  = 0;
 static int  s_borderless;
 static RECT s_windowed_rect;   /* the frame's rectangle before going borderless */
 static volatile LONG s_shot_pending;   /* F12: write the next presented frame (shot_png) */
+static volatile LONG s_tex_drop;       /* F9: every held texture uploaded again (vp_upload_tex_slot) */
 static int s_shot_cap;                 /* RSX_CAP_SHOT: this frame's shot also captures it */
 static void ov_toast(const char* msg);
 /* The view's client size, set by the window's thread; the presenting thread
@@ -3059,6 +3063,13 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         } else if (wp == VK_F12) {
             if (!(lp & (1 << 30))) InterlockedExchange(&s_shot_pending, 1);
+        } else if (wp == VK_F9) {
+            /* Every texture read again from the game's memory: if that mends a broken picture,
+             * what broke was the copy held here, not the game's bytes (issue #9). */
+            if (!(lp & (1 << 30))) {
+                InterlockedExchange(&s_tex_drop, 1);
+                ov_toast("Textures uploaded again");
+            }
         } else if (wp == VK_ESCAPE && d3d12_esc_quits()) {
             s_d3d.window_closed = 1;
             if (s_rt_mode <= 0) DestroyWindow(hwnd);   /* as WM_CLOSE */
@@ -8950,10 +8961,22 @@ static u32 tex_csum_part(const u8* base, u32 nbytes, u32 part)
  * image shows in any part at once, and a change in a few samples within eight
  * checks. 4 KB or less is read whole, as those are the textures it sees to the
  * word. TEX_CHECK_ALL=1: every part at every check. */
+/* An upload whose source bytes changed while they were read: the first eight said, then every
+ * power of two. A report with these lines had a texture the title wrote while it was read. */
+static volatile LONG s_tex_torn;
+static void tex_torn_note(u32 off, u32 w, u32 h, u32 fmt)
+{
+    const LONG n = InterlockedIncrement(&s_tex_torn);
+    if (n <= 8 || !(n & (n - 1)))
+        fprintf(stderr, "[tex] 0x%08X %ux%u format 0x%02X changed while it was read (%ld so far): read again "
+                        "at its next bind%c", off, w, h, fmt, (long)n, 10);
+}
+
 static int tex_changed(VPTexSlot* c, const u8* base)
 {
     static int all = -1;
     if (all < 0) all = getenv("TEX_CHECK_ALL") ? 1 : 0;
+    if (c->again) return 1;
     for (u32 n = all || c->csum_bytes <= 4096u ? TEX_CSUM_PARTS : 1u; n; n--) {
         const u32 p = c->csum_next++ % TEX_CSUM_PARTS;
         if (tex_csum_part(base, c->csum_bytes, p) != c->csum[p]) return 1;
@@ -9534,6 +9557,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     extern uint8_t* vm_base;
 
     if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
+    /* F9 (s_tex_drop): every held texture is read again at its next bind. Here, on the thread that
+     * holds the slots. */
+    if (s_tex_drop && InterlockedExchange(&s_tex_drop, 0)) {
+        int n = 0;
+        for (int i = 0; i < VP_TEX_SLOTS; i++)
+            if (s_d3d.vp_tex[i].res) { s_d3d.vp_tex[i].again = 1; n++; }
+        fprintf(stderr, "[tex] F9: the %d textures held are read again at their next bind%c", n, 10);
+    }
     const u32 key_off = off;         /* lookup key: the offset as bound */
     /* Before any of the format's arithmetic: nearly all of a frame's calls end here. */
     int slot = vp_tex_find(key_off, w, h, fmt, cube);
@@ -9855,6 +9886,24 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     if (is_cube) _face_bytes = rsx_texture_cube_face_stride(fmt, w, h, mips ? mips : 1u, 0);
     /* A volume is decoded below, slice by slice (tex_decode_volume). */
     const u32 _nfaces     = vol ? 0u : is_cube ? 6u : 1u;
+    /* What the decode reads -- every level, face and slice -- and its checksum before it is read.
+     * Taken after the read, it was the checksum of what a title had written meanwhile: God of War:
+     * Ascension's streaming refills a block once the RSX has said it read it, sometimes while this
+     * still reads it (issue #9). The slot held part of each texture, its checksum matched the new
+     * bytes at every later bind, and the texture stayed broken. The levels below 0 were not in it. */
+    u32 src_bytes = (dxt ? (blkrow * blkrows) : (w * h * bpp)) * vdepth;   /* level 0 */
+    if (is_cube) {
+        src_bytes = 6u * _face_bytes;   /* six whole pyramids */
+    } else if (vol && nlev > 1) {
+        src_bytes = 0;
+        for (u32 l = 0, d = vdepth; l < nlev; l++, d = d > 1 ? d >> 1 : 1u)
+            src_bytes += s_lv[l].tl.face_bytes * d;
+    } else if (nlev > 1) {
+        src_bytes = s_lv[nlev - 1].offset + s_lv[nlev - 1].tl.face_bytes;
+    }
+    u32 csum_pre[TEX_CSUM_PARTS];
+    for (u32 i = 0; i < TEX_CSUM_PARTS; i++)
+        csum_pre[i] = tex_csum_part(vm_base + off, src_bytes, i);
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
     for (u32 _f = 0; _f < _nfaces; _f++) {
     off    = _off0 + _f * _face_bytes;
@@ -10185,9 +10234,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
         t->up = NULL;
     }
-    t->csum_bytes = (dxt ? (blkrow * blkrows) : (w * h * bpp)) * vdepth;
-    for (u32 i = 0; i < TEX_CSUM_PARTS; i++)
-        t->csum[i] = tex_csum_part(vm_base + off, t->csum_bytes, i);
+    /* The checksum of before the read is kept. If the bytes changed while they were read, the next
+     * bind's check would see it only in the part it compares; `again` uploads them then anyway. */
+    t->csum_bytes = src_bytes;
+    t->again = 0;
+    for (u32 i = 0; i < TEX_CSUM_PARTS; i++) {
+        t->csum[i] = csum_pre[i];
+        if (tex_csum_part(vm_base + off, src_bytes, i) != csum_pre[i]) t->again = 1;
+    }
+    if (t->again) tex_torn_note(off, w, h, fmt);
     s_ts_out = ts_new ? TS_NEW : TS_CHANGED;
     return slot;
 }

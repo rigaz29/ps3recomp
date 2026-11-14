@@ -283,6 +283,11 @@ static int s_raw_run_valid;
 static u32 s_res_vb_size, s_res_ib_size, s_res_vb_used, s_res_ib_used;
 static u32 s_res_gen;           /* what a block was put there under; a new one starts it over */
 static int s_res_full;          /* a block found no room: start over after this batch */
+/* Starting over: no draw takes the resident part (they go through the ring) until the fence reaches s_res_retire, the
+ * value signalled after the last batch that read it; then it is written again from the start. No wait for the GPU. */
+static int s_res_retiring;
+static u64 s_res_retire;
+static u32 s_res_retire_frames;
 
 /* The vertex pass (phase 2b.1 of the God of War: Ascension port): see "The vertex pass" below. */
 #define VPT_SEGS 8192u                      /* a batch's lit segments: 32 bytes each in its table */
@@ -3972,11 +3977,12 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        /* VTX_RESIDENT_MB: a resident part after the two halves (rsx_kept.h), and a sixteenth of it
-         * in indexes after vp_ib's */
+        /* VTX_RESIDENT_MB: a resident part after the two halves (rsx_kept.h), and an eighth of it
+         * in indexes after vp_ib's: half as many bytes as the vertexes. With a sixteenth the indexes
+         * ran out first, at the temple with 128-192 of the 256 MB of vertexes used (issue #9). */
         { const char* e = getenv("VTX_RESIDENT_MB");
           s_res_vb_size = e ? (u32)atoi(e) << 20 : 0;
-          s_res_ib_size = s_res_vb_size / 16u; }
+          s_res_ib_size = s_res_vb_size / 8u; }
         bd.Width = (u64)MAX_VERTICES * 256 * 2 + s_res_vb_size;  /* generic VP vertex: 16 float4 slots,
                                           * DOUBLE-buffered by frame parity so a
                                           * new frame's upload never overwrites
@@ -15390,13 +15396,28 @@ skip_dump_consider: ;
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
 
     /* The resident part is full, of blocks nobody may draw any more among others: it starts over
-     * once this batch has read what it reads there. Rare: it takes a level's worth of new results. */
-    if (s_res_full && s_res_vb_size) {
-        wait_for_gpu();
-        s_res_vb_used = s_res_ib_used = 0;
-        s_res_gen++;
-        s_res_full = 0;
-        fprintf(stderr, "[vtx-kept] resident part full: started over (%u)%c", s_res_gen, 10);
+     * once the batches that read it are done. It took a wait for the GPU here, 9-17 ms on a
+     * GTX 1650 Ti, a frame of ~50 ms against ~25 every 11-17 s at the temple (issue #9). Now the
+     * draws go through the ring meanwhile, a frame or two, and nothing waits: the value the
+     * fence gets next comes after this frame's batches, whoever signals it (move_to_next_frame,
+     * or a wait before it). Rare: it takes a level's worth of new results. */
+    if (s_res_vb_size) {
+        if (s_res_retiring) {
+            if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) >= s_res_retire) {
+                s_res_vb_used = s_res_ib_used = 0;
+                s_res_gen++;
+                s_res_retiring = 0;
+                fprintf(stderr, "[vtx-kept] resident part full: started over (%u), %u frames through the ring%c",
+                        s_res_gen, s_res_retire_frames, 10);
+            } else {
+                s_res_retire_frames++;
+            }
+        } else if (s_res_full) {
+            s_res_retire = s_d3d.fence_values[s_d3d.frame_index];
+            s_res_retiring = 1;
+            s_res_retire_frames = 1;
+            s_res_full = 0;
+        }
     }
 
     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
@@ -17478,6 +17499,7 @@ static int raw_can_continue(u32 first)
 static unsigned long long s_kept_draws, s_kept_fills;
 static int kept_resident(rsx_kept* k)
 {
+    if (s_res_retiring) return 0;   /* starting over: not even a block that is there (see render_frame) */
     if (k->res_state && k->res_gen == s_res_gen) return k->res_state == 1;
     const u32 rs = k->skin ? k->rec : k->stride;
     const u32 vb = (k->nverts * rs + 64u + 255u) & ~255u, nix = k->list_bytes / 2u;

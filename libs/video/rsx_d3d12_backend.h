@@ -91,6 +91,11 @@ int rsx_d3d12_precompile_vertex_programs(const uint8_t* const* ucode, const uint
                                          int threads, void (*progress)(uint32_t done, uint32_t total),
                                          uint32_t stats[3], char* why, size_t why_len);
 
+/* The vertex pass's program (rsx_d3d12_vertex_pass_set's text) into the shader cache ahead of play, under the key
+ * the game looks it up by: it is then read at the first lit draw, not compiled there. *compiled: 1 built now, 0 the
+ * cache had it. Returns 0, or -1 with why. Safe beside rsx_d3d12_precompile_vertex_programs, on another thread. */
+int rsx_d3d12_precompile_vertex_pass(const char* hlsl, int* compiled, char* why, size_t why_len);
+
 #ifdef __cplusplus
 }
 #endif

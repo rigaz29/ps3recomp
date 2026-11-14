@@ -16334,41 +16334,66 @@ static int vpass_dxc_wanted(void)
     return rsx_own_dxc();
 }
 /* Through the shader cache file (graphics.shader_cache) too, keyed apart from the guest programs and
- * DXC's apart from D3DCompile's: compiled the first time, read back after. */
-static void vpass_compile_now(void)
+ * DXC's apart from D3DCompile's: compiled the first time, read back after. The precompile builds it
+ * before the game starts (rsx_d3d12_precompile_vertex_pass), under the same key. */
+static HRESULT vpass_program(const char* src, ID3DBlob** out, int* cached, int* dxc, char* err_text, size_t err_len)
 {
-    const char* src = s_vpass.hlsl;
     const size_t len = strlen(src);
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
-    const double t0 = perf_now();
+    *out = NULL;
+    *cached = 0;
     AcquireSRWLockExclusive(&s_shc_lock);
     if (s_shc_on < 0) shc_open();
-    s_vpass_dxc = vpass_dxc_wanted();
-    const u64 key = shc_key(src, len, s_vpass_dxc ? "cs_6_0" : "cs_5_0", flags | 0x80000000u);
+    *dxc = vpass_dxc_wanted();
+    const u64 key = shc_key(src, len, *dxc ? "cs_6_0" : "cs_5_0", flags | 0x80000000u);
     if (s_shc_on && s_shc_cap) {
         ShaderCacheEntry* e = shc_slot(key, (u32)len);
-        if (e->prog) s_vpass_cs = shp_blob(e->prog);
+        if (e->prog) *out = shp_blob(e->prog);
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
-    if (s_vpass_cs) {
-        s_vpass_chr = S_OK;
-        s_vpass_cached = 1;
-        s_vpass_cdt = perf_now() - t0;
-        return;
+    if (*out) {
+        *cached = 1;
+        return S_OK;
     }
     ID3DBlob* err = NULL;
-    s_vpass_chr = s_vpass_dxc ? rsx_dxc_compile(src, len, "cs_5_0", shc_dxc_level(flags), &s_vpass_cs, &err)
-                              : D3DCompile(src, len, "vertex_pass", NULL, NULL, "main", "cs_5_0", flags, 0, &s_vpass_cs, &err);
-    s_vpass_cdt = perf_now() - t0;
+    const HRESULT hr = *dxc ? rsx_dxc_compile(src, len, "cs_5_0", shc_dxc_level(flags), out, &err)
+                            : D3DCompile(src, len, "vertex_pass", NULL, NULL, "main", "cs_5_0", flags, 0, out, &err);
     if (err) {
-        snprintf(s_vpass_cerr, sizeof s_vpass_cerr, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
+        if (err_text) snprintf(err_text, err_len, "%s", (const char*)err->lpVtbl->GetBufferPointer(err));
         err->lpVtbl->Release(err);
     }
-    if (SUCCEEDED(s_vpass_chr) && s_vpass_cs) {
+    if (SUCCEEDED(hr) && *out) {
         AcquireSRWLockExclusive(&s_shc_lock);
-        if (s_shc_on) shc_keep(key, (u32)len, s_vpass_cs);
+        if (s_shc_on) shc_keep(key, (u32)len, *out);
         ReleaseSRWLockExclusive(&s_shc_lock);
     }
+    return hr;
+}
+static void vpass_compile_now(void)
+{
+    const double t0 = perf_now();
+    int dxc = 0;
+    s_vpass_chr = vpass_program(s_vpass.hlsl, &s_vpass_cs, &s_vpass_cached, &dxc, s_vpass_cerr, sizeof s_vpass_cerr);
+    s_vpass_dxc = dxc;
+    s_vpass_cdt = perf_now() - t0;
+}
+
+int rsx_d3d12_precompile_vertex_pass(const char* hlsl, int* compiled, char* why, size_t why_len)
+{
+    *compiled = 0;
+    if (!hlsl || !*hlsl) { snprintf(why, why_len, "no vertex pass text"); return -1; }
+    if (rsx_d3d12_precompile_open(why, why_len) != 0) return -1;
+    ID3DBlob* b = NULL;
+    int cached = 0, dxc = 0;
+    char err[512] = "";
+    const HRESULT hr = vpass_program(hlsl, &b, &cached, &dxc, err, sizeof err);
+    if (b) b->lpVtbl->Release(b);
+    if (FAILED(hr)) {
+        snprintf(why, why_len, "the vertex pass did not compile (0x%08lX): %s", (unsigned long)hr, err);
+        return -1;
+    }
+    *compiled = !cached;
+    return 0;
 }
 static DWORD WINAPI vpass_compile(LPVOID arg)
 {

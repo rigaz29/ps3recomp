@@ -5588,7 +5588,13 @@ static void aa_finish(void)
  * bilinear. Everything ends where the next frame expects it: the display
  * target and pp_tmp in COMMON, the swap chain's buffer in PRESENT. */
 /* The upscaler's output into the back buffer. Where the frame has a HUD, what the HUD changed in
- * the 720p picture goes on top: t1 is the frame with it, t2 the picture without. */
+ * the 720p picture goes on top: t1 is the frame with it, t2 the picture without. What it added
+ * (text, icons, glow, a light tint) goes on as a difference. Where it darkened the picture a lot
+ * (the death screen's black, a fade, the pause menu's dimming) the frame is taken as it is: the
+ * difference took the scene back out of the upscaled scene, and left what the upscaler and its
+ * sharpening put in, the scene's edges, on black (issue #9: the death screen showed the fall's
+ * outlines with FSR 3.1). The luminance ratio, frame to picture: 0.9 and up the difference, 0.6
+ * and down the frame, between them a blend. */
 static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
 {
     static const char hlsl[] =
@@ -5601,7 +5607,12 @@ static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
         "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
         "float4 ps(V i) : SV_TARGET {\n"
         "  float3 c = up.SampleLevel(pnt, i.uv, 0).rgb;\n"
-        "  if (p0.x > 0.5) c += frame.SampleLevel(lin, i.uv, 0).rgb - scene.SampleLevel(lin, i.uv, 0).rgb;\n"
+        "  if (p0.x > 0.5) {\n"
+        "    const float3 f = frame.SampleLevel(lin, i.uv, 0).rgb, s = scene.SampleLevel(lin, i.uv, 0).rgb;\n"
+        "    const float3 lw = float3(0.299, 0.587, 0.114);\n"
+        "    const float r = (dot(f, lw) + 0.01) / (dot(s, lw) + 0.01);\n"
+        "    c = lerp(c + f - s, f, saturate((0.9 - r) / 0.3));\n"
+        "  }\n"
         "  return float4(saturate(c), 1); }\n";
     if (pp_root_create(3, &s_up.root) != 0) return -1;
     ID3DBlob *ps = NULL, *err = NULL;

@@ -361,14 +361,18 @@ static int pad_host_window_focused(void)
 }
 
 /* input.device: auto (the pads, and the keyboard as slot 0 when it has no
- * pad), pad (no keyboard; also PAD_NO_KEYBOARD) or keyboard (no pads). */
-enum { PAD_DEV_AUTO, PAD_DEV_PAD, PAD_DEV_KEYBOARD };
+ * pad), pad (no keyboard; also PAD_NO_KEYBOARD) or keyboard (no pads).
+ * PAD_NO_HOST=1: neither, slot 0 a pad that only PAD_FILE, PAD_SCRIPT and the
+ * like press: a run that drives itself, which the player's own pads and
+ * keyboard must not disturb (a port's training run while the player waits). */
+enum { PAD_DEV_AUTO, PAD_DEV_PAD, PAD_DEV_KEYBOARD, PAD_DEV_NONE };
 static int pad_device(void)
 {
     static int d = -1;
     if (d >= 0) return d;
     const char* v = ps3_settings_str("input", "device", NULL, "auto");
-    if (getenv("PAD_NO_KEYBOARD"))               d = PAD_DEV_PAD;
+    if (getenv("PAD_NO_HOST"))                   d = PAD_DEV_NONE;
+    else if (getenv("PAD_NO_KEYBOARD"))          d = PAD_DEV_PAD;
     else if (ps3_settings_ieq(v, "pad"))         d = PAD_DEV_PAD;
     else if (ps3_settings_ieq(v, "keyboard"))    d = PAD_DEV_KEYBOARD;
     else {
@@ -1253,7 +1257,14 @@ static void pad_poll_backend(void)
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
     const int dev = pad_device();
-    if (dev != PAD_DEV_KEYBOARD) {
+    if (dev == PAD_DEV_NONE) {
+        PadHostState* hs = &s_host_state[0];
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+    }
+    if (dev != PAD_DEV_KEYBOARD && dev != PAD_DEV_NONE) {
 #if PAD_BACKEND_XINPUT
         pad_poll_host();
 #elif PAD_BACKEND_SDL2
@@ -1261,7 +1272,7 @@ static void pad_poll_backend(void)
 #endif
     }
 #ifdef _WIN32
-    if (dev != PAD_DEV_PAD && !s_host_state[0].connected) pad_poll_keyboard();
+    if ((dev == PAD_DEV_AUTO || dev == PAD_DEV_KEYBOARD) && !s_host_state[0].connected) pad_poll_keyboard();
 #endif
     pad_track_assign();
     if (s_sampling)

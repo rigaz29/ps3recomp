@@ -1425,6 +1425,12 @@ void (*cellGcm_blit_observer)(int src_display, u32 src_off, u32 sx, u32 sy, u32 
  * and the pitches. */
 void (*cellGcm_blit_local_observer)(u32 src_off, u32 src_pitch, u32 dst_off, u32 dst_pitch,
                                     u32 w, u32 h) = NULL;
+/* The same renderer, told of each copy's destination in guest memory (its
+ * effective address and the bytes from its first row's start to its last row's
+ * end) before the copy writes it. The RSX makes a copy after the draws before it
+ * have read their textures; a renderer that reads them later than this walk
+ * reads, first, those of the draws whose textures the copy writes over. */
+void (*cellGcm_copy_write_observer)(u32 dst_ea, u32 bytes) = NULL;
 
 static void nv3089_blit(void)
 {
@@ -1547,6 +1553,7 @@ static void nv3089_blit(void)
         if (!gcm_local_span(sl, (u64)s_nv3089.in_off + ylast * in_pitch + xlast * 4u, 4) ||
             !gcm_local_span(1, s_nv309e.offset, (u64)out_w * out_h * 4u))
             return;
+        if (cellGcm_copy_write_observer) cellGcm_copy_write_observer(dst2, out_w * out_h * 4u);
         nv3089_engine_read(in_pitch, out_w, out_h);
         /* Copy words verbatim through raw pointers rather than vm_read32/
          * vm_write32: this moves ~500k pixels per blit and several blits run per
@@ -1617,6 +1624,11 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
+    if (cellGcm_copy_write_observer) {   /* from the first row's start to the last row's end */
+        const u64 lo = (u64)dst + (u64)out_y * dst_pitch + (u64)out_x * bpp;
+        const u64 hi = (u64)dst + (u64)(out_y + out_h - 1) * dst_pitch + (u64)(out_x + out_w) * bpp;
+        if (hi > lo && hi <= 0x100000000ull) cellGcm_copy_write_observer((u32)lo, (u32)(hi - lo));
+    }
     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
     /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
      * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the

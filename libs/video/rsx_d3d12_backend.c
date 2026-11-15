@@ -785,6 +785,7 @@ static void rt_released(void);
 static void rt_render(int present, int full);
 static void rt_excl_begin(void);
 static void rt_excl_end(void);
+static void d3d12_copy_write_observed(u32 ea, u32 bytes);
 static u32 s_dbg_last_draws = 0;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
@@ -19007,7 +19008,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
       extern void (*cellGcm_flip_observer)(u32);
       cellGcm_flip_observer = d3d12_flip_observed;
       extern void (*cellGcm_zpass_observer)(int, u32, u32);
-      if (zq_wanted()) cellGcm_zpass_observer = d3d12_zpass_observed; }
+      if (zq_wanted()) cellGcm_zpass_observer = d3d12_zpass_observed;
+      extern void (*cellGcm_copy_write_observer)(u32, u32);
+      cellGcm_copy_write_observer = d3d12_copy_write_observed; }
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();
@@ -19137,6 +19140,31 @@ static void rf_ahead(u32 upto, int wait_gpu)
     if (vupto > s_rf.done) s_rf.done = rf_vp_draws(s_rf.done, vupto, 1);
 }
 
+/* Record-ahead up to record upto whatever the count (rf_ahead waits for
+ * RF_AHEAD_MIN): the textures of records [pre_done, upto) read from guest
+ * memory, and the draws recorded, in order. 0 when legacy records are among
+ * them (the batch's end takes those) or the pipeline is not up yet. */
+static int rf_ahead_force(u32 upto)
+{
+    if (!s_d3d.vp_ready) return 0;
+    const u32 from = s_rf.open ? s_rf.pre_done : 0u;
+    if (upto <= from) return 1;
+    for (u32 i = from; i < upto; i++)
+        if (!s_d3d.draws[i].is_vp) return 0;
+    if (!s_rf.open) {
+        s_rf_open_ahead = 1;
+        rf_open();
+        s_rf_open_ahead = 0;
+        rf_target();
+        rf_vp_begin();
+        s_rf.open = 1;
+    }
+    rf_prepass(s_rf.pre_done, upto);
+    const u32 vupto = cap_stop(upto);
+    if (vupto > s_rf.done) s_rf.done = rf_vp_draws(s_rf.done, vupto, 1);
+    return 1;
+}
+
 /* ---------------------------------------------------------------------------
  * The render thread
  * -----------------------------------------------------------------------*/
@@ -19195,6 +19223,61 @@ static u32 s_rt_woke;                      /* the walk: published when it last w
 static LONG s_rt_cur;                      /* the render thread: the request render_frame runs for */
 
 static LONG rt_get(volatile LONG* v) { return InterlockedCompareExchange(v, 0, 0); }
+
+/* An RSX copy about to write guest memory (cellGcm_copy_write_observer,
+ * cellGcmSys.c). The RSX makes it after the draws before it have read their
+ * textures; the walk makes it at once, and the render thread reads those draws'
+ * textures from guest memory only when it records them (rf_prepass), later. A
+ * copy over a texture that a record not yet read samples first has the records
+ * so far read and recorded, by the walk under the render thread's lock.
+ * God of War: Ascension moves textures in VRAM with such copies (its VRAM
+ * manager, up to 16 MB a frame), and with its MLAA on copies each frame's scene
+ * into the main-memory surface the frame before is composited from: draws before
+ * a copy sampled what it wrote, one frame of the wrong textures or of the scene
+ * without its post-processing, 16 in a minute of the first cinematic (its
+ * issue #15). ~3.6 copies a second there need it. RSX_COPY_TEX_BARRIER=0: off. */
+static int copy_tex_barrier_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_COPY_TEX_BARRIER"); v = !(e && atoi(e) == 0); }
+    return v;
+}
+static void d3d12_copy_write_observed(u32 ea, u32 bytes)
+{
+    if (!s_d3d.initialized || !bytes || !copy_tex_barrier_on() || !rf_ahead_on()) return;
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    const u32 from = s_rf.open ? s_rf.pre_done : 0u;   /* the render thread's: a stale one scans more */
+    const u64 lo = ea, hi = (u64)ea + bytes;
+    const D3D12DrawRecord* hit = NULL;
+    int hu = 0;
+    for (u32 i = from; i < n && !hit; i++) {
+        const D3D12DrawRecord* r = &s_d3d.draws[i];
+        if (!r->is_vp || r->is_clear) continue;
+        for (int u = 0; u < VP_TEX_UNITS; u++) {
+            if (!r->tex[u].set || !r->tex[u].off || r->tex[u].off >= hi) continue;
+            u64 sz = rsx_texture_cube_face_stride(r->tex[u].fmt, r->tex[u].w, r->tex[u].h,
+                                                  r->tex[u].mips ? r->tex[u].mips : 1u, 0);
+            if (r->tex[u].cube) sz *= 6u;
+            if (r->tex[u].depth > 1) sz *= r->tex[u].depth;
+            if (r->tex[u].off + sz > lo) { hit = r; hu = u; break; }
+        }
+    }
+    if (!hit) return;
+    { static int said;
+      static unsigned long count;
+      count++;
+      if (PS3_LOG_FIRST(said, 4) || !(count & 1023))
+          fprintf(stderr, "[copy-tex] a copy to 0x%08X (%u bytes) writes over a texture of a record not read yet "
+                  "(0x%08X %ux%u format 0x%X, record %u, %u waiting): its records read first (%lu so far)%c",
+                  ea, bytes, hit->tex[hu].off, hit->tex[hu].w, hit->tex[hu].h, hit->tex[hu].fmt,
+                  (u32)(hit - s_d3d.draws), n - from, count, 10); }
+    s_d3d.merge_prev_draw = 0;   /* the records so far are final */
+    s_ix_run_valid = 0;
+    s_raw_run_valid = 0;
+    rt_excl_begin();
+    rf_ahead_force(n);
+    rt_excl_end();
+}
 
 /* A capture reads the records after render_frame has reset the batch. */
 static int rt_cap_on(void)

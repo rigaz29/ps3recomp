@@ -62,8 +62,15 @@ void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 /* A line of the game's own at the foot of the stats panel: fn writes it and returns its length, 0 for none. */
 void rsx_d3d12_backend_overlay_line(int (*fn)(char* out, int max));
 
-/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the screen is wider. */
+/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the monitor the game is on
+ * (or display.window_size, windowed) is wider. */
 float rsx_d3d12_backend_wide_ratio(void);
+
+/* Where the game's window opens: on the monitor with this point on it (a launcher's window, say), given before the window is
+ * made; centred in its work area, or covering it borderless. Without one, Windows places the window. */
+void rsx_d3d12_backend_open_on(int x, int y);
+/* That monitor's rectangle and work area, left, top, right, bottom in pixels: 1, or 0 when no point was given. */
+int rsx_d3d12_backend_open_monitor(int monitor[4], int work[4]);
 
 /* The refresh rate of the display the window opened on, 0 if Windows cannot say. */
 double rsx_d3d12_backend_refresh_hz(void);

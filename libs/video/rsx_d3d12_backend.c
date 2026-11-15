@@ -2957,21 +2957,69 @@ static void ov_toast(const char* msg);
  * resizes the swap chain to it after its next Present (bb_resize). */
 static volatile LONG s_view_w, s_view_h;
 
-/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the screen is wider. */
+/* Where the window opens (rsx_d3d12_backend_open_on): a point of that monitor, given before the window is made. */
+static int s_open_set;
+static POINT s_open_pt;
+static HWND s_wide_hwnd;   /* the window while create_window makes it, before s_d3d.hwnd holds it */
+
+void rsx_d3d12_backend_open_on(int x, int y)
+{
+    s_open_pt.x = x;
+    s_open_pt.y = y;
+    s_open_set = 1;
+}
+
+int rsx_d3d12_backend_open_monitor(int monitor[4], int work[4])
+{
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    if (!s_open_set || !GetMonitorInfoA(MonitorFromPoint(s_open_pt, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
+    if (monitor) {
+        monitor[0] = mi.rcMonitor.left; monitor[1] = mi.rcMonitor.top;
+        monitor[2] = mi.rcMonitor.right; monitor[3] = mi.rcMonitor.bottom;
+    }
+    if (work) {
+        work[0] = mi.rcWork.left; work[1] = mi.rcWork.top;
+        work[2] = mi.rcWork.right; work[3] = mi.rcWork.bottom;
+    }
+    return 1;
+}
+
+/* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the monitor the game is
+ * on is wider, or display.window_size in a window. Worked out once, at the window's making: the title takes its aspect
+ * once. The monitor is the window's, else the one it opens on, else the main display. It was the main display's alone,
+ * and borderless covers the window's monitor: an ultrawide monitor beside a 16:9 main one got the picture at 16:9's
+ * width, stretched across it. */
 float rsx_d3d12_backend_wide_ratio(void)
 {
     static float r = -1.0f;
     if (r < 0.0f) {
         float v = 1.0f;
         if (ps3_settings_bool("display", "ultrawide", "D3D12_ULTRAWIDE", 0)) {
-            int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN), ww = 0, wh = 0;
+            const HWND hw = s_d3d.hwnd ? s_d3d.hwnd : s_wide_hwnd;
+            const HMONITOR mon = hw ? MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST)
+                               : s_open_set ? MonitorFromPoint(s_open_pt, MONITOR_DEFAULTTONEAREST) : NULL;
+            const char* from = hw ? "the window's monitor" : "the monitor it opens on";
+            int w = 0, h = 0, ww = 0, wh = 0;
+            MONITORINFO mi;
+            mi.cbSize = sizeof mi;
+            if (mon && GetMonitorInfoA(mon, &mi)) {
+                w = mi.rcMonitor.right - mi.rcMonitor.left;
+                h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            } else {
+                w = GetSystemMetrics(SM_CXSCREEN);
+                h = GetSystemMetrics(SM_CYSCREEN);
+                from = "the main display";
+            }
             const char* ws = ps3_settings_str("display", "window_size", NULL, NULL);
             if (!ps3_settings_ieq(ps3_settings_str("display", "mode", NULL, "windowed"), "borderless") &&
                 ws && sscanf(ws, "%dx%d", &ww, &wh) == 2 && ww > 0 && wh > 0) {
                 w = ww;
                 h = wh;
+                from = "display.window_size";
             }
             if (w > 0 && h > 0 && (float)w / (float)h / (16.0f / 9.0f) > 1.02f) v = (float)w / (float)h / (16.0f / 9.0f);
+            printf("[D3D12] ultrawide: %s, %dx%d: %.3g times 16:9's width%c", from, w, h, v, 10);
         }
         r = v;
     }
@@ -3137,6 +3185,15 @@ static HWND create_window(u32 width, u32 height, const char* title)
     }
     RECT wr = {0, 0, (LONG)cw, (LONG)ch};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    /* On the monitor it was asked to open on (rsx_d3d12_backend_open_on), centred in its work area; borderless then
+     * covers that monitor. Else where Windows puts it. */
+    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT, mon[4], work[4];
+    if (rsx_d3d12_backend_open_monitor(mon, work)) {
+        wx = work[0] + ((work[2] - work[0]) - (wr.right - wr.left)) / 2;
+        wy = work[1] + ((work[3] - work[1]) - (wr.bottom - wr.top)) / 2;
+        if (wx < work[0]) wx = work[0];
+        if (wy < work[1]) wy = work[1];
+    }
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
@@ -3144,10 +3201,11 @@ static HWND create_window(u32 width, u32 height, const char* title)
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT,
+        wx, wy,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!hwnd) return NULL;
+    s_wide_hwnd = hwnd;   /* the ultrawide ratio goes by this window's monitor from d3d12_place_view on */
     s_d3d.view = CreateWindowExA(0, "ps3recomp_d3d12_view", NULL, WS_CHILD | WS_VISIBLE,
                                  0, 0, (int)cw, (int)ch, hwnd, NULL, GetModuleHandle(NULL), NULL);
     if (!s_d3d.view) { DestroyWindow(hwnd); return NULL; }

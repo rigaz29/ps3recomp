@@ -146,17 +146,84 @@ static void pad_host_release(PadHostState* hs)
 
 /* One poll at a time: the guest polls from several threads, and a poll that
  * opens or closes a controller must not race another one using it.
- * cellPadSetActDirect takes it too (it talks to the controller). */
+ * cellPadSetActDirect takes it too (it talks to the controller).
+ *
+ * The holder names the call it is in (pad_step), and the lock keeps since when
+ * it is held. A call into a controller's driver that does not come back holds
+ * the lock, every read of the pad after it gets nothing new, and the game gets
+ * no input at all; the log says so, and where: a caller that finds the lock
+ * held PAD_STALL_MS or more says it while it lasts (pad_lock_waited), and a
+ * hold of PAD_SLOW_MS or more is said when it ends. */
 #ifdef _WIN32
   #define pad_yield() Sleep(0)
 #else
   #include <sched.h>
   #define pad_yield() sched_yield()
 #endif
+#define PAD_SLOW_MS   250
+#define PAD_STALL_MS 2000
+static unsigned long long pad_now_ms(void);
 static volatile char s_poll_lock;
-static int  pad_lock_try(void) { return !__atomic_test_and_set(&s_poll_lock, __ATOMIC_ACQUIRE); }
-static void pad_lock(void)     { while (!pad_lock_try()) pad_yield(); }
-static void pad_unlock(void)   { __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE); }
+static const char* volatile s_lock_what;        /* the call the holder is in */
+static volatile unsigned long long s_lock_ms;   /* since when the lock is held (pad_now_ms) */
+static unsigned long long s_step_ms;            /* since when the holder is in s_lock_what */
+static const char* s_slow_what;                 /* the hold's slowest call so far, and how long it took */
+static unsigned long long s_slow_ms;
+static void pad_step_end(unsigned long long now)
+{
+    if (now - s_step_ms >= s_slow_ms) { s_slow_ms = now - s_step_ms; s_slow_what = s_lock_what; }
+    s_step_ms = now;
+}
+static void pad_step(const char* what) { pad_step_end(pad_now_ms()); s_lock_what = what; }
+static int pad_lock_try(void)
+{
+    if (__atomic_test_and_set(&s_poll_lock, __ATOMIC_ACQUIRE)) return 0;
+    s_lock_ms = s_step_ms = pad_now_ms();
+    s_lock_what = "cellPad";
+    s_slow_what = NULL;
+    s_slow_ms = 0;
+    return 1;
+}
+static void pad_lock_waited(void)
+{
+    static unsigned long long said_for;   /* the hold already said, by when it began */
+    const unsigned long long t0 = s_lock_ms, now = pad_now_ms();
+    if (!t0 || now < t0 || now - t0 < PAD_STALL_MS) return;
+    if (__atomic_exchange_n(&said_for, t0, __ATOMIC_RELAXED) == t0) return;
+    printf("[cellPad] the controllers have not been read for %.1f s: the read is still in %s\n",
+           (double)(now - t0) / 1000.0, s_lock_what);
+    fflush(stdout);
+}
+static void pad_lock(void) { while (!pad_lock_try()) { pad_lock_waited(); pad_yield(); } }
+static void pad_unlock(void)
+{
+    static int said;   /* the first few long holds */
+    const unsigned long long now = pad_now_ms();
+    pad_step_end(now);
+    const unsigned long long held = now - s_lock_ms, slow = s_slow_ms;
+    const char* what = s_slow_what;
+    const int say = held >= PAD_SLOW_MS && said < 8;
+    if (say) said++;
+    __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE);
+    if (say) {
+        printf("[cellPad] the controllers took %.1f s, %.1f s of it in %s\n", (double)held / 1000.0,
+               (double)slow / 1000.0, what ? what : "cellPad");
+        fflush(stdout);
+    }
+}
+
+/* The first press each port reads from a controller, in the log: when the
+ * game gets nothing from a controller that was found, this says whether any
+ * press came from it at all. Under the lock. */
+static void pad_first_press(int port, const char* api, u16 buttons)
+{
+    static unsigned said;   /* a bit per port */
+    if (!buttons || port < 0 || port >= PAD_MAX_HOST_PORTS || (said & (1u << port))) return;
+    said |= 1u << port;
+    printf("[cellPad] port %d: the controller's first press (%s, buttons %04X)\n", port, api, (unsigned)buttons);
+    fflush(stdout);
+}
+
 
 /* CELL_PAD_STATUS_ASSIGN_CHANGES: a port whose reported connection changed
  * since the title last asked (cellPadGetInfo/GetInfo2/PeriphGetInfo), as
@@ -334,18 +401,21 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     return (u8)val;
 }
 
-/* Keyboard fallback for port 0.
+/* The keyboard as pad 0.
  *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
+ * On a machine with no controller plugged in a title gets a pad that is
+ * reported present and never presses anything -- it can be watched but not
+ * played. That is what The Simpsons Arcade Game hit: it reached its attract
+ * loop and no input existed to start a game.
  *
- * Only fills in for port 0, only when XInput found nothing there, so a real
- * controller always wins and nothing changes for a port that has one. Keys are
- * read only while a window of THIS process is in the foreground, so typing in
- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
- * disable it entirely.
+ * input.device auto reads the keyboard beside the controllers: what it presses
+ * goes into port 0, by itself when no controller is there, else with what that
+ * controller presses (pad_kb_beside). It was read only while port 0 had no
+ * controller, so a controller there shut it out, and when the game got nothing
+ * from that controller the player could press nothing at all. Keyboard only
+ * (input.device keyboard) reads it alone. Keys are read only while a window of
+ * THIS process is in the foreground, so typing in another application does
+ * not drive the game. Set PAD_NO_KEYBOARD=1 to disable it entirely.
  *
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
@@ -360,8 +430,8 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
-/* input.device: auto (the pads, and the keyboard as slot 0 when it has no
- * pad), pad (no keyboard; also PAD_NO_KEYBOARD) or keyboard (no pads).
+/* input.device: auto (the pads, and the keyboard into slot 0 beside them), pad
+ * (no keyboard; also PAD_NO_KEYBOARD) or keyboard (no pads).
  * PAD_NO_HOST=1: neither, slot 0 a pad that only PAD_FILE, PAD_SCRIPT and the
  * like press: a run that drives itself, which the player's own pads and
  * keyboard must not disturb (a port's training run while the player waits). */
@@ -479,26 +549,27 @@ static void kb_load_map(void)
     }
 }
 
+/* The keyboard as a pad, for port 0: pad_poll_backend puts it there. */
+static PadHostState s_kb;
+
+static int kb_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
 static void pad_poll_keyboard(void)
 {
     static int loaded;
     if (!loaded) { loaded = 1; kb_load_map(); }
-    PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused() || (GetAsyncKeyState(VK_MENU) & 0x8000)) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
-    }
+    PadHostState* hs = &s_kb;
+    pad_host_release(hs);
+    hs->connected = 1;
+    /* Nothing while another program is in front or Alt is down: a key held
+     * while alt-tabbing would stay down forever. */
+    if (!pad_host_window_focused() || kb_down(VK_MENU)) return;
 
     u16 btns = 0;
     unsigned ax = 0;
     for (int a = 0; a < KB_BTN + KB_AXIS; a++)
         for (int k = 0; k < KB_KEYS && s_kb_vk[a][k]; k++)
-            if (GetAsyncKeyState(s_kb_vk[a][k]) & 0x8000) {
+            if (kb_down(s_kb_vk[a][k])) {
                 if (a < KB_BTN) btns |= s_kb_btn[a].btn;
                 else ax |= 1u << (a - KB_BTN);
                 break;
@@ -507,7 +578,6 @@ static void pad_poll_keyboard(void)
     /* A direction held both ways is centred. */
 #define KB_STICK(neg, pos) (u8)(((ax >> (neg)) & 1) == ((ax >> (pos)) & 1) ? 128 : ((ax >> (neg)) & 1) ? 0 : 255)
     hs->buttons   = btns;
-    hs->connected = 1;
     hs->analog_lx = KB_STICK(2, 3);
     hs->analog_ly = KB_STICK(0, 1);
     hs->analog_rx = KB_STICK(6, 7);
@@ -518,8 +588,19 @@ static void pad_poll_keyboard(void)
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no controller there)\n");
+          printf("[cellPad] the keyboard's first press (buttons %04X)\n", (unsigned)btns);
           fflush(stdout); } }
+}
+
+/* The keyboard beside the controller on port 0: what either presses is
+ * pressed, and a stick the keyboard pushes is where the keyboard has it. */
+static void pad_kb_beside(PadHostState* hs, const PadHostState* kb)
+{
+    hs->buttons |= kb->buttons;
+    if (kb->analog_lx != 128 || kb->analog_ly != 128) { hs->analog_lx = kb->analog_lx; hs->analog_ly = kb->analog_ly; }
+    if (kb->analog_rx != 128 || kb->analog_ry != 128) { hs->analog_rx = kb->analog_rx; hs->analog_ry = kb->analog_ry; }
+    if (kb->trigger_l2 > hs->trigger_l2) hs->trigger_l2 = kb->trigger_l2;
+    if (kb->trigger_r2 > hs->trigger_r2) hs->trigger_r2 = kb->trigger_r2;
 }
 #endif
 
@@ -609,6 +690,7 @@ static void pad_poll_xinput(void)
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
 
+        pad_step("XInputGetState");
         DWORD result = p_xi_get_state ? p_xi_get_state((DWORD)i, &state)
                                       : ERROR_DEVICE_NOT_CONNECTED;
         if (result != ERROR_SUCCESS) {
@@ -647,6 +729,7 @@ static void pad_poll_xinput(void)
         if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
         pad_fill(&s_host_state[i], btns, gp->sThumbLX, gp->sThumbLY, gp->sThumbRX, gp->sThumbRY,
                  gp->bLeftTrigger, gp->bRightTrigger);
+        pad_first_press(i, "XInput", s_host_state[i].buttons);
     }
 }
 
@@ -713,6 +796,7 @@ static int pad_sdl_load(void)
     HMODULE m = NULL;
     if (slash) {
         wcscpy(slash + 1, L"SDL3.dll");
+        pad_step("loading SDL3.dll");
         m = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (!m) {
@@ -737,6 +821,7 @@ static int pad_sdl_load(void)
     p_SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "1");
     /* SDL has no window of its own here: it would take the program for one in the background and drop the input. */
     p_SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    pad_step("SDL_InitSubSystem");
     if (!p_SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         printf("[cellPad] SDL3 did not start (%s): XInput's controllers only\n", p_SDL_GetError());
         return 0;
@@ -768,6 +853,7 @@ static void pad_sdl_rumble_send(int p)
     if (!gc) return;
     PadRumble* r = &s_rumble[p];
     const int on = pad_vibration_on() && (r->lo || r->hi);
+    pad_step("SDL_RumbleGamepad");
     p_SDL_RumbleGamepad(gc, on ? r->lo : 0, on ? r->hi : 0, on ? PAD_RUMBLE_HOLD_MS : 0);
     r->sent_ms = on ? pad_now_ms() : 0;
 }
@@ -777,6 +863,7 @@ static void pad_sdl_close(int p, int gone)
 {
     SDL_Gamepad* gc = s_sdl_pad[p];
     if (!gc) return;
+    pad_step("SDL_CloseGamepad");
     if (gone) printf("[cellPad] SDL3 controller on port %d disconnected\n", p);
     else      p_SDL_RumbleGamepad(gc, 0, 0, 0);
     p_SDL_CloseGamepad(gc);
@@ -788,11 +875,13 @@ static void pad_sdl_close(int p, int gone)
 static void pad_sdl_scan(const int* xi)
 {
     int n = 0;
+    pad_step("SDL_GetGamepads");
     SDL_JoystickID* ids = p_SDL_GetGamepads(&n);
     if (!ids) return;
     for (int k = 0; k < n; k++) {
         const SDL_JoystickID id = ids[k];
         int open = 0;
+        pad_step("SDL_GetGamepadPathForID");
         for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) if (s_sdl_pad[p] && s_sdl_pad_id[p] == id) open = 1;
         if (open || (s_api == PAD_API_AUTO && pad_sdl_is_xinput(id))) continue;
         const SDL_GUID guid = p_SDL_GetGamepadGUIDForID(id);
@@ -805,6 +894,7 @@ static void pad_sdl_scan(const int* xi)
         for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
             if (!xi[p] && !s_sdl_pad[p]) port = p;
         if (port < 0) break;   /* every port is read already */
+        pad_step("SDL_OpenGamepad");
         SDL_Gamepad* gc = p_SDL_OpenGamepad(id);
         if (!gc) {
             printf("[cellPad] SDL3 controller %u did not open: %s\n", (unsigned)id, p_SDL_GetError());
@@ -829,6 +919,7 @@ static u8 pad_sdl_trigger(Sint16 v) { return (u8)(v <= 0 ? 0 : v >> 7); }
 /* The controllers SDL3 reads, into their ports; xi[p]: XInput has port p this poll. */
 static void pad_poll_sdl(const int* xi)
 {
+    pad_step("SDL_UpdateGamepads");
     p_SDL_UpdateGamepads();
     int moved = 0;
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
@@ -855,6 +946,7 @@ static void pad_poll_sdl(const int* xi)
         if (s_rumble[p].sent_ms && now - s_rumble[p].sent_ms >= PAD_RUMBLE_RENEW_MS) pad_sdl_rumble_send(p);
         /* By position, as the PS3's: the bottom one is Cross on every pad, B on Nintendo's. */
         u16 btns = 0;
+        pad_step("SDL_GetGamepadButton");
         if (p_SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_BACK))           btns |= CELL_PAD_CTRL_SELECT;
         if (p_SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_LEFT_STICK))     btns |= CELL_PAD_CTRL_L3;
         if (p_SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_RIGHT_STICK))    btns |= CELL_PAD_CTRL_R3;
@@ -874,6 +966,7 @@ static void pad_poll_sdl(const int* xi)
                  p_SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHTX), pad_sdl_up(p_SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHTY)),
                  pad_sdl_trigger(p_SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_LEFT_TRIGGER)),
                  pad_sdl_trigger(p_SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)));
+        pad_first_press(p, "SDL3", s_host_state[p].buttons);
     }
 }
 #endif /* PAD_SDL3 */
@@ -913,6 +1006,7 @@ int ps3_pad_host_describe(const char* api_name, char* out, size_t n)
     int count = 0;
     out[0] = 0;
     pad_lock();
+    pad_step("loading XInput");
     pad_xinput_load();
 #if PAD_SDL3
     const int api = !api_name ? pad_api_read() : ps3_settings_ieq(api_name, "xinput") ? PAD_API_XINPUT
@@ -920,6 +1014,7 @@ int ps3_pad_host_describe(const char* api_name, char* out, size_t n)
 #else
     (void)api_name;
 #endif
+    pad_step("XInputGetState");
     for (int i = 0; i < PAD_MAX_HOST_PORTS && p_xi_get_state; i++) {
 #if PAD_SDL3
         if (api == PAD_API_SDL3) break;
@@ -930,8 +1025,10 @@ int ps3_pad_host_describe(const char* api_name, char* out, size_t n)
     }
 #if PAD_SDL3
     if (api != PAD_API_XINPUT && pad_sdl_load()) {
+        pad_step("SDL_UpdateGamepads");
         p_SDL_UpdateGamepads();
         int k = 0;
+        pad_step("SDL_GetGamepads");
         SDL_JoystickID* ids = p_SDL_GetGamepads(&k);
         for (int j = 0; ids && j < k; j++) {
             const int xinput = pad_sdl_is_xinput(ids[j]);
@@ -1108,8 +1205,11 @@ static void pad_sdl_hotplug(int force)
 
 static void pad_poll_sdl2(void)
 {
+    pad_step("SDL_GameControllerUpdate");
     SDL_GameControllerUpdate();
+    pad_step("SDL2's controller list");
     pad_sdl_hotplug(0);
+    pad_step("SDL_GameControllerGetButton");
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
@@ -1170,6 +1270,7 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        pad_first_press(i, "SDL2", btns);
     }
 }
 
@@ -1249,7 +1350,10 @@ static void pad_poll_backend(void)
     static unsigned long long s_last_ms = 0;
     unsigned long long now = pad_now_ms();
     if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
-    if (!pad_lock_try()) return;   /* another thread is polling: its result serves this read */
+    if (!pad_lock_try()) {   /* another thread is polling: its result serves this read */
+        pad_lock_waited();
+        return;
+    }
     s_last_ms = now;
     /* A real pad streams reports at roughly this rate whether or not anything
      * changed, and libpad buffers them; a fresh sweep is a fresh report for
@@ -1272,7 +1376,15 @@ static void pad_poll_backend(void)
 #endif
     }
 #ifdef _WIN32
-    if ((dev == PAD_DEV_AUTO || dev == PAD_DEV_KEYBOARD) && !s_host_state[0].connected) pad_poll_keyboard();
+    /* The keyboard into port 0: by itself with Keyboard only or when the poll
+     * above found no controller there, else beside the controller it has just
+     * read. */
+    if (dev == PAD_DEV_AUTO || dev == PAD_DEV_KEYBOARD) {
+        pad_step("GetAsyncKeyState");
+        pad_poll_keyboard();
+        if (dev == PAD_DEV_KEYBOARD || !s_host_state[0].connected) s_host_state[0] = s_kb;
+        else pad_kb_beside(&s_host_state[0], &s_kb);
+    }
 #endif
     pad_track_assign();
     if (s_sampling)
@@ -1295,6 +1407,7 @@ static void pad_take(u32 port, PadHostState* hs)
 {
     if (!s_sampling || port >= PAD_MAX_HOST_PORTS) return;
     pad_lock();
+    pad_step("a report for the game");
     hs->buttons |= s_latch_buttons[port];
     s_latch_buttons[port] = 0;
     const int reach = s_flick[port].reach;
@@ -1352,6 +1465,7 @@ s32 cellPadInit(u32 max_connect)
         pad_host_release(&s_host_state[i]);
 
     pad_lock();
+    pad_step("opening the controllers");
     pad_init_backend();
     pad_unlock();
 
@@ -1387,6 +1501,7 @@ s32 cellPadEnd(void)
         return CELL_PAD_ERROR_NOT_OPENED;
 
     pad_lock();
+    pad_step("closing the controllers");
     pad_shutdown_backend();
     pad_unlock();
 

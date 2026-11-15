@@ -421,8 +421,16 @@ static float s_rs = 1.0f;
  * 2D comes through those cameras too, and its movies take the aspect from the same setting, so they keep their shape in
  * the 16:9 in the middle by themselves. A frame with no 3D scene has black bars beside that (present_to_backbuffer). */
 static float s_wide = 1.0f;
-static int s_wide_3d;                   /* recording: this frame has drawn through the title's camera */
-static int s_wide_scene;                /* replay: the same */
+static int s_wide_3d;                   /* recording: this frame has drawn a scene through the title's camera */
+static int s_wide_3d_n;                 /* recording: its draws through the camera so far */
+static int s_wide_scene;                /* replay: the same, the draws through the camera */
+static int s_wide_flip = -1;            /* replay: the last flip's frame drew a scene (1), not (0); -1 no flip yet */
+/* How many draws through the camera into a target the size of the display, other than the display, make a scene. Play
+ * draws its world there, a thousand draws and more; the pause menu draws only its backdrop there, a mesh made to fill a
+ * 16:9 view, with a few, over the last frame of play left in that target, and its item's model on the display itself:
+ * at a wider view the backdrop covered the middle only, and that frame showed beside it. With fewer than this the frame
+ * is a menu, 16:9 between black bars. */
+#define WIDE_SCENE_MIN 8
 #define RS_ON (s_rs != 1.0f || s_wide != 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
  * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
@@ -6134,7 +6142,10 @@ static void present_to_backbuffer(u32 fi)
     ID3D12Resource* disp = s_d3d.render_targets[fi];
     ID3D12Resource* bb = s_d3d.backbuffers[fi];
 
-    if (s_wide != 1.0f && !s_wide_scene) {
+    /* No scene: a menu, or the pause menu's backdrop. Its frame's own count, from its flip (a menu can take more than one
+     * batch to a present, and the batches' counts would add up), else this present's batches'. */
+    const int wide_scene = s_wide_flip >= 0 ? s_wide_flip : s_wide_scene >= WIDE_SCENE_MIN;
+    if (s_wide != 1.0f && !wide_scene) {
         const LONG side = (LONG)(((float)s_d3d.pw - (float)s_d3d.pw / s_wide) * 0.5f);
         const D3D12_RECT bars[2] = { { 0, 0, side, (LONG)s_d3d.ph },
                                      { (LONG)s_d3d.pw - side, 0, (LONG)s_d3d.pw, (LONG)s_d3d.ph } };
@@ -6147,6 +6158,7 @@ static void present_to_backbuffer(u32 fi)
         pp_barrier(disp, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
     }
     s_wide_scene = 0;
+    s_wide_flip = -1;
     pp_barrier(disp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     const int up = up_run(fi, disp, bb, bb_rtv);
     if (!up) {
@@ -11018,10 +11030,13 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         vpx[5] += s_up.cy;
     }
     if (s_wide != 1.0f && dr) {
-        if (dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
-            vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
+        if (dr->zeta_off && !(dr->rt_off & DISP_RT_TAG) && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
+            vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {   /* WIDE_SCENE_MIN */
             const float* m = c + s_fg.cam_reg * 4;
-            if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) { s_wide_3d = 1; dr->wide_cam = 1; }
+            if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) {
+                dr->wide_cam = 1;
+                if (++s_wide_3d_n >= WIDE_SCENE_MIN) s_wide_3d = 1;
+            }
         }
         if (s_wide_3d && (dr->rt_off & DISP_RT_TAG)) vpx[7] = 1.0f;   /* over a scene: see "the screen's edges" */
     }
@@ -12786,7 +12801,9 @@ static unsigned s_fo_batch, s_fo_dropped, s_fo_failed;
 static void d3d12_flip_observed(u32 buffer_id)
 {
     static int on = -1;
+    const int wide_scene = s_wide_3d_n >= WIDE_SCENE_MIN;   /* the frame this flips drew a scene: on its FLIP record */
     s_wide_3d = 0;
+    s_wide_3d_n = 0;
     guest_peek_poke();
     if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
     extern u32 cellGcm_display_buffer_offset(u32 id);
@@ -12803,6 +12820,7 @@ static void d3d12_flip_observed(u32 buffer_id)
     memset(dr, 0, sizeof(*dr));
     dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1; dr->snap_slot = -1;
     dr->flip_key = DISP_RT_TAG | o;
+    dr->wide_cam = (u8)wide_scene;   /* on a FLIP: the frame it shows drew a scene */
     { static int cap = -1, n = 0;
       if (cap < 0) { const char* e = getenv("FLIP_PATH_DBG"); cap = e ? atoi(e) : 0; }
       if (n < cap) { n++; fprintf(stderr, "[flip-op] buffer %u at op %u%c", buffer_id,
@@ -14786,6 +14804,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 if (dr->flip_key) {
                     const int fslot = off_rt_find(dr->flip_key);
                     s_fo_batch++;
+                    s_wide_flip = dr->wide_cam;   /* its frame drew a scene (d3d12_flip_observed) */
                     if (fslot < 0 || s_d3d.off_rt[fslot].dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
                         s_fo_failed++;
                         if (flip_op_dbg())
@@ -14800,7 +14819,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     continue;
                 }
                 if (dr->zq_op) { zq_op_replay(dr); continue; }
-                if (dr->wide_cam) s_wide_scene = 1;
+                if (dr->wide_cam) s_wide_scene++;
                 if (dr->is_clear && dr->clear_mask == 1u && (dr->rt_off & DISP_RT_TAG)) fg_marker(dr);
                 if (!dr->is_clear) zq_before_draw();
                 /* The targets and depth surface this draw binds (as the retarget

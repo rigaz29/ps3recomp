@@ -16,6 +16,11 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros (st_atim.tv_sec
  * etc.) that collide with the identically named members of CellSaveData*Stat; undef
@@ -700,7 +705,25 @@ static int copy_host_file(const char* src, const char* dst)
     if (ferror(in)) failed = 1;
     fclose(in);
     if (fclose(out) != 0) failed = 1;
-    return failed ? -1 : 0;
+    if (failed) return -1;
+    /* The copy keeps the file's time. A title can check it: God of War: Ascension's profile (DATFEST) holds the
+     * time it was written, and a save whose files have another is refused. With the time of the copy, a backup could
+     * not be loaded as it was saved. */
+    struct stat st;
+    if (stat(src, &st) == 0) {
+#ifdef _WIN32
+        struct _utimbuf ub;
+        ub.actime = st.st_atime;
+        ub.modtime = st.st_mtime;
+        _utime(dst, &ub);
+#else
+        struct utimbuf ub;
+        ub.actime = st.st_atime;
+        ub.modtime = st.st_mtime;
+        utime(dst, &ub);
+#endif
+    }
+    return 0;
 }
 
 /* Names of the subdirectories of `dir`, sorted, up to `max`. */

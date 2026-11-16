@@ -58,6 +58,8 @@ int main(void)
     const char* const before[3] = { "first", "second", "third" };
     for (int i = 0; i < 3; i++) {
         put(file, before[i]);
+        struct utimbuf ub = { (time_t)(1700000000 + 100 * i), (time_t)(1700000000 + 100 * i) };
+        assert(utime(file, &ub) == 0);
         save_backup(save, "TEST00000");
     }
     char broot[1100];
@@ -68,6 +70,9 @@ int main(void)
     expect(file, "second");
     snprintf(file, sizeof file, "%s/%s/DATA00.BIN", broot, names[1]);
     expect(file, "third");
+    /* and the file's time: a title can check it against what its save says */
+    struct stat st;
+    assert(stat(file, &st) == 0 && st.st_mtime == (time_t)1700000200);
     snprintf(file, sizeof file, "%s/%s/PARAM.SFO", broot, names[1]);
     expect(file, "sfo");
 

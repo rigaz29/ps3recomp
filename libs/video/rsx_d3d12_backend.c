@@ -17862,10 +17862,13 @@ static int ix_can_continue(u32 first)
 }
 
 /* Returns the number of indices written; 0 means "use the list path". */
-/* The frame's index buffer is full: the batch goes to the CPU's conversion. Said the first times. */
+/* The frame's index buffer is full: the batch goes to the CPU's conversion. Said the first times, and counted
+ * on the "[vtx-kept] N fills" lines. */
+static unsigned long long s_ib_full;
 static void ib_full_note(u32 count)
 {
     static int n = 0;
+    s_ib_full++;
     if (PS3_LOG_FIRST(n, 4))
         fprintf(stderr, "[D3D12] the frame's index buffer is full (%u of %u indices, %u more asked):"
                         " batches go to the CPU's conversion%c", s_d3d.vp_ib_offset, VP_MAX_INDICES, count, 10);
@@ -17973,6 +17976,39 @@ static int raw_can_continue(u32 first)
            pv->seg_first + pv->seg_n == s_seg_n;
 }
 
+/* Why a draw of a kept block did not go through the resident part, counted for the "[vtx-kept] N fills" lines:
+ * each such draw puts the block's bytes back in the ring and takes a path that copies them again, and converts
+ * its indexes, on the CPU. Issue #9 had half a million of them in 45 s in one area of Kirra, at 21 frames a second,
+ * with nothing in the log to say why. */
+enum {
+    KD_LIST,          /* not a 16-bit triangle list inside the block's list */
+    KD_SEGS,          /* the frame's segment table full */
+    KD_RETIRING,      /* the resident part starting over */
+    KD_NO_ROOM,       /* the resident part full */
+    KD_PAST_VERTS,    /* an index past the block's vertexes */
+    KD_ATTR,          /* an attribute instanced, of another type, or out of range */
+    KD_MAIN_MEM,      /* an array in main memory, not contiguous */
+    KD_VB_FULL,       /* the frame's vertex buffer full */
+    KD_SKIN_NO_PASS,  /* skinned, and no vertex pass */
+    KD_BIG,           /* more vertexes than the pass's table takes */
+    KD_NO_RECORD,     /* the pass: no record of the job */
+    KD_APPLIED,       /* the pass: the record applied already */
+    KD_PASS,          /* the pass not built */
+    KD_SKIN_DIFF,     /* the pass: skinned on one side only */
+    KD_REC_ROOM,      /* the pass: no room for the record or its segment */
+    KD_REC_LOST,      /* the pass: the record written over while it was copied */
+    KD_LIT_ROOM,      /* the pass: no room for the lit vertexes */
+    KD_OTHER_PATH,    /* the draw on another path than the vertex program's raw one */
+    KD_N
+};
+static const char* const k_kd_name[KD_N] = {
+    "list", "segments", "starting over", "no room", "index past vertexes", "attribute", "main memory",
+    "vertex buffer", "skinned without the pass", "too many vertexes", "no record", "record used", "pass not built",
+    "skin differs", "record room", "record lost", "lit room", "another path",
+};
+static unsigned long long s_kd[KD_N];
+static u32 kept_no(int why) { s_kd[why]++; return 0; }
+
 /* A kept block's bytes in the resident parts, the first time (rsx_kept.h). 0: no room. */
 static unsigned long long s_kept_draws, s_kept_fills;
 static int kept_resident(rsx_kept* k)
@@ -18038,8 +18074,17 @@ static void kept_fill(const rsx_state* st, const rsx_kept* k, u32 io, u32 first,
     if (((st->index_array_dma >> 4) & 0xF) == 1 && lb <= k->list_bytes)
         memcpy(vm_base + cellGcmResolveLocated(ilocal, st->index_array_offset), k->list, lb);
     s_kept_fills++;
-    if (!(s_kept_fills & (s_kept_fills - 1)))
-        fprintf(stderr, "[vtx-kept] %llu fills, %llu draws from the resident part%c", s_kept_fills, s_kept_draws, 10);
+    if (!(s_kept_fills & (s_kept_fills - 1))) {
+        char why[640];
+        size_t n = 0;
+        why[0] = 0;
+        for (int i = 0; i < KD_N && n < sizeof why - 48; i++)
+            if (s_kd[i]) n += (size_t)snprintf(why + n, sizeof why - n, "%s%s %llu", n ? ", " : "", k_kd_name[i], s_kd[i]);
+        if (s_ib_full && n < sizeof why - 48)
+            n += (size_t)snprintf(why + n, sizeof why - n, "%sindex buffer full %llu", n ? "; " : "", s_ib_full);
+        fprintf(stderr, "[vtx-kept] %llu fills, %llu draws from the resident part%s%s%s%c", s_kept_fills, s_kept_draws,
+                n ? " (" : "", why, n ? ")" : "", 10);
+    }
 }
 
 /* A draw of a kept block, from the resident parts. What the draw has enabled outside the block (a
@@ -18051,8 +18096,9 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
-    if (!sixteen || (first + count) * 2u > k->list_bytes || count % 3u || first % 3u) return 0;
-    if (s_seg_n >= VP_MAX_SEGS || !kept_resident(k)) return 0;
+    if (!sixteen || (first + count) * 2u > k->list_bytes || count % 3u || first % 3u) return kept_no(KD_LIST);
+    if (s_seg_n >= VP_MAX_SEGS) return kept_no(KD_SEGS);
+    if (!kept_resident(k)) return kept_no(s_res_retiring ? KD_RETIRING : KD_NO_ROOM);
     /* the range of what has been drawn: past the job's count the list holds junk */
     if (first + count > k->res_n) {
         const u8* l = (const u8*)k->list;
@@ -18063,7 +18109,7 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
         }
         k->res_n = first + count;
     }
-    if (k->res_hi >= k->nverts) return 0;
+    if (k->res_hi >= k->nverts) return kept_no(KD_PAST_VERTS);
     const u32 par = s_d3d.vp_parity, lo = k->res_lo, hi = k->res_hi;
     /* the resident bytes, from the half's start, as a segment's bases are */
     const u32 rv = (2u - par) * (u32)(MAX_VERTICES * VP_VERT_STRIDE) + k->res_vb;
@@ -18075,7 +18121,7 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
     for (int i = 0; i < 16; i++) {
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (!a->enabled || a->stride == 0) continue;
-        if (a->frequency > 1 || a->type < 1 || a->type > 7) return 0;
+        if (a->frequency > 1 || a->type < 1 || a->type > 7) return kept_no(KD_ATTR);
         const u32 off = a->offset & 0x7FFFFFFFu;
         if ((a->offset & 0x80000000u) && off - io < k->stride) {
             bslot[nb] = (u32)i; bd[nb] = off - io; nb++;
@@ -18087,7 +18133,7 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
         ar[na].loc   = (a->offset & 0x80000000u) ? 0u : 1u;
         ar[na].start = (u64)off + (u64)lo * a->stride;
         ar[na].end   = (u64)off + (u64)hi * a->stride + vp_raw_elem_bytes(a->type, c);
-        if (ar[na].end > 0xFFFFFFFFull) return 0;
+        if (ar[na].end > 0xFFFFFFFFull) return kept_no(KD_ATTR);
         na++;
     }
     for (int j = 1; j < na; j++)
@@ -18111,37 +18157,40 @@ static u32 upload_tris_kept(const rsx_state* state, rsx_kept* k, u32 io, u32 fir
         const u32 len = (u32)(gr[g].end - gr[g].start);
         gr[g].src = cellGcmResolveLocated((int)gr[g].loc, (u32)gr[g].start);
         if (!gr[g].loc && cellGcmResolveLocated(0, (u32)gr[g].end - 1) - gr[g].src != len - 1)
-            return 0;                               /* main memory, not contiguous */
+            return kept_no(KD_MAIN_MEM);            /* main memory, not contiguous */
         at = (at + 15) & ~15ull;
         gr[g].dst = at;
         at += len;
     }
     at = (at + 15) & ~15ull;
-    if (at + 256 > (u64)MAX_VERTICES * VP_VERT_STRIDE) return 0;
+    if (at + 256 > (u64)MAX_VERTICES * VP_VERT_STRIDE) return kept_no(KD_VB_FULL);
     const u32 data = (u32)(at - hdr);
 
     u32 lhdr = 0;
     int lit = 0;
-    if (k->skin && !s_vpass.set) return 0;
-    if (k->nverts > 0xFFFFu) return 0;          /* the pass's table: the count in a word's low half */
+    if (k->skin && !s_vpass.set) return kept_no(KD_SKIN_NO_PASS);
+    if (k->nverts > 0xFFFFu) return kept_no(KD_BIG);   /* the pass's table: the count in a word's low half */
     if (s_vpass.set && (k->stride == s_vpass.stride || k->skin)) {
         LONG seq = 0;
         const vpr_head* h = vpr_find(io, &seq);
-        if (!h || h->applied || !vpass_build() || (k->skin != 0) != (h->skin != 0)) return 0;
+        if (!h) return kept_no(KD_NO_RECORD);
+        if (h->applied) return kept_no(KD_APPLIED);
+        if (!vpass_build()) return kept_no(KD_PASS);
+        if ((k->skin != 0) != (h->skin != 0)) return kept_no(KD_SKIN_DIFF);
         u8* tab = s_vpass.tab_mapped + (size_t)par * VPT_HALF;
         u32 rec_off;
         if (s_vpass.last_ok && s_vpass.last_key == h->key && s_vpass.last_seq == seq) {
             rec_off = s_vpass.last_rec;
         } else {
             rec_off = VPT_SEGB + ((s_vpass.rec_used + 15u) & ~15u);
-            if (rec_off + h->bytes > VPT_HALF || s_vpass.nseg >= VPT_SEGS) return 0;
-            if (!vpr_copy(h, seq, tab + rec_off)) return 0;
+            if (rec_off + h->bytes > VPT_HALF || s_vpass.nseg >= VPT_SEGS) return kept_no(KD_REC_ROOM);
+            if (!vpr_copy(h, seq, tab + rec_off)) return kept_no(KD_REC_LOST);
             s_vpass.rec_used = rec_off - VPT_SEGB + h->bytes;
             s_vpass.last_key = h->key; s_vpass.last_seq = seq; s_vpass.last_rec = rec_off; s_vpass.last_ok = 1;
         }
         lhdr = (s_vpass.lit_used + 15u) & ~15u;
         const u32 need = data + k->nverts * k->stride + 64u;
-        if (s_vpass.nseg >= VPT_SEGS || (u64)lhdr + need > s_vpass.lit_half) return 0;
+        if (s_vpass.nseg >= VPT_SEGS || (u64)lhdr + need > s_vpass.lit_half) return kept_no(KD_LIT_ROOM);
         /* the pass copies the header and the other arrays, and lights from the resident bytes */
         u32* e = (u32*)(tab + (size_t)s_vpass.nseg * 32u);
         e[0] = (u32)hdr; e[1] = lhdr; e[2] = data; e[3] = k->nverts; e[4] = rec_off; e[5] = data; e[6] = rv;
@@ -18923,7 +18972,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     if (!raw_used && s_kept_seen) {
         u32 kio = 0;
         const rsx_kept* k = kept_find(s_d3d.current_rsx_state, &kio);
-        if (k) kept_fill(s_d3d.current_rsx_state, k, kio, first, count);
+        if (k) {
+            s_kd[KD_OTHER_PATH]++;
+            kept_fill(s_d3d.current_rsx_state, k, kio, first, count);
+        }
     }
     /* the vertex pass's record, on another path: lit in guest memory, once */
     if (!raw_used && s_vpass.set) vpass_guest(s_d3d.current_rsx_state);

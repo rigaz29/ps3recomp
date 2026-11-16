@@ -90,6 +90,8 @@ static char s_exit_param[256] = "";
 
 static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
+/* A disc game started from its update, /dev_hdd0/game/<id> with CATEGORY GD (cellGame_init_from_paramsfo). */
+static int  s_patch_boot = 0;
 
 /* Current content-check session. BootCheck/DataCheck open a session naming
  * some content; ContentPermit reports THAT content's paths and closes it.
@@ -317,6 +319,28 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
     }
+    /* A disc game booted from its update: PS3_BOOT_PATH under /dev_hdd0/game/<id>/, whose PARAM.SFO says GD.
+     * The PS3 starts an installed update's executable, and so does the port (God of War: Ascension's
+     * BCES01741 runs GOWA.SELF from there). The update's PARAM.SFO gives APP_VER and VERSION, BootCheck reports
+     * the PATCH attribute and cellGamePatchCheck answers that it is one, after which the title takes its
+     * PATCHES and patch archives from that folder; RPCS3 answers a GD boot the same way. */
+    if (s_game_type == CELL_GAME_GAMETYPE_DISC && s_title_id[0]) {
+        const char* boot = getenv("PS3_BOOT_PATH");
+        char prefix[96], psfo[CELL_GAME_PATH_MAX];
+        snprintf(prefix, sizeof prefix, "/dev_hdd0/game/%s/", s_title_id);
+        snprintf(psfo, sizeof psfo, "%s/%s/PARAM.SFO", content_root(), s_title_id);
+        if (boot && strncmp(boot, prefix, strlen(prefix)) == 0 &&
+            sfo_read_string(psfo, "CATEGORY", tmp, sizeof(tmp)) == 0 && strcmp(tmp, "GD") == 0) {
+            s_patch_boot = 1;
+            if (sfo_read_string(psfo, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+                strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
+            }
+            if (sfo_read_string(psfo, "VERSION", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+                strncpy(s_version, tmp, sizeof(s_version) - 1); s_version[sizeof(s_version) - 1] = '\0';
+            }
+            printf("[cellGame] booted from its update %s: APP_VER %s, a patch boot\n", psfo, s_app_ver);
+        }
+    }
 }
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
@@ -328,13 +352,27 @@ const char* cellGame_get_hdd_title_id(void)
     return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
 }
 
-/* Whether the title was started as a game patch (CATEGORY GP over a disc
- * game). The port boots the title itself, never a patch. */
+/* Whether the title was started as a game patch: a disc game booted from its update (CATEGORY GD,
+ * s_patch_boot). Then the next ContentPermit reports the update's folder, /dev_hdd0/game/<id>, as RPCS3's
+ * does; otherwise the title was booted itself and is not a patch. */
 s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
 {
-    (void)size; (void)reserved;
-    printf("[cellGame] PatchCheck() -> not a patch\n");
-    return CELL_GAME_ERROR_NOTPATCH;
+    (void)reserved;
+    if (!s_patch_boot) {
+        printf("[cellGame] PatchCheck() -> not a patch\n");
+        return CELL_GAME_ERROR_NOTPATCH;
+    }
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;   /* guest address */
+    if (size_ea) {
+        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+        vm_write32(size_ea + 8, 0);
+    }
+    s_check_is_disc = 0;
+    strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
+    printf("[cellGame] PatchCheck() -> a patch: /dev_hdd0/game/%s\n", s_title_id);
+    return CELL_OK;
 }
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
@@ -366,7 +404,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
     if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
-    if (attr_ea) vm_write32(attr_ea, 0);
+    if (attr_ea) vm_write32(attr_ea, s_patch_boot ? CELL_GAME_ATTRIBUTE_PATCH : 0u);
 
     if (size_ea) {
         vm_write32(size_ea + 0, (u32)content_free_kb());
@@ -405,7 +443,11 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
          * forever and exits. Create it where cellFs will actually find it. */
         ensure_dirs(s_content_info_path);
         ensure_dirs(s_usrdir_path);
-        {
+        /* Only where /dev_hdd0 is mapped under the VFS root, which is when PS3_HDD0_ROOT is not set
+         * (content_root): with it set, folders made there are never read, and the VFS root can be a disc's
+         * own folder, which nothing should write to. */
+        const char* hdd0_root = getenv("PS3_HDD0_ROOT");
+        if (!hdd0_root || !*hdd0_root) {
             extern const char* ppu_vfs_root;
             char vpath[CELL_GAME_PATH_MAX];
             snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);

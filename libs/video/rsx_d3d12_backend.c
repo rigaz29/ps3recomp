@@ -2098,6 +2098,18 @@ static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
  * Default 2 workers; 0 builds everything on the drain thread, as before. A
  * program already in the disk cache needs no compile and is used at once
  * (its pipeline is still created by a worker).
+ *
+ * A solid draw waits for its builds (D3D12_ASYNC_SOLID, on unless 0): one with
+ * no blending, or blending that keeps only what it draws. God of War:
+ * Ascension never clears its colour target, each frame drawing over every
+ * pixel, so a skipped solid draw left an earlier frame showing there, and as
+ * the camera moved those pixels smeared into shards and stacked copies, the
+ * first time each place was played (issue #18, docs/notes/2026-11-16-issue18-
+ * first-play-trails.md). Its job goes to the front of the queue and the workers
+ * run at normal priority while it waits, up to D3D12_ASYNC_SOLID_MS (2000); a
+ * blended draw (fire, smoke, sparks) is still skipped, which leaves no gap.
+ * On (2) the workers are sized by the CPU: 2 below eight threads, 3 at eight
+ * to eleven, 4 at twelve and more; another number sets them.
  * -----------------------------------------------------------------------*/
 typedef struct ShaderJob {
     struct ShaderJob* next;         /* queue link */
@@ -2123,8 +2135,11 @@ static ShaderJob *s_sj_head, *s_sj_tail;
 static int s_sj_quit;
 static HANDLE s_sj_thread[8];
 static int s_sj_nowait;             /* set while render_frame only queues builds */
+static int s_sj_full;               /* set for a solid draw: its builds are waited for (sj_wait) */
 static int s_pso_pending;           /* vp_get_fp_pso returned NULL: still building */
 static u32 s_sj_stat_jobs, s_sj_stat_skipped;   /* PERF=1 report */
+static u32 s_sj_solid_waits;        /* solid draws that waited, and how long in all */
+static double s_sj_solid_wait_s;
 
 static void sj_release(ShaderJob* j)
 {
@@ -2812,11 +2827,21 @@ static DWORD WINAPI sj_worker(LPVOID arg)
 }
 
 /* Workers in use, started on first call; 0 = build on the drain thread.
- * graphics.async_shaders (D3D12_ASYNC_SHADERS), 2 by default. */
+ * graphics.async_shaders (D3D12_ASYNC_SHADERS), 2 by default: on, sized by
+ * the threads the process may run on (2 below eight, 3 at eight to eleven,
+ * 4 at twelve and more). */
 static int sj_workers(void)
 {
     if (s_sj_workers >= 0) return s_sj_workers;
     int n = (int)ps3_settings_int("graphics", "async_shaders", "D3D12_ASYNC_SHADERS", 2);
+    if (n == 2) {
+        DWORD_PTR pm = 0, sm = 0;
+        int t = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm))
+            for (; pm; pm &= pm - 1) t++;
+        if (!t) { SYSTEM_INFO si; GetSystemInfo(&si); t = (int)si.dwNumberOfProcessors; }
+        n = t >= 12 ? 4 : t >= 8 ? 3 : 2;
+    }
     if (n < 0) n = 0;
     if (n > (int)(sizeof s_sj_thread / sizeof s_sj_thread[0])) n = (int)(sizeof s_sj_thread / sizeof s_sj_thread[0]);
     int started = 0;
@@ -2870,11 +2895,73 @@ static int sj_is_done(ShaderJob* j)
     return InterlockedCompareExchange(&j->done, 0, 0) != 0;
 }
 
-/* 1 once j is built, waiting for it out of this 16 ms window's budget. */
+/* D3D12_ASYNC_SOLID: a solid draw waits for its builds (1, the default) or is skipped as a blended one (0). */
+static int sj_solid_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("D3D12_ASYNC_SOLID"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+/* A draw that covers what is under it: no blending (blend_key 0, rsx_blend_key), or blending that keeps only what it
+ * draws (ONE, ZERO, ADD). Skipped, it leaves an earlier frame showing; a blended one leaves an effect out. */
+static int dr_solid(const D3D12DrawRecord* dr)
+{
+    const u32 k = dr->blend_key;
+    if (!k) return 1;
+    return ((k >> 1) & 31u) == (u32)D3D12_BLEND_ONE && ((k >> 6) & 31u) == (u32)D3D12_BLEND_ZERO &&
+           ((k >> 21) & 7u) == (u32)D3D12_BLEND_OP_ADD;
+}
+
+/* A solid draw's wait (s_sj_full): its job to the front of the queue if no worker has taken it yet,
+ * the workers at normal priority until it is built (below normal they lost the cores to the game's
+ * threads, which go on meanwhile), up to D3D12_ASYNC_SOLID_MS. 1 once built. */
+static int sj_wait_full(ShaderJob* j)
+{
+    static double cap = -1.0;
+    if (cap < 0.0) {
+        const char* e = getenv("D3D12_ASYNC_SOLID_MS");
+        cap = (e ? atof(e) : 2000.0) / 1000.0;
+    }
+    const double t0 = perf_now();
+    AcquireSRWLockExclusive(&s_sj_lock);
+    if (s_sj_head != j) {
+        ShaderJob* prev = s_sj_head;
+        while (prev && prev->next != j) prev = prev->next;
+        if (prev) {                     /* queued, not taken: to the front */
+            prev->next = j->next;
+            if (s_sj_tail == j) s_sj_tail = prev;
+            j->next = s_sj_head;
+            s_sj_head = j;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_sj_lock);
+    for (int i = 0; i < s_sj_workers; i++) SetThreadPriority(s_sj_thread[i], THREAD_PRIORITY_NORMAL);
+    AcquireSRWLockExclusive(&s_sj_lock);
+    for (;;) {
+        if (j->done) break;
+        const double left = cap - (perf_now() - t0);
+        if (left <= 0.0) break;
+        SleepConditionVariableSRW(&s_sj_done, &s_sj_lock, (DWORD)(left * 1000.0) + 1, 0);
+    }
+    ReleaseSRWLockExclusive(&s_sj_lock);
+    for (int i = 0; i < s_sj_workers; i++) SetThreadPriority(s_sj_thread[i], THREAD_PRIORITY_BELOW_NORMAL);
+    const double dt = perf_now() - t0;
+    s_hl_sjwait_s += dt;
+    s_sj_solid_wait_s += dt;
+    const u32 n = ++s_sj_solid_waits;
+    if (!(n & (n - 1)))
+        printf("[d3d12] background shaders: %u solid draw%s waited for their builds, %.2f s in all%c", n,
+               n == 1 ? "" : "s", s_sj_solid_wait_s, 10);
+    return sj_is_done(j);
+}
+
+/* 1 once j is built, waiting for it out of this 16 ms window's budget (a solid draw: until it is). */
 static int sj_wait(ShaderJob* j)
 {
     if (sj_is_done(j)) return 1;
     if (s_sj_nowait) return 0;
+    if (s_sj_full) return sj_wait_full(j);
     static double budget = -1.0, win0, used;
     if (budget < 0.0) {
         const char* e = getenv("D3D12_ASYNC_WAIT_MS");
@@ -15045,8 +15132,10 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     continue;
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
-                 * back to the hardcoded atlas/colour PS pair. */
+                 * back to the hardcoded atlas/colour PS pair. A solid draw waits
+                 * for its builds (D3D12_ASYNC_SOLID, issue #18). */
                 if (ahead) s_sj_nowait = 1;
+                else if (dr->fp_addr && dr_solid(dr) && sj_solid_on()) s_sj_full = 1;
                 ID3D12PipelineState* dpso =
                     dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                                 dr_num_rts(dr),
@@ -15056,8 +15145,10 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                                                 0u, dr->raw, dr->zs_key,
                                                 0u, 0u, dr) : NULL;
                 /* Its program is still being built: skip the draw this frame
-                 * rather than draw it with another one. */
+                 * rather than draw it with another one (a solid draw only past
+                 * D3D12_ASYNC_SOLID_MS). */
                 s_sj_nowait = 0;
+                s_sj_full = 0;
                 if (dr->fp_addr && !dpso && s_pso_pending) {
                     if (ahead) break;   /* the final pass waits for it, as it always did */
                     zq_draw_lost();

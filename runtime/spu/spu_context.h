@@ -906,6 +906,14 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
+/* The runtime's switches that a port measures by turns (spu_channels.c): 1 on, 0 off. A port's clock may set it
+ * off and on by turns within one run, so that both halves share the scene and the heat; nothing else writes it. */
+extern volatile int g_spu_rt_turn;
+/* Each switch on unless it follows the turns (SPU_RT_TURNS) and the turn is off: piece GETs by their EA's
+ * sources, the coherency notifier's scan four hints at a time, a lift's new entries (SPU_LIFT_TURN). */
+enum { SPU_RT_OVL = 1, SPU_RT_COH = 2, SPU_RT_LIFT = 4 };
+int spu_rt_follows(int which);
+static inline int spu_rt_on(int which) { return g_spu_rt_turn || !spu_rt_follows(which); }
 /* ctx->resident_pages from ctx->resident_code (spu_channels.c): after a slot changes, or a
  * context is copied in whole. */
 void spu_resident_pages_rebuild(spu_context* ctx);

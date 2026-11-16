@@ -17,6 +17,9 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>   /* spu_coh_next_holder's scan */
+#endif
 #include "ps3emu/log_first.h"
 #ifdef PS3_SPU_JOBCAP
 #include "spu_jobcap.h"   /* SPU_JS_ADD: SPU_JOB_TIME's per-job counts */
@@ -540,6 +543,33 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
 static inline spu_context* spu_coh_next_holder(uint32_t line, uint32_t* i, spu_coh_entry** e)
 {
     const uint32_t n = __atomic_load_n(&s_coh_nslots, __ATOMIC_ACQUIRE);
+#if defined(__SSE2__) || defined(_M_X64)
+    /* Four hints a compare: ~99 slots in God of War: Ascension, scanned at each of ~400,000 notifies a
+     * second, 1.2% of EDGE's samples one at a time. Each 4-byte hint is read whole, as the relaxed load
+     * below reads it. With the runtime's switches off by turns (g_spu_rt_turn), one at a time. */
+    if (spu_rt_on(SPU_RT_COH)) {
+        const __m128i want = _mm_set1_epi32((int)line);
+        while (*i < n) {
+            const uint32_t k = *i;
+            if (k + 4u > n) {
+                *i = k + 1u;
+                if (__atomic_load_n(&s_coh_hint[k], __ATOMIC_RELAXED) != line) continue;
+                spu_context* c = __atomic_load_n(&s_coh_slot_ctx[k], __ATOMIC_ACQUIRE);
+                if (c && spu_coh_holds(c, line)) return c;
+                continue;
+            }
+            unsigned m = (unsigned)_mm_movemask_ps(_mm_castsi128_ps(
+                _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)&s_coh_hint[k]), want)));
+            *i = k + 4u;
+            while (m) {
+                const unsigned j = (unsigned)__builtin_ctz(m);
+                m &= m - 1u;
+                spu_context* c = __atomic_load_n(&s_coh_slot_ctx[k + j], __ATOMIC_ACQUIRE);
+                if (c && spu_coh_holds(c, line)) { *i = k + j + 1u; return c; }
+            }
+        }
+    }
+#endif
     while (*i < n) {
         const uint32_t k = (*i)++;
         if (__atomic_load_n(&s_coh_hint[k], __ATOMIC_RELAXED) != line) continue;

@@ -160,6 +160,22 @@ static uint32_t spu_ft_who(const spu_context* ctx)
 }
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
+volatile int g_spu_rt_turn = 1;      /* spu_context.h */
+/* SPU_RT_TURNS=<ovl,coh,lift>: which of the runtime's switches follow the turns, so that one is measured
+ * alone; every one unless set (spu_context.h). */
+int spu_rt_follows(int which)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("SPU_RT_TURNS");
+        int v = e ? 0 : 7;
+        if (e && strstr(e, "ovl")) v |= SPU_RT_OVL;
+        if (e && strstr(e, "coh")) v |= SPU_RT_COH;
+        if (e && strstr(e, "lift")) v |= SPU_RT_LIFT;
+        m = v;
+    }
+    return (m & which) != 0;
+}
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
 #define SPU_WATCH_MAX 4
@@ -2184,6 +2200,38 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
     if (!f && ctx && s_pic_sig_n) f = spu_pic_adopt((spu_context*)ctx, lsa);
     return f;
 }
+/* SPU_LIFT_TURN=<image>:<hex>[,...] (benches): entries a new lift added, left out of the lookup while the runtime's
+ * switches are off by turns (g_spu_rt_turn), so that one run shows what lifting them gave: their code goes to the
+ * micro-step there, as before the lift. <hex> is the offset in the image's resident span when that is position-
+ * independent, else the local-store address. Unset: nothing left out, and the lookup as before. */
+#define SPU_LIFT_VETO_MAX 256
+static uint64_t s_lift_veto[SPU_LIFT_VETO_MAX];
+static int s_lift_veto_n = -1;
+static int spu_lift_veto_on(void)
+{
+    if (__builtin_expect(s_lift_veto_n >= 0, 1)) return s_lift_veto_n > 0;
+    int n = 0;
+    const char* e = getenv("SPU_LIFT_TURN");
+    while (e && *e && n < SPU_LIFT_VETO_MAX) {
+        char* end;
+        const unsigned long img = strtoul(e, &end, 10);
+        if (*end != ':') break;
+        const unsigned long at = strtoul(end + 1, &end, 16);
+        s_lift_veto[n++] = ((uint64_t)img << 32) | (uint32_t)at;
+        if (*end != ',') break;
+        e = end + 1;
+    }
+    if (n) fprintf(stderr, "[spu] SPU_LIFT_TURN: %d entries left out in the turns that are off\n", n);
+    s_lift_veto_n = n;
+    return n > 0;
+}
+static int spu_lift_vetoed(int image, uint32_t at)
+{
+    if (spu_rt_on(SPU_RT_LIFT) || !spu_lift_veto_on()) return 0;
+    const uint64_t k = ((uint64_t)(uint32_t)image << 32) | at;
+    for (int i = 0; i < s_lift_veto_n; i++) if (s_lift_veto[i] == k) return 1;
+    return 0;
+}
 static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t lsa)
 {
     /* Every probe below goes through #436's per-thread memo rather than
@@ -2199,6 +2247,9 @@ static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t ls
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
+            if (spu_lift_vetoed(ctx->resident_code[slot].image_id,
+                                ctx->resident_code[slot].pic ? lsa - ctx->resident_code[slot].lsa : lsa))
+                return NULL;
             if (ctx->resident_code[slot].pic) {
                 const uint32_t d = ctx->resident_code[slot].pic_delta;
                 const spu_lifted_fn f = (spu_lifted_fn)spu_lookup_memoized(
@@ -2209,9 +2260,9 @@ static spu_lifted_fn spu_lifted_lookup_owned(const spu_context* ctx, uint32_t ls
             return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
         }
     spu_fn fn = NULL;
-    if (ctx->resident_task) fn = spu_lookup_memoized(lsa, ctx->resident_task);
-    if (!fn && ctx->resident_ovl) fn = spu_lookup_memoized(lsa, ctx->resident_ovl);
-    if (!fn) fn = spu_lookup_memoized(lsa, ctx->image_id);
+    if (ctx->resident_task && !spu_lift_vetoed(ctx->resident_task, lsa)) fn = spu_lookup_memoized(lsa, ctx->resident_task);
+    if (!fn && ctx->resident_ovl && !spu_lift_vetoed(ctx->resident_ovl, lsa)) fn = spu_lookup_memoized(lsa, ctx->resident_ovl);
+    if (!fn && !spu_lift_vetoed(ctx->image_id, lsa)) fn = spu_lookup_memoized(lsa, ctx->image_id);
     return (spu_lifted_fn)fn;
 }
 
@@ -2251,6 +2302,7 @@ typedef struct {
     uint32_t id, lsa, rgen, residency;
     int image, ovl, task;
     uint32_t pic_base;   /* what the resolution set ctx->pic_base to */
+    int turn;            /* g_spu_rt_turn it was resolved in, with SPU_LIFT_TURN set (else 0) */
 } spu_dcache_ent;
 #define SPU_DCACHE_ENTRIES 512u
 static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
@@ -2303,9 +2355,11 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
     const uint32_t* const pgen = &c->dcache_page_gen[(lsa >> 12) & ((SPU_LS_SIZE >> 12) - 1u)];
     spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
+    /* the list read at the first lookup, so that no entry is kept without the turn */
+    const int turn = spu_lift_veto_on() ? spu_rt_on(SPU_RT_LIFT) : 0;
     if (e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == *pgen && e->image == c->image_id &&
-        e->ovl == c->resident_ovl && e->task == c->resident_task) {
+        e->ovl == c->resident_ovl && e->task == c->resident_task && e->turn == turn) {
         /* A kept miss outlives a GET that ends no resident span, and a block
          * with a position-independent piece inside is such a GET: look for
          * one there again (spu_pic_adopt). */
@@ -2344,6 +2398,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     e->residency = *pgen; e->image = c->image_id;
     e->ovl = c->resident_ovl; e->task = c->resident_task;
     e->pic_base = c->pic_base;
+    e->turn = turn;
     return fn;
 }
 
@@ -2376,7 +2431,9 @@ int spu_ijmp_shadow(spu_context* ctx, uint32_t pc, void (*fn)(spu_context*))
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; uint64_t sig64[2]; int has_sig; uint32_t span;
                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
-                 int pic; } spu_ovl_src;
+                 int pic;
+                 int next_ea;   /* the next source with this EA (s_ovl_ea_first), -1 none */
+               } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature),
  * and the position-independent pieces jobs stream after them. */
@@ -2400,26 +2457,80 @@ static int s_ovl_src_count = 0;
 #define SPU_OVL_EA_SET 1024u
 static uint32_t s_ovl_ea_set[SPU_OVL_EA_SET];
 static uint8_t s_ovl_ea_used[SPU_OVL_EA_SET];
+/* Each EA's sources, in the order they were registered: the first here, the rest through next_ea.
+ * The GET of a piece scanned every source for its EA, ~150 in God of War: Ascension, three pieces an
+ * EDGE job; it now visits those with its EA, and the signature sources (s_ovl_sig_srcs) for a GET
+ * that may match one, in the scan's order (spu_overlay_note_get). */
+static int s_ovl_ea_first[SPU_OVL_EA_SET];
 static unsigned spu_ovl_ea_slot(uint32_t ea) { return (ea * 0x9E3779B1u) >> 22; }
-static void spu_ovl_ea_add(uint32_t ea)
+static int spu_ovl_ea_add(uint32_t ea)
 {
     for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
         if (__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) {
-            if (s_ovl_ea_set[i] == ea) return;
+            if (s_ovl_ea_set[i] == ea) return (int)i;
             continue;
         }
         s_ovl_ea_set[i] = ea;
+        __atomic_store_n(&s_ovl_ea_first[i], -1, __ATOMIC_RELAXED);
         __atomic_store_n(&s_ovl_ea_used[i], 1, __ATOMIC_RELEASE);
-        return;
+        return (int)i;
     }
+    return -1;
 }
-static int spu_ovl_ea_known(uint32_t ea)
+/* The EA's slot in the set, -1 when it was never registered; -2 when the set is full (cannot happen). */
+static int spu_ovl_ea_find(uint32_t ea)
 {
     for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
-        if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return 0;
-        if (s_ovl_ea_set[i] == ea) return 1;
+        if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return -1;
+        if (s_ovl_ea_set[i] == ea) return (int)i;
     }
-    return 1;   /* full (cannot happen): never filter */
+    return -2;
+}
+/* Source index src, its EA's slot: at the end of that EA's chain. Registration only (one thread at a time,
+ * as the count it publishes). A reader stops at an index past the count it loaded. */
+static void spu_ovl_ea_link(int slot, int src)
+{
+    s_ovl_src[src].next_ea = -1;
+    if (slot < 0) return;
+    int i = __atomic_load_n(&s_ovl_ea_first[slot], __ATOMIC_ACQUIRE);
+    if (i < 0) { __atomic_store_n(&s_ovl_ea_first[slot], src, __ATOMIC_RELEASE); return; }
+    while (s_ovl_src[i].next_ea >= 0) i = s_ovl_src[i].next_ea;
+    __atomic_store_n(&s_ovl_src[i].next_ea, src, __ATOMIC_RELEASE);
+}
+static int s_ovl_sig_srcs[SPU_OVL_SRC_MAX];   /* the signature sources, in order */
+static int s_ovl_sig_n;
+
+/* SPU_OVL_CHECK=1: at every GET that may match a source, the sources the whole scan finds and those
+ * the EA's chain and the signature sources give, compared in order; counts every 2^16 GETs. */
+static int spu_ovl_check_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_OVL_CHECK") ? 1 : 0;
+    return on;
+}
+static void spu_ovl_check(uint32_t ea, int big, uint64_t head0, uint64_t head1, int nsrc, int a, int nsig)
+{
+    static volatile long long s_n, s_bad;
+    int full[SPU_OVL_SRC_MAX], nf = 0, cand[SPU_OVL_SRC_MAX], nc = 0, b = 0;
+    for (int i = 0; i < nsrc; i++) {
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (o->has_sig ? (big && o->sig64[0] == head0 && o->sig64[1] == head1) : (o->src_ea == ea)) full[nf++] = i;
+    }
+    for (;;) {
+        const int sa = a >= 0 ? a : SPU_OVL_SRC_MAX, sb = b < nsig ? s_ovl_sig_srcs[b] : SPU_OVL_SRC_MAX;
+        const int i = sa < sb ? sa : sb;
+        if (i >= nsrc) break;
+        if (i == sa) a = s_ovl_src[a].next_ea;
+        else b++;
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (o->has_sig ? (big && o->sig64[0] == head0 && o->sig64[1] == head1) : (o->src_ea == ea)) cand[nc++] = i;
+    }
+    if ((nf != nc || memcmp(full, cand, (size_t)nf * sizeof full[0])) &&
+        __atomic_add_fetch(&s_bad, 1, __ATOMIC_RELAXED) <= 8)
+        fprintf(stderr, "[spu-ovl] check: a GET from 0x%08X: the scan finds %d sources, the chain %d\n", ea, nf, nc);
+    const long long n = __atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED);
+    if (!(n & 0xFFFF))
+        fprintf(stderr, "[spu-ovl] check: %lld GETs, %lld found other sources\n", n, (long long)s_bad);
 }
 
 /* A GET of 512 bytes or more was compared with every signature source's 16
@@ -2456,10 +2567,11 @@ static int spu_ovl_sig_known(uint64_t k)
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
-        spu_ovl_ea_add(content_ea);
+        const int slot = spu_ovl_ea_add(content_ea);
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        spu_ovl_ea_link(slot, s_ovl_src_count);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
@@ -2835,7 +2947,10 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         memcpy(s_ovl_src[s_ovl_src_count].sig64, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        s_ovl_src[s_ovl_src_count].next_ea = -1;
         spu_ovl_sig_add(s_ovl_src[s_ovl_src_count].sig64[0]);
+        s_ovl_sig_srcs[s_ovl_sig_n] = s_ovl_src_count;
+        __atomic_store_n(&s_ovl_sig_n, s_ovl_sig_n + 1, __ATOMIC_RELEASE);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
@@ -2919,6 +3034,8 @@ static int spu_overlay_get_kept_code(const spu_context* ctx, unsigned slot, uint
 
 /* Set by runtime/diag/missed_code.c while it records: every GET, to name what streamed code came in. */
 void (*g_spu_missed_get)(const void* ctx, uint32_t ea, uint32_t lsa, uint32_t size);
+/* And each run of code no lift has (spu_interp.c defines it; the micro-step's runs report to it too). */
+extern volatile long long* (*g_spu_missed_entry)(const void* ctx, uint32_t pc, int owner, const uint32_t sig[4]);
 
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
@@ -2962,8 +3079,28 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     const int big = size >= 512;
     uint64_t head0 = 0, head1 = 0;   /* not an array: the frame then needs no stack cookie */
     if (big) { memcpy(&head0, ls, 8); memcpy(&head1, ls + 8, 8); }
-    if (!spu_ovl_ea_known(ea) && (!big || !spu_ovl_sig_known(head0))) return;
-    for (int i = 0; i < nsrc; i++) {
+    const int eslot = spu_ovl_ea_find(ea), sig_ok = big && spu_ovl_sig_known(head0);
+    if (eslot == -1 && !sig_ok) return;
+    /* The sources that can match, in the order of the scan they replace: those with this EA and,
+     * when the head is a signature's, the signature sources. The whole scan when the EA set is
+     * full (cannot happen), or with the runtime's switches off by turns (g_spu_rt_turn). */
+    const int all = eslot == -2 || !spu_rt_on(SPU_RT_OVL);
+    int a = eslot >= 0 ? __atomic_load_n(&s_ovl_ea_first[eslot], __ATOMIC_ACQUIRE) : -1;
+    const int nsig = sig_ok ? __atomic_load_n(&s_ovl_sig_n, __ATOMIC_ACQUIRE) : 0;
+    int b = 0, scan = 0;
+    if (__builtin_expect(spu_ovl_check_on(), 0) && !all) spu_ovl_check(ea, big, head0, head1, nsrc, a, nsig);
+    for (;;) {
+        int i;
+        if (all) {
+            if (scan >= nsrc) break;
+            i = scan++;
+        } else {
+            const int sa = a >= 0 ? a : SPU_OVL_SRC_MAX, sb = b < nsig ? s_ovl_sig_srcs[b] : SPU_OVL_SRC_MAX;
+            i = sa < sb ? sa : sb;
+            if (i >= nsrc) break;
+            if (i == sa) a = __atomic_load_n(&s_ovl_src[a].next_ea, __ATOMIC_ACQUIRE);
+            else b++;
+        }
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (big && o->sig64[0] == head0 && o->sig64[1] == head1)
                              : (o->src_ea == ea);
@@ -3467,7 +3604,7 @@ typedef struct {
     uint8_t bytes[SPU_SMC_MEMO_MAX];
     /* The stub decoded, when it is all lqa/stqa (absolute addresses) and stores none of them
      * into its own bytes: what spu_smc_microstep's fast loop does for each word, in order,
-     * then the branch. */
+     * then the branch. (God of War: Ascension's WWS stubs are all such, SPU_SMC_STATS.) */
     int decoded;
     uint32_t nops, branch;
     uint32_t addr[SPU_SMC_MEMO_MAX / 4];
@@ -3563,6 +3700,113 @@ static int spu_smc_memo_run(spu_context* ctx, const spu_smc_memo_ent* m)
     ctx->pc = tgt & SPU_LS_MASK & ~3u;
     g_spu_trampoline_fn = spu_indirect_branch;
     return 1;
+}
+
+/* SPU_SMC_MEMO_CHECK=1: every remembered stub run both ways, the decoded run and then the micro-step
+ * from the same state, and the registers, the pc, the interrupt enable and the local store at every
+ * quadword the stub touches compared; the micro-step's result stays. Counts every 2^16 checks. */
+static SPU_THREAD_LOCAL u128 t_smcchk_gpr[128];
+static SPU_THREAD_LOCAL uint8_t t_smcchk_ls[SPU_SMC_MEMO_MAX / 4][16], t_smcchk_ls2[SPU_SMC_MEMO_MAX / 4][16];
+static SPU_THREAD_LOCAL uint32_t t_smcchk_at[SPU_SMC_MEMO_MAX / 4];
+static volatile long long s_smcchk_n, s_smcchk_bad, s_smcchk_bail;
+static int spu_smc_memo_check_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_SMC_MEMO_CHECK") ? 1 : 0;
+    return on;
+}
+static int spu_smc_memo_run(spu_context* ctx, const spu_smc_memo_ent* m);
+static int spu_smc_microstep(spu_context* ctx);
+static void spu_smc_memo_check(spu_context* ctx, const spu_smc_memo_ent* m)
+{
+    const uint32_t pc0 = ctx->pc;
+    const int ie0 = ctx->int_enable;
+    memcpy(t_smcchk_gpr, ctx->gpr, sizeof t_smcchk_gpr);
+    const uint32_t n = m->decoded ? m->nops : 0;
+    for (uint32_t i = 0; i < n; i++) {
+        t_smcchk_at[i] = m->addr[i];
+        memcpy(t_smcchk_ls[i], ctx->ls + t_smcchk_at[i], 16);
+    }
+    if (!spu_smc_memo_run(ctx, m)) {
+        __atomic_add_fetch(&s_smcchk_bail, 1, __ATOMIC_RELAXED);
+        spu_smc_microstep(ctx);
+        return;
+    }
+    u128 g[128];
+    memcpy(g, ctx->gpr, sizeof g);
+    const uint32_t pc1 = ctx->pc;
+    const int ie1 = ctx->int_enable;
+    for (uint32_t i = 0; i < n; i++) memcpy(t_smcchk_ls2[i], ctx->ls + t_smcchk_at[i], 16);
+    /* back to where it started (the stores in reverse, so an address stored twice ends as it was) */
+    for (uint32_t i = n; i-- > 0;) memcpy(ctx->ls + t_smcchk_at[i], t_smcchk_ls[i], 16);
+    memcpy(ctx->gpr, t_smcchk_gpr, sizeof t_smcchk_gpr);
+    ctx->pc = pc0;
+    ctx->int_enable = ie0;
+    spu_smc_microstep(ctx);
+    int bad = memcmp(g, ctx->gpr, sizeof g) != 0 || pc1 != ctx->pc || ie1 != ctx->int_enable;
+    for (uint32_t i = 0; i < n && !bad; i++) bad = memcmp(t_smcchk_ls2[i], ctx->ls + t_smcchk_at[i], 16) != 0;
+    if (bad && __atomic_add_fetch(&s_smcchk_bad, 1, __ATOMIC_RELAXED) <= 8)
+        fprintf(stderr, "[spu-smc] memo check: a stub at 0x%05X (%u words) ran differently\n", m->pc, m->nops + 1);
+    const long long c = __atomic_add_fetch(&s_smcchk_n, 1, __ATOMIC_RELAXED);
+    if (!(c & 0xFFFF))
+        fprintf(stderr, "[spu-smc] memo check: %lld stubs run both ways, %lld different, %lld left to the micro-step\n",
+                c, (long long)s_smcchk_bad, (long long)s_smcchk_bail);
+}
+
+/* SPU_SMC_STATS=1: the micro-step's work, every 2^18: the remembered stubs run decoded or left to the
+ * micro-step, and what the full path ran (not remembered: a stub that is not straight or not the one
+ * remembered, or code no lift has), the most run of those with their first words. It found God of
+ * War: Ascension's job modules' and pieces' entries no lift had, ~30 million a fight run, which the
+ * missed-code recorder now sees too (spu_indirect_branch_full). */
+static volatile long long s_smcst_abs, s_smcst_bail, s_smcst_full, s_smcst_full_noted;
+static struct { uint32_t pc, w0, w1, len; long long n; } s_smcst_top[64];
+static int spu_smc_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_SMC_STATS") ? 1 : 0;
+    return on;
+}
+static void spu_smc_stats_print(void)
+{
+    const long long t = s_smcst_abs + s_smcst_bail + s_smcst_full;
+    if (t & ((1ll << 18) - 1)) return;
+    fprintf(stderr, "[spu-smc] stats: remembered and run decoded %lld, left to the micro-step %lld; through the full "
+            "path %lld (%lld of them noted as straight)\n",
+            (long long)s_smcst_abs, (long long)s_smcst_bail, (long long)s_smcst_full, (long long)s_smcst_full_noted);
+    for (int r = 0; r < 6; r++) {
+        int b = -1;
+        for (int i = 0; i < 64; i++) if (s_smcst_top[i].n > 0 && (b < 0 || s_smcst_top[i].n > s_smcst_top[b].n)) b = i;
+        if (b < 0) break;
+        fprintf(stderr, "[spu-smc]   full path at 0x%05X: %lld, words %08X %08X, straight %u bytes\n", s_smcst_top[b].pc,
+                s_smcst_top[b].n, s_smcst_top[b].w0, s_smcst_top[b].w1, s_smcst_top[b].len);
+        s_smcst_top[b].n = -s_smcst_top[b].n;
+    }
+    for (int i = 0; i < 64; i++) if (s_smcst_top[i].n < 0) s_smcst_top[i].n = -s_smcst_top[i].n;
+}
+static void spu_smc_stats_hit(const spu_smc_memo_ent* m, int ran)
+{
+    (void)m;
+    __atomic_add_fetch(!ran ? &s_smcst_bail : &s_smcst_abs, 1, __ATOMIC_RELAXED);
+    spu_smc_stats_print();
+}
+static uint32_t spu_smc_straight_len(const spu_context* ctx, uint32_t pc);
+static void spu_smc_stats_full(const spu_context* ctx, int noted)
+{
+    __atomic_add_fetch(&s_smcst_full, 1, __ATOMIC_RELAXED);
+    if (noted >= 0) __atomic_add_fetch(&s_smcst_full_noted, 1, __ATOMIC_RELAXED);
+    const uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    uint32_t w0, w1;
+    memcpy(&w0, ctx->ls + pc, 4); memcpy(&w1, ctx->ls + ((pc + 4u) & SPU_LS_MASK), 4);
+    w0 = SPU_BSWAP32(w0); w1 = SPU_BSWAP32(w1);
+    const int k = (int)(((pc >> 2) ^ w0 * 2654435761u) & 63u);
+    if (s_smcst_top[k].n && (s_smcst_top[k].pc != pc || s_smcst_top[k].w0 != w0)) {
+        if (--s_smcst_top[k].n > 0) { spu_smc_stats_print(); return; }
+    }
+    if (s_smcst_top[k].pc != pc || s_smcst_top[k].w0 != w0) s_smcst_top[k].n = 0;
+    s_smcst_top[k].pc = pc; s_smcst_top[k].w0 = w0; s_smcst_top[k].w1 = w1;
+    s_smcst_top[k].len = spu_smc_straight_len(ctx, pc);
+    s_smcst_top[k].n++;
+    spu_smc_stats_print();
 }
 
 static inline int spu_smc_memo_ent_holds(const spu_smc_memo_ent* m, const spu_context* ctx)
@@ -3679,7 +3923,11 @@ void spu_indirect_branch(spu_context* ctx)
         spu_ib_resolve_task(ctx);
         const spu_smc_memo_ent* const memo = spu_smc_memo_holds(ctx);
         if (memo) {                          /* a runtime stub the full path ran (t_smc_memo) */
-            if (!spu_smc_memo_run(ctx, memo)) spu_smc_microstep(ctx);
+            if (__builtin_expect(spu_smc_memo_check_on(), 0)) { spu_smc_memo_check(ctx, memo); return; }
+            if (!spu_smc_memo_run(ctx, memo)) {
+                if (__builtin_expect(spu_smc_stats_on(), 0)) spu_smc_stats_hit(memo, 0);
+                spu_smc_microstep(ctx);
+            } else if (__builtin_expect(spu_smc_stats_on(), 0)) spu_smc_stats_hit(memo, 1);
             return;
         }
         spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
@@ -4296,8 +4544,31 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
     const int memo = spu_smc_memo_note(ctx, ctx->pc);
-    if (spu_smc_microstep(ctx))
+    if (__builtin_expect(spu_smc_stats_on(), 0)) spu_smc_stats_full(ctx, memo);
+    /* The missed-code recorder (runtime/diag/missed_code.c) sees the micro-step's runs too: a job
+     * module's function reached only through a pointer (a constructor, a callback) has no lift and
+     * ran here, at every call, without ever reaching the interpreter it watches. A runtime-generated
+     * stub has bytes no ELF holds; the tool leaves it out. */
+    volatile long long* missed_steps = NULL;
+    if (__builtin_expect(g_spu_missed_entry != NULL, 0)) {
+        const uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+        uint32_t sig[4];
+        for (int k = 0; k < 4; k++) {
+            uint32_t w;
+            memcpy(&w, ctx->ls + ((pc + 4u * (uint32_t)k) & SPU_LS_MASK), 4);
+            sig[k] = SPU_BSWAP32(w);
+        }
+        int owner = ctx->image_id;
+        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
+            if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+                owner = ctx->resident_code[s].image_id;
+        missed_steps = g_spu_missed_entry(ctx, pc, owner, sig);
+    }
+    if (spu_smc_microstep(ctx)) {
+        if (missed_steps) __atomic_fetch_add(missed_steps, 1, __ATOMIC_RELAXED);
         return;
+    }
     if (memo >= 0) t_smc_memo[memo].ctx = NULL;
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide

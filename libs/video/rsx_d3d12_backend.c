@@ -11303,10 +11303,16 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
           st->surface_clip_w == s_d3d.width && st->surface_clip_h == s_d3d.height)
           return 0; }
     /* Surface clip dims when sane; else the window size. Any size works --
-     * passes draw normalized full-surface quads -- this only picks resolution. */
+     * passes draw normalized full-surface quads -- this only picks resolution.
+     * Up to 4096, the RSX's own limit: an antialiased surface is held at its
+     * samples, and God of War HD's 2x scene (1216x684 pixels) is 2432 wide.
+     * Above the 2048 this had, it fell back to the window's size, in pixels,
+     * while its viewport, WPOS and the resolve's texture coordinate took it in
+     * samples: the resolve read 2432 samples' width from a 1280-wide target
+     * and the scene came out squeezed into the left half of the frame. */
     u32 w = st->surface_clip_w, h = st->surface_clip_h;
     { u32 ax, ay; rsx_aa_grid(st->surface_format, &ax, &ay); w *= ax; h *= ay; }
-    if (w < 16 || w > 2048 || h < 16 || h > 2048) { w = 0; h = 0; }
+    if (w < 16 || w > 4096 || h < 16 || h > 4096) { w = 0; h = 0; }
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return raw;

@@ -2899,8 +2899,8 @@ static int sj_is_done(ShaderJob* j)
 }
 
 /* How long a solid draw waits for its builds, in seconds (graphics.shader_wait, D3D12_SHADER_WAIT): short 0.25, the
- * default; full 2; off 0, skipped as a blended one, as 0.1.0-alpha.12 had it. D3D12_ASYNC_SOLID=0 and
- * D3D12_ASYNC_SOLID_MS=<ms> still set it, for tests. */
+ * default, though its frame's budget (sj_frame_budget) is less; full 2; off 0, skipped as a blended one, as
+ * 0.1.0-alpha.12 had it. D3D12_ASYNC_SOLID=0 and D3D12_ASYNC_SOLID_MS=<ms> still set it, for tests. */
 static double sj_wait_cap(void)
 {
     static double cap = -1.0;
@@ -2918,6 +2918,29 @@ static double sj_wait_cap(void)
 
 static int sj_solid_on(void) { return sj_wait_cap() > 0.0; }
 
+/* How long the solid draws of one frame wait in all, in seconds: short SJ_FRAME_SHORT; full no more than its per-draw
+ * two seconds each. Past it, a draw whose builds are not done is skipped this frame as with off, and its builds go
+ * on. The waits of one frame added up before: a place with many new shaders stopped for a second or more (issue #15,
+ * 1,024 waits, 79 s in 38 minutes). From an empty cache in the temple (#9's checkpoint, render scale 1.5, 150 s of a
+ * fight), the longest frame was 2,068 ms with each draw's quarter second, 318 ms with 33 ms a frame and 354 ms with no
+ * wait; frames over 250 ms 6, 1 and 1. A quarter to a third of the waits still ended with the draw's builds done.
+ * D3D12_SHADER_WAIT_FRAME_MS sets it, for tests. */
+#define SJ_FRAME_SHORT 0.033
+static double sj_frame_budget(void)
+{
+    static double b = -1.0;
+    if (b < 0.0) {
+        const char* w = ps3_settings_str("graphics", "shader_wait", "D3D12_SHADER_WAIT", "short");
+        double v = ps3_settings_ieq(w, "full") ? 1e9 : SJ_FRAME_SHORT;
+        const char* e = getenv("D3D12_SHADER_WAIT_FRAME_MS");
+        if (e && *e) v = atof(e) / 1000.0;
+        b = v > 0.0 ? v : 0.0;
+    }
+    return b;
+}
+static double s_sj_frame_left = -1.0;   /* what this frame may still wait; set again at each batch's end */
+static u32 s_sj_budget_skips;           /* solid draws skipped for it */
+
 /* A draw that covers what is under it: no blending (blend_key 0, rsx_blend_key), or blending that keeps only what it
  * draws (ONE, ZERO, ADD). Skipped, it leaves an earlier frame showing; a blended one leaves an effect out. */
 static int dr_solid(const D3D12DrawRecord* dr)
@@ -2934,7 +2957,9 @@ static int dr_solid(const D3D12DrawRecord* dr)
 static u32 s_sj_solid_late;   /* waits that met the cap: the draw skipped, its gap shown until the build is done */
 static int sj_wait_full(ShaderJob* j)
 {
-    const double cap = sj_wait_cap();
+    if (s_sj_frame_left < 0.0) s_sj_frame_left = sj_frame_budget();
+    double cap = sj_wait_cap();
+    if (cap > s_sj_frame_left) cap = s_sj_frame_left;
     const double t0 = perf_now();
     AcquireSRWLockExclusive(&s_sj_lock);
     if (s_sj_head != j) {
@@ -2948,6 +2973,11 @@ static int sj_wait_full(ShaderJob* j)
         }
     }
     ReleaseSRWLockExclusive(&s_sj_lock);
+    if (cap <= 0.0) {   /* the frame has waited its share: not this draw, its job stays at the front */
+        const int built = sj_is_done(j);
+        if (!built) s_sj_budget_skips++;
+        return built;
+    }
     for (int i = 0; i < s_sj_workers; i++) SetThreadPriority(s_sj_thread[i], THREAD_PRIORITY_NORMAL);
     AcquireSRWLockExclusive(&s_sj_lock);
     for (;;) {
@@ -2961,12 +2991,23 @@ static int sj_wait_full(ShaderJob* j)
     const double dt = perf_now() - t0;
     s_hl_sjwait_s += dt;
     s_sj_solid_wait_s += dt;
+    s_sj_frame_left = s_sj_frame_left > dt ? s_sj_frame_left - dt : 0.0;
     const int built = sj_is_done(j);
     if (!built) s_sj_solid_late++;
+    { static int wl = -1;   /* D3D12_SJ_WAITLOG=1: each wait, for tests */
+      if (wl < 0) { const char* e = getenv("D3D12_SJ_WAITLOG"); wl = e && *e == '1'; }
+      if (wl) fprintf(stderr, "[sjwait] %.1f ms %s, %.1f ms of the frame's left%c", dt * 1000.0,
+                      built ? "built" : "not built", s_sj_frame_left * 1000.0, 10); }
     const u32 n = ++s_sj_solid_waits;
-    if (!(n & (n - 1)))
-        printf("[d3d12] background shaders: %u solid draw%s waited for their builds, %.2f s in all, %u past the "
-               "%.2f s cap (graphics.shader_wait)%c", n, n == 1 ? "" : "s", s_sj_solid_wait_s, s_sj_solid_late, cap, 10);
+    if (!(n & (n - 1))) {
+        char fb[32];
+        if (sj_frame_budget() < 1000.0) snprintf(fb, sizeof fb, "%.0f ms a frame", sj_frame_budget() * 1000.0);
+        else snprintf(fb, sizeof fb, "no limit a frame");
+        printf("[d3d12] background shaders: %u solid draw%s waited for their builds, %.2f s in all, %u of them "
+               "skipped when the wait ran out (%.2f s a draw, %s), %u more not waited for in a frame that had "
+               "waited its share (graphics.shader_wait)%c", n, n == 1 ? "" : "s", s_sj_solid_wait_s,
+               s_sj_solid_late, sj_wait_cap(), fb, s_sj_budget_skips, 10);
+    }
     return built;
 }
 
@@ -15773,6 +15814,7 @@ static void render_frame(void)
     s_seg_n = 0;
     s_d3d.draw_count = 0;
     batch_overflow_note();
+    s_sj_frame_left = sj_frame_budget();   /* the next frame's waits */
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
     vpass_reset();
     s_fpcb_used = 0;

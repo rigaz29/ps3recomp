@@ -8186,18 +8186,37 @@ static void rec_step2_state(D3D12DrawRecord* dr, const rsx_state* st)
     cen_top(&s_c2_zmm, dr->zmm);
 }
 
-/* Room for one more draw record. A full batch drops the draw: said once, so
- * a scene that outgrows MAX_DRAWS shows in the log, not as missing objects. */
+/* Room for one more draw record. A full batch drops the draw; how many, and over how many of the title's flips the
+ * batch filled, are said when it ends (render_frame), so a scene that outgrows MAX_DRAWS shows in the log, not as
+ * missing objects. */
+static u32 s_batch_dropped;       /* draws dropped in this batch */
+static unsigned s_batch_flip0;    /* the title's flip requests when it began */
+static double s_batch_t0;         /* and the time */
 static int rsx_draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;
-    static int said = 0;
-    if (!said) {
-        said = 1;
-        fprintf(stderr, "[D3D12] a frame has more than %d draws; the rest of it is dropped (MAX_DRAWS)\n",
-                MAX_DRAWS);
-    }
+    s_batch_dropped++;
     return 0;
+}
+
+/* At a batch's reset: what it dropped, said for the first eight and then at powers of two. More than one flip asked
+ * for while it filled says frames piled up in it with no present between them; one says one frame outgrew it. */
+static void batch_overflow_note(void)
+{
+    extern unsigned cellGcm_flip_request_count(void);
+    const unsigned fc = cellGcm_flip_request_count();
+    const double now = perf_now();
+    if (s_batch_dropped) {
+        static u32 n;
+        n++;
+        if (n <= 8 || !(n & (n - 1)))
+            fprintf(stderr, "[D3D12] a batch outgrew MAX_DRAWS (%d): %u draws dropped, %u flips asked for while it "
+                            "filled, over %.0f ms (%u so far)%c", MAX_DRAWS, s_batch_dropped, fc - s_batch_flip0,
+                    s_batch_t0 > 0.0 ? (now - s_batch_t0) * 1000.0 : 0.0, n, 10);
+        s_batch_dropped = 0;
+    }
+    s_batch_flip0 = fc;
+    s_batch_t0 = now;
 }
 
 /* The per-draw pipeline key bits of step 2: the depth bounds test (bit 0) and
@@ -15753,6 +15772,7 @@ static void render_frame(void)
     s_raw_run_valid = 0;
     s_seg_n = 0;
     s_d3d.draw_count = 0;
+    batch_overflow_note();
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
     vpass_reset();
     s_fpcb_used = 0;

@@ -2099,15 +2099,18 @@ static ID3DBlob* shc_find(const char* src, size_t len, const char* target)
  * program already in the disk cache needs no compile and is used at once
  * (its pipeline is still created by a worker).
  *
- * A solid draw waits for its builds (D3D12_ASYNC_SOLID, on unless 0): one with
- * no blending, or blending that keeps only what it draws. God of War:
- * Ascension never clears its colour target, each frame drawing over every
- * pixel, so a skipped solid draw left an earlier frame showing there, and as
- * the camera moved those pixels smeared into shards and stacked copies, the
- * first time each place was played (issue #18, docs/notes/2026-11-16-issue18-
- * first-play-trails.md). Its job goes to the front of the queue and the workers
- * run at normal priority while it waits, up to D3D12_ASYNC_SOLID_MS (2000); a
- * blended draw (fire, smoke, sparks) is still skipped, which leaves no gap.
+ * A solid draw waits for its builds: one with no blending, or blending that
+ * keeps only what it draws. God of War: Ascension never clears its colour
+ * target, each frame drawing over every pixel, so a skipped solid draw left an
+ * earlier frame showing there, and as the camera moved those pixels smeared
+ * into shards and stacked copies, the first time each place was played (issue
+ * #18, docs/notes/2026-11-16-issue18-first-play-trails.md). Its job goes to the
+ * front of the queue and the workers run at normal priority while it waits, for
+ * as long as graphics.shader_wait has it (sj_wait_cap): short, 0.25 s, the
+ * default; full, 2 s; off, not at all. Past that the draw is skipped and its gap
+ * shows until the build is done: a pause of a second or two at every new place
+ * was the other way to lose (issue #15, docs/notes/2026-11-17-issue15-shader-
+ * waits.md). A blended draw (fire, smoke, sparks) is skipped, which leaves no gap.
  * On (2) the workers are sized by the CPU: 2 below eight threads, 3 at eight
  * to eleven, 4 at twelve and more; another number sets them.
  * -----------------------------------------------------------------------*/
@@ -2895,13 +2898,25 @@ static int sj_is_done(ShaderJob* j)
     return InterlockedCompareExchange(&j->done, 0, 0) != 0;
 }
 
-/* D3D12_ASYNC_SOLID: a solid draw waits for its builds (1, the default) or is skipped as a blended one (0). */
-static int sj_solid_on(void)
+/* How long a solid draw waits for its builds, in seconds (graphics.shader_wait, D3D12_SHADER_WAIT): short 0.25, the
+ * default; full 2; off 0, skipped as a blended one, as 0.1.0-alpha.12 had it. D3D12_ASYNC_SOLID=0 and
+ * D3D12_ASYNC_SOLID_MS=<ms> still set it, for tests. */
+static double sj_wait_cap(void)
 {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("D3D12_ASYNC_SOLID"); on = !(e && e[0] == '0'); }
-    return on;
+    static double cap = -1.0;
+    if (cap < 0.0) {
+        const char* w = ps3_settings_str("graphics", "shader_wait", "D3D12_SHADER_WAIT", "short");
+        double c = ps3_settings_ieq(w, "off") ? 0.0 : ps3_settings_ieq(w, "full") ? 2.0 : 0.25;
+        const char* e = getenv("D3D12_ASYNC_SOLID_MS");
+        if (e && *e) c = atof(e) / 1000.0;
+        e = getenv("D3D12_ASYNC_SOLID");
+        if (e && e[0] == '0') c = 0.0;
+        cap = c > 0.0 ? c : 0.0;
+    }
+    return cap;
 }
+
+static int sj_solid_on(void) { return sj_wait_cap() > 0.0; }
 
 /* A draw that covers what is under it: no blending (blend_key 0, rsx_blend_key), or blending that keeps only what it
  * draws (ONE, ZERO, ADD). Skipped, it leaves an earlier frame showing; a blended one leaves an effect out. */
@@ -2915,14 +2930,11 @@ static int dr_solid(const D3D12DrawRecord* dr)
 
 /* A solid draw's wait (s_sj_full): its job to the front of the queue if no worker has taken it yet,
  * the workers at normal priority until it is built (below normal they lost the cores to the game's
- * threads, which go on meanwhile), up to D3D12_ASYNC_SOLID_MS. 1 once built. */
+ * threads, which go on meanwhile), up to sj_wait_cap. 1 once built. */
+static u32 s_sj_solid_late;   /* waits that met the cap: the draw skipped, its gap shown until the build is done */
 static int sj_wait_full(ShaderJob* j)
 {
-    static double cap = -1.0;
-    if (cap < 0.0) {
-        const char* e = getenv("D3D12_ASYNC_SOLID_MS");
-        cap = (e ? atof(e) : 2000.0) / 1000.0;
-    }
+    const double cap = sj_wait_cap();
     const double t0 = perf_now();
     AcquireSRWLockExclusive(&s_sj_lock);
     if (s_sj_head != j) {
@@ -2949,11 +2961,13 @@ static int sj_wait_full(ShaderJob* j)
     const double dt = perf_now() - t0;
     s_hl_sjwait_s += dt;
     s_sj_solid_wait_s += dt;
+    const int built = sj_is_done(j);
+    if (!built) s_sj_solid_late++;
     const u32 n = ++s_sj_solid_waits;
     if (!(n & (n - 1)))
-        printf("[d3d12] background shaders: %u solid draw%s waited for their builds, %.2f s in all%c", n,
-               n == 1 ? "" : "s", s_sj_solid_wait_s, 10);
-    return sj_is_done(j);
+        printf("[d3d12] background shaders: %u solid draw%s waited for their builds, %.2f s in all, %u past the "
+               "%.2f s cap (graphics.shader_wait)%c", n, n == 1 ? "" : "s", s_sj_solid_wait_s, s_sj_solid_late, cap, 10);
+    return built;
 }
 
 /* 1 once j is built, waiting for it out of this 16 ms window's budget (a solid draw: until it is). */

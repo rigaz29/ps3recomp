@@ -5228,23 +5228,26 @@ static void ov_render_panel(u32 font_px)
 }
 
 /* ---------------------------------------------------------------------------
- * The neon panel (display.show_fps = overlay), top right: the frame rate, the frame time and a
- * graph of the last frames' times, in an 8-bit look -- a pixel font of its own, a notched border,
- * scan lines, and a glow added to what is behind. Laid out as designed for a 720-line window and
- * scaled by k = the window's height / 720, each font pixel a whole number of pixels so it stays
- * crisp; k stops where the panel fills OVS_W. Painted by the panel's thread like the stats panel;
- * the box, its border and their glow once a scale, the readings and their glow each time, that glow
- * worked out at half size over the box only: 1.3 ms a paint at 720 lines, up to 1.9 while the game
- * ran; in full over the whole image it had taken 3.5, up to 5.4.
+ * The neon panel (display.show_fps = overlay), top right: the rows of the first stats panel
+ * (2026-11-03) -- the frame rate, the frame time, and the loads of the CPU, the GPU and the guest's
+ * processors (PPU, SPU, RSX), each load with a meter -- and the last frames' times as bars, in an
+ * 8-bit look: a pixel font of its own, a border notched at the corners and scan lines, no glow.
+ * Top right, where the game's HUD is not. Laid out as designed for a 720-line window and scaled
+ * by k = the window's height / 720, each font pixel a whole number of pixels so it stays crisp;
+ * k stops where the panel fills OVS_W. Painted by the panel's thread like the stats panel: the
+ * box, its border and its labels once a scale, the readings each time.
  * -----------------------------------------------------------------------*/
-#define OVN_CYAN  0x3CF0FFu   /* the border, the bars and a good frame rate */
-#define OVN_PINK  0xFF4FD8u   /* the FPS label */
-#define OVN_AMBER 0xFFC23Cu   /* a slow frame; 20-28 frames a second */
-#define OVN_HOT   0xFF3B6Bu   /* a hitch; under 20 */
-#define OVN_TEXT  0xE9ECFFu
-#define OVN_DIM   0xA9B0D6u
-#define OVN_BOX_W 300.0f      /* the box at 720 lines; its border 4 outside it and the glow 16 past that */
-#define OVN_EDGE  20.0f
+#define OVN_CYAN   0x3CF0FFu   /* the border, the CPU, a good frame rate and a good frame */
+#define OVN_PINK   0xFF4FD8u   /* the RSX */
+#define OVN_AMBER  0xFFC23Cu   /* the frame time; a slow frame, or 20-28 frames a second */
+#define OVN_HOT    0xFF3B6Bu   /* the GPU; a hitch, or under 20 frames a second */
+#define OVN_GREEN  0x39FF88u   /* the frame rate's label */
+#define OVN_BLUE   0x4F8CFFu   /* the PPU */
+#define OVN_VIOLET 0xB46BFFu   /* the SPU */
+#define OVN_TEXT   0xE9ECFFu
+#define OVN_DIM    0xA9B0D6u
+#define OVN_BOX_W  226.0f      /* the box at 720 lines, about (its rows size it): how far k may go */
+#define OVN_EDGE   4.0f        /* the border, outside the box */
 
 /* The font, 7 x 7 in an 8 x 8 cell, only what the panel writes. A row a byte, bit 6 the left column. */
 static const struct { char c; unsigned char row[7]; } k_ovn_font[] = {
@@ -5258,7 +5261,9 @@ static const struct { char c; unsigned char row[7]; } k_ovn_font[] = {
     { 'F', { 0x7F, 0x60, 0x60, 0x7E, 0x60, 0x60, 0x60 } }, { 'I', { 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C } },
     { 'M', { 0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63 } }, { 'P', { 0x7E, 0x63, 0x63, 0x7E, 0x60, 0x60, 0x60 } },
     { 'R', { 0x7E, 0x63, 0x63, 0x7E, 0x6C, 0x66, 0x63 } }, { 'S', { 0x3E, 0x63, 0x60, 0x3E, 0x03, 0x63, 0x3E } },
-    { 'T', { 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18 } },
+    { 'T', { 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18 } }, { 'C', { 0x3E, 0x63, 0x60, 0x60, 0x60, 0x63, 0x3E } },
+    { 'G', { 0x3E, 0x63, 0x60, 0x6F, 0x63, 0x63, 0x3F } }, { 'U', { 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x3E } },
+    { 'X', { 0x63, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x63 } }, { '%', { 0x63, 0x66, 0x0C, 0x18, 0x30, 0x33, 0x63 } },
 };
 
 /* The scale for a window this many lines tall. */
@@ -5277,35 +5282,35 @@ static int ovn_px1(float v, float k) { const int r = ovn_px(v, k); return r < 1 
 /* How wide s is in font pixels of p. */
 static int ovn_width(const char* s, int p) { const int n = (int)strlen(s); return n ? (n * 8 - 1) * p : 0; }
 
-/* One painting of the panel: rgba is premultiplied, rows OVS_W apart, w x h. emit, unless NULL, takes
- * the light of what is drawn there for its glow, RGB in 0..1: ew x eh cells from ex0, ey0, each
- * 1 << shift pixels square, rows ew apart. */
-typedef struct { u32* rgba; float* emit; int w, h, ex0, ey0, ew, eh, shift; } OvnCanvas;
+/* One painting of the panel: rgba is premultiplied, rows OVS_W apart, w x h. */
+typedef struct { u32* rgba; int w, h; } OvnCanvas;
 
-static void ovn_fill(const OvnCanvas* cv, int x0, int y0, int x1, int y1, u32 rgb, float glow)
+/* x0..x1 by y0..y1 in rgb, over what is there at t: 1 in its place. */
+static void ovn_fill(const OvnCanvas* cv, int x0, int y0, int x1, int y1, u32 rgb, float t)
 {
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > cv->w) x1 = cv->w;
     if (y1 > cv->h) y1 = cv->h;
-    const float f = glow / (float)(1 << (2 * cv->shift));   /* a cell's share of a pixel's light */
-    const float er = (float)((rgb >> 16) & 0xFF) / 255.0f * f, eg = (float)((rgb >> 8) & 0xFF) / 255.0f * f,
-                eb = (float)(rgb & 0xFF) / 255.0f * f;
+    const float c[3] = { (float)((rgb >> 16) & 0xFF), (float)((rgb >> 8) & 0xFF), (float)(rgb & 0xFF) };
     const u32 px = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00u) | ((rgb & 0xFF) << 16) | 0xFF000000u;
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++) {
-            cv->rgba[(size_t)y * OVS_W + x] = px;
-            if (cv->emit && glow > 0.0f && x >= cv->ex0 && y >= cv->ey0) {
-                const int ex = (x - cv->ex0) >> cv->shift, ey = (y - cv->ey0) >> cv->shift;
-                if (ex >= cv->ew || ey >= cv->eh) continue;
-                float* e = cv->emit + ((size_t)ey * cv->ew + ex) * 3;
-                e[0] += er; e[1] += eg; e[2] += eb;
+            u32* const q = cv->rgba + (size_t)y * OVS_W + x;
+            if (t >= 1.0f) {
+                *q = px;
+                continue;
             }
+            const u32 p = *q;
+            u32 o = (u32)((t + (float)(p >> 24) / 255.0f * (1.0f - t)) * 255.0f + 0.5f) << 24;
+            for (int ch = 0; ch < 3; ch++)
+                o |= (u32)(c[ch] * t + (float)((p >> (8 * ch)) & 0xFF) * (1.0f - t) + 0.5f) << (8 * ch);
+            *q = o;
         }
 }
 
 /* s with its top left at x, y, each font pixel p x p. */
-static void ovn_text(const OvnCanvas* cv, int x, int y, int p, const char* s, u32 rgb, float glow)
+static void ovn_text(const OvnCanvas* cv, int x, int y, int p, const char* s, u32 rgb)
 {
     for (; *s; s++, x += 8 * p) {
         const unsigned char* row = NULL;
@@ -5315,163 +5320,107 @@ static void ovn_text(const OvnCanvas* cv, int x, int y, int p, const char* s, u3
         for (int r = 0; r < 7; r++)
             for (int c = 0; c < 7; c++)
                 if (row[r] & (0x40 >> c))
-                    ovn_fill(cv, x + c * p, y + r * p, x + (c + 1) * p, y + (r + 1) * p, rgb, glow);
-    }
-}
-
-/* A box blur of radius r over a w x h RGB image (rows w apart), by way of tmp; what is outside is dark. */
-static void ovn_blur(float* img, float* tmp, int w, int h, int r)
-{
-    const float inv = 1.0f / (float)(2 * r + 1);
-    for (int pass = 0; pass < 2; pass++) {
-        const int n = pass ? h : w, lines = pass ? w : h;
-        const size_t step = pass ? (size_t)w * 3 : 3, next = pass ? 3 : (size_t)w * 3;
-        float* src = pass ? tmp : img;
-        float* dst = pass ? img : tmp;
-        for (int l = 0; l < lines; l++) {
-            const float* s = src + (size_t)l * next;
-            float* d = dst + (size_t)l * next;
-            for (int c = 0; c < 3; c++) {
-                float sum = 0.0f;
-                for (int i = 0; i <= r && i < n; i++) sum += s[(size_t)i * step + c];
-                for (int i = 0; i < n; i++) {
-                    d[(size_t)i * step + c] = sum * inv;
-                    if (i + r + 1 < n) sum += s[(size_t)(i + r + 1) * step + c];
-                    if (i - r >= 0) sum -= s[(size_t)(i - r) * step + c];
-                }
-            }
-        }
+                    ovn_fill(cv, x + c * p, y + r * p, x + (c + 1) * p, y + (r + 1) * p, rgb, 1.0f);
     }
 }
 
 static void ov_render_neon(float k)
 {
-    static u32 *base, *pair[2];          /* the panel without its readings, its glow in it; the images */
-    static float *emit, *tmp;            /* the readings' light at half size over the box, and the blur's */
-    static int back, W, H, o, bw, bh, hw, hh;
-    static int cx0, cx1, y_lab, y_big, y_ms, y_unit, gy1, bar_h, p_lab, p_big, p_ms, p_sm;
+    static const char* const lab[7] = { "FPS", "MS", "CPU", "GPU", "PPU", "SPU", "RSX" };
+    static const u32 col[7] = { OVN_GREEN, OVN_AMBER, OVN_CYAN, OVN_HOT, OVN_BLUE, OVN_VIOLET, OVN_PINK };
+    static u32 *base, *pair[2];          /* the panel without its readings; the images */
+    static int back, W, H, o, bw, bh, sl;
+    static int cx0, cx1, p, rh, y0, mx, segw, segg, segh, gy1, bar_h;
     static float base_k;
     if (!base) {
-        const size_t half = (size_t)(OVS_W / 2 + 1) * (OVS_H / 2 + 1) * 3 * sizeof(float);
         base = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
         pair[0] = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
         pair[1] = (u32*)malloc((size_t)OVS_W * OVS_H * 4);
-        emit = (float*)malloc(half);
-        tmp = (float*)malloc(half);
-        if (!base || !pair[0] || !pair[1] || !emit || !tmp) {
-            free(base); free(pair[0]); free(pair[1]); free(emit); free(tmp);
+        if (!base || !pair[0] || !pair[1]) {
+            free(base); free(pair[0]); free(pair[1]);
             base = NULL;
             return;
         }
     }
     if (k != base_k) {
-        /* the layout, from the design at 720 lines */
-        const int b = ovn_px1(4.0f, k), pad = ovn_px(18.0f, k), gline = ovn_px1(2.0f, k);
-        o = b + ovn_px(16.0f, k);
-        bw = ovn_px(OVN_BOX_W, k);
-        p_lab = ovn_px1(1.25f, k); p_big = ovn_px1(5.0f, k); p_ms = ovn_px1(2.0f, k); p_sm = ovn_px1(1.0f, k);
+        /* the layout, from the design at 720 lines: rows of labels, meters and values, then the bars */
+        const int b = ovn_px1(OVN_EDGE, k), pad = ovn_px(12.0f, k), gap = ovn_px(9.0f, k);
+        const int p_sm = ovn_px1(1.34f, k);
+        o = b;
+        p = ovn_px1(2.0f, k);
+        rh = ovn_px(20.0f, k);
+        segw = ovn_px1(4.5f, k); segg = ovn_px1(1.5f, k); segh = ovn_px1(10.0f, k);
+        const int labw = ovn_width("RSX", p), valw = ovn_width("100%", p), meterw = 10 * (segw + segg) - segg;
+        bw = pad + labw + gap + meterw + gap + valw + pad;
         cx0 = o + pad;
         cx1 = o + bw - pad;
-        y_lab = o + pad;
-        y_big = y_lab + 8 * p_lab + ovn_px(10.0f, k);
-        y_unit = y_big + 7 * p_big - 7 * p_sm;                  /* "MS", its foot on the number's */
-        y_ms = y_unit - ovn_px(8.0f, k) - 7 * p_ms;
-        const int g_top = y_big + 8 * p_big + ovn_px(14.0f, k);  /* the graph's block: a line, the bars, a line */
-        const int g_bot = g_top + ovn_px(56.0f, k);
-        gy1 = g_bot - gline - ovn_px(4.0f, k);                   /* the bars' foot */
-        bar_h = ovn_px1(36.0f, k);
-        const int y_foot = g_bot + ovn_px(14.0f, k);
-        bh = y_foot + 8 * p_sm + ovn_px(14.0f, k) - o;
+        mx = cx0 + labw + gap;
+        y0 = o + pad;
+        bar_h = ovn_px1(32.0f, k);
+        gy1 = y0 + 7 * rh + ovn_px(7.0f, k) + bar_h;              /* the bars' foot */
+        const int y_foot = gy1 + ovn_px(6.0f, k);
+        bh = y_foot + 7 * p_sm + pad - o;
         W = o + bw + o;
         H = o + bh + o;
         if (W > OVS_W) W = OVS_W;
         if (H > OVS_H) H = OVS_H;
-        /* the box: dark glass with scan lines */
-        const int sl = ovn_px1(1.0f, k);
+        sl = ovn_px1(1.0f, k);
+        /* the box: dark glass at 80% */
+        const u32 glass = (u32)(11.0f * 0.8f + 0.5f) | (u32)(13.0f * 0.8f + 0.5f) << 8 | (u32)(26.0f * 0.8f + 0.5f) << 16 |
+                          (u32)(0.8f * 255.0f + 0.5f) << 24;
         for (int y = 0; y < H; y++)
-            for (int x = 0; x < W; x++) {
-                u32 p = 0;
-                if (x >= o && x < o + bw && y >= o && y < o + bh) {
-                    float a = 0.84f, r = 12.0f / 255.0f * a, g = 6.0f / 255.0f * a, bl = 28.0f / 255.0f * a;
-                    if ((y - o) % (3 * sl) < sl) {   /* a scan line: white at 4.5% over it */
-                        r = 0.045f + r * 0.955f; g = 0.045f + g * 0.955f; bl = 0.045f + bl * 0.955f; a = 0.045f + a * 0.955f;
-                    }
-                    p = (u32)(r * 255.0f + 0.5f) | (u32)(g * 255.0f + 0.5f) << 8 | (u32)(bl * 255.0f + 0.5f) << 16 |
-                        (u32)(a * 255.0f + 0.5f) << 24;
-                }
-                base[(size_t)y * OVS_W + x] = p;
-            }
-        /* the graph's two lines, white at 8% */
-        for (int pass = 0; pass < 2; pass++) {
-            const int y0 = pass ? g_bot - gline : g_top;
-            for (int y = y0; y < y0 + gline && y < H; y++)
-                for (int x = cx0; x < cx1; x++) {
-                    const u32 p = base[(size_t)y * OVS_W + x];
-                    const float a = (float)(p >> 24) / 255.0f, t = 0.08f;
-                    const u32 r = (u32)(t * 255.0f + (float)(p & 0xFF) * (1.0f - t) + 0.5f);
-                    const u32 g = (u32)(t * 255.0f + (float)((p >> 8) & 0xFF) * (1.0f - t) + 0.5f);
-                    const u32 bl = (u32)(t * 255.0f + (float)((p >> 16) & 0xFF) * (1.0f - t) + 0.5f);
-                    base[(size_t)y * OVS_W + x] = r | g << 8 | bl << 16 | (u32)((t + a * (1.0f - t)) * 255.0f + 0.5f) << 24;
-                }
-        }
-        /* the border, notched at the corners, and its glow, added to what is behind: light with no
-         * cover, alpha 0 outside the box */
-        float* g = (float*)calloc((size_t)W * H * 3, sizeof(float));
-        float* t = (float*)malloc((size_t)W * H * 3 * sizeof(float));
-        const OvnCanvas cv = { base, g, W, H, 0, 0, W, H, 0 };
+            for (int x = 0; x < W; x++)
+                base[(size_t)y * OVS_W + x] = x >= o && x < o + bw && y >= o && y < o + bh ? glass : 0;
+        const OvnCanvas cv = { base, W, H };
+        /* the border, its corners left out */
         ovn_fill(&cv, o, o - b, o + bw, o, OVN_CYAN, 1.0f);
         ovn_fill(&cv, o, o + bh, o + bw, o + bh + b, OVN_CYAN, 1.0f);
         ovn_fill(&cv, o - b, o, o, o + bh, OVN_CYAN, 1.0f);
         ovn_fill(&cv, o + bw, o, o + bw + b, o + bh, OVN_CYAN, 1.0f);
-        if (g && t) {
-            ovn_blur(g, t, W, H, ovn_px1(9.0f, k));
-            ovn_blur(g, t, W, H, ovn_px1(9.0f, k));
-            for (int y = 0; y < H; y++)
-                for (int x = 0; x < W; x++) {
-                    u32* const q = base + (size_t)y * OVS_W + x;
-                    if ((*q >> 24) == 0xFF) continue;   /* the border itself */
-                    const float* e = g + ((size_t)y * W + x) * 3;
-                    u32 p = *q & 0xFF000000u;
-                    for (int c = 0; c < 3; c++) {
-                        const float v = (float)((*q >> (8 * c)) & 0xFF) + e[c] * 1.6f * 255.0f;
-                        p |= (v >= 255.0f ? 255u : (u32)(v + 0.5f)) << (8 * c);
-                    }
-                    *q = p;
-                }
-        }
-        free(g);
-        free(t);
-        /* what does not change */
-        const OvnCanvas cs = { base, NULL, W, H, 0, 0, 0, 0, 0 };
-        ovn_text(&cs, cx1 - ovn_width("MS", p_sm), y_unit, p_sm, "MS", OVN_DIM, 0.0f);
-        ovn_text(&cs, cx0, y_foot, p_sm, "FRAME TIME", OVN_DIM, 0.0f);
-        hw = (bw + 1) / 2;
-        hh = (bh + 1) / 2;
+        /* what does not change: the labels, the bars' floor, the graph's name */
+        for (int r = 0; r < 7; r++) ovn_text(&cv, cx0, y0 + r * rh + (rh - 7 * p) / 2, p, lab[r], col[r]);
+        ovn_fill(&cv, cx0, gy1, cx1, gy1 + sl, OVN_DIM, 0.35f);
+        ovn_text(&cv, cx0, y_foot, p_sm, "FRAME TIME", OVN_DIM);
         base_k = k;
     }
 
-    /* the readings, over the panel, their light at half size */
+    /* the readings, over the panel */
     u32* const img = pair[back];
     for (int y = 0; y < H; y++) memcpy(img + (size_t)y * OVS_W, base + (size_t)y * OVS_W, (size_t)W * 4);
-    memset(emit, 0, (size_t)hw * hh * 3 * sizeof(float));
-    const OvnCanvas cv = { img, emit, W, H, o, o, hw, hh, 1 };
-    const double fps = s_ovs_fps, ms = s_ovs_ms;
-    char num[8], mst[12];
-    if (fps > 0.0) snprintf(num, sizeof num, "%d", (int)(fps < 999.0 ? fps + 0.5 : 999.0));
-    else snprintf(num, sizeof num, "--");
-    if (ms > 0.0) snprintf(mst, sizeof mst, "%.1f", ms < 999.9 ? ms : 999.9);
-    else snprintf(mst, sizeof mst, "--.-");
-    const u32 ncol = fps <= 0.0 ? OVN_DIM : fps >= 28.5 ? OVN_CYAN : fps >= 19.5 ? OVN_AMBER : OVN_HOT;
-    ovn_text(&cv, cx0, y_lab, p_lab, "FPS", OVN_PINK, 0.8f);
-    ovn_text(&cv, cx0, y_big, p_big, num, ncol, 1.0f);
-    ovn_text(&cv, cx1 - ovn_width(mst, p_ms), y_ms, p_ms, mst, OVN_TEXT, 0.0f);
+    const OvnCanvas cv = { img, W, H };
+    const double fps = s_ovs_fps;
+    int load[7] = { -1, -1, -1, -1, -1, -1, -1 };
+    char val[7][12];
+    if (fps > 0.0) {
+        snprintf(val[0], sizeof val[0], "%.1f", fps < 999.9 ? fps : 999.9);
+        snprintf(val[1], sizeof val[1], "%.1f", s_ovs_ms < 999.9 ? s_ovs_ms : 999.9);
+    } else {
+        snprintf(val[0], sizeof val[0], "--");
+        snprintf(val[1], sizeof val[1], "--.-");
+    }
+    const long pct[5] = { (long)((InterlockedCompareExchange(&s_ovs_pct[0], 0, 0) + 5) / 10), (long)(s_ovs_gpu + 0.5),
+                          (long)((InterlockedCompareExchange(&s_ovs_pct[1], 0, 0) + 5) / 10),
+                          (long)((InterlockedCompareExchange(&s_ovs_pct[2], 0, 0) + 5) / 10),
+                          (long)((InterlockedCompareExchange(&s_ovs_pct[3], 0, 0) + 5) / 10) };
+    for (int i = 0; i < 5; i++) {
+        load[2 + i] = pct[i] < 0 ? 0 : pct[i] > 100 ? 100 : (int)pct[i];
+        snprintf(val[2 + i], sizeof val[2 + i], "%d%%", load[2 + i]);
+    }
+    for (int r = 0; r < 7; r++) {
+        const u32 vc = r ? OVN_TEXT : fps <= 0.0 ? OVN_DIM : fps >= 28.5 ? OVN_CYAN : fps >= 19.5 ? OVN_AMBER : OVN_HOT;
+        ovn_text(&cv, cx1 - ovn_width(val[r], p), y0 + r * rh + (rh - 7 * p) / 2, p, val[r], vc);
+        if (load[r] < 0) continue;
+        /* the load's meter: ten segments, lit in the label's colour, the rest at 30% of it */
+        const int lit = (load[r] * 10 + 50) / 100, sy = y0 + r * rh + (rh - segh) / 2;
+        for (int s = 0; s < 10; s++)
+            ovn_fill(&cv, mx + s * (segw + segg), sy, mx + s * (segw + segg) + segw, sy + segh, col[r],
+                     s < lit ? 1.0f : 0.30f);
+    }
     /* the bars: the last frames two a bar, the slower of each pair, newest on the right, against
      * the median of them all -- 1.25 times it slow, 1.8 times a hitch. At 1.15 a third of the bars
      * of a 60-frame movie were slow: presents a vblank apart and two apart, as it always paces. */
     {
-        const int bwid = ovn_px1(4.0f, k), bgap = ovn_px1(2.0f, k);
-        int nb = (cx1 - cx0 + bgap) / (bwid + bgap);
-        if (nb > OVS_HIST / 2) nb = OVS_HIST / 2;
+        const int bgap = ovn_px1(0.67f, k), nb = OVS_HIST / 2;   /* the 96 frames, over the box's width */
         float v[OVS_HIST / 2], sorted[OVS_HIST];
         int ns = 0;
         for (int j = 0; j < nb; j++) {
@@ -5488,43 +5437,25 @@ static void ov_render_neon(float k)
             sorted[j + 1] = t;
         }
         const float med = ns ? sorted[ns / 2] : 0.0f;
-        const int x_end = cx0 + nb * (bwid + bgap) - bgap, x_start = cx0 + (cx1 - x_end) / 2;
         for (int j = 0; med > 0.0f && j < nb; j++) {
             if (v[j] <= 0.0f) continue;
             const float m = v[j] / med;
             int h = (int)lroundf((m / 2.6f < 1.0f ? m / 2.6f : 1.0f) * (float)bar_h);
             if (h < ovn_px1(3.0f, k)) h = ovn_px1(3.0f, k);
             const u32 c = m <= 1.25f ? OVN_CYAN : m <= 1.8f ? OVN_AMBER : OVN_HOT;
-            const int x = x_start + j * (bwid + bgap);
-            ovn_fill(&cv, x, gy1 - h, x + bwid, gy1, c, 0.6f);
+            const int x = cx0 + (cx1 - cx0) * j / nb, xn = cx0 + (cx1 - cx0) * (j + 1) / nb;
+            ovn_fill(&cv, x, gy1 - h, xn - bgap > x ? xn - bgap : x + 1, gy1, c, 1.0f);
         }
     }
-    ovn_blur(emit, tmp, hw, hh, ovn_px1(3.0f, k));
-    ovn_blur(emit, tmp, hw, hh, ovn_px1(3.0f, k));
-    /* their glow over the box, filtered up from half size, where nothing is drawn */
+    /* the scan lines: every third line of the box at 72%, what is drawn on it too */
     for (int y = o; y < o + bh && y < H; y++) {
-        float v = ((float)(y - o) + 0.5f) * 0.5f - 0.5f;
-        if (v < 0.0f) v = 0.0f;
-        if (v > (float)(hh - 1)) v = (float)(hh - 1);
-        const int j0 = (int)v, j1 = j0 + 1 < hh ? j0 + 1 : j0;
-        const float tv = v - (float)j0;
-        const float* r0 = emit + (size_t)j0 * hw * 3, *r1 = emit + (size_t)j1 * hw * 3;
+        if ((y - o) % (3 * sl) < 2 * sl) continue;
         for (int x = o; x < o + bw && x < W; x++) {
-            u32* const out = img + (size_t)y * OVS_W + x;
-            if ((*out >> 24) == 0xFF) continue;   /* a reading, the border, the fixed text */
-            float u = ((float)(x - o) + 0.5f) * 0.5f - 0.5f;
-            if (u < 0.0f) u = 0.0f;
-            if (u > (float)(hw - 1)) u = (float)(hw - 1);
-            const int i0 = (int)u, i1 = i0 + 1 < hw ? i0 + 1 : i0;
-            const float tu = u - (float)i0;
-            u32 p = *out & 0xFF000000u;
-            for (int c = 0; c < 3; c++) {
-                const float top = r0[i0 * 3 + c] + (r0[i1 * 3 + c] - r0[i0 * 3 + c]) * tu;
-                const float bot = r1[i0 * 3 + c] + (r1[i1 * 3 + c] - r1[i0 * 3 + c]) * tu;
-                const float val = (float)((*out >> (8 * c)) & 0xFF) + (top + (bot - top) * tv) * 1.2f * 255.0f;
-                p |= (val >= 255.0f ? 255u : (u32)(val + 0.5f)) << (8 * c);
-            }
-            *out = p;
+            u32* const q = img + (size_t)y * OVS_W + x;
+            const u32 p0 = *q;
+            u32 out = p0 & 0xFF000000u;
+            for (int ch = 0; ch < 3; ch++) out |= (u32)((float)((p0 >> (8 * ch)) & 0xFF) * 0.72f + 0.5f) << (8 * ch);
+            *q = out;
         }
     }
     EnterCriticalSection(&s_ovs_lock);
@@ -5816,7 +5747,7 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     }
     if (panel && pw && ph) {
         /* the panel in the top right corner, a texel to a pixel: the stats panel pfont in, the neon
-         * one's box 44 x 40 in at 720 lines (its glow reaching past it) */
+         * one's box 44 x 40 in at 720 lines (its border just outside it) */
         float x = bw - (float)pfont - (float)pw, y = (float)pfont;
         if (!ovs_stats_on()) {
             x = bw - (float)ovn_px(44.0f, nk) - (float)(pw - po);
@@ -5905,7 +5836,7 @@ static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
                                                                         "SetThreadDescription");
         const struct { LPTHREAD_START_ROUTINE fn; const wchar_t* name; } th[2] = {
             { ovs_painter, L"overlay panel" }, { ovs_sampler, L"overlay stats" } };
-        for (int i = 0; i < (ovs_stats_on() ? 2 : 1); i++) {   /* the loads only for the stats panel */
+        for (int i = 0; i < 2; i++) {   /* the loads, for either panel */
             HANDLE h = CreateThread(NULL, 0, th[i].fn, NULL, 0, NULL);
             if (!h) continue;
             if (set_desc) set_desc(h, th[i].name);
@@ -13498,7 +13429,7 @@ static int gts_on(void)
     static int v = -1;
     if (v >= 0) return v;
     v = 0;
-    if (!(rsx_census_secs() || ovs_stats_on()) || !s_d3d.device || !s_d3d.cmd_queue) return v;
+    if (!(rsx_census_secs() || ovs_on()) || !s_d3d.device || !s_d3d.cmd_queue) return v;
     D3D12_QUERY_HEAP_DESC qd;
     memset(&qd, 0, sizeof qd);
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -13597,7 +13528,7 @@ static void gts_read(void)
     s_hl_gpu_ms[1] = (double)(t[2] - t[1]) * k;
     s_hl_gpu_ms[2] = (double)(t[3] - t[2]) * k;
     s_hl_gpu_ms[3] = (double)(t[3] - t[0]) * k;
-    if (ovs_stats_on()) s_ovs_gpu_ms += s_hl_gpu_ms[3];
+    if (ovs_on()) s_ovs_gpu_ms += s_hl_gpu_ms[3];
     if (s_hl_gpu_ms[1] < 50.0 || s_gps_rd_slot < 0) return;
     const int fi = s_gps_rd_slot, n = s_gps_rd_n;
     D3D12_RANGE pr = { (SIZE_T)8 * GPS_MAX * fi, (SIZE_T)8 * GPS_MAX * fi + (SIZE_T)8 * n };

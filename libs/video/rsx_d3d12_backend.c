@@ -7645,14 +7645,21 @@ static int vp_get_vs(const rsx_state* st)
         }
     }
     /* display.ultrawide, the screen's edges: the title keeps its 2D inside the 16:9 in the middle, so a fade, a backdrop
-     * or a cutscene's bars would stop there with the scene going on beside them. A flat vertex at or past that edge goes
-     * as far past the screen's when the draw asks for it (vp_posoffset.w, vp_record_cb); inside the 16:9 nothing moves. */
+     * or a cutscene's bars would stop there with the scene going on beside them. When the draw asks for it
+     * (vp_posoffset.w 1, vp_record_cb), a flat vertex on that edge, within a few of the title's pixels, goes to the
+     * screen's; inside the 16:9 nothing moves, and neither does one well past the edge: the HUD slides in and out from
+     * there, and pulled to the screen's edge its pieces stretched across the side (issue #23).
+     * A picture the title made at the display's size (vp_posoffset.w -1: a studio's logo, a notice) comes the other way:
+     * its vertices at the screen's edges go to the 16:9's, so it keeps its shape in the middle. The title's movies set
+     * their own width and stay as they are. */
     if (s_wide != 1.0f) {
         static const char anchor[] = "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
-        char add[256];
+        char add[400];
         const int n = snprintf(add, sizeof add,
-                               " if (vp_posoffset.w != 0.0 && abs(_p.w - 1.0) < 0.001 && abs(Out.pos.x) >= %f && abs(Out.pos.x) < 0.999)"
-                               " Out.pos.x *= %f;", 1.0f / s_wide - 0.002f, s_wide);
+                               " if (vp_posoffset.w > 0.0 && abs(_p.w - 1.0) < 0.001 && abs(abs(Out.pos.x) - %f) < %f)"
+                               " Out.pos.x = sign(Out.pos.x);"
+                               " if (vp_posoffset.w < 0.0 && abs(Out.pos.x) >= 0.999 * abs(Out.pos.w)) Out.pos.x *= %f;",
+                               1.0f / s_wide, 0.003f / s_wide, 1.0f / s_wide);   /* 0.003 / s_wide: 2 pixels of 1280 */
         char* at = strstr(hlsl, anchor);
         if (at && n > 0 && n < (int)sizeof add && strlen(hlsl) + (size_t)n < sizeof hlsl) {
             at += sizeof anchor - 1;
@@ -11385,6 +11392,11 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             }
         }
         if (s_wide_3d && (dr->rt_off & DISP_RT_TAG)) vpx[7] = 1.0f;   /* over a scene: see "the screen's edges" */
+        /* A picture in main memory at the display's size, drawn on the display through no camera: the title's studio
+         * logos and notices, made for 16:9 and drawn over the whole screen. Its edges come in to the 16:9's. */
+        if ((dr->rt_off & DISP_RT_TAG) && !(vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) &&
+            dr->tex[0].off && dr->tex[0].off < 0xC0000000u && dr->tex[0].w == s_d3d.width && dr->tex[0].h == s_d3d.height)
+            vpx[7] = -1.0f;
     }
     if (FG_INPUTS() && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
         vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {

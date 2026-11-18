@@ -1791,6 +1791,49 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     return 1;
 }
 
+int rsx_fp_apply_alpha_test_dyn(char* hlsl, u32 out_size)
+{
+    if (!hlsl || out_size == 0)
+        return -1;
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
+        marker = p;
+    if (!marker)
+        return -1;
+    char* expression = marker + strlen("    return ");
+    char* terminator = strstr(expression, ";\n}\n");
+    if (!terminator || terminator == expression ||
+        (size_t)(terminator - expression) >= 96)
+        return -1;
+    char output[96];
+    memcpy(output, expression, (size_t)(terminator - expression));
+    output[terminator - expression] = '\0';
+
+    const int mrt = fp_returns_struct(hlsl);
+    char suffix[1024];
+    const int n = snprintf(
+        suffix, sizeof(suffix),
+        "    %s _rsx_out = %s;\n"
+        "    const uint _rsx_at = asuint(fp_state.x);\n"
+        "    [branch] if (_rsx_at & 0x800u) {\n"
+        "        const float _rsx_a = %s.a, _rsx_r = fp_alpha.x;\n"
+        "        const uint _rsx_f = (_rsx_at >> 8) & 7u;\n"
+        "        const bool _rsx_pass = _rsx_f == 1u ? _rsx_a < _rsx_r : _rsx_f == 2u ? _rsx_a == _rsx_r :\n"
+        "                               _rsx_f == 3u ? _rsx_a <= _rsx_r : _rsx_f == 4u ? _rsx_a > _rsx_r :\n"
+        "                               _rsx_f == 5u ? _rsx_a != _rsx_r : _rsx_f == 6u ? _rsx_a >= _rsx_r : false;\n"
+        "        if (!_rsx_pass) discard;\n"
+        "    }\n"
+        "    return _rsx_out;\n}\n",
+        mrt ? "PSOutput" : "float4", output, mrt ? "_rsx_out.t0" : "_rsx_out");
+    if (n < 0 || (u32)n >= sizeof(suffix))
+        return -1;
+    const size_t prefix = (size_t)(marker - hlsl);
+    if (prefix + (size_t)n + 1 > out_size)
+        return -1;
+    memcpy(marker, suffix, (size_t)n + 1);
+    return 1;
+}
+
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func)
 {

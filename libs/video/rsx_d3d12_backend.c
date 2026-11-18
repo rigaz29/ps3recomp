@@ -128,12 +128,23 @@
  * (rsx_fp_decompile_buffered_state_ex), so it can be built before any draw needs it: what
  * a draw binds and sets is read as the program runs, from b1. fp_tcscale[u].w: the unit's
  * view, depth comparison and its function, filter and coordinates (fp_dyn_tex_helpers);
- * fp_state (c17): x the flags (bit 0 the sRGB output), y the ultrawide x factor (1/s_wide,
- * for a target drawn wider, fp_alpha.w < 0), zw the AA sample grid; fp_alpha.w is 1 when
- * the render scale is off. The alpha test, sign expansion and which units compare depth
- * stay in the text (variants: the comparison's path would double a fetch). The setting
- * graphics.shader_prebuild (on by default), or RSX_FP_DYNAMIC; it needs DXC (register
- * spaces), and is off without it. Read once the device is made; 0 before it, not kept. */
+ * fp_state (c17): x the flags (bit 0 the sRGB output; bit 11 the alpha test, bits 8-10 its
+ * function, rsx_fp_apply_alpha_test_dyn, against fp_alpha.x), y the ultrawide x factor
+ * (1/s_wide, for a target drawn wider, fp_alpha.w < 0), zw the AA sample grid; fp_alpha.w
+ * is 1 when the render scale is off. Sign expansion and which units compare depth stay in
+ * the text (variants: the comparison's path would double a fetch). The alpha test was one
+ * too, a text a function, until FP_DYN_FORM 2: its discard in every program cost nothing
+ * measured (2026-11-18), and the build ahead then takes the alpha-tested draws' programs
+ * too (RSX_FP_ATEST_VARIANT=1: as before). The setting graphics.shader_prebuild (on by
+ * default), or RSX_FP_DYNAMIC; it needs DXC (register spaces), and is off without it. Read
+ * once the device is made; 0 before it, not kept. */
+#define FP_DYN_FORM 2u   /* the texts' form: the file built ahead (FPB_TEXT) and the pipelines (PSOC_VERSION_DYN) carry it */
+static int fp_atest_variant(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_ATEST_VARIANT"); v = e && atoi(e) ? 1 : 0; }
+    return v;
+}
 static int fp_dyn_dxc(void);   /* 1 DXC, 0 not, -1 no device yet */
 static int fp_dyn_on(void)
 {
@@ -1353,15 +1364,16 @@ static const char s_psoc_magic1[8] = { 'G', 'W', 'P', 'S', 'O', 'C', '0', '1' };
 /* The pipelines the store had at the start, in order: built by psoc_thread. */
 typedef struct { u64 key, vs, ps; u32 used, stn; const u8* st; } PsocRec;
 static PsocRec* s_psoc_recs;
-/* A PIPE's description begins with its form (psoc_state_bytes): 1, or 2 when its session drew with the pixel shaders'
- * new form (fp_dyn_on), whose pipelines the other form's draws never ask for, nor the other way round. */
+/* A PIPE's description begins with its form (psoc_state_bytes): 1, or 1 + FP_DYN_FORM when its session drew with the
+ * pixel shaders' dynamic texts (fp_dyn_on): a session's draws ask for its own form's pipelines only, not the old texts'
+ * nor an earlier dynamic form's (2: the alpha test still compiled in). */
 #define PSOC_VERSION     1u
-#define PSOC_VERSION_DYN 2u
-static int psoc_rec_dyn(const PsocRec* r)
+#define PSOC_VERSION_DYN (1u + FP_DYN_FORM)
+static u32 psoc_rec_tag(const PsocRec* r)
 {
     u32 v = 0;
     if (r->st && r->stn >= 4) memcpy(&v, r->st, 4);
-    return v == PSOC_VERSION_DYN;
+    return v;
 }
 static u32 s_psoc_nrecs, s_psoc_rcap;
 
@@ -1900,15 +1912,15 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
     F->srcs = (ShaderCacheEntry*)malloc((size_t)(s_shc_n + 1) * sizeof *F->srcs);
     F->pipes = (u32*)malloc((size_t)(s_psoc_nrecs + 1) * sizeof *F->pipes);
     if (F->progs && F->srcs && F->pipes) {
-        /* With the pixel shaders' new form on (fp_dyn_on), the pipelines sessions of the old one made go (their
-         * description's PSOC_VERSION), and the pixel programs only they had, with the sources that name them: no
-         * draw asks for them again. On a store of 1,787 pipelines (2026-11-18) all were old: the start's build took
+        /* With the pixel shaders' new form on (fp_dyn_on), the pipelines sessions of another form made go (the old
+         * texts', an earlier dynamic form's: their description's first word is not PSOC_VERSION_DYN), and the pixel
+         * programs only they had, with the sources that name them: no draw asks for them again. On a store of 1,787 pipelines (2026-11-18) all were old: the start's build took
          * 57 s and 918 MB more for them with a cold driver cache; 886 programs went with them. The vertex programs
          * and everything else stay; with it off, all of it. */
         const int drop = fp_dyn_on();
         for (u32 r = 0; r < s_psoc_nrecs; r++) {
             ShProg* ps = drop ? shp_get(s_psoc_recs[r].ps) : NULL;
-            if (drop && !psoc_rec_dyn(&s_psoc_recs[r])) {
+            if (drop && psoc_rec_tag(&s_psoc_recs[r]) != PSOC_VERSION_DYN) {
                 if (ps) ps->mark |= SHP_DROP;
                 F->drop_pipes++;
                 continue;
@@ -2017,7 +2029,7 @@ static int fp_dyn_dxc(void)
  * A record cut short, or still without its tag, ends the read until the next
  * look, a second after the last one, when a source is not found.
  * -----------------------------------------------------------------------*/
-#define FPB_TEXT  1u                  /* the texts' form: bump it when fp_dyn_text makes another text of a program */
+#define FPB_TEXT  FP_DYN_FORM         /* the texts' form: a file of another is begun again */
 #define FPB_HDR   32u
 #define FPB_ID    24u                 /* the header's part that names the build: magic to the compiler */
 #define FPB_DICT  (1u << 20)          /* the dictionary, at most */
@@ -2691,7 +2703,7 @@ static int psoc_state_read(const u8* b, u32 n, D3D12_GRAPHICS_PIPELINE_STATE_DES
 #define PSOC_RD() (o + 4u <= n ? (o += 4u, *(const u32*)(b + o - 4u)) : (o = n + 1u, 0u))
     memset(pd, 0, sizeof *pd);
     const u32 ver = PSOC_RD();
-    if (ver != PSOC_VERSION && ver != PSOC_VERSION_DYN) return 0;
+    if (ver != PSOC_VERSION && ver != PSOC_VERSION_DYN) return 0;   /* an earlier dynamic form's: not built */
     *dbt = (int)PSOC_RD();
     D3D12_BLEND_DESC* bl = &pd->BlendState;
     bl->AlphaToCoverageEnable = (BOOL)PSOC_RD(); bl->IndependentBlendEnable = (BOOL)PSOC_RD();
@@ -3074,7 +3086,7 @@ static void psoc_start(void)
     s_psoc_want = (u8*)malloc((size_t)s_psoc_nrecs + 1);
     if (s_psoc_want)
         for (u32 r = 0; r < s_psoc_nrecs; r++) {
-            s_psoc_want[r] = (u8)(psoc_rec_dyn(&s_psoc_recs[r]) == (dyn != 0));
+            s_psoc_want[r] = (u8)(psoc_rec_tag(&s_psoc_recs[r]) == (dyn ? PSOC_VERSION_DYN : PSOC_VERSION));
             other += !s_psoc_want[r];
         }
     AcquireSRWLockExclusive(&s_psoc_lock);
@@ -9444,8 +9456,9 @@ static int dr_unit_view(const D3D12DrawRecord* dr, int u)
 /* RSX_FP_DYNAMIC: what a draw's program reads at run time, written into its b1 slot at
  * replay beside the coordinate scales (fp_dyn_on, fp_dyn_tex_helpers): each unit's view
  * (the one its descriptor was made with, dr_unit_view) and depth comparison in
- * fp_tcscale[u].w, the sRGB output, the ultrawide factor and the AA grid in fp_state, and
- * fp_alpha.w 1 while the render scale is off. */
+ * fp_tcscale[u].w, the sRGB output, the alpha test (its reference is fp_alpha.x already),
+ * the ultrawide factor and the AA grid in fp_state, and fp_alpha.w 1 while the render
+ * scale is off. */
 static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
 {
     rsx_fp_shadow_desc sd[16];
@@ -9457,7 +9470,11 @@ static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
                   (u32)(sd[u].unnormalized & 1u) << 7;
         memcpy(&ts[u * 4 + 3], &st, 4);
     }
-    const u32 flags = (dr->fp_ctrl & FP_CTRL_SRGB_OUT) ? 1u : 0u;
+    u32 flags = (dr->fp_ctrl & FP_CTRL_SRGB_OUT) ? 1u : 0u;
+    /* The alpha test as vp_get_fp_pso reads it, ALWAYS as none: bit 11, its function in bits 8-10. */
+    if (((dr->alpha_ctl >> 16) & 1u) && ((dr->alpha_ctl >> 8) & 0xFFu) < 7u &&
+        !env_on("NO_ALPHATEST", &s_env_noalphatest))
+        flags |= 0x800u | ((dr->alpha_ctl >> 8) & 7u) << 8;
     u32 aax = 1, aay = 1;
     rsx_aa_grid(dr->rt_fmt, &aax, &aay);
     float* fs = ts + FPCB_STATE * 4;
@@ -9470,7 +9487,8 @@ static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
 
 /* RSX_FP_DYNAMIC: a buffered program's whole text, from the program, its control bits (SET_SHADER_CONTROL's
  * export bits, 0x4E), the units it compares depth on, its sign-expanding lanes (NULL: none) and its alpha test
- * function (0: none). The draw's pipeline lookup (vp_get_fp_pso) and the build ahead of play
+ * function (0: none; every text tests alpha as it runs, so the function changes the text only with
+ * RSX_FP_ATEST_VARIANT=1). The draw's pipeline lookup (vp_get_fp_pso) and the build ahead of play
  * (rsx_d3d12_prebuild_fragment_programs) both make it here, so a program has the one text, and the one source key,
  * in both. Returns the instruction count, or 0 or less when it does not translate. */
 static int fp_dyn_text(const u8* prog, u32 prog_max, u32 fp_ctrl, u32 dshadow, const u8* exp_masks, u32 atest,
@@ -9515,7 +9533,10 @@ static int fp_dyn_text(const u8* prog, u32 prog_max, u32 fp_ctrl, u32 dshadow, c
                      "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? fp_state.y : 1.0) + fp_alpha.z, "
                      "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + "
                      "fp_alpha.z,");
-    if (atest && rsx_fp_apply_alpha_test_buffered(hlsl, (u32)cap, atest & 0xFFFFu) < 0) {
+    /* The alpha test: read as the program runs, in every text (fp_dyn_state's bits), or compiled in, a text a
+     * function, as before FP_DYN_FORM 2 (RSX_FP_ATEST_VARIANT=1). */
+    if (fp_atest_variant() ? atest && rsx_fp_apply_alpha_test_buffered(hlsl, (u32)cap, atest & 0xFFFFu) < 0
+                           : rsx_fp_apply_alpha_test_dyn(hlsl, (u32)cap) < 0) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 8))
             fprintf(stderr, "[FP] fp=0x%08X: alpha test 0x%X not applied (shape)%c", fp_addr, atest & 0xFFFFu, 10);
@@ -10053,6 +10074,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         atest = 0x200u | ((udr->alpha_ctl >> 8) & 0xFFu);
         if (!buffered) atest |= (udr->alpha_ctl & 0xFFu) << 16;
     }
+    if (dyn && !fp_atest_variant()) atest = 0;   /* read as the program runs (fp_dyn_state): not in the text or key */
 
     s_perf_pso_calls++;
     /* Keyed on the code, not on where it lives. The compiled shader reads its

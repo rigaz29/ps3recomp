@@ -187,6 +187,15 @@ u64 rsx_fp_literal_source_hash(
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
 
+/* The alpha test read as the program runs, for a text that declares fp_state
+ * (rsx_fp_decompile_buffered_state_ex): asuint(fp_state.x) bit 11 on, bits
+ * 8-10 the function (CELL_GCM's less 0x200, NEVER 0 to GEQUAL 6), fp_alpha.x
+ * the reference; the colour output's alpha (with MRT the first target's) is
+ * tested as the RSX does after the program. Every text has it, so one text
+ * serves a program's draws with any alpha test or none. 1 added, -1 when the
+ * text's last return is not of the shape it rewrites. */
+int rsx_fp_apply_alpha_test_dyn(char* hlsl, u32 out_size);
+
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
  * -1 when one allocation can never fit. */

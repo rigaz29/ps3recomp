@@ -1310,7 +1310,13 @@ static void fg_frame(void)
  * bench's to 129 MB. Both are read once into the store; the fold replaces the
  * first and deletes the second.
  * -----------------------------------------------------------------------*/
-typedef struct ShProg { u64 id; u32 len; u32 mark; const u8* p; } ShProg;   /* mark: shc_fold_start's, while it looks */
+typedef struct ShProg { u64 id; u32 len; u32 mark; const u8* p; } ShProg;
+/* ShProg.mark: shc_fold_start's, while it looks at the pipelines (DROP, KEEP), and what it leaves out of the pack
+ * (GONE): a program it left out that a draw uses again goes back onto the journal (shp_put, shc_keep,
+ * d3d_compile_cached), else the pipelines made with it would name a program the next start does not have. */
+#define SHP_DROP     0x10u          /* a pixel program of old pipelines */
+#define SHP_KEEP     0x20u          /* a program of a pipeline it keeps */
+#define SHP_GONE     0x40u          /* left out of the last pack, and not used since */
 typedef struct { u64 key; u32 srclen; ShProg* prog; } ShaderCacheEntry;
 static ShaderCacheEntry* s_shc;     /* source -> program: open addressing, s_shc_cap slots (a power of two) */
 static u32    s_shc_cap, s_shc_n;
@@ -1471,7 +1477,11 @@ static ShProg* shp_put(const void* p, u32 n, u64 id, int own, int* added)
         free(old);
     }
     ShProg** s = shp_slot(id);
-    if (*s) return (*s)->len == n && !memcmp((*s)->p, p, n) ? *s : NULL;
+    if (*s) {
+        if ((*s)->len != n || memcmp((*s)->p, p, n)) return NULL;
+        if ((*s)->mark & SHP_GONE) { (*s)->mark &= ~SHP_GONE; *added = 1; }   /* a pack left it out: again */
+        return *s;
+    }
     ShProg* g = (ShProg*)malloc(sizeof *g + (own ? n : 0));
     if (!g) return NULL;
     g->id = id; g->len = n; g->mark = 0;
@@ -1482,9 +1492,6 @@ static ShProg* shp_put(const void* p, u32 n, u64 id, int own, int* added)
     return g;
 }
 
-/* shc_fold_start's marks on the programs, while it looks at the pipelines (ShProg.mark). */
-#define SHP_DROP     0x10u          /* a pixel program of old pipelines */
-#define SHP_KEEP     0x20u          /* a program of a pipeline it keeps */
 
 /* A program's bytes in a blob for the caller to own: the store hands out no
  * blob of its own. d3dcompiler_47 counts a blob's references without atomics
@@ -1561,7 +1568,7 @@ static void shc_keep(u64 key, u32 srclen, ID3DBlob* b)
     ShProg* g = shp_put(b->lpVtbl->GetBufferPointer(b), (u32)b->lpVtbl->GetBufferSize(b), 0, 1, &added);
     if (!g) return;
     if (added) shj_prog(g);
-    if (shc_put(key, srclen, g)) {
+    if (shc_put(key, srclen, g) || added) {   /* added: new, or back from a pack that left it and its sources out */
         u32 h[6];
         shr_srck(h, key, srclen, g->id);
         shj_put(SHR_SRCK, h, 24, NULL, 0);
@@ -1917,7 +1924,10 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
         }
         for (u32 i = 0; i < s_shc_cap; i++)
             if (s_shc[i].prog && (s_shc[i].prog->mark & (SHP_DROP | SHP_KEEP)) != SHP_DROP) F->srcs[F->nsrc++] = s_shc[i];
-        for (u32 i = 0; i < s_shp_n; i++) s_shp_list[i]->mark = 0;
+        for (u32 i = 0; i < s_shp_n; i++) {
+            ShProg* g = s_shp_list[i];
+            g->mark = (g->mark & (SHP_DROP | SHP_KEEP)) == SHP_DROP ? SHP_GONE : 0;
+        }
         F->jid = s_shc_file ? s_shc_jid : 0;
         F->jlen = s_shc_file ? jlen : 0;
         F->old_pso = old_pso;
@@ -2307,6 +2317,13 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
         key = shc_key(src, len, target, flags);
         ShaderCacheEntry* e = s_shc_cap ? shc_slot(key, (u32)len) : NULL;
         ID3DBlob* c = e && e->prog ? shp_blob(e->prog) : NULL;
+        if (c && (e->prog->mark & SHP_GONE)) {   /* a pack left it out, and it is used: back onto the journal */
+            u32 h[6];
+            e->prog->mark &= ~SHP_GONE;
+            shj_prog(e->prog);
+            shr_srck(h, key, (u32)len, e->prog->id);
+            shj_put(SHR_SRCK, h, 24, NULL, 0);
+        }
         if (c) {
             *out = c;
             if (err) *err = NULL;

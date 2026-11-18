@@ -78,16 +78,18 @@
  * batch falls to the CPU's conversion (ib_full_note), which at that rate cost two thirds of a
  * core and dropped most of the frame's geometry (2 M, the old size, went black). */
 #define VP_MAX_INDICES  (1u << 22)
-#define MAX_DRAWS         8192  /* per-frame draw records. 2048 was sized
+#define MAX_DRAWS        16384  /* per-frame draw records. 2048 was sized
                                  * from God of War HD's worst case (~1841):
                                  * God of War: Ascension's first level needs
                                  * up to 3226, and two thirds of its frames
                                  * lost the draws past 2048 -- the HUD and
-                                 * effects drawn last among them. A full batch
-                                 * still drops, and says so once (rsx_draw_room).
-                                 * The per-draw constant buffer is
-                                 * VP_CB_STRIDE * MAX_DRAWS * 2 bytes, so 16384
-                                 * asked for a 264 MB upload allocation. */
+                                 * effects drawn last among them. 8192 held
+                                 * until the end of that level: two frames of
+                                 * 8,439 and 8,363 as the parasitic hand
+                                 * arrives (issue #15). A full batch still
+                                 * drops, and says so (rsx_draw_room). A record
+                                 * is 1,560 bytes; the vertex constants have
+                                 * slots of their own, VP_CB_SLOTS a batch. */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
  * (514 vec4 = 8224 B), then the raw-fetch attribute table (vp_fa[16] and
  * vp_fk[16], 32 vec4, at VP_CB_RAW_OFF), rounded up to D3D12's 256-byte CBV
@@ -102,14 +104,21 @@
 #define VP_TEX_UNITS      16
 #define VP_CB_STRIDE      8960
 #define VP_CB_RAW_OFF     8224
+/* The per-draw constant buffer's slots, each parity half: VP_CB_STRIDE * VP_CB_SLOTS * 2 bytes of upload heap,
+ * 140 MB. A draw whose constants equal the last written ones shares their slot (vp_cb_commit), five records in six
+ * at the gate, so a slot is taken only when they differ, the next one in turn: a batch of more records than slots
+ * fits while it shares. A slot for each record, at the record's index, asked for 280 MB at 16384. */
+#define VP_CB_SLOTS       8192
 /* b1, a draw's fragment program constants: the PSConstants of
  * rsx_fp_decompile_buffered_*, rearranged by vp_get_fp_pso so the fixed members
  * come first -- fp_tcscale[16] (c0-c15), fp_alpha (c16), fp_constants[] (c17
  * on). Each draw's slot is as long as its program needs (vp_record_cb), taken
  * in turn from its frame's half of vp_fpcb; up to FP_CB_MAX_K constants, a
  * program with more is compiled with them as literals. The guard after the
- * second half keeps a slot read past its end inside the buffer. */
-#define FPCB_HALF         ((u32)MAX_DRAWS * 2048u)
+ * second half keeps a slot read past its end inside the buffer. 16 MB a half,
+ * as at 8192 records: 512 bytes a slot at least, 1 KB a record on the average
+ * at MAX_DRAWS; a full half says so (vp_record_cb). */
+#define FPCB_HALF         ((u32)MAX_DRAWS * 1024u)
 #define FPCB_GUARD        (64u * 1024u)
 #define FPCB_ALPHA        16
 #define FPCB_CONSTS       17
@@ -4222,12 +4231,12 @@ static int init_d3d12(u32 width, u32 height)
         else
             fprintf(stderr, "[VPIB] allocation failed -- indexed draws are expanded to lists%c", 10);
 
-        bd.Width = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;   /* per-draw constant slots, x2 parity */
+        bd.Width = (u64)VP_CB_STRIDE * VP_CB_SLOTS * 2;   /* per-draw constant slots, x2 parity */
         /* A failure here is silent and catastrophic: vp_record_cb returns early,
          * every draw loses its constants, and the whole scene transforms by
          * zeros -- indistinguishable from a broken vertex program. Say so. */
-        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
-                (unsigned long long)(bd.Width >> 20), MAX_DRAWS, 10);
+        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d slots a batch, %d draws)%c",
+                (unsigned long long)(bd.Width >> 20), VP_CB_SLOTS, MAX_DRAWS, 10);
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
@@ -7545,7 +7554,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 const D3D12DrawRecord* r = &s_d3d.draws[d];
                 if (r->is_clear || !r->rt_off) continue;
                 const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
-                    + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
+                    + ((u64)par * VP_CB_SLOTS + r->cb_slot) * VP_CB_STRIDE);
                 int last_nz = -1; float maxabs = 0.0f;
                 for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++) {
                     float a = c[i] < 0 ? -c[i] : c[i];
@@ -7574,7 +7583,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 const D3D12DrawRecord* r = &s_d3d.draws[d];
                 if (r->is_clear || !r->dbt) continue;
                 const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
-                    + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
+                    + ((u64)par * VP_CB_SLOTS + r->cb_slot) * VP_CB_STRIDE);
                 fprintf(mf, "op%03u vs=%d n=%u sref=0x%02X\n", d, r->vs_idx, r->vertex_count,
                         (unsigned)r->stencil_ref);
                 for (int sl = 0; sl < RSX_MAX_VERTEX_CONSTANTS; sl++) {
@@ -8679,8 +8688,10 @@ static void rec_step2_state(D3D12DrawRecord* dr, const rsx_state* st)
  * batch filled, are said when it ends (render_frame), so a scene that outgrows MAX_DRAWS shows in the log, not as
  * missing objects. */
 static u32 s_batch_dropped;       /* draws dropped in this batch */
+static u32 s_batch_cb_dropped;    /* and for want of a constant slot (vp_cb_commit) */
 static unsigned s_batch_flip0;    /* the title's flip requests when it began */
 static double s_batch_t0;         /* and the time */
+static u32 s_batch_most;          /* the most records a batch has had, past half of MAX_DRAWS */
 static int rsx_draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;
@@ -8688,21 +8699,44 @@ static int rsx_draw_room(void)
     return 0;
 }
 
-/* At a batch's reset: what it dropped, said for the first eight and then at powers of two. More than one flip asked
- * for while it filled says frames piled up in it with no present between them; one says one frame outgrew it. */
-static void batch_overflow_note(void)
+/* At a batch's reset, with its records and the constant slots they took: what it dropped, said for the first eight
+ * and then at powers of two. More than one flip asked for while it filled says frames piled up in it with no present
+ * between them; one says one frame outgrew it. A batch past half of MAX_DRAWS (8192, the old size) says so too, at
+ * each new most, so a report shows how big the frames get and how many slots they take; D3D12_BATCH_NOTE=<records>
+ * from another size. */
+static void batch_overflow_note(u32 records, u32 slots)
 {
     extern unsigned cellGcm_flip_request_count(void);
+    static int note_at = -1;
+    if (note_at < 0) { const char* e = getenv("D3D12_BATCH_NOTE"); note_at = e ? atoi(e) : MAX_DRAWS / 2; }
     const unsigned fc = cellGcm_flip_request_count();
     const double now = perf_now();
+    const double ms = s_batch_t0 > 0.0 ? (now - s_batch_t0) * 1000.0 : 0.0;
     if (s_batch_dropped) {
         static u32 n;
         n++;
         if (n <= 8 || !(n & (n - 1)))
             fprintf(stderr, "[D3D12] a batch outgrew MAX_DRAWS (%d): %u draws dropped, %u flips asked for while it "
                             "filled, over %.0f ms (%u so far)%c", MAX_DRAWS, s_batch_dropped, fc - s_batch_flip0,
-                    s_batch_t0 > 0.0 ? (now - s_batch_t0) * 1000.0 : 0.0, n, 10);
+                    ms, n, 10);
         s_batch_dropped = 0;
+    }
+    if (s_batch_cb_dropped) {
+        static u32 n;
+        n++;
+        if (n <= 8 || !(n & (n - 1)))
+            fprintf(stderr, "[D3D12] a batch ran out of vertex constant slots: %u draws dropped, %u records, %u slots "
+                            "(%u so far)%c", s_batch_cb_dropped, records, slots, n, 10);
+        s_batch_cb_dropped = 0;
+    }
+    if (records > (u32)note_at && records > s_batch_most) {
+        static u32 n;
+        n++;
+        s_batch_most = records;
+        if (n <= 8 || !(n & (n - 1)))
+            fprintf(stderr, "[D3D12] the largest batch so far: %u draws, %u of the %d vertex constant slots, %u flips "
+                            "asked for while it filled, over %.0f ms%c", records, slots, VP_CB_SLOTS,
+                    fc - s_batch_flip0, ms, 10);
     }
     s_batch_flip0 = fc;
     s_batch_t0 = now;
@@ -11335,6 +11369,7 @@ static void vp_draw_raw(const D3D12DrawRecord* dr, int* ib_bound, int* raw_bound
 static u8 s_cbimg[VP_CB_STRIDE], s_cblast[VP_CB_STRIDE];
 static int s_cbimg_ok, s_cbimg_raw, s_cblast_raw;
 static u32 s_cblast_slot, s_cblast_gen = ~0u, s_cb_gen;
+static u32 s_cb_next;                       /* the batch's next free slot of its half (vpass_reset) */
 static u32 s_cbimg_bank, s_cblast_bank;     /* the bank's generation in each, 0 for none */
 static unsigned long long s_cb_written, s_cb_shared, s_cb_same_bank;
 
@@ -11671,13 +11706,25 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
     s_cbimg_ok = 1;
 }
 
-/* The slot made by vp_record_cb (and vp_record_raw_cb for a raw draw) to the draw: its own, or the
- * last written one of this batch when the same. */
-static void vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
+/* The slot made by vp_record_cb (and vp_record_raw_cb for a raw draw) to the draw: the last written one of this
+ * batch when the same, else the batch's next free one (s_cb_next), not one at the record's index, so a batch of more
+ * records than VP_CB_SLOTS fits while enough of them share. 0 when the constants differ and the half has no slot left:
+ * the caller drops the draw, its motion-vector record (FG) goes with it, and the batch's end says so. With
+ * VP_CB_SHARE=0 every draw takes a slot, and a batch past VP_CB_SLOTS records drops the rest. D3D12_CB_SLOTS=<n>
+ * takes fewer, to try that end. `slot` is the record's index. */
+static int vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
 {
     static int share = -1;
+    static u32 slots = 0;
     if (share < 0) { const char* e = getenv("VP_CB_SHARE"); share = e ? atoi(e) != 0 : 1; }
-    if (!s_cbimg_ok || !dr || slot >= MAX_DRAWS) return;
+    if (!slots) {
+        const char* e = getenv("D3D12_CB_SLOTS");
+        const int n = e ? atoi(e) : 0;
+        slots = n > 0 && n < VP_CB_SLOTS ? (u32)n : VP_CB_SLOTS;
+    }
+    if (!dr) return 1;
+    dr->cb_slot = 0;                        /* no image made: a slot of the half, as a record's own was */
+    if (!s_cbimg_ok || slot >= MAX_DRAWS) return 1;
     s_cbimg_ok = 0;
     const u32 bank_bytes = RSX_MAX_VERTEX_CONSTANTS * 16;
     const int same_bank = s_cbimg_bank && s_cbimg_bank == s_cblast_bank;
@@ -11689,19 +11736,26 @@ static void vp_cb_commit(D3D12DrawRecord* dr, u32 slot)
         s_cb_shared++;
         s_cb_same_bank += (unsigned)same_bank;
         s_cblast_bank = s_cbimg_bank;       /* the same words */
-        return;
+        return 1;
     }
-    char* dst = (char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+    if (s_cb_next >= slots) {
+        s_batch_cb_dropped++;
+        if (s_fg.obj_n && s_fg.obj[s_fg.obj_n - 1] == slot) s_fg.obj_n--;
+        return 0;
+    }
+    const u32 cs = s_cb_next++;
+    char* dst = (char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * VP_CB_SLOTS + cs) * VP_CB_STRIDE;
     memcpy(dst, s_cbimg, VP_CB_IMG);
     if (s_cbimg_raw) memcpy(dst + VP_CB_RAW_OFF, s_cbimg + VP_CB_RAW_OFF, VP_CB_RAW_BYTES);
     memcpy(s_cblast, s_cbimg, VP_CB_IMG);
     if (s_cbimg_raw) memcpy(s_cblast + VP_CB_RAW_OFF, s_cbimg + VP_CB_RAW_OFF, VP_CB_RAW_BYTES);
     s_cblast_raw = s_cbimg_raw;
     s_cblast_bank = s_cbimg_bank;
-    s_cblast_slot = slot;
+    s_cblast_slot = cs;
     s_cblast_gen = s_cb_gen;
-    dr->cb_slot = slot;
+    dr->cb_slot = cs;
     s_cb_written++;
+    return 1;
 }
 
 /* The SET_SHADER_CONTROL bits a guest FP's translation depends on. */
@@ -15831,7 +15885,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 }
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
-                    + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_CB_STRIDE);
+                    + ((u64)s_d3d.vp_parity * VP_CB_SLOTS + dr->cb_slot) * VP_CB_STRIDE);
                 if (s_d3d.vp_fpcb)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
@@ -16048,7 +16102,7 @@ static void fg_objects(void)
     const D3D12_RECT sc = { 0, 0, (LONG)s_d3d.pw, (LONG)s_d3d.ph };
     cl->lpVtbl->RSSetViewports(cl, 1, &vp);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
-    const u64 cb = s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb) + (u64)s_d3d.vp_parity * MAX_DRAWS * VP_CB_STRIDE;
+    const u64 cb = s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb) + (u64)s_d3d.vp_parity * VP_CB_SLOTS * VP_CB_STRIDE;
     for (u32 i = 0; i < s_fg.obj_n; i++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[s_fg.obj[i]];
         ID3D12PipelineState* pso = dr->raw ? fg_obj_pso(dr->vs_idx) : NULL;
@@ -16266,7 +16320,7 @@ static void render_frame(void)
     s_raw_run_valid = 0;
     s_seg_n = 0;
     s_d3d.draw_count = 0;
-    batch_overflow_note();
+    batch_overflow_note(s_dbg_last_draws, s_cb_next);   /* before vpass_reset, which starts the slots over */
     s_sj_frame_left = sj_frame_budget();   /* the next frame's waits */
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
     vpass_reset();
@@ -17843,6 +17897,7 @@ static void vpass_submit(u32 fi)
 static void vpass_reset(void)
 {
     s_cb_gen++;                 /* the constant slots: none of the last batch's to share */
+    s_cb_next = 0;              /* and its half's slots taken from the first again */
     s_vpass.nseg = 0;
     s_vpass.lit_used = 0;
     s_vpass.rec_used = 0;
@@ -19382,10 +19437,9 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->vp_h = s_d3d.current_rsx_state->viewport_h;
                 } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
                 rec_scissor(dr);
-                dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
-                vp_cb_commit(dr, s_d3d.draw_count);
-                s_d3d.draw_count++;
+                if (vp_cb_commit(dr, s_d3d.draw_count)) s_d3d.draw_count++;
+                else s_d3d.merge_prev_draw = 0;   /* dropped: no record to merge the next one into */
             }
             return;
         }
@@ -19500,9 +19554,11 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->vp_h = s_d3d.current_rsx_state->viewport_h;
             } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
             rec_scissor(dr);
-            dr->cb_slot = s_d3d.draw_count;
-                vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
-            vp_cb_commit(dr, s_d3d.draw_count);
+            vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+            if (!vp_cb_commit(dr, s_d3d.draw_count)) {
+                s_d3d.merge_prev_draw = 0;    /* dropped: no record to merge the next one into */
+                return;
+            }
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
             s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
@@ -19729,10 +19785,12 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->vp_h = s_d3d.current_rsx_state->viewport_h;
         } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
         rec_scissor(dr);
-        dr->cb_slot = s_d3d.draw_count;
-                vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+        vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         if (dr->raw) vp_record_raw_cb(s_d3d.draw_count, s_d3d.current_rsx_state);
-        vp_cb_commit(dr, s_d3d.draw_count);
+        if (!vp_cb_commit(dr, s_d3d.draw_count)) {
+            s_d3d.merge_prev_draw = 0;        /* dropped: no record to merge the next one into */
+            return;
+        }
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
         s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);

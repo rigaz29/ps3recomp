@@ -1941,9 +1941,10 @@ static int fp_dyn_dxc(void)
  * <store>.prebuilt, beside the store: the fragment programs of the game's files
  * as rsx_d3d12_prebuild_fragment_programs compiled them, their texts made as a
  * draw makes them (fp_dyn_text), so under the same source keys. Not in the
- * store, which keeps every program in memory: some 30,000 are 450 MB of DXIL.
+ * store, which keeps every program in memory: some 40,000 are 750 MB of DXIL.
  * The build is a process of its own, one at a time (a named mutex per file),
- * while the game plays or from the launcher; it appends, and the game reads.
+ * a port's before play (beside the game it took 7% of the frames on six
+ * cores); it appends, and a game that runs meanwhile reads what is there.
  * When the store has not a source, d3d_compile_cached looks here, and what it
  * takes goes into the store as a compiled program would.
  *  - header, 32 bytes: "GWFPBLD2", its size (u32), the texts' form (FPB_TEXT),
@@ -2049,7 +2050,7 @@ static void fpb_index(HANDLE h, u64* end)
 }
 
 /* The file of the store at s_shc_path opened for reading, its header this build's, and indexed (s_fpb_lock held).
- * Again a few seconds later while there is none: the first session's build makes it as the game plays. */
+ * Again a second after a miss while there is none: a build may be making it. */
 static void fpb_open(void)
 {
     s_fpb_seen = perf_now();

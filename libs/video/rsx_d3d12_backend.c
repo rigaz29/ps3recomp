@@ -132,13 +132,17 @@
  * for a target drawn wider, fp_alpha.w < 0), zw the AA sample grid; fp_alpha.w is 1 when
  * the render scale is off. The alpha test, sign expansion and which units compare depth
  * stay in the text (variants: the comparison's path would double a fetch). The setting
- * graphics.shader_prebuild, or RSX_FP_DYNAMIC; it needs DXC (register spaces), and is off
- * without it. Read once, the device made. */
-static int fp_dyn_dxc(void);
+ * graphics.shader_prebuild (on by default), or RSX_FP_DYNAMIC; it needs DXC (register
+ * spaces), and is off without it. Read once the device is made; 0 before it, not kept. */
+static int fp_dyn_dxc(void);   /* 1 DXC, 0 not, -1 no device yet */
 static int fp_dyn_on(void)
 {
     static int v = -1;
-    if (v < 0) v = ps3_settings_bool("graphics", "shader_prebuild", "RSX_FP_DYNAMIC", 0) && fp_dyn_dxc();
+    if (v < 0) {
+        const int d = ps3_settings_bool("graphics", "shader_prebuild", "RSX_FP_DYNAMIC", 1) ? fp_dyn_dxc() : 0;
+        if (d < 0) return 0;
+        v = d;
+    }
     return v;
 }
 /* RSX_FP_CB_MAXK=<n>: fewer constants read from b1 (1-1024, default 1024). */
@@ -1306,7 +1310,7 @@ static void fg_frame(void)
  * bench's to 129 MB. Both are read once into the store; the fold replaces the
  * first and deletes the second.
  * -----------------------------------------------------------------------*/
-typedef struct ShProg { u64 id; u32 len; u32 pad; const u8* p; } ShProg;
+typedef struct ShProg { u64 id; u32 len; u32 mark; const u8* p; } ShProg;   /* mark: shc_fold_start's, while it looks */
 typedef struct { u64 key; u32 srclen; ShProg* prog; } ShaderCacheEntry;
 static ShaderCacheEntry* s_shc;     /* source -> program: open addressing, s_shc_cap slots (a power of two) */
 static u32    s_shc_cap, s_shc_n;
@@ -1343,6 +1347,16 @@ static const char s_psoc_magic1[8] = { 'G', 'W', 'P', 'S', 'O', 'C', '0', '1' };
 /* The pipelines the store had at the start, in order: built by psoc_thread. */
 typedef struct { u64 key, vs, ps; u32 used, stn; const u8* st; } PsocRec;
 static PsocRec* s_psoc_recs;
+/* A PIPE's description begins with its form (psoc_state_bytes): 1, or 2 when its session drew with the pixel shaders'
+ * new form (fp_dyn_on), whose pipelines the other form's draws never ask for, nor the other way round. */
+#define PSOC_VERSION     1u
+#define PSOC_VERSION_DYN 2u
+static int psoc_rec_dyn(const PsocRec* r)
+{
+    u32 v = 0;
+    if (r->st && r->stn >= 4) memcpy(&v, r->st, 4);
+    return v == PSOC_VERSION_DYN;
+}
 static u32 s_psoc_nrecs, s_psoc_rcap;
 
 /* D3D12_SHADER_OPT=0|1|2|3|skip: the D3DCompile optimisation level for guest
@@ -1460,13 +1474,17 @@ static ShProg* shp_put(const void* p, u32 n, u64 id, int own, int* added)
     if (*s) return (*s)->len == n && !memcmp((*s)->p, p, n) ? *s : NULL;
     ShProg* g = (ShProg*)malloc(sizeof *g + (own ? n : 0));
     if (!g) return NULL;
-    g->id = id; g->len = n; g->pad = 0;
+    g->id = id; g->len = n; g->mark = 0;
     g->p = own ? (const u8*)memcpy(g + 1, p, n) : (const u8*)p;
     *s = g;
     s_shp_list[s_shp_n++] = g;
     *added = 1;
     return g;
 }
+
+/* shc_fold_start's marks on the programs, while it looks at the pipelines (ShProg.mark). */
+#define SHP_DROP     0x10u          /* a pixel program of old pipelines */
+#define SHP_KEEP     0x20u          /* a program of a pipeline it keeps */
 
 /* A program's bytes in a blob for the caller to own: the store hands out no
  * blob of its own. d3dcompiler_47 counts a blob's references without atomics
@@ -1768,7 +1786,8 @@ static void shj_restart(u64 jid, u64 jlen)
 typedef struct {
     ShProg** progs; u32 nprog;
     ShaderCacheEntry* srcs; u32 nsrc;
-    u32 npipe;                      /* the first npipe of s_psoc_recs, which no one changes */
+    u32* pipes; u32 npipe;          /* which of s_psoc_recs' first entries, which no one changes, it keeps */
+    u32 drop_pipes, drop_progs;     /* left out: the old pixel shaders' (shc_fold_start) */
     u64 jid, jlen;                  /* the journal, and how long it was */
     int old_pso;                    /* <pack>.pso was read and goes */
     int inline_;                    /* on the caller's thread (the precompile), not one of its own */
@@ -1786,7 +1805,7 @@ static DWORD WINAPI shc_fold(LPVOID arg)
     size_t raw = 0, cz = 0;
     for (u32 i = 0; i < F->nprog; i++) raw += shr_size(16, F->progs[i]->len);
     raw += (size_t)F->nsrc * shr_size(24, 0);
-    for (u32 i = 0; i < F->npipe; i++) raw += shr_size(32, s_psoc_recs[i].stn);
+    for (u32 i = 0; i < F->npipe; i++) raw += shr_size(32, s_psoc_recs[F->pipes[i]].stn);
     const char* fail = NULL;
     u8* pay = (u8*)malloc(raw ? raw : 1);
     const size_t cap = ZSTD_compressBound(raw);
@@ -1806,9 +1825,10 @@ static DWORD WINAPI shc_fold(LPVOID arg)
             o += shr_fill(o, SHR_SRCK, h, 24, NULL, 0);
         }
         for (u32 i = 0; i < F->npipe; i++) {
+            const PsocRec* r = &s_psoc_recs[F->pipes[i]];
             u32 h[8];
-            shr_pipe(h, &s_psoc_recs[i]);
-            o += shr_fill(o, SHR_PIPE, h, 32, s_psoc_recs[i].st, s_psoc_recs[i].stn);
+            shr_pipe(h, r);
+            o += shr_fill(o, SHR_PIPE, h, 32, r->st, r->stn);
         }
         ZSTD_CCtx* cc = ZSTD_createCCtx();
         if (!cc) {
@@ -1849,13 +1869,17 @@ static DWORD WINAPI shc_fold(LPVOID arg)
             snprintf(p, sizeof p, "%s.pso", s_shc_path);
             DeleteFileA(p);
         }
+        char left[128] = "";
+        if (F->drop_pipes || F->drop_progs)
+            snprintf(left, sizeof left, "; left out, the old pixel shaders': %u pipelines, %u programs",
+                     F->drop_pipes, F->drop_progs);
         fprintf(stderr, "[d3d12] shader cache packed (%s): %u programs, %u sources, %u pipelines, "
-                        "%.1f MB in %.1f MB, %.1f s%c", F->why, F->nprog, F->nsrc, F->npipe,
-                raw / 1048576.0, (SHC_HDR + cz) / 1048576.0, perf_now() - t0, 10);
+                        "%.1f MB in %.1f MB, %.1f s%s%c", F->why, F->nprog, F->nsrc, F->npipe,
+                raw / 1048576.0, (SHC_HDR + cz) / 1048576.0, perf_now() - t0, left, 10);
     } else {
         fprintf(stderr, "[d3d12] shader cache not packed (%s): %s%c", F->why, fail, 10);
     }
-    free(F->progs); free(F->srcs); free(F);
+    free(F->progs); free(F->srcs); free(F->pipes); free(F);
     return 0;
 }
 
@@ -1867,12 +1891,33 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
     if (!F) return;
     F->progs = (ShProg**)malloc((size_t)(s_shp_n + 1) * sizeof *F->progs);
     F->srcs = (ShaderCacheEntry*)malloc((size_t)(s_shc_n + 1) * sizeof *F->srcs);
-    if (F->progs && F->srcs) {
-        if (s_shp_n) memcpy(F->progs, s_shp_list, (size_t)s_shp_n * sizeof *F->progs);
-        F->nprog = s_shp_n;
+    F->pipes = (u32*)malloc((size_t)(s_psoc_nrecs + 1) * sizeof *F->pipes);
+    if (F->progs && F->srcs && F->pipes) {
+        /* With the pixel shaders' new form on (fp_dyn_on), the pipelines sessions of the old one made go (their
+         * description's PSOC_VERSION), and the pixel programs only they had, with the sources that name them: no
+         * draw asks for them again. On a store of 1,787 pipelines (2026-11-18) all were old: the start's build took
+         * 57 s and 918 MB more for them with a cold driver cache; 886 programs went with them. The vertex programs
+         * and everything else stay; with it off, all of it. */
+        const int drop = fp_dyn_on();
+        for (u32 r = 0; r < s_psoc_nrecs; r++) {
+            ShProg* ps = drop ? shp_get(s_psoc_recs[r].ps) : NULL;
+            if (drop && !psoc_rec_dyn(&s_psoc_recs[r])) {
+                if (ps) ps->mark |= SHP_DROP;
+                F->drop_pipes++;
+                continue;
+            }
+            F->pipes[F->npipe++] = r;
+            ShProg* vs = drop ? shp_get(s_psoc_recs[r].vs) : NULL;
+            if (vs) vs->mark |= SHP_KEEP;
+            if (ps) ps->mark |= SHP_KEEP;
+        }
+        for (u32 i = 0; i < s_shp_n; i++) {
+            if ((s_shp_list[i]->mark & (SHP_DROP | SHP_KEEP)) == SHP_DROP) F->drop_progs++;
+            else F->progs[F->nprog++] = s_shp_list[i];
+        }
         for (u32 i = 0; i < s_shc_cap; i++)
-            if (s_shc[i].prog) F->srcs[F->nsrc++] = s_shc[i];
-        F->npipe = s_psoc_nrecs;
+            if (s_shc[i].prog && (s_shc[i].prog->mark & (SHP_DROP | SHP_KEEP)) != SHP_DROP) F->srcs[F->nsrc++] = s_shc[i];
+        for (u32 i = 0; i < s_shp_n; i++) s_shp_list[i]->mark = 0;
         F->jid = s_shc_file ? s_shc_jid : 0;
         F->jlen = s_shc_file ? jlen : 0;
         F->old_pso = old_pso;
@@ -1887,7 +1932,7 @@ static void shc_fold_start(const char* why, int old_pso, u64 jlen, int wait)
         HANDLE t = CreateThread(NULL, 0, shc_fold, F, 0, NULL);
         if (t) { CloseHandle(t); return; }
     }
-    free(F->progs); free(F->srcs); free(F);
+    free(F->progs); free(F->srcs); free(F->pipes); free(F);
 }
 
 /* graphics.shader_compiler (D3D12_SHADER_COMPILER): dxc, or fxc for D3DCompile.
@@ -1926,10 +1971,11 @@ static void shc_pick_compiler(void)
                own ? " (D3D12_OWN_SHADER_COMPILER)" : "", wine ? ", on Wine " : "", wine ? wine : "", 10);
 }
 
-/* fp_dyn_on's other half: the guest programs come from DXC (the texts declare register spaces). No device yet: no. */
+/* fp_dyn_on's other half: the guest programs come from DXC (the texts declare register spaces). -1 with no device
+ * yet: the compiler is chosen by it. */
 static int fp_dyn_dxc(void)
 {
-    if (!s_d3d.device) return 0;
+    if (!s_d3d.device) return -1;
     shc_pick_compiler();
     if (!s_shc_dxc) printf("[d3d12] graphics.shader_prebuild needs DXC for the guest programs: off%c", 10);
     return s_shc_dxc;
@@ -2000,6 +2046,24 @@ static void fpb_header(u8 h[FPB_HDR])
     memcpy(h, s_fpb_magic, 8);
     const u32 v[4] = { FPB_HDR, FPB_TEXT, (u32)shc_flags(), s_shc_dxc ? 1u : 2u };
     memcpy(h + 8, v, sizeof v);
+}
+
+int rsx_d3d12_prebuilt_current(const char* cache)
+{
+    if (!cache || !*cache) return 0;
+    char path[1120];
+    snprintf(path, sizeof path, "%s.dxil.prebuilt", cache);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    u8 hd[FPB_HDR], mine[FPB_HDR];
+    memset(mine, 0, sizeof mine);
+    memcpy(mine, s_fpb_magic, 8);
+    const u32 v[4] = { FPB_HDR, FPB_TEXT, (u32)shc_flags(), 1u };   /* the build's compiler is DXC, always */
+    memcpy(mine + 8, v, sizeof v);
+    const int ok = fpb_read_at(h, 0, hd, FPB_HDR) && !memcmp(hd, mine, FPB_ID);
+    CloseHandle(h);
+    return ok;
 }
 
 static FpbEnt* fpb_slot(u64 key, u32 srclen)
@@ -2521,7 +2585,6 @@ static HRESULT guest_pso_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, in
  * (boot, menus, 140 s of the fight) queued one build, on the first logo; the
  * wait is for when the driver compiles them all again, after an update.
  * -----------------------------------------------------------------------*/
-#define PSOC_VERSION   1u
 static struct PsocSlot { u64 key; ID3D12PipelineState* pso; u32 seen, pad; } *s_psoc;   /* open addressing, s_psoc_cap slots */
 static u32 s_psoc_cap, s_psoc_n;
 static u32 s_psoc_held, s_psoc_max = 8192;   /* built pipelines held, and the most it holds */
@@ -2553,7 +2616,7 @@ static u32 psoc_state_bytes(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, int db
     if (pd->pRootSignature != s_d3d.vp_root_sig || pd->InputLayout.NumElements > 16 ||
         pd->StreamOutput.NumEntries || pd->CachedPSO.CachedBlobSizeInBytes)
         return 0;
-    psoc_u32(b, &n, PSOC_VERSION); psoc_u32(b, &n, (u32)dbt);
+    psoc_u32(b, &n, fp_dyn_on() ? PSOC_VERSION_DYN : PSOC_VERSION); psoc_u32(b, &n, (u32)dbt);
     const D3D12_BLEND_DESC* bl = &pd->BlendState;
     psoc_u32(b, &n, (u32)bl->AlphaToCoverageEnable); psoc_u32(b, &n, (u32)bl->IndependentBlendEnable);
     for (int r = 0; r < 8; r++) {
@@ -2610,7 +2673,8 @@ static int psoc_state_read(const u8* b, u32 n, D3D12_GRAPHICS_PIPELINE_STATE_DES
     u32 o = 0;
 #define PSOC_RD() (o + 4u <= n ? (o += 4u, *(const u32*)(b + o - 4u)) : (o = n + 1u, 0u))
     memset(pd, 0, sizeof *pd);
-    if (PSOC_RD() != PSOC_VERSION) return 0;
+    const u32 ver = PSOC_RD();
+    if (ver != PSOC_VERSION && ver != PSOC_VERSION_DYN) return 0;
     *dbt = (int)PSOC_RD();
     D3D12_BLEND_DESC* bl = &pd->BlendState;
     bl->AlphaToCoverageEnable = (BOOL)PSOC_RD(); bl->IndependentBlendEnable = (BOOL)PSOC_RD();
@@ -2839,6 +2903,8 @@ static int psoc_wait_on(void)
  * logical processors, at most 8), each taking the next pipeline in
  * psoc_order's order until none is left or the table holds s_psoc_max. */
 static u32* s_psoc_order;
+static u32 s_psoc_norder;                     /* how many of them: the store's pipelines of this form */
+static u8* s_psoc_want;                       /* each of the store's: of the pixel shaders' form this session uses */
 static volatile LONG s_psoc_next;
 static HANDLE s_psoc_built_ev;          /* set when it is over */
 
@@ -2865,9 +2931,11 @@ static DWORD WINAPI psoc_builder(LPVOID arg)
     char names[16][16];
     for (;;) {
         const LONG n = InterlockedIncrement(&s_psoc_next) - 1;
-        if ((u32)n >= s_psoc_nrecs || s_psoc_held >= s_psoc_max) break;
+        if ((u32)n >= (s_psoc_order ? s_psoc_norder : s_psoc_nrecs) || s_psoc_held >= s_psoc_max) break;
+        const u32 ri = s_psoc_order ? s_psoc_order[n] : (u32)n;
+        if (s_psoc_want && !s_psoc_want[ri]) continue;
         InterlockedIncrement(&s_psoc_done);
-        const PsocRec* rec = &s_psoc_recs[s_psoc_order ? s_psoc_order[n] : (u32)n];
+        const PsocRec* rec = &s_psoc_recs[ri];
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
         int dbt = 0, known = 0;
         ID3D12PipelineState* have = psoc_find(rec->key, &known, 0);
@@ -2909,13 +2977,17 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
     const double t0 = perf_now();
     double m0[3], m1[3];
     psoc_mem(&m0[0], &m0[1], &m0[2]);
+    u32 want = 0;
+    for (u32 r = 0; r < s_psoc_nrecs; r++) want += !s_psoc_want || s_psoc_want[r];
     s_psoc_order = (u32*)malloc((size_t)s_psoc_nrecs * sizeof *s_psoc_order);
     if (s_psoc_order) {
-        for (u32 r = 0; r < s_psoc_nrecs; r++) s_psoc_order[r] = r;
-        qsort(s_psoc_order, s_psoc_nrecs, sizeof *s_psoc_order, psoc_order);
+        s_psoc_norder = 0;
+        for (u32 r = 0; r < s_psoc_nrecs; r++)
+            if (!s_psoc_want || s_psoc_want[r]) s_psoc_order[s_psoc_norder++] = r;
+        qsort(s_psoc_order, s_psoc_norder, sizeof *s_psoc_order, psoc_order);
     }
     InterlockedExchange(&s_psoc_done, 0);
-    InterlockedExchange(&s_psoc_total, (LONG)(s_psoc_nrecs < s_psoc_max ? s_psoc_nrecs : s_psoc_max));
+    InterlockedExchange(&s_psoc_total, (LONG)(want < s_psoc_max ? want : s_psoc_max));
     HANDLE h[8];
     int nh = 0;
     for (int k = 1; k < nt && nh < 8; k++) {
@@ -2927,11 +2999,13 @@ static DWORD WINAPI psoc_thread(LPVOID arg)
     for (int k = 0; k < nh; k++) CloseHandle(h[k]);
     free(s_psoc_order);
     s_psoc_order = NULL;
+    free(s_psoc_want);
+    s_psoc_want = NULL;
     InterlockedExchange(&s_psoc_total, 0);
     psoc_mem(&m1[0], &m1[1], &m1[2]);
     fprintf(stderr, "[d3d12] pipeline cache: %ld of %u pipelines built in %.0f ms by %d threads (%ld failed, %u "
                     "held at most); memory while it ran: private %+.0f MB, GPU local %+.0f MB, shared %+.0f MB%c",
-            (long)s_psoc_built, s_psoc_nrecs, (perf_now() - t0) * 1000.0, nh + 1, (long)s_psoc_failed,
+            (long)s_psoc_built, want, (perf_now() - t0) * 1000.0, nh + 1, (long)s_psoc_failed,
             s_psoc_max, m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2], 10);
     SetEvent(s_psoc_built_ev);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -2976,17 +3050,43 @@ static void psoc_start(void)
     const char* mx = getenv("D3D12_PSO_CACHE_MAX");
     if (mx && atoi(mx) > 0) s_psoc_max = (u32)atoi(mx);
     s_psoc_now = (u32)time(NULL);
+    /* The pipelines of the pixel shaders' other form stay out of the table and the build: no draw of this session asks
+     * for them (fp_dyn_on). The old ones go from the store at its next fold (shc_fold_start), started now. */
+    const int dyn = fp_dyn_on();
+    u32 other = 0;
+    s_psoc_want = (u8*)malloc((size_t)s_psoc_nrecs + 1);
+    if (s_psoc_want)
+        for (u32 r = 0; r < s_psoc_nrecs; r++) {
+            s_psoc_want[r] = (u8)(psoc_rec_dyn(&s_psoc_recs[r]) == (dyn != 0));
+            other += !s_psoc_want[r];
+        }
     AcquireSRWLockExclusive(&s_psoc_lock);
     for (u32 r = 0; r < s_psoc_nrecs && psoc_room(); r++) {
+        if (s_psoc_want && !s_psoc_want[r]) continue;
         const u32 i = psoc_slot(s_psoc_recs[r].key);
         if (!s_psoc[i].key) { s_psoc[i].key = s_psoc_recs[r].key; s_psoc_n++; }
     }
     ReleaseSRWLockExclusive(&s_psoc_lock);
     s_psoc_mode = 1;
     const int nt = psoc_nthreads();
-    fprintf(stderr, "[d3d12] pipeline cache: %u pipelines to build on %d threads%s%c", s_psoc_nrecs, nt,
-            s_psoc_nrecs && psoc_wait_on() ? ", the title waits for them" : "", 10);
-    if (s_psoc_nrecs) {
+    const u32 want = s_psoc_nrecs - other;
+    fprintf(stderr, "[d3d12] pipeline cache: %u pipelines to build on %d threads%s%c", want, nt,
+            want && psoc_wait_on() ? ", the title waits for them" : "", 10);
+    if (other) {
+        fprintf(stderr, "[d3d12] pipeline cache: %u of the %s pixel shaders' pipelines left out (graphics.shader_prebuild "
+                        "%s)%c", other, dyn ? "old" : "new", dyn ? "on" : "off", 10);
+        AcquireSRWLockExclusive(&s_shc_lock);
+        if (dyn && !s_shc_why && !s_shc_ro && s_shc_file) {   /* shc_open's fold, if it made one, left them out */
+            u64 jl = 0;
+            if (fflush(s_shc_file) == 0 && _fseeki64(s_shc_file, 0, SEEK_END) == 0) jl = (u64)_ftelli64(s_shc_file);
+            shc_fold_start("the old pixel shaders", 0, jl, 0);
+        }
+        ReleaseSRWLockExclusive(&s_shc_lock);
+    }
+    if (!want) {
+        free(s_psoc_want);
+        s_psoc_want = NULL;
+    } else {
         s_psoc_built_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
         HANDLE t = s_psoc_built_ev ? CreateThread(NULL, 0, psoc_thread, (LPVOID)(intptr_t)nt, 0, NULL) : NULL;
         if (t) {

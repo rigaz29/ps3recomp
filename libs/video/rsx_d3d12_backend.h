@@ -122,6 +122,10 @@ int rsx_d3d12_prebuild_fragment_programs(const uint8_t* const* ucode, const uint
                                          void (*progress)(uint32_t done, uint32_t total),
                                          uint32_t stats[3], char* why, size_t why_len);
 
+/* 1 if <cache>.dxil.prebuilt is of this build's form, the one rsx_d3d12_prebuild_fragment_programs goes on with and
+ * the game reads; 0 if it is missing or of another, which the build begins again. No device needed (a launcher's). */
+int rsx_d3d12_prebuilt_current(const char* cache);
+
 #ifdef __cplusplus
 }
 #endif

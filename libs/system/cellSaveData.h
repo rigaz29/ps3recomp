@@ -57,6 +57,14 @@ s32 cellSaveData_set_scratch_region(u32 base, u32 size);
 #define CELL_SAVEDATA_FILETYPE_CONTENT_SND0   5
 
 /* Callback result values */
+/* What a call returns when it ran (a done callback's excResult too): done, or the player went back. */
+#define CELL_SAVEDATA_RET_OK                0
+#define CELL_SAVEDATA_RET_CANCEL            1
+
+/* CellSaveDataFixedSet.option: the system asks the player first, or not. */
+#define CELL_SAVEDATA_OPTION_NONE           0
+#define CELL_SAVEDATA_OPTION_NOCONFIRM      1
+
 #define CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM 2
 #define CELL_SAVEDATA_CBRESULT_OK_LAST      1
 #define CELL_SAVEDATA_CBRESULT_OK_NEXT      0
@@ -214,6 +222,7 @@ typedef struct CellSaveDataFileSet {
 typedef struct CellSaveDataDoneGet {
     s32  excResult;
     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
+    s32  sizeKB;
     s32  hddFreeSizeKB;
     char reserved[64];
 } CellSaveDataDoneGet;
@@ -330,6 +339,9 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            u32 container, void* userdata);
 
 s32 cellSaveDataDelete2(u32 container);
+s32 cellSaveDataFixedDelete(CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed, CellSaveDataDoneCallback funcDone,
+                            u32 container, void* userdata);
 
 /* Old / non-_2 variants from earlier SDK builds — same semantics. */
 s32 cellSaveDataAutoSave(u32 version, const char* dirName,

@@ -7,6 +7,8 @@
 
 #include "cellSaveData.h"
 #include "ps3_psf.h"
+#include "sys_dialog.h"           /* the question before a save is deleted */
+#include "../codec/stb_image.h"   /* a save's ICON0.PNG for that question */
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
@@ -463,6 +465,21 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
 }
 
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+/* A listed save's listParam: its PARAM.SFO's SAVEDATA_LIST_PARAM, as the PS3 lists it. A title's fixed callback can
+ * pick its save by it: God of War: Ascension deletes a profile only where it reads "PROF0". */
+static void dirlist_param(CellSaveDataDirList* e)
+{
+    char path[1100];
+    CellSaveDataSystemFileParam* p = (CellSaveDataSystemFileParam*)calloc(1, sizeof *p);
+    if (!p) return;
+    snprintf(path, sizeof path, "%s/%s", s_save_root, e->dirName);
+    read_param_sfo(path, p);
+    memcpy(e->listParam, p->listParam, CELL_SAVEDATA_SYSP_LPARAM_SIZE);
+    free(p);
+}
+
 static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
 {
     u32 count = 0;
@@ -494,6 +511,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, fd.cFileName,
                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+                dirlist_param(&dirList[count]);
             }
             count++;
         } while (FindNextFileA(hFind, &fd));
@@ -521,6 +539,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, de->d_name,
                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+                dirlist_param(&dirList[count]);
             }
             count++;
         }
@@ -1511,6 +1530,179 @@ s32 cellSaveDataDelete2(u32 container)
     /* Without a directory name we can't delete anything meaningful.
        This variant typically shows a UI for deletion - just succeed. */
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * cellSaveDataFixedDelete: the title names one of its saves (funcFixed, from the list of those under its prefix)
+ * and the system deletes it -- after asking the player, unless the title set CELL_SAVEDATA_OPTION_NOCONFIRM -- then
+ * tells the title how it went (funcDone: excResult CELL_SAVEDATA_RET_OK, or CELL_SAVEDATA_RET_CANCEL when the player
+ * said no). God of War: Ascension deletes a profile so and asks nothing itself; unregistered, the call did nothing
+ * and its Delete Profile only flickered (Ascension-R issue 24).
+ *
+ * The question is the system's own (sys_dialog.h): the save's picture, title and subtitle over the title's picture,
+ * the cursor on No. A save deleted is copied first like one about to be written over (save_backup).
+ * -----------------------------------------------------------------------*/
+
+/* Every file in a save's folder, then the folder: 0 if it is gone. A save holds files only. */
+static int remove_save_dir(const char* dir)
+{
+#ifdef _WIN32
+    char pat[1200], p[1300];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    for (char* c = pat; *c; c++) if (*c == '/') *c = '\\';
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            snprintf(p, sizeof p, "%s/%s", dir, fd.cFileName);
+            SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);
+            DeleteFileA(p);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return RemoveDirectoryA(dir) ? 0 : -1;
+#else
+    DIR* dp = opendir(dir);
+    if (dp) {
+        struct dirent* de;
+        char p[1300];
+        while ((de = readdir(dp)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+            unlink(p);
+        }
+        closedir(dp);
+    }
+    return rmdir(dir);
+#endif
+}
+
+/* The first line of s into out. */
+static void first_line(const char* s, char* out, size_t cap)
+{
+    size_t n = 0;
+    while (s[n] && s[n] != '\n' && s[n] != '\r' && n + 1 < cap) n++;
+    memcpy(out, s, n);
+    out[n] = 0;
+}
+
+/* Ask the player whether to delete the save at save_path: 1 yes. */
+static int savedata_ask_delete(const char* save_path, const char* dirName)
+{
+    PS3SysDialog* d = (PS3SysDialog*)calloc(1, sizeof *d);
+    CellSaveDataSystemFileParam* p = (CellSaveDataSystemFileParam*)calloc(1, sizeof *p);
+    if (!d || !p) { free(d); free(p); return 0; }
+    read_param_sfo(save_path, p);
+    snprintf(d->title, sizeof d->title, "Delete Saved Data");
+    int n = 0;
+    if (p->title[0]) first_line(p->title, d->line[n++], sizeof d->line[0]);
+    if (p->subTitle[0]) first_line(p->subTitle, d->line[n++], sizeof d->line[0]);
+    if (p->detail[0]) first_line(p->detail, d->line[n++], sizeof d->line[0]);
+    if (!n) snprintf(d->line[n++], sizeof d->line[0], "%s", dirName);
+    snprintf(d->line[n++], sizeof d->line[0], "Delete this saved data?");
+    d->nlines = n;
+    snprintf(d->choice[0], sizeof d->choice[0], "Yes");
+    snprintf(d->choice[1], sizeof d->choice[1], "No");
+    d->focus = 1;
+    {   /* its picture, ICON0.PNG, if it is one the question can show */
+        char icon_path[1200];
+        snprintf(icon_path, sizeof icon_path, "%s/ICON0.PNG", save_path);
+        int w = 0, h = 0, c = 0;
+        unsigned char* px = stbi_load(icon_path, &w, &h, &c, 4);
+        if (px && w > 0 && h > 0 && w <= PS3_SYSDLG_ICON_W && h <= PS3_SYSDLG_ICON_H) {
+            memcpy(d->icon, px, (size_t)w * (size_t)h * 4);
+            d->iw = w;
+            d->ih = h;
+        }
+        if (px) stbi_image_free(px);
+    }
+    const int yes = ps3_sysdlg_ask(d, 1) == 0;
+    free(d);
+    free(p);
+    return yes;
+}
+
+s32 cellSaveDataFixedDelete(CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed, CellSaveDataDoneCallback funcDone,
+                            u32 container, void* userdata)
+{
+    (void)container;
+    if (!setList || !setBuf || !funcFixed)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "setList/setBuf/funcFixed is NULL");
+    if (!g_ps3_guest_caller)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_INTERNAL, "no guest caller installed");
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf);
+    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "dirListMax over CELL_SAVEDATA_DIRLIST_MAX");
+    CellSaveDataDirList* dirs = dir_max ? calloc(dir_max, sizeof(*dirs)) : NULL;
+    if (dir_max && !dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
+    u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
+    u32 count = enumerate_save_dirs(prefix ? (char*)vm_base + prefix : "", dirs, dir_max);
+    u32 listed = count < dir_max ? count : dir_max;
+    printf("[cellSaveData] FixedDelete(prefix='%s'): %u listed\n",
+           prefix ? (const char*)(vm_base + prefix) : "", listed);
+    scratch_reset();
+    u32 cb = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    u32 get = scratch_alloc(0x4C); /* dirNum, dirListNum, dirList, reserved[64] */
+    u32 set = scratch_alloc(12);   /* dirName, newIcon, option */
+    u32 done = scratch_alloc(108); /* excResult, dirName[32], sizeKB, hddFreeSizeKB, reserved[64] */
+    u32 list = listed ? scratch_alloc(listed * 48) : 0;
+    if (!cb || !get || !set || !done || (listed && !list)) {
+        free(dirs); return CELL_SAVEDATA_ERROR_INTERNAL;
+    }
+    marshal_cbresult_init(cb, CELL_SAVEDATA_CBRESULT_OK_NEXT, (u32)(uintptr_t)userdata);
+    vm_write32(get, count); vm_write32(get + 4, listed); vm_write32(get + 8, list);
+    if (listed) memcpy(vm_base + list, dirs, listed * 48);
+    free(dirs);
+    g_ps3_guest_caller((u32)(uintptr_t)funcFixed, cb, get, set, 0, 0, 0, 0, 0);
+    const s32 result = marshal_cbresult_read_result(cb);
+    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST || result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) {
+        printf("[cellSaveData] FixedDelete: the title chose nothing to delete\n");
+        return CELL_SAVEDATA_RET_OK;
+    }
+    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, "funcFixed returned an error");
+    const u32 selected = vm_read32(set);
+    const u32 option = vm_read32(set + 8);
+    if (!selected || option > CELL_SAVEDATA_OPTION_NOCONFIRM)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set no dirName, or an out-of-range option");
+    const char* name = (const char*)vm_base + selected;
+    size_t len = strnlen(name, CELL_SAVEDATA_DIRNAME_SIZE);
+    if (!len || len == CELL_SAVEDATA_DIRNAME_SIZE || strchr(name, '/') ||
+        strchr(name, '\\') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set an unusable dirName");
+    char directory[CELL_SAVEDATA_DIRNAME_SIZE];
+    memcpy(directory, name, len + 1);
+    char save_path[1100];
+    snprintf(save_path, sizeof save_path, "%s/%s", s_save_root, directory);
+    if (!dir_exists(save_path))
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_NODATA, "the save funcFixed chose is not there");
+
+    s32 exc = CELL_SAVEDATA_RET_CANCEL;
+    if (option == CELL_SAVEDATA_OPTION_NOCONFIRM || savedata_ask_delete(save_path, directory)) {
+        save_backup(save_path, directory);
+        if (remove_save_dir(save_path) == 0) {
+            exc = CELL_SAVEDATA_RET_OK;
+            printf("[cellSaveData] FixedDelete: '%s' deleted\n", directory);
+        } else {
+            exc = CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+            printf("[cellSaveData] FixedDelete: '%s' could not be deleted\n", directory);
+        }
+    } else {
+        printf("[cellSaveData] FixedDelete: '%s' kept, the player said no\n", directory);
+    }
+    if (funcDone) {
+        marshal_cbresult_init(cb, CELL_SAVEDATA_CBRESULT_OK_NEXT, (u32)(uintptr_t)userdata);
+        vm_write32(done + 0, (u32)exc);
+        memcpy(vm_base + done + 4, directory, len + 1);
+        vm_write32(done + 36, 0);              /* sizeKB */
+        vm_write32(done + 40, 1024 * 1024);    /* hddFreeSizeKB: 1 GB, as the stat callbacks have it */
+        g_ps3_guest_caller((u32)(uintptr_t)funcDone, cb, done, 0, 0, 0, 0, 0, 0);
+        if (marshal_cbresult_read_result(cb) < 0)
+            SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, "funcDone returned an error");
+    }
+    return exc;
 }
 
 /* ---------------------------------------------------------------------------

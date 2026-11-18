@@ -101,6 +101,9 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
  * to do (a 1x1 grid, or no WPOS read), or -1 without mutation when the entry
  * point is not found, the grid is already applied, or the buffer is short. */
 int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
+/* The same with the grid an HLSL float2 expression (e.g. one the program reads from a constant buffer), applied
+ * whatever its value: on a 1x1 grid floor(p) + 0.5 is the position SV_POSITION already gives. */
+int rsx_fp_apply_wpos_grid_expr(char* hlsl, u32 capacity, const char* grid);
 
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
@@ -207,6 +210,8 @@ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format);
  * Returns 1, or -1 without mutation for malformed source/insufficient space.
  * Apply before alpha-test wrapping; disabled draws should skip this helper. */
 int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
+/* The same, the conversion done only when the HLSL condition cond holds as the program runs. */
+int rsx_fp_apply_srgb_output_if(char* hlsl, u32 capacity, const char* cond);
 
 /* Gamma metadata is a post-filter/post-remap RGBA lane mask, with formats
  * validated by rsx_texture_gamma_mask. EXP_TEX overrides gamma per fetch.
@@ -233,6 +238,15 @@ int rsx_fp_decompile_buffered_color_dyn_ex(
 int rsx_fp_decompile_buffered_color_dyn_vol_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
     const u8* expand_masks, char* out, u32 out_size, u32* out_constant_count);
+/* Buffered, with the texture state read as the program runs, so the text depends on the program alone (and
+ * shadow_units, expand_masks): every unit is declared Texture2D, TextureCube and Texture3D, in register spaces
+ * 0, 1 and 2 at its t-register, and each fetch calls a helper of its unit that picks the view and the coordinate
+ * scale from the backend's fp_tcscale[16] (see fp_dyn_tex_helpers); the units of shadow_units can also compare
+ * depth, its function and filtering read the same way; gamma as the _dyn entries. The backend declares fp_tcscale
+ * in PSConstants. */
+int rsx_fp_decompile_buffered_state_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 shadow_units, const u8* expand_masks,
+    char* out, u32 out_size, u32* out_constant_count);
 int rsx_fp_decompile_color_vol_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                                   u32 tex_cube_mask, u32 tex_vol_mask,
                                   const u8 gamma_masks[16], const u8* expand_masks,

@@ -121,8 +121,23 @@
 #define FPCB_HALF         ((u32)MAX_DRAWS * 1024u)
 #define FPCB_GUARD        (64u * 1024u)
 #define FPCB_ALPHA        16
-#define FPCB_CONSTS       17
+#define FPCB_STATE        17      /* fp_state, with the texture state read at run time (fp_dyn_on) */
+#define FPCB_CONSTS       (fp_dyn_on() ? 18 : 17)
 #define FP_CB_MAX_K       fp_cb_max_k()
+/* RSX_FP_DYNAMIC=1: a buffered fragment program's text is made from the program alone
+ * (rsx_fp_decompile_buffered_state_ex), so it can be built before any draw needs it: what
+ * a draw binds and sets is read as the program runs, from b1. fp_tcscale[u].w: the unit's
+ * view, depth comparison and its function, filter and coordinates (fp_dyn_tex_helpers);
+ * fp_state (c17): x the flags (bit 0 the sRGB output), y the ultrawide x factor (1/s_wide,
+ * for a target drawn wider, fp_alpha.w < 0), zw the AA sample grid; fp_alpha.w is 1 when
+ * the render scale is off. The alpha test, sign expansion and which units compare depth
+ * stay in the text (variants: the comparison's path would double a fetch). Read once. */
+static int fp_dyn_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_DYNAMIC"); v = e && atoi(e) != 0; }
+    return v;
+}
 /* RSX_FP_CB_MAXK=<n>: fewer constants read from b1 (1-1024, default 1024). */
 static u32 fp_cb_max_k(void)
 {
@@ -4132,19 +4147,26 @@ static int init_d3d12(u32 width, u32 height)
     {
         /* SRV table t0-t15, one register per RSX texture unit; the hardcoded
          * atlas/colour PSs use only t0 and are unaffected. */
-        D3D12_DESCRIPTOR_RANGE srv_range = {0};
-        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srv_range.NumDescriptors = VP_TEX_UNITS;
-        srv_range.BaseShaderRegister = 0;
-        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        D3D12_DESCRIPTOR_RANGE srv_range[3] = {{0}};
+        srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range[0].NumDescriptors = VP_TEX_UNITS;
+        srv_range[0].BaseShaderRegister = 0;
+        srv_range[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        /* RSX_FP_DYNAMIC: the same sixteen descriptors again as t0-t15 of spaces 1 and 2,
+         * which a program's helpers read as TextureCube and Texture3D. */
+        for (int _r = 1; _r < 3; _r++) {
+            srv_range[_r] = srv_range[0];
+            srv_range[_r].RegisterSpace = (UINT)_r;
+            srv_range[_r].OffsetInDescriptorsFromTableStart = 0;
+        }
 
         D3D12_ROOT_PARAMETER rp[5 + VP_TEX_UNITS] = {0};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
         rp[0].Descriptor.ShaderRegister = 0;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[1].DescriptorTable.NumDescriptorRanges = 1;
-        rp[1].DescriptorTable.pDescriptorRanges = &srv_range;
+        rp[1].DescriptorTable.NumDescriptorRanges = fp_dyn_on() ? 3 : 1;
+        rp[1].DescriptorTable.pDescriptorRanges = srv_range;
         rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b1 = FP texscale */
         rp[2].Descriptor.ShaderRegister = 1;
@@ -9096,6 +9118,33 @@ static int dr_unit_view(const D3D12DrawRecord* dr, int u)
     return dr_unit_vol(dr, u) ? 2 : 0;
 }
 
+/* RSX_FP_DYNAMIC: what a draw's program reads at run time, written into its b1 slot at
+ * replay beside the coordinate scales (fp_dyn_on, fp_dyn_tex_helpers): each unit's view
+ * (the one its descriptor was made with, dr_unit_view) and depth comparison in
+ * fp_tcscale[u].w, the sRGB output, the ultrawide factor and the AA grid in fp_state, and
+ * fp_alpha.w 1 while the render scale is off. */
+static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
+{
+    rsx_fp_shadow_desc sd[16];
+    const u64 any = dr_shadow_descs(dr, sd);
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        u32 st = (u32)dr_unit_view(dr, u) & 3u;
+        if (any && u < 16 && sd[u].enabled == 1)
+            st |= 4u | (u32)(sd[u].func & 7u) << 3 | (u32)(sd[u].linear & 1u) << 6 |
+                  (u32)(sd[u].unnormalized & 1u) << 7;
+        memcpy(&ts[u * 4 + 3], &st, 4);
+    }
+    const u32 flags = (dr->fp_ctrl & FP_CTRL_SRGB_OUT) ? 1u : 0u;
+    u32 aax = 1, aay = 1;
+    rsx_aa_grid(dr->rt_fmt, &aax, &aay);
+    float* fs = ts + FPCB_STATE * 4;
+    memcpy(&fs[0], &flags, 4);
+    fs[1] = s_wide > 0.0f ? 1.0f / s_wide : 1.0f;
+    fs[2] = (float)aax;
+    fs[3] = (float)aay;
+    if (!RS_ON) ts[FPCB_ALPHA * 4 + 3] = 1.0f;
+}
+
 /* A texture's shape as the cache keys it (VPTexSlot.cube). */
 static int tex_shape_vol(u32 depth) { return (int)((depth << 8) | 2u); }
 static u32 tex_shape_depth(int shape) { return (shape & 2) ? ((u32)shape >> 8) : 1u; }
@@ -9241,11 +9290,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         gamma = dr_gamma_key(udr);
         unnorm = dr_unnorm_key(udr);
     }
+    /* RSX_FP_DYNAMIC: a buffered program's text and key leave out what the draw binds and
+     * sets (views, comparisons, sRGB output, AA grid): the program reads them from b1. */
+    const int dyn = buffered && fp_dyn_on();
+    if (dyn) ctrl &= ~FP_CTRL_SRGB_OUT;
     /* The units declared on their own: cubes in the low 16 bits, volumes in the
      * high 16, of the units the program samples (a stale binding on another
      * unit would make a variant of its own). A buffered program has them
      * declared too unless RSX_TEX_SEP=0. */
-    if (udr && (!buffered || tex_sep_on())) {
+    if (udr && !dyn && (!buffered || tex_sep_on())) {
         const u32 su = (udr->fp_snap && udr->fp_addr == fp_addr) ? udr->fp_units : 0xFFFFu;
         cube_mask = ((dr_cube_mask(udr) | dr_vol_mask(udr) << 16) & (su | su << 16));
     }
@@ -9271,12 +9324,22 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * program's other units (the shadow entry point takes the masks rather
      * than choosing them at run time). */
     rsx_fp_shadow_desc shd[16];
-    const u64 shadow = (buffered && udr) ? dr_shadow_descs(udr, shd) : 0u;
+    const u64 shadow = (buffered && !dyn && udr) ? dr_shadow_descs(udr, shd) : 0u;
     if (shadow) gamma = dr_gamma_key(udr);
+    /* Dynamic: the comparison's path costs a fetch half its compile time and DXIL, and few
+     * programs compare (the title's shadow mask), so it is a variant: in the text only for
+     * the units this draw compares and the program samples, its function and filtering from
+     * b1. The key holds those units. */
+    u32 dshadow = 0;
+    if (dyn && udr && dr_shadow_descs(udr, shd)) {
+        const u32 su = (udr->fp_snap && udr->fp_addr == fp_addr) ? udr->fp_units : 0xFFFFu;
+        for (u32 u = 0; u < 16; u++) if (shd[u].enabled == 1 && ((su >> u) & 1u)) dshadow |= 1u << u;
+    }
+    const u64 shadow_key = dyn ? (u64)dshadow : shadow;
     /* An antialiased surface is drawn at its sample grid; WPOS reads the
      * pixel (rsx_fp_apply_wpos_grid), so the grid is part of the key. */
     u32 aax = 1, aay = 1;
-    if (udr) rsx_aa_grid(udr->rt_fmt, &aax, &aay);
+    if (udr && !dyn) rsx_aa_grid(udr->rt_fmt, &aax, &aay);
     const u32 aa = (aax > 1 || aay > 1) ? (aax | aay << 4) : 0u;
     /* Nor, buffered, on the units' gamma decode or on which are cubes. The
      * decode is chosen when the program runs (_rsx_gamma_dyn, its lanes in
@@ -9312,7 +9375,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].raw == raw &&
             s_d3d.vp_fp[i].expand == expand &&
             s_d3d.vp_fp[i].gamma == gamma && s_d3d.vp_fp[i].unnorm == unnorm &&
-            s_d3d.vp_fp[i].shadow == shadow && s_d3d.vp_fp[i].aa == aa &&
+            s_d3d.vp_fp[i].shadow == shadow_key && s_d3d.vp_fp[i].aa == aa &&
             s_d3d.vp_fp[i].wpos == wpos_key && s_d3d.vp_fp[i].atest == atest &&
             s_d3d.vp_fp[i].poly == pkey &&
             s_d3d.vp_fp[i].ext == ext && s_d3d.vp_fp[i].mrt == mrt &&
@@ -9409,7 +9472,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     u8 gamma_masks[16] = {0};
     for (int u = 0; u < VP_TEX_UNITS; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
     u32 nk = 0;
-    int n = (buffered && shadow)
+    int n = dyn
+        ? rsx_fp_decompile_buffered_state_ex(prog, prog_max, fp_ctrl, dshadow, expand ? exp_masks : NULL,
+                                             hlsl, sizeof(hlsl), &nk)
+        : (buffered && shadow)
         ? rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, prog_max, fp_ctrl,
                                                     cube_units, vol_units, shd, gamma_masks,
                                                     expand ? exp_masks : NULL,
@@ -9431,9 +9497,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
     /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
-     * before they reach an integer target. */
-    if (n > 0 && !ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
-        rsx_fp_apply_srgb_output(hlsl, sizeof(hlsl)) < 0) {
+     * before they reach an integer target. Dynamic: when fp_state's flag says so. */
+    if (n > 0 && (dyn ? rsx_fp_apply_srgb_output_if(hlsl, sizeof(hlsl), "asuint(fp_state.x) & 1u") < 0
+                      : (!ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
+                         rsx_fp_apply_srgb_output(hlsl, sizeof(hlsl)) < 0))) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 8))
             fprintf(stderr, "[FP] fp=0x%08X: sRGB output not applied (shape)%c", fp_addr, 10);
@@ -9449,7 +9516,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         snprintf(from, sizeof from, "cbuffer PSConstants : register(b1) {\n    float4 fp_constants[%u];\n"
                                     "    float4 fp_alpha;\n};\n", nd);
         snprintf(to, sizeof to, "cbuffer PSConstants : register(b1) {\n    float4 fp_tcscale[16];\n"
-                                "    float4 fp_alpha;\n    float4 fp_constants[%u];\n};\n", nd);
+                                "    float4 fp_alpha;\n%s    float4 fp_constants[%u];\n};\n",
+                 dyn ? "    float4 fp_state;\n" : "", nd);
         if (!strstr(hlsl, from)) {
             static int _e = 0;
             if (PS3_LOG_FIRST(_e, 8))
@@ -9459,14 +9527,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         hlsl_replace_all(hlsl, sizeof hlsl, from, to);
         hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_gamma_mask(u) 0u\n",
                          "#define _rsx_gamma_mask(u) ((uint)fp_tcscale[u].z)\n");
-        fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~(cube_units | vol_units), NULL);
+        if (!dyn) fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~(cube_units | vol_units), NULL);
         if (shadow) fp_shadow_scale(hlsl, sizeof(hlsl), shd);
     } else if (unnorm && udr) {
         float sc[VP_TEX_UNITS][2];
         const u32 mask = dr_coord_scales(udr, sc);
         fp_apply_coord_scale(hlsl, sizeof(hlsl), mask & ~(cube_units | vol_units), (const float (*)[2])sc);
     }
-    if (aa && rsx_fp_apply_wpos_grid(hlsl, sizeof(hlsl), aax, aay) < 0) {
+    if (dyn ? rsx_fp_apply_wpos_grid_expr(hlsl, sizeof(hlsl), "fp_state.zw") < 0
+            : aa && rsx_fp_apply_wpos_grid(hlsl, sizeof(hlsl), aax, aay) < 0) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 8))
             fprintf(stderr, "[FP] fp=0x%08X: WPOS sample grid not applied (shape)%c", fp_addr, 10);
@@ -9484,8 +9553,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_wpos(p) (p)\n", def);
     }
     /* Internal resolution: WPOS back in guest pixels by the target's own factor, which replay
-     * puts in fp_alpha.w. Only when it is on, so that at 1 every program is the text it was. */
-    if (buffered && s_wide != 1.0f) {
+     * puts in fp_alpha.w. Only when it is on, so that at 1 every program is the text it was.
+     * Dynamic: always, the ultrawide factor from fp_state.y and fp_alpha.w 1 with it off. */
+    if (dyn)
+        hlsl_replace_all(hlsl, sizeof hlsl,
+                         "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,",
+                         "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? fp_state.y : 1.0) + fp_alpha.z, "
+                         "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + "
+                         "fp_alpha.z,");
+    else if (buffered && s_wide != 1.0f) {
         /* A target drawn wider has -1/sy in fp_alpha.w; x is then that much further. */
         char wp[256];
         snprintf(wp, sizeof wp, "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? %.7f : 1.0) + fp_alpha.z, (fp_alpha.y != 0.0 ? "
@@ -9938,7 +10014,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].gamma     = gamma;
     s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm    = unnorm;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].shadow    = shadow;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].shadow    = shadow_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].expand    = expand;
     s_d3d.vp_fp[s_d3d.vp_fp_n].wpos      = wpos_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].atest     = atest;
@@ -12339,6 +12415,10 @@ static int rsx_census_secs(void)
 static unsigned long long s_cen_bind[256], s_cen_null[256][3], s_cen_mips, s_cen_binds;
 static unsigned long long s_cen_hist[10];
 static double s_cen_last_present, s_cen_t0, s_cen_max_ms;
+/* The frames read back from the GPU's timestamps since the last report: their number, their
+ * time in all (copies, draws, the rest, the whole) and the longest. */
+static unsigned long long s_cen_gpu_n;
+static double s_cen_gpu_ms[4], s_cen_gpu_max;
 static void rsx_census_bind(u32 fmt, u32 mips)
 {
     s_cen_bind[fmt & 0xFFu]++; s_cen_binds++;
@@ -12422,6 +12502,14 @@ static void rsx_census_present(void)
                     "80-100:%llu 100-150:%llu 150-250:%llu 250-500:%llu 500-1000:%llu >1000:%llu, max %.0f\n",
             s_cen_hist[0], s_cen_hist[1], s_cen_hist[2], s_cen_hist[3], s_cen_hist[4], s_cen_hist[5],
             s_cen_hist[6], s_cen_hist[7], s_cen_hist[8], s_cen_hist[9], s_cen_max_ms);
+    if (s_cen_gpu_n) {
+        const double n = (double)s_cen_gpu_n;
+        fprintf(stderr, "[census] GPU: %llu frames, %.2f ms a frame on average (copies %.2f, draws %.2f, the rest "
+                        "%.2f), the longest %.1f%c", s_cen_gpu_n, s_cen_gpu_ms[3] / n, s_cen_gpu_ms[0] / n,
+                s_cen_gpu_ms[1] / n, s_cen_gpu_ms[2] / n, s_cen_gpu_max, 10);
+        s_cen_gpu_n = 0; s_cen_gpu_max = 0.0;
+        memset(s_cen_gpu_ms, 0, sizeof s_cen_gpu_ms);
+    }
     if (s_psoc_mode == 1)
         fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
                 (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);
@@ -14104,6 +14192,11 @@ static void gts_read(void)
     s_hl_gpu_ms[2] = (double)(t[3] - t[2]) * k;
     s_hl_gpu_ms[3] = (double)(t[3] - t[0]) * k;
     if (ovs_on()) s_ovs_gpu_ms += s_hl_gpu_ms[3];
+    if (rsx_census_secs()) {
+        s_cen_gpu_n++;
+        for (int i = 0; i < 4; i++) s_cen_gpu_ms[i] += s_hl_gpu_ms[i];
+        if (s_hl_gpu_ms[3] > s_cen_gpu_max) s_cen_gpu_max = s_hl_gpu_ms[3];
+    }
     if (s_hl_gpu_ms[1] < 50.0 || s_gps_rd_slot < 0) return;
     const int fi = s_gps_rd_slot, n = s_gps_rd_n;
     D3D12_RANGE pr = { (SIZE_T)8 * GPS_MAX * fi, (SIZE_T)8 * GPS_MAX * fi + (SIZE_T)8 * n };
@@ -15882,6 +15975,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         rs_target(cur_rt, cur_z, cur_nc, &rx, &ry);
                         ts[FPCB_ALPHA * 4 + 3] = rx != ry ? -1.0f / ry : 1.0f / rx;
                     }
+                    if (fp_dyn_on()) fp_dyn_state(dr, ts);
                 }
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)

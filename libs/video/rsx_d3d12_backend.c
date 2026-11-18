@@ -4684,7 +4684,8 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
 #define OVS_W  640     /* the stats panel's region, below the rows */
 #define OVS_H  736
 #define OVI_H  96      /* the shader build indicator's band, below the panel's region */
-#define OV_H   (OV_ROWS_H + OVS_H + OVI_H)
+#define OVT_H  160     /* a trophy's notice, below the indicator's band */
+#define OV_H   (OV_ROWS_H + OVS_H + OVI_H + OVT_H)
 
 static const char* volatile s_toast_msg;   /* a string literal, or NULL */
 static volatile ULONGLONG   s_toast_until;
@@ -4695,6 +4696,70 @@ static void ov_toast(const char* msg)
 {
     s_toast_until = GetTickCount64() + 2000;
     InterlockedExchangePointer((void* volatile*)&s_toast_msg, (void*)msg);
+}
+
+/* Trophy notices (rsx_d3d12_backend_trophy): a queue, each shown in turn at the top centre for six
+ * seconds, fading in and out. Any thread adds at the tail; the presenting thread alone takes the head. */
+#define OVT_QUEUE   8
+#define OVT_SHOW_MS 6000
+#define OVT_FADE_IN 250
+#define OVT_FADE_OUT 400
+typedef struct {
+    char caption[96];             /* UTF-8 */
+    char name[192];               /* UTF-8 */
+    int grade;                    /* 1 platinum .. 4 bronze */
+    unsigned char* icon;          /* straight-alpha RGBA, malloc'd, or NULL */
+    int iw, ih;
+    unsigned seq;                 /* which notice it is, for its slot is reused */
+    ULONGLONG start;              /* its first frame on screen, 0 before */
+} OvTrophy;
+static OvTrophy s_ovt_q[OVT_QUEUE];
+static int s_ovt_head, s_ovt_n;
+static unsigned s_ovt_seq;
+static SRWLOCK s_ovt_lock = SRWLOCK_INIT;
+
+void rsx_d3d12_backend_trophy(const char* caption, const char* name, int grade,
+                              const unsigned char* icon, int w, int h)
+{
+    AcquireSRWLockExclusive(&s_ovt_lock);
+    if (s_ovt_n < OVT_QUEUE) {
+        OvTrophy* t = &s_ovt_q[(s_ovt_head + s_ovt_n) % OVT_QUEUE];
+        memset(t, 0, sizeof *t);
+        snprintf(t->caption, sizeof t->caption, "%s", caption ? caption : "");
+        snprintf(t->name, sizeof t->name, "%s", name ? name : "");
+        t->grade = grade;
+        t->seq = ++s_ovt_seq;
+        if (icon && w > 0 && h > 0 && w <= 1024 && h <= 1024) {
+            t->icon = (unsigned char*)malloc((size_t)w * h * 4);
+            if (t->icon) {
+                memcpy(t->icon, icon, (size_t)w * h * 4);
+                t->iw = w;
+                t->ih = h;
+            }
+        }
+        s_ovt_n++;
+    }
+    ReleaseSRWLockExclusive(&s_ovt_lock);
+}
+
+/* The notice on screen now, or NULL; one past its time is dropped first. Presenting thread only. */
+static OvTrophy* ovt_current(ULONGLONG now)
+{
+    if (!*(volatile int*)&s_ovt_n) return NULL;   /* most frames: none, and no lock */
+    AcquireSRWLockExclusive(&s_ovt_lock);
+    OvTrophy* t = NULL;
+    while (s_ovt_n > 0) {
+        t = &s_ovt_q[s_ovt_head];
+        if (!t->start) t->start = now;
+        if (now - t->start < OVT_SHOW_MS) break;
+        free(t->icon);
+        memset(t, 0, sizeof *t);
+        s_ovt_head = (s_ovt_head + 1) % OVT_QUEUE;
+        s_ovt_n--;
+        t = NULL;
+    }
+    ReleaseSRWLockExclusive(&s_ovt_lock);
+    return t;
 }
 
 /* display.show_fps: 0 off, 1 the title bar (the default), 2 overlay (the neon panel), 3 stats (the
@@ -5608,6 +5673,178 @@ static void ovi_render(unsigned char* dst, u32 font_px, const char* text, float 
     *ph = (u32)bh;
 }
 
+/* A grade's colour in its notice: platinum, gold, silver, bronze. */
+static void ovt_grade_rgb(int grade, float* r, float* g, float* b)
+{
+    switch (grade) {
+    case 1:  *r = 0.70f; *g = 0.80f; *b = 0.94f; break;
+    case 2:  *r = 0.92f; *g = 0.75f; *b = 0.24f; break;
+    case 3:  *r = 0.78f; *g = 0.80f; *b = 0.83f; break;
+    default: *r = 0.82f; *g = 0.55f; *b = 0.33f; break;
+    }
+}
+
+/* Trophy t's notice into s_ovt_img, premultiplied RGBA with rows OV_W * 4 apart, at most OV_W x OVT_H; its
+ * size comes back in *pw, *ph. A rounded box of 88% near-black; in it the trophy's picture, area-sampled to a
+ * square, and two lines: the caption in the grade's colour, the trophy's name in white under it. GDI draws
+ * the text, for its coverage; the strings are UTF-8, for names in any of the title's languages. */
+static unsigned char s_ovt_img[OV_W * OVT_H * 4];
+static void ovt_render(const OvTrophy* t, u32 font_px, u32* pw, u32* ph)
+{
+    static HDC dc;
+    static u32* bits;
+    static HFONT f_big, f_small;
+    static u32 font_size;
+    if (!dc) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = OV_W;
+        bi.bmiHeader.biHeight = -OVT_H;   /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        dc = CreateCompatibleDC(NULL);
+        HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0) : NULL;
+        if (!bmp || !bits) { dc = NULL; *pw = *ph = 0; return; }
+        SelectObject(dc, bmp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+    if (font_size != font_px) {
+        if (f_big) DeleteObject(f_big);
+        if (f_small) DeleteObject(f_small);
+        f_big = CreateFontW(-(int)font_px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS,
+                          L"Segoe UI");
+        f_small = CreateFontW(-(int)(font_px * 3 / 4), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS,
+                            L"Segoe UI");
+        font_size = font_px;
+    }
+    const int pad = (int)(font_px * 11 / 20), icon = (int)(font_px * 12 / 5), gap = pad;
+    const int bh = icon + 2 * pad;
+    if (bh > OVT_H) { *pw = *ph = 0; return; }
+    wchar_t cap[96], name[192];
+    if (!MultiByteToWideChar(CP_UTF8, 0, t->caption, -1, cap, 96)) cap[0] = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, t->name, -1, name, 192)) name[0] = 0;
+    const int cl = (int)wcslen(cap), nl = (int)wcslen(name);
+    memset(bits, 0, (size_t)OV_W * OVT_H * 4);
+    SIZE cs = {0, 0}, ns = {0, 0};
+    SelectObject(dc, f_small);
+    GetTextExtentPoint32W(dc, cap, cl, &cs);
+    SelectObject(dc, f_big);
+    GetTextExtentPoint32W(dc, name, nl, &ns);
+    const int tx = pad + icon + gap, line_gap = (int)(font_px / 8), tmax = OV_W - pad;
+    const int cy0 = pad + (icon - (cs.cy + line_gap + ns.cy)) / 2, ny0 = cy0 + cs.cy + line_gap;
+    RECT rc = { tx, cy0, tmax, cy0 + cs.cy };   /* a name too long for the box ends in an ellipsis */
+    SelectObject(dc, f_small);
+    DrawTextW(dc, cap, cl, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    rc.top = ny0;
+    rc.bottom = ny0 + ns.cy;
+    SelectObject(dc, f_big);
+    DrawTextW(dc, name, nl, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    GdiFlush();
+    int bw = tx + (cs.cx > ns.cx ? cs.cx : ns.cx) + pad;
+    if (bw > OV_W) bw = OV_W;
+    float gr, gg, gb;
+    ovt_grade_rgb(t->grade, &gr, &gg, &gb);
+    const float rad = (float)bh * 0.22f;   /* the box's corners */
+    for (int y = 0; y < OVT_H; y++) {
+        for (int x = 0; x < OV_W; x++) {
+            unsigned char* o = s_ovt_img + ((size_t)y * OV_W + x) * 4;
+            if (x >= bw || y >= bh) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
+            const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            const float qx = px < rad ? rad - px : px > (float)bw - rad ? px - ((float)bw - rad) : 0.0f;
+            const float qy = py < rad ? rad - py : py > (float)bh - rad ? py - ((float)bh - rad) : 0.0f;
+            const float box = ovi_clamp01(rad - sqrtf(qx * qx + qy * qy) + 0.5f);
+            float a = 0.88f * box, r = 10.0f / 255.0f * a, g = 12.0f / 255.0f * a, b = 18.0f / 255.0f * a;
+            /* the picture: the mean of the source pixels under this one, premultiplied */
+            if (t->icon && x >= pad && x < pad + icon && y >= pad && y < pad + icon) {
+                const int ix = x - pad, iy = y - pad;
+                int sx0 = ix * t->iw / icon, sx1 = (ix + 1) * t->iw / icon;
+                int sy0 = iy * t->ih / icon, sy1 = (iy + 1) * t->ih / icon;
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+                if (sy1 <= sy0) sy1 = sy0 + 1;
+                float sr = 0.0f, sg = 0.0f, sb = 0.0f, sa = 0.0f;
+                int n = 0;
+                for (int sy = sy0; sy < sy1 && sy < t->ih; sy++)
+                    for (int sx = sx0; sx < sx1 && sx < t->iw; sx++) {
+                        const unsigned char* s = t->icon + ((size_t)sy * t->iw + sx) * 4;
+                        const float al = (float)s[3] / 255.0f;
+                        sr += (float)s[0] / 255.0f * al;
+                        sg += (float)s[1] / 255.0f * al;
+                        sb += (float)s[2] / 255.0f * al;
+                        sa += al;
+                        n++;
+                    }
+                if (n) {
+                    sr /= (float)n; sg /= (float)n; sb /= (float)n; sa /= (float)n;
+                    r = sr + r * (1.0f - sa); g = sg + g * (1.0f - sa); b = sb + b * (1.0f - sa);
+                    a = sa + a * (1.0f - sa);
+                }
+            }
+            /* the text */
+            const u32 p = bits[(size_t)y * OV_W + x];
+            u32 cov = p & 0xFF;
+            if (((p >> 8) & 0xFF) > cov) cov = (p >> 8) & 0xFF;
+            if (((p >> 16) & 0xFF) > cov) cov = (p >> 16) & 0xFF;
+            if (cov) {
+                const float c = (float)cov / 255.0f * box;
+                const int caption = y < ny0;
+                r = (caption ? gr : 1.0f) * c + r * (1.0f - c);
+                g = (caption ? gg : 1.0f) * c + g * (1.0f - c);
+                b = (caption ? gb : 1.0f) * c + b * (1.0f - c);
+                a = c + a * (1.0f - c);
+            }
+            o[0] = (unsigned char)(r * 255.0f + 0.5f);
+            o[1] = (unsigned char)(g * 255.0f + 0.5f);
+            o[2] = (unsigned char)(b * 255.0f + 0.5f);
+            o[3] = (unsigned char)(a * 255.0f + 0.5f);
+        }
+    }
+    *pw = (u32)bw;
+    *ph = (u32)bh;
+}
+
+/* The rendered notice, w x h, into its band at dst (rows OV_W * 4 apart), every value times k for a fade. */
+static void ovt_put(unsigned char* dst, u32 w, u32 h, float k)
+{
+    const u32 kk = (u32)(k * 256.0f + 0.5f);
+    for (u32 y = 0; y < h; y++) {
+        const unsigned char* s = s_ovt_img + (size_t)y * OV_W * 4;
+        unsigned char* d = dst + (size_t)y * OV_W * 4;
+        if (kk >= 256) {
+            memcpy(d, s, (size_t)w * 4);
+            continue;
+        }
+        for (u32 i = 0; i < w * 4; i++)
+            d[i] = (unsigned char)((s[i] * kk + 128) >> 8);
+    }
+}
+
+/* Rows [y0, y1) of this frame's upload buffer into the overlay's texture. */
+static void ov_upload_rows(u32 fi, u32 y0, u32 y1)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    pp_barrier(s_d3d.ov_tex, s_d3d.ov_tex_ready ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                                : D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+    dl.pResource = s_d3d.ov_tex;
+    dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    sl.pResource = s_d3d.ov_up[fi];
+    sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sl.PlacedFootprint.Footprint.Width = OV_W;
+    sl.PlacedFootprint.Footprint.Height = OV_H;
+    sl.PlacedFootprint.Footprint.Depth = 1;
+    sl.PlacedFootprint.Footprint.RowPitch = OV_W * 4;
+    const D3D12_BOX band = { 0, y0, 0, OV_W, y1, 1 };
+    cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, y0, 0, &sl, &band);
+    pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    s_d3d.ov_tex_ready = 1;
+}
+
 static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     if (!s_d3d.ov_pso) return;
@@ -5637,7 +5874,8 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         }
     }
     const int ind = ovi_on() && GetTickCount64() < ovi_until && ovi_text[0];
-    if (!panel && !item[1] && !ind) return;
+    const OvTrophy* tro = ovt_current(GetTickCount64());
+    if (!panel && !item[1] && !ind && !tro) return;
 
     /* Text the window's height can read: the message 1/40 of it (14 to 40
      * pixels), the panel 1/60 (12 to 28). */
@@ -5662,6 +5900,22 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     if (ind)   /* its band every frame it shows: the ring turns */
         ovi_render(s_d3d.ov_up_ptr[fi] + (size_t)(OV_ROWS_H + OVS_H) * OV_W * 4, pfont, ovi_text, ovi_frac,
                    (float)(now % 100000u) / 1000.0f * 1.25f, &iw, &ih);
+    /* A trophy's notice: drawn once, then into its band every frame it shows, for each frame has its own
+     * upload buffer and it fades in and out. */
+    static unsigned tro_seq;
+    static u32 tro_px, tw, th;
+    if (tro) {
+        if (tro->seq != tro_seq || tro_px != font_px) {
+            ovt_render(tro, font_px, &tw, &th);
+            tro_seq = tro->seq;
+            tro_px = font_px;
+        }
+        const ULONGLONG el = now >= tro->start ? now - tro->start : 0;
+        float k = 1.0f;
+        if (el < OVT_FADE_IN) k = (float)el / (float)OVT_FADE_IN;
+        else if (el + OVT_FADE_OUT > OVT_SHOW_MS) k = (float)(OVT_SHOW_MS - el) / (float)OVT_FADE_OUT;
+        ovt_put(s_d3d.ov_up_ptr[fi] + (size_t)(OV_ROWS_H + OVS_H + OVI_H) * OV_W * 4, tw, th, k);
+    }
     int whole = 0;
     if (panel_due || font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") ||
         strcmp(shown[1], item[1] ? item[1] : "")) {
@@ -5691,25 +5945,11 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         s_d3d.ov_tex_ready = 1;
     }
-    if (ind && !whole && ih) {
-        /* only the indicator's band */
-        pp_barrier(s_d3d.ov_tex, s_d3d.ov_tex_ready ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                                                    : D3D12_RESOURCE_STATE_COMMON,
-                   D3D12_RESOURCE_STATE_COPY_DEST);
-        D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
-        dl.pResource = s_d3d.ov_tex;
-        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        sl.pResource = s_d3d.ov_up[fi];
-        sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sl.PlacedFootprint.Footprint.Width = OV_W;
-        sl.PlacedFootprint.Footprint.Height = OV_H;
-        sl.PlacedFootprint.Footprint.Depth = 1;
-        sl.PlacedFootprint.Footprint.RowPitch = OV_W * 4;
-        const D3D12_BOX band = { 0, OV_ROWS_H + OVS_H, 0, OV_W, OV_ROWS_H + OVS_H + OVI_H, 1 };
-        cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, OV_ROWS_H + OVS_H, 0, &sl, &band);
-        pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        s_d3d.ov_tex_ready = 1;
+    if (!whole && ((ind && ih) || (tro && th))) {
+        /* only the bands that change every frame they show: the indicator's, the trophy's under it */
+        const u32 y0 = ind && ih ? OV_ROWS_H + OVS_H : OV_ROWS_H + OVS_H + OVI_H;
+        const u32 y1 = tro && th ? OV_H : OV_ROWS_H + OVS_H + OVI_H;
+        ov_upload_rows(fi, y0, y1);
     }
 
     D3D12_GPU_DESCRIPTOR_HANDLE srv;
@@ -5723,10 +5963,23 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     const float bw = (float)s_d3d.bb_w, bh = (float)s_d3d.bb_h;
+    float msg_y = bh * 0.08f;
+    if (tro && tw && th) {
+        /* the trophy's notice at the top centre, a texel to a pixel; a message goes under it */
+        const float x = floorf((bw - (float)tw) * 0.5f), y = floorf(bh * 0.04f);
+        const float y0 = (float)(OV_ROWS_H + OVS_H + OVI_H);
+        const float c[16] = {
+            x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
+            (x + (float)tw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)th) / bh * 2.0f,
+            0.0f, y0 / (float)OV_H, (float)tw / (float)OV_W, (y0 + (float)th) / (float)OV_H };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+        if (msg_y < y + (float)th + (float)pfont * 0.5f) msg_y = y + (float)th + (float)pfont * 0.5f;
+    }
     for (int r = 0; r < 2; r++) {
         if (!item[r] || !w[r]) continue;
         /* a message centred near the top */
-        const float x = (bw - (float)w[r]) * 0.5f, y = bh * 0.08f;
+        const float x = (bw - (float)w[r]) * 0.5f, y = msg_y;
         const float c[16] = {
             x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
             (x + (float)w[r]) / bw * 2.0f - 1.0f, 1.0f - (y + (float)OV_ROW) / bh * 2.0f,

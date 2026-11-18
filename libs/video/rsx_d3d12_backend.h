@@ -62,6 +62,12 @@ void rsx_d3d12_backend_camera_register(int reg, int prev_reg, int prev_attr);
 /* A line of the game's own at the foot of the stats panel: fn writes it and returns its length, 0 for none. */
 void rsx_d3d12_backend_overlay_line(int (*fn)(char* out, int max));
 
+/* A trophy's notice at the top centre of the picture for six seconds, after any before it: caption over the
+ * trophy's name (both UTF-8), in the colour of grade (1 platinum, 2 gold, 3 silver, 4 bronze), beside its
+ * picture icon, w x h straight-alpha RGBA (copied; NULL for none). Any thread; up to eight wait their turn. */
+void rsx_d3d12_backend_trophy(const char* caption, const char* name, int grade,
+                              const unsigned char* icon, int w, int h);
+
 /* How much wider than the title's 16:9 the picture is to be: 1 unless display.ultrawide is on and the monitor the game is on
  * (or display.window_size, windowed) is wider. */
 float rsx_d3d12_backend_wide_ratio(void);

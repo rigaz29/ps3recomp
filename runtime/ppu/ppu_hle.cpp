@@ -768,8 +768,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
+        /* Each NID the first time it is called, whenever that is: a cap of 40 lines a run went to one import the
+         * title calls in a loop, and an import called later (God of War: Ascension's cellSaveDataFixedDelete, at
+         * the player's Delete Profile) never showed. */
+        {
+            static uint32_t seen[512];
+            static unsigned n_seen;
+            static volatile char seen_lock;
+            while (__atomic_test_and_set(&seen_lock, __ATOMIC_ACQUIRE)) {}
+            unsigned i = 0;
+            while (i < n_seen && seen[i] != nid) i++;
+            const int first = i == n_seen && n_seen < 512;
+            if (first) seen[n_seen++] = nid;
+            __atomic_clear(&seen_lock, __ATOMIC_RELEASE);
+            if (first) fprintf(stderr, "[hle] unresolved NID 0x%08X (its first call; not reported again)\n", nid);
+        }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */

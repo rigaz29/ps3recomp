@@ -35,6 +35,10 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
 {
     (void)nid; (void)name; (void)fn;
 }
+/* cellSaveDataFixedDelete's question (sys_dialog.c) and its picture (stb_image): none here, the answer No. */
+stbi_uc* stbi_load(char const* f, int* x, int* y, int* c, int req) { (void)f; (void)x; (void)y; (void)c; (void)req; return NULL; }
+void stbi_image_free(void* p) { (void)p; }
+int ps3_sysdlg_ask(const PS3SysDialog* d, int cancel) { (void)d; return cancel; }
 
 #define LOW 0x10000u
 #define SIZE 0x200000u

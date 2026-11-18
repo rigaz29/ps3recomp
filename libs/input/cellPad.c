@@ -25,6 +25,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_settings.h"
+#include "../system/sys_dialog.h"   /* a system question takes the pad while it is up */
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -2223,6 +2224,20 @@ emit:
      * attack firing once.
      *
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+    /* A system question is up (sys_dialog.h, a save's deletion asking first): as on the PS3 the pad is the
+     * system's while it is, and the title is handed nothing pressed and the sticks at rest. */
+    if (ps3_sysdlg_active()) {
+        if (port_no == 0 && data->len > 0)
+            ps3_sysdlg_pad(((unsigned)(data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xFF) << 8) |
+                               (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF),
+                           data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]);
+        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = 0;
+        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0;
+        for (int _i = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X; _i <= CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y; _i++)
+            data->button[_i] = 0x80;
+        for (int _i = CELL_PAD_BTN_OFFSET_PRESS_RIGHT; _i <= CELL_PAD_BTN_OFFSET_PRESS_R2; _i++)
+            data->button[_i] = 0;
+    }
     if (s_rec && read_ms && port_no == 0 && data->len > 0)
         pad_rec_report(data->button, (s_port_setting[0] & CELL_PAD_SETTING_PRESS_ON) != 0, read_ms);
     {

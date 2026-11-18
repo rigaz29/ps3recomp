@@ -25,6 +25,7 @@
 #include "rsx_smaa.h"
 #include "ps3emu/thread_name.h"
 #include "rsx_d3d12_backend.h"
+#include "../system/sys_dialog.h"   /* the system's questions, drawn in the overlay */
 #include "rsx_present_policy.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -3261,6 +3262,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;   /* Alt+F4 and the rest: the default */
     case WM_KEYDOWN:
+        if (ps3_sysdlg_key((int)wp)) return 0;   /* a system question up takes Enter, Esc and the arrows */
         if (wp == VK_F11) {
             if (!(lp & (1 << 30))) {
                 d3d12_set_borderless(hwnd, !s_borderless);
@@ -4685,7 +4687,9 @@ static void pp_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESO
 #define OVS_H  736
 #define OVI_H  96      /* the shader build indicator's band, below the panel's region */
 #define OVT_H  160     /* a trophy's notice, below the indicator's band */
-#define OV_H   (OV_ROWS_H + OVS_H + OVI_H + OVT_H)
+#define OVD_H  480     /* a system question (sys_dialog.h), below the trophy's */
+#define OVD_Y0 (OV_ROWS_H + OVS_H + OVI_H + OVT_H)
+#define OV_H   (OV_ROWS_H + OVS_H + OVI_H + OVT_H + OVD_H)
 
 static const char* volatile s_toast_msg;   /* a string literal, or NULL */
 static volatile ULONGLONG   s_toast_until;
@@ -5845,6 +5849,226 @@ static void ov_upload_rows(u32 fi, u32 y0, u32 y1)
     s_d3d.ov_tex_ready = 1;
 }
 
+/* A system question (sys_dialog.h) into s_ovd_img, premultiplied RGBA with rows OV_W * 4 apart, its size in *pw,
+ * *ph: a rounded near-black box; the heading in gold over a rule; the save's picture beside its lines; the
+ * question; the two choices, the cursor's lit; and under them the button that chooses and the one that goes back,
+ * drawn as the pad's own shapes. In the band's bottom right corner a block of 55% black, which dims the picture
+ * behind the box. GDI draws the text, white on black, for its coverage; the colours are put on here. */
+static unsigned char s_ovd_img[OV_W * OVD_H * 4];
+#define OVD_DIM 4
+
+/* "a over": the premultiplied colour c at coverage k over (r, g, b, a). */
+static void ovd_over(float* p, float cr, float cg, float cb, float k)
+{
+    p[0] = cr * k + p[0] * (1.0f - k);
+    p[1] = cg * k + p[1] * (1.0f - k);
+    p[2] = cb * k + p[2] * (1.0f - k);
+    p[3] = k + p[3] * (1.0f - k);
+}
+
+/* How much of the pixel centred at (px, py) a box (x0, y0)-(x1, y1) with corners of radius r covers. */
+static float ovd_box(float px, float py, float x0, float y0, float x1, float y1, float r)
+{
+    if (px < x0 - 1.0f || px > x1 + 1.0f || py < y0 - 1.0f || py > y1 + 1.0f) return 0.0f;
+    const float qx = px < x0 + r ? x0 + r - px : px > x1 - r ? px - (x1 - r) : 0.0f;
+    const float qy = py < y0 + r ? y0 + r - py : py > y1 - r ? py - (y1 - r) : 0.0f;
+    return ovi_clamp01(r - sqrtf(qx * qx + qy * qy) + 0.5f);
+}
+
+/* The pad's cross (blue) or circle (red) on a dark disc of radius R at (cx, cy). */
+static void ovd_glyph(float* p, float px, float py, float cx, float cy, float R, int circle)
+{
+    const float dx = px - cx, dy = py - cy, dist = sqrtf(dx * dx + dy * dy);
+    const float disc = ovi_clamp01(R - dist + 0.5f);
+    if (disc <= 0.0f) return;
+    ovd_over(p, 0.13f, 0.13f, 0.15f, disc);
+    float k;
+    if (circle) {
+        k = ovi_clamp01(0.13f * R - fabsf(dist - 0.52f * R) + 0.5f);
+        ovd_over(p, 0.95f, 0.36f, 0.36f, k * disc);
+    } else {
+        const float d1 = fabsf(dx - dy) * 0.7071f, d2 = fabsf(dx + dy) * 0.7071f;
+        const float in = (fabsf(dx) < 0.48f * R && fabsf(dy) < 0.48f * R) ? 1.0f : 0.0f;
+        k = in * ovi_clamp01(0.11f * R - (d1 < d2 ? d1 : d2) + 0.5f);
+        ovd_over(p, 0.45f, 0.66f, 0.98f, k * disc);
+    }
+}
+
+static void ovd_render(const PS3SysDialog* d, u32 font_px, u32* pw, u32* ph)
+{
+    static HDC dc;
+    static u32* bits;
+    static HFONT f_head, f_text, f_bold, f_small;
+    static int font_u;
+    *pw = *ph = 0;
+    if (!dc) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = OV_W;
+        bi.bmiHeader.biHeight = -OVD_H;   /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        dc = CreateCompatibleDC(NULL);
+        HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0) : NULL;
+        if (!bmp || !bits) { dc = NULL; return; }
+        SelectObject(dc, bmp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+    int u = (int)(font_px * 3 / 4);   /* the unit everything is sized by: 20 at 1080 lines */
+    if (u < 10) u = 10;
+    if (u > 30) u = 30;
+    if (font_u != u) {
+        HFONT* f[4] = { &f_head, &f_text, &f_bold, &f_small };
+        const int size[4] = { u * 23 / 20, u * 19 / 20, u * 19 / 20, u * 4 / 5 };
+        const int weight[4] = { FW_SEMIBOLD, FW_NORMAL, FW_SEMIBOLD, FW_NORMAL };
+        for (int i = 0; i < 4; i++) {
+            if (*f[i]) DeleteObject(*f[i]);
+            *f[i] = CreateFontW(-size[i], 0, 0, 0, weight[i], FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        }
+        font_u = u;
+    }
+    /* Where each part goes. */
+    int W = u * 27;
+    if (W > OV_W - 2 * OVD_DIM) W = OV_W - 2 * OVD_DIM;
+    const int pad = u, info_n = d->nlines > 0 ? d->nlines - 1 : 0, line_h = u * 13 / 10;
+    const int head_y = pad, rule_y = head_y + u * 3 / 2;
+    const int icon_h = d->iw > 0 && d->ih > 0 ? u * 21 / 5 : 0;
+    int icon_w = icon_h ? icon_h * d->iw / d->ih : 0;
+    if (icon_w > W / 2) icon_w = W / 2;
+    const int info_y = rule_y + u * 7 / 10, text_x = pad + (icon_w ? icon_w + u : 0);
+    const int block_h = icon_h > info_n * line_h ? icon_h : info_n * line_h;
+    const int q_y = info_y + block_h + u * 9 / 10;
+    const int btn_w = u * 5, btn_h = u * 9 / 5, btn_gap = u, btn_y = q_y + u * 3 / 2;
+    const int bx[2] = { (W - (2 * btn_w + btn_gap)) / 2, (W - (2 * btn_w + btn_gap)) / 2 + btn_w + btn_gap };
+    const int hint_y = btn_y + btn_h + u * 4 / 5, hint_h = u * 6 / 5;
+    const int H = hint_y + hint_h + pad;
+    if (H > OVD_H - 2 * OVD_DIM || W < u * 10) return;
+
+    /* The text, white on black. */
+    memset(bits, 0, (size_t)OV_W * OVD_H * 4);
+    wchar_t w[256];
+    RECT rc;
+    const UINT one = DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS | DT_VCENTER;
+#define OVD_TEXT(font, s, l, t, r, b, fl)                                                         \
+    do {                                                                                          \
+        if (!MultiByteToWideChar(CP_UTF8, 0, (s), -1, w, 256)) w[0] = 0;                          \
+        SetRect(&rc, (l), (t), (r), (b));                                                         \
+        SelectObject(dc, (font));                                                                 \
+        DrawTextW(dc, w, -1, &rc, (fl));                                                          \
+    } while (0)
+    OVD_TEXT(f_head, d->title, pad, head_y, W - pad, rule_y, one | DT_LEFT);
+    for (int i = 0; i < info_n; i++)
+        OVD_TEXT(i == 0 ? f_bold : f_text, d->line[i], text_x, info_y + i * line_h, W - pad,
+                 info_y + (i + 1) * line_h, one | DT_LEFT);
+    if (d->nlines > 0)
+        OVD_TEXT(f_text, d->line[d->nlines - 1], pad, q_y, W - pad, q_y + u * 3 / 2, one | DT_CENTER);
+    for (int i = 0; i < 2; i++)
+        OVD_TEXT(f_bold, d->choice[i], bx[i], btn_y, bx[i] + btn_w, btn_y + btn_h, one | DT_CENTER);
+    /* the hint: [enter] Select   [back] Back, in the middle */
+    SIZE s_sel = { 0, 0 }, s_back = { 0, 0 };
+    SelectObject(dc, f_small);
+    GetTextExtentPoint32W(dc, L"Select", 6, &s_sel);
+    GetTextExtentPoint32W(dc, L"Back", 4, &s_back);
+    const int gsz = u * 19 / 20, ggap = u * 7 / 20, sgap = u * 6 / 5;
+    const int hint_w = gsz + ggap + s_sel.cx + sgap + gsz + ggap + s_back.cx;
+    const int g0 = (W - hint_w) / 2, t0 = g0 + gsz + ggap, g1 = t0 + s_sel.cx + sgap, t1 = g1 + gsz + ggap;
+    OVD_TEXT(f_small, "Select", t0, hint_y, t0 + s_sel.cx + 2, hint_y + hint_h, one | DT_LEFT);
+    OVD_TEXT(f_small, "Back", t1, hint_y, t1 + s_back.cx + 2, hint_y + hint_h, one | DT_LEFT);
+#undef OVD_TEXT
+    GdiFlush();
+
+    /* Everything put together, a pixel at a time. */
+    const float rad = (float)u * 0.6f, brad = (float)btn_h * 0.35f;
+    for (int y = 0; y < OVD_H; y++) {
+        for (int x = 0; x < OV_W; x++) {
+            unsigned char* o = s_ovd_img + ((size_t)y * OV_W + x) * 4;
+            if (x >= OV_W - OVD_DIM && y >= OVD_H - OVD_DIM) {   /* the dimming block */
+                o[0] = o[1] = o[2] = 0;
+                o[3] = 140;
+                continue;
+            }
+            if (x >= W || y >= H) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
+            const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float p[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const float box = ovd_box(px, py, 0.0f, 0.0f, (float)W, (float)H, rad);
+            ovd_over(p, 0.07f, 0.07f, 0.09f, 0.94f * box);
+            const float edge = box - ovd_box(px, py, 1.5f, 1.5f, (float)W - 1.5f, (float)H - 1.5f, rad - 1.5f);
+            ovd_over(p, 1.0f, 1.0f, 1.0f, 0.22f * ovi_clamp01(edge));
+            if (y == rule_y && x >= pad && x < W - pad) ovd_over(p, 1.0f, 1.0f, 1.0f, 0.2f);
+            /* the save's picture, the mean of its pixels under this one */
+            if (icon_w && x >= pad && x < pad + icon_w && y >= info_y && y < info_y + icon_h) {
+                const int ix = x - pad, iy = y - info_y;
+                int sx0 = ix * d->iw / icon_w, sx1 = (ix + 1) * d->iw / icon_w;
+                int sy0 = iy * d->ih / icon_h, sy1 = (iy + 1) * d->ih / icon_h;
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+                if (sy1 <= sy0) sy1 = sy0 + 1;
+                float sr = 0.0f, sg = 0.0f, sb = 0.0f, sa = 0.0f;
+                int n = 0;
+                for (int sy = sy0; sy < sy1 && sy < d->ih; sy++)
+                    for (int sx = sx0; sx < sx1 && sx < d->iw; sx++) {
+                        const unsigned char* s = d->icon + ((size_t)sy * (size_t)d->iw + (size_t)sx) * 4;
+                        const float al = (float)s[3] / 255.0f;
+                        sr += (float)s[0] / 255.0f * al;
+                        sg += (float)s[1] / 255.0f * al;
+                        sb += (float)s[2] / 255.0f * al;
+                        sa += al;
+                        n++;
+                    }
+                if (n) {
+                    sr /= (float)n; sg /= (float)n; sb /= (float)n; sa /= (float)n;
+                    p[0] = sr + p[0] * (1.0f - sa); p[1] = sg + p[1] * (1.0f - sa);
+                    p[2] = sb + p[2] * (1.0f - sa); p[3] = sa + p[3] * (1.0f - sa);
+                }
+            }
+            /* the choices: the cursor's one light, the other a frame */
+            int in_btn = -1;
+            for (int i = 0; i < 2; i++) {
+                const float k = ovd_box(px, py, (float)bx[i], (float)btn_y, (float)(bx[i] + btn_w),
+                                        (float)(btn_y + btn_h), brad);
+                if (k <= 0.0f) continue;
+                in_btn = i;
+                if (i == d->focus) {
+                    ovd_over(p, 0.94f, 0.94f, 0.94f, k);
+                } else {
+                    ovd_over(p, 1.0f, 1.0f, 1.0f, 0.08f * k);
+                    const float e = k - ovd_box(px, py, (float)bx[i] + 1.5f, (float)btn_y + 1.5f,
+                                                (float)(bx[i] + btn_w) - 1.5f, (float)(btn_y + btn_h) - 1.5f,
+                                                brad - 1.5f);
+                    ovd_over(p, 1.0f, 1.0f, 1.0f, 0.35f * ovi_clamp01(e));
+                }
+            }
+            /* the hint's two buttons */
+            if (y >= hint_y && y < hint_y + hint_h) {
+                const float cy = (float)hint_y + (float)hint_h * 0.5f, R = (float)gsz * 0.5f;
+                ovd_glyph(p, px, py, (float)g0 + R, cy, R, d->enter_circle);
+                ovd_glyph(p, px, py, (float)g1 + R, cy, R, !d->enter_circle);
+            }
+            /* the text, in its part's colour */
+            const u32 t = bits[(size_t)y * OV_W + x];
+            u32 cov = t & 0xFF;
+            if (((t >> 8) & 0xFF) > cov) cov = (t >> 8) & 0xFF;
+            if (((t >> 16) & 0xFF) > cov) cov = (t >> 16) & 0xFF;
+            if (cov) {
+                float cr = 0.97f, cg = 0.97f, cb = 0.97f;
+                if (y < rule_y) { cr = 0.96f; cg = 0.80f; cb = 0.45f; }                       /* the heading */
+                else if (y >= info_y + line_h && y < info_y + block_h) { cr = cg = cb = 0.78f; }   /* details */
+                else if (y >= hint_y) { cr = cg = cb = 0.75f; }                               /* the hint */
+                if (in_btn >= 0 && in_btn == d->focus) { cr = cg = cb = 0.08f; }              /* on the lit choice */
+                ovd_over(p, cr, cg, cb, (float)cov / 255.0f * box);
+            }
+            o[0] = (unsigned char)(ovi_clamp01(p[0]) * 255.0f + 0.5f);
+            o[1] = (unsigned char)(ovi_clamp01(p[1]) * 255.0f + 0.5f);
+            o[2] = (unsigned char)(ovi_clamp01(p[2]) * 255.0f + 0.5f);
+            o[3] = (unsigned char)(ovi_clamp01(p[3]) * 255.0f + 0.5f);
+        }
+    }
+    *pw = (u32)W;
+    *ph = (u32)H;
+}
+
 static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     if (!s_d3d.ov_pso) return;
@@ -5875,7 +6099,8 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     }
     const int ind = ovi_on() && GetTickCount64() < ovi_until && ovi_text[0];
     const OvTrophy* tro = ovt_current(GetTickCount64());
-    if (!panel && !item[1] && !ind && !tro) return;
+    const unsigned dlg = ps3_sysdlg_state();   /* a system question up: nonzero, and changes as it does */
+    if (!panel && !item[1] && !ind && !tro && !dlg) return;
 
     /* Text the window's height can read: the message 1/40 of it (14 to 40
      * pixels), the panel 1/60 (12 to 28). */
@@ -5916,6 +6141,18 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         else if (el + OVT_FADE_OUT > OVT_SHOW_MS) k = (float)(OVT_SHOW_MS - el) / (float)OVT_FADE_OUT;
         ovt_put(s_d3d.ov_up_ptr[fi] + (size_t)(OV_ROWS_H + OVS_H + OVI_H) * OV_W * 4, tw, th, k);
     }
+    /* A system question: drawn when it changes (the cursor moves), into its band every frame it is up. */
+    static PS3SysDialog s_dlg_view;
+    static unsigned dlg_shown;
+    static u32 dlg_px, dw, dh;
+    if (dlg) {
+        if (dlg != dlg_shown || dlg_px != font_px) {
+            if (ps3_sysdlg_view(&s_dlg_view)) ovd_render(&s_dlg_view, font_px, &dw, &dh);
+            dlg_shown = dlg;
+            dlg_px = font_px;
+        }
+        memcpy(s_d3d.ov_up_ptr[fi] + (size_t)OVD_Y0 * OV_W * 4, s_ovd_img, sizeof s_ovd_img);
+    }
     int whole = 0;
     if (panel_due || font_px != shown_px || strcmp(shown[0], item[0] ? item[0] : "") ||
         strcmp(shown[1], item[1] ? item[1] : "")) {
@@ -5945,10 +6182,11 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
         pp_barrier(s_d3d.ov_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         s_d3d.ov_tex_ready = 1;
     }
-    if (!whole && ((ind && ih) || (tro && th))) {
-        /* only the bands that change every frame they show: the indicator's, the trophy's under it */
-        const u32 y0 = ind && ih ? OV_ROWS_H + OVS_H : OV_ROWS_H + OVS_H + OVI_H;
-        const u32 y1 = tro && th ? OV_H : OV_ROWS_H + OVS_H + OVI_H;
+    if (!whole && ((ind && ih) || (tro && th) || dlg)) {
+        /* only the bands that change every frame they show: the indicator's, the trophy's under it, the
+         * question's under that */
+        const u32 y0 = ind && ih ? OV_ROWS_H + OVS_H : tro && th ? OV_ROWS_H + OVS_H + OVI_H : OVD_Y0;
+        const u32 y1 = dlg ? OV_H : tro && th ? OVD_Y0 : OV_ROWS_H + OVS_H + OVI_H;
         ov_upload_rows(fi, y0, y1);
     }
 
@@ -6010,6 +6248,23 @@ static void ov_draw(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
             x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
             (x + (float)pw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)ph) / bh * 2.0f,
             0.0f, (float)OV_ROWS_H / (float)OV_H, (float)pw / (float)OV_W, (float)(OV_ROWS_H + ph) / (float)OV_H };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+    }
+    if (dlg && dw && dh) {
+        /* over everything: the window dimmed (the band's corner block stretched over it), the question in the
+         * middle, a texel to a pixel */
+        const float y0 = (float)OVD_Y0;
+        const float du = ((float)OV_W - (float)OVD_DIM * 0.5f) / (float)OV_W;
+        const float dv = (y0 + (float)OVD_H - (float)OVD_DIM * 0.5f) / (float)OV_H;
+        const float dim[16] = { -1.0f, 1.0f, 1.0f, -1.0f, du, dv, du, dv };
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, dim, 0);
+        cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
+        const float x = floorf((bw - (float)dw) * 0.5f), y = floorf((bh - (float)dh) * 0.5f);
+        const float c[16] = {
+            x / bw * 2.0f - 1.0f, 1.0f - y / bh * 2.0f,
+            (x + (float)dw) / bw * 2.0f - 1.0f, 1.0f - (y + (float)dh) / bh * 2.0f,
+            0.0f, y0 / (float)OV_H, (float)dw / (float)OV_W, (y0 + (float)dh) / (float)OV_H };
         cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 16, c, 0);
         cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
     }
@@ -6080,6 +6335,7 @@ static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
     if (vsb) vsb->lpVtbl->Release(vsb);
     if (psb) psb->lpVtbl->Release(psb);
     if (FAILED(hr)) { printf("[D3D12] overlay unavailable (0x%08lX)\n", hr); s_d3d.ov_pso = NULL; }
+    if (s_d3d.ov_pso) ps3_sysdlg_drawn();   /* the system's questions have somewhere to show */
     static int started;
     if (s_d3d.ov_pso && ovs_on() && !started) {
         started = 1;

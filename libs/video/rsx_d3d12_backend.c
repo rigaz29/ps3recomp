@@ -30,6 +30,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_tex_replace.h"   /* a port's pictures in place of the guest's textures */
 #include "rsx_index_copy.h"
 #include <stdio.h>
 #include <string.h>
@@ -534,6 +535,11 @@ typedef struct {
      * format/swizzle/cube combinations; cleared when res goes (vp_tex_drop). */
     u32 srv_fmt[4], srv_map[4];
     u8 srv_cube[4], srv_n, srv_next;
+    u8 repl;            /* res holds a port's picture (rsx_tex_replace.h): res_w x res_h, a full chain */
+    u8 churn;           /* uploads again for a change of its bytes, up to 255: one that keeps changing (a copy of
+                         * the frame, a video) is not named for a picture any more */
+    u32 res_w, res_h;   /* res's size: the guest's (w, h) unless repl */
+    u32 res_fmt;        /* res's DXGI format when repl */
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -11386,6 +11392,37 @@ static void tex_decode_volume(u8* mapped, const D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
 }
 
+/* A port's picture in this texture's place (rsx_tex_replace.h), asked at each upload of a 2D texture of a format
+ * it can name: its id worked out only while the hooks are set, its level 0 decoded to RGBA only for a picture made
+ * over the guest's own or for the dump. 1 with *pic when there is one. */
+static int tex_take_picture(const u8* src, u32 w, u32 h, u32 fmt, const rsx_tex_layout* tl, rsx_tex_picture* pic)
+{
+    const rsx_tex_hooks* hk = rsx_tex_get_hooks();
+    if (!hk || !rsx_tex_replaceable(fmt) || w > 8192u || h > 8192u) return 0;
+    const double t0 = perf_now();
+    const u64 id = rsx_tex_id(src, w, h, fmt, tl);
+    const int has = hk->has ? hk->has(id) : 0;
+    u8* base = NULL;
+    if (has == 2 || hk->dump) {
+        base = (u8*)malloc((size_t)w * h * 4u);
+        if (base && !rsx_tex_base_rgba(base, src, w, h, tl)) { free(base); base = NULL; }
+    }
+    if (hk->dump && base) hk->dump(id, w, h, fmt, base);
+    int got = 0;
+    if (has && hk->picture && (has != 2 || base))
+        got = hk->picture(id, w, h, has == 2 ? base : NULL, pic) && pic->rgba && pic->w && pic->h &&
+              pic->w <= 16384u && pic->h <= 16384u;
+    free(base);
+    s_tex_decode_s += perf_now() - t0;
+    if (got) {
+        static int n = 0;
+        if (PS3_LOG_FIRST(n, 32))
+            fprintf(stderr, "[tex] %016llx %ux%u fmt %02X: a picture in its place, %ux%u%c", (unsigned long long)id,
+                    w, h, fmt, pic->w, pic->h, 10);
+    }
+    return got;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* cube is the texture's shape as the cache keys it (tex_shape_*): a 2D
@@ -11434,6 +11471,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             return slot;
         }
         /* stale: uploaded again below, in its own slot */
+        if (c->churn < 255) c->churn++;
     }
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
@@ -11558,6 +11596,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * each face's levels go in the staging buffer (GetCopyableFootprints:
      * subresource = level + face * levels). RSX_TEX_MIPS=0 uploads level 0
      * only, as before. */
+    /* A port's picture in its place (rsx_tex_replace.h), for a 2D texture: uploaded as RGBA8 of its own size with a
+     * full chain made from it, and sampled through the same mapping, the decoded image of these formats being R, G,
+     * B, A too. The guest's bytes still key it and say when it changes. */
+    rsx_tex_picture pic;
+    memset(&pic, 0, sizeof pic);
+    const int churny = slot >= 0 && s_d3d.vp_tex[slot].churn >= 4;   /* a copy of the frame, a video: not asked */
+    const int repl = !is_cube && !vol && !churny && tex_take_picture(vm_base + off, w, h, fmt, &tl, &pic);
+    const u32 repl_kind = repl ? rsx_tex_channels(fmt) : 0u;
     static rsx_tex_level s_lv[RSX_MAX_TEXTURE_LEVELS];
     static D3D12_PLACED_SUBRESOURCE_FOOTPRINT s_lay[6 * RSX_MAX_TEXTURE_LEVELS];
     static int mips_on = -1;
@@ -11578,18 +11624,23 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             o += s_lv[l].tl.face_bytes;
         }
     }
-    const u32 nsub = (is_cube ? 6u : 1u) * nlev;   /* a volume: one per level */
+    /* The resource: the guest's size, format and chain, or the picture's. */
+    const u32 res_w = repl ? pic.w : w, res_h = repl ? pic.h : h;
+    const u32 res_lev = repl ? rsx_tex_chain_levels(pic.w, pic.h) : nlev;
+    /* RGBA8, or the texture's own one or two channels (R8, R8G8, R16) filled from the picture's R and G. */
+    const DXGI_FORMAT res_fmt = repl_kind == RSX_TEXREP_RGBA8 ? DXGI_FORMAT_R8G8B8A8_UNORM : dxfmt;
+    const u32 nsub = (is_cube ? 6u : 1u) * res_lev;   /* a volume: one per level */
     D3D12_RESOURCE_DESC fd = {0};
     fd.Dimension = vol ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    fd.Width = w; fd.Height = h;
+    fd.Width = res_w; fd.Height = res_h;
     fd.DepthOrArraySize = vol ? (UINT16)vdepth : is_cube ? 6 : 1;   /* cube = 6 array slices */
-    fd.MipLevels = (UINT16)nlev;
-    fd.Format = dxfmt; fd.SampleDesc.Count = 1;
+    fd.MipLevels = (UINT16)res_lev;
+    fd.Format = res_fmt; fd.SampleDesc.Count = 1;
     fd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     UINT64 lay_total = 0;
     s_d3d.device->lpVtbl->GetCopyableFootprints(s_d3d.device, &fd, 0, nsub, 0, s_lay, NULL, NULL, &lay_total);
     if (!lay_total) return -1;
-    if (nlev > 1) tex_mipcheck(off, w, h, fmt, nlev, s_lv);
+    if (nlev > 1 && !repl) tex_mipcheck(off, w, h, fmt, nlev, s_lv);
     /* A texture not held gets a slot from vp_tex_alloc; its size there is the
      * staged chain's, in the 64 KB units a committed resource takes. */
     const int ts_new = slot < 0;
@@ -11608,7 +11659,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->levels != nlev))
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->levels != nlev ||
+                   t->repl != (u8)repl || t->res_w != res_w || t->res_h != res_h))
         vp_tex_drop(t);
     if (!t->res) {
         s_ts_create++;
@@ -11616,10 +11668,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td = {0};
         td.Dimension = vol ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w; td.Height = h;
+        td.Width = res_w; td.Height = res_h;
         td.DepthOrArraySize = vol ? (UINT16)vdepth : is_cube ? 6 : 1;   /* cube = 6 array slices */
-        td.MipLevels = (UINT16)nlev;
-        td.Format = dxfmt; td.SampleDesc.Count = 1;
+        td.MipLevels = (UINT16)res_lev;
+        td.Format = res_fmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         t->heap = 0;
         if (tex_placed_on()) t->res = tex_place(&td, &t->heap, &t->hoff, &t->hsize);
@@ -11735,8 +11787,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * sampled as cubes. */
     u32 _face_bytes = dxt ? (blkrow * blkrows) : (w * h * bpp);
     if (is_cube) _face_bytes = rsx_texture_cube_face_stride(fmt, w, h, mips ? mips : 1u, 0);
-    /* A volume is decoded below, slice by slice (tex_decode_volume). */
-    const u32 _nfaces     = vol ? 0u : is_cube ? 6u : 1u;
+    /* A volume is decoded below, slice by slice (tex_decode_volume); a picture in the texture's place has none of
+     * the guest's to decode. */
+    const u32 _nfaces     = vol || repl ? 0u : is_cube ? 6u : 1u;
     /* What the decode reads -- every level, face and slice -- and its checksum before it is read.
      * Taken after the read, it was the checksum of what a title had written meanwhile: God of War:
      * Ascension's streaming refills a block once the RSX has said it read it, sometimes while this
@@ -11756,6 +11809,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     for (u32 i = 0; i < TEX_CSUM_PARTS; i++)
         csum_pre[i] = tex_csum_part(vm_base + off, src_bytes, i);
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
+    if (repl) {   /* the picture and the chain made from it, each level at its footprint */
+        const double dr0 = perf_now();
+        u32 lw = res_w, lh = res_h;
+        u8* lvl = (u8*)malloc((size_t)lw * lh * 4u);
+        if (lvl) memcpy(lvl, pic.rgba, (size_t)lw * lh * 4u);
+        for (u32 l = 0; l < res_lev && lvl; l++) {
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* fp = &s_lay[l];
+            for (u32 y = 0; y < lh; y++)
+                rsx_tex_pack(_map0 + fp->Offset + (size_t)y * fp->Footprint.RowPitch, lvl + (size_t)y * lw * 4u, lw,
+                             repl_kind);
+            if (l + 1 < res_lev) {
+                const u32 nw = lw > 1 ? lw >> 1 : 1u, nh = lh > 1 ? lh >> 1 : 1u;
+                u8* next = (u8*)malloc((size_t)nw * nh * 4u);
+                if (next) rsx_tex_mip_down(lvl, lw, lh, next);
+                free(lvl);
+                lvl = next;
+                lw = nw; lh = nh;
+            }
+        }
+        free(lvl);
+        s_tex_decode_s += perf_now() - dr0;
+    }
     for (u32 _f = 0; _f < _nfaces; _f++) {
     off    = _off0 + _f * _face_bytes;
     if (is_cube && getenv("CUBEDBG")) { u32 _s=0; const u8* _p = vm_base + off;
@@ -12080,6 +12155,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1; t->levels = nlev;
+    t->repl = (u8)repl; t->res_w = res_w; t->res_h = res_h; t->res_fmt = (u32)res_fmt;
+    if (ts_new) t->churn = 0;   /* a slot new to this texture */
     if (!t->linked) vp_tex_link(slot);
     if (t->up && s_tex_staging_n < (int)(sizeof s_tex_staging / sizeof s_tex_staging[0])) {
         s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
@@ -15978,8 +16055,10 @@ static void rf_prepass(u32 from, u32 to)
                         s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
                         /* The upload's own format: an X16 font atlas bound
-                         * as R8 over an R16 resource sampled nothing. */
-                        DXGI_FORMAT sf = vp_tex_dxgi(dr->tex[_u].fmt);
+                         * as R8 over an R16 resource sampled nothing. A port's
+                         * picture in its place is RGBA8 whatever the guest's. */
+                        DXGI_FORMAT sf = s_d3d.vp_tex[ts].repl ? (DXGI_FORMAT)s_d3d.vp_tex[ts].res_fmt
+                                                               : vp_tex_dxgi(dr->tex[_u].fmt);
                         srv_write_tex(wslot, ts, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),

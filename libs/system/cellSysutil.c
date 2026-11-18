@@ -372,10 +372,9 @@ static void sysutil_host_language(char* out, size_t n)
 #endif
 }
 
-static s32 sysutil_language(void)
+/* The language a system.language value e means (auto or none: the host's), and where it came from in *from. */
+static s32 sysutil_language_of(const char* e, const char** from_out)
 {
-    static s32 lang = -1;
-    if (lang >= 0) return lang;
     static const struct { const char* code; s32 id; } k[] = {
         {"ja", CELL_SYSUTIL_LANG_JAPANESE}, {"en", CELL_SYSUTIL_LANG_ENGLISH_US},
         {"en-us", CELL_SYSUTIL_LANG_ENGLISH_US}, {"fr", CELL_SYSUTIL_LANG_FRENCH},
@@ -389,9 +388,7 @@ static s32 sysutil_language(void)
         {"pl", CELL_SYSUTIL_LANG_POLISH}, {"pt-br", CELL_SYSUTIL_LANG_PORTUGUESE_BR},
         {"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB}, {"tr", CELL_SYSUTIL_LANG_TURKISH},
     };
-    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
-    /* system.language (PS3_LANG); auto = the host's language. */
-    const char* e = ps3_settings_str("system", "language", "PS3_LANG", "auto");
+    s32 lang = CELL_SYSUTIL_LANG_ENGLISH_US;
     const char* from = "default";
     if (e && *e && !ps3_settings_ieq(e, "auto")) {
         char* end = NULL;
@@ -410,8 +407,24 @@ static s32 sysutil_language(void)
         for (unsigned i = 0; host[0] && i < sizeof k / sizeof k[0]; i++)
             if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
     }
+    if (from_out) *from_out = from;
+    return lang;
+}
+
+s32 cellSysutil_language(void)
+{
+    static s32 lang = -1;   /* the title's for the whole run */
+    if (lang >= 0) return lang;
+    const char* from = "default";
+    /* system.language (PS3_LANG); auto = the host's language. */
+    lang = sysutil_language_of(ps3_settings_str("system", "language", "PS3_LANG", "auto"), &from);
     printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
     return lang;
+}
+
+s32 cellSysutil_language_of(const char* value)
+{
+    return sysutil_language_of(value, NULL);
 }
 
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
@@ -422,7 +435,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = sysutil_language();
+        v = cellSysutil_language();
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         /* input.enter_button = cross (the default) or circle */

@@ -116,6 +116,13 @@ s32 cellSysutilCheckCallback(void);
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
 s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 
+/* The system language (CELL_SYSUTIL_LANG_*) the title is told: system.language, else the host's. Also for the
+ * runtime's own text in the title's language, such as a trophy set's names. */
+s32 cellSysutil_language(void);
+/* The language a system.language value means: a code ("de", "pt-br") or a number; auto, NULL or "" the host's.
+ * For a port's own window before the title runs, where the setting can still change. */
+s32 cellSysutil_language_of(const char* value);
+
 /* Internal HLE completion queue, delivered by the guest's next callback poll. */
 s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 /* Copy eight guest register arguments into the deferred completion queue. */

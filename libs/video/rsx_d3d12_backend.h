@@ -109,6 +109,19 @@ int rsx_d3d12_precompile_vertex_programs(const uint8_t* const* ucode, const uint
  * cache had it. Returns 0, or -1 with why. Safe beside rsx_d3d12_precompile_vertex_programs, on another thread. */
 int rsx_d3d12_precompile_vertex_pass(const char* hlsl, int* compiled, char* why, size_t why_len);
 
+/* Pixel shaders built ahead of play (graphics.shader_prebuild): the fragment programs of the title's files into
+ * <shader cache>.dxil.prebuilt, which the game reads when its store has not a source. ucode[i] is a program as the
+ * files hold it, bytes[i] bytes with its inline constants, ctrl[i] its SET_SHADER_CONTROL bits (its header's). Each
+ * one's text is the one a draw of it makes with no alpha test, sign expansion or depth comparison; those the file has
+ * are passed over, the rest compiled on `threads` threads (at the idle priority with background) and appended as each
+ * is done, so a game playing meanwhile can take them. progress(done, total) on this thread. stats: compiled, had
+ * already, failed. Returns 0, or -1 with why: the setting off or no DXC, no shader cache, no device, another build
+ * holding the file. With the game running or not. */
+int rsx_d3d12_prebuild_fragment_programs(const uint8_t* const* ucode, const uint32_t* bytes, const uint32_t* ctrl,
+                                         uint32_t n, int threads, int background,
+                                         void (*progress)(uint32_t done, uint32_t total),
+                                         uint32_t stats[3], char* why, size_t why_len);
+
 #ifdef __cplusplus
 }
 #endif

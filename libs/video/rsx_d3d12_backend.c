@@ -131,11 +131,14 @@
  * fp_state (c17): x the flags (bit 0 the sRGB output), y the ultrawide x factor (1/s_wide,
  * for a target drawn wider, fp_alpha.w < 0), zw the AA sample grid; fp_alpha.w is 1 when
  * the render scale is off. The alpha test, sign expansion and which units compare depth
- * stay in the text (variants: the comparison's path would double a fetch). Read once. */
+ * stay in the text (variants: the comparison's path would double a fetch). The setting
+ * graphics.shader_prebuild, or RSX_FP_DYNAMIC; it needs DXC (register spaces), and is off
+ * without it. Read once, the device made. */
+static int fp_dyn_dxc(void);
 static int fp_dyn_on(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("RSX_FP_DYNAMIC"); v = e && atoi(e) != 0; }
+    if (v < 0) v = ps3_settings_bool("graphics", "shader_prebuild", "RSX_FP_DYNAMIC", 0) && fp_dyn_dxc();
     return v;
 }
 /* RSX_FP_CB_MAXK=<n>: fewer constants read from b1 (1-1024, default 1024). */
@@ -1923,6 +1926,192 @@ static void shc_pick_compiler(void)
                own ? " (D3D12_OWN_SHADER_COMPILER)" : "", wine ? ", on Wine " : "", wine ? wine : "", 10);
 }
 
+/* fp_dyn_on's other half: the guest programs come from DXC (the texts declare register spaces). No device yet: no. */
+static int fp_dyn_dxc(void)
+{
+    if (!s_d3d.device) return 0;
+    shc_pick_compiler();
+    if (!s_shc_dxc) printf("[d3d12] graphics.shader_prebuild needs DXC for the guest programs: off%c", 10);
+    return s_shc_dxc;
+}
+
+/* ---------------------------------------------------------------------------
+ * Pixel shaders built ahead of play (graphics.shader_prebuild, fp_dyn_on)
+ *
+ * <store>.prebuilt, beside the store: the fragment programs of the game's files
+ * as rsx_d3d12_prebuild_fragment_programs compiled them, their texts made as a
+ * draw makes them (fp_dyn_text), so under the same source keys. Not in the
+ * store, which keeps every program in memory: some 30,000 are 450 MB of DXIL.
+ * The build is a process of its own, one at a time (a named mutex per file),
+ * while the game plays or from the launcher; it appends, and the game reads.
+ * When the store has not a source, d3d_compile_cached looks here, and what it
+ * takes goes into the store as a compiled program would.
+ *  - header, 32 bytes: "GWFPBLD2", its size (u32), the texts' form (FPB_TEXT),
+ *    the compile flags (shc_flags), the compiler (1: DXC), the dictionary's
+ *    length (u32), 0.
+ *  - the dictionary: the programs the build compiled first, one after the other,
+ *    up to 1 MB, padded to 4; zstd takes it as raw content for every frame. A
+ *    program's DXIL alone packs 1.6:1; with it, 2.6:1 (some 245 MB for all).
+ *    It is written before the header, so a header found has all of it.
+ *  - a record a program: "FPB1" (0 while it is written: the tag goes last), the
+ *    length of the rest, the source key (u64), the source's length, the
+ *    program's length, its zstd frame's length, the frame (with zstd's
+ *    checksum of the program), padded to 4.
+ * A record cut short, or still without its tag, ends the read until the next
+ * look, a second after the last one, when a source is not found.
+ * -----------------------------------------------------------------------*/
+#define FPB_TEXT  1u                  /* the texts' form: bump it when fp_dyn_text makes another text of a program */
+#define FPB_HDR   32u
+#define FPB_ID    24u                 /* the header's part that names the build: magic to the compiler */
+#define FPB_DICT  (1u << 20)          /* the dictionary, at most */
+#define FPB_TAG   0x31425046u         /* "FPB1" */
+#define FPB_HEAD  28u                 /* a record's head: tag, rest, key, source length, program length, frame */
+#define FPB_LEVEL 12                  /* 2.56:1 against 2.82:1 at 19, which takes 35 MB a compressing thread */
+static const char s_fpb_magic[8] = { 'G', 'W', 'F', 'P', 'B', 'L', 'D', '2' };
+typedef struct { u64 key, off; u32 srclen, rawlen, plen, pad; } FpbEnt;
+static SRWLOCK s_fpb_lock = SRWLOCK_INIT;
+static HANDLE  s_fpb_h = INVALID_HANDLE_VALUE;
+static char    s_fpb_path[1120];
+static FpbEnt* s_fpb_map;
+static u32     s_fpb_cap, s_fpb_n;
+static u64     s_fpb_end;             /* indexed up to here */
+static double  s_fpb_seen;            /* when the file was last looked at (opened, or its tail read) */
+static ZSTD_DDict* s_fpb_ddict;       /* the file's dictionary, for reading */
+static volatile LONG s_fpb_hits, s_fpb_misses;
+
+/* Where the records begin after a dictionary of ds bytes. */
+static u64 fpb_first(u32 ds) { return FPB_HDR + ((ds + 3u) & ~3u); }
+
+static int fpb_read_at(HANDLE h, u64 off, void* buf, u32 n)
+{
+    OVERLAPPED o;
+    memset(&o, 0, sizeof o);
+    o.Offset = (DWORD)off;
+    o.OffsetHigh = (DWORD)(off >> 32);
+    DWORD got = 0;
+    return ReadFile(h, buf, n, &got, &o) && got == n;
+}
+
+/* The header this build writes, and reads back as its own. */
+static void fpb_header(u8 h[FPB_HDR])
+{
+    memset(h, 0, FPB_HDR);
+    memcpy(h, s_fpb_magic, 8);
+    const u32 v[4] = { FPB_HDR, FPB_TEXT, (u32)shc_flags(), s_shc_dxc ? 1u : 2u };
+    memcpy(h + 8, v, sizeof v);
+}
+
+static FpbEnt* fpb_slot(u64 key, u32 srclen)
+{
+    u32 i = (u32)(key ^ (key >> 32)) & (s_fpb_cap - 1);
+    while (s_fpb_map[i].srclen && !(s_fpb_map[i].key == key && s_fpb_map[i].srclen == srclen))
+        i = (i + 1) & (s_fpb_cap - 1);
+    return &s_fpb_map[i];
+}
+
+/* An entry into the index (s_fpb_lock held). 0 when there is no room for it. */
+static int fpb_put(const FpbEnt* e)
+{
+    if ((s_fpb_n + 1) * 2 > s_fpb_cap) {
+        const u32 cap = s_fpb_cap ? s_fpb_cap * 2 : 4096;
+        FpbEnt* m = (FpbEnt*)calloc(cap, sizeof *m);
+        if (!m) return 0;
+        FpbEnt* old = s_fpb_map;
+        const u32 ocap = s_fpb_cap;
+        s_fpb_map = m; s_fpb_cap = cap;
+        for (u32 i = 0; i < ocap; i++) if (old[i].srclen) *fpb_slot(old[i].key, old[i].srclen) = old[i];
+        free(old);
+    }
+    FpbEnt* s = fpb_slot(e->key, e->srclen);
+    if (!s->srclen) s_fpb_n++;
+    *s = *e;
+    return 1;
+}
+
+/* The records from s_fpb_end on, into the index; up to the first one cut short or not yet tagged (s_fpb_lock held). */
+static void fpb_index(HANDLE h, u64* end)
+{
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) return;
+    const u64 size = (u64)sz.QuadPart;
+    u8 r[FPB_HEAD];
+    while (*end + FPB_HEAD <= size && fpb_read_at(h, *end, r, FPB_HEAD)) {
+        u32 tag, rest;
+        FpbEnt e;
+        memcpy(&tag, r, 4); memcpy(&rest, r + 4, 4);
+        memcpy(&e.key, r + 8, 8); memcpy(&e.srclen, r + 16, 4); memcpy(&e.rawlen, r + 20, 4); memcpy(&e.plen, r + 24, 4);
+        if (tag != FPB_TAG || rest < FPB_HEAD - 8 + e.plen || *end + 8 + rest > size || !e.srclen || !e.rawlen) break;
+        e.off = *end + FPB_HEAD;
+        e.pad = 0;
+        if (!fpb_put(&e)) break;
+        *end += 8 + rest;
+    }
+}
+
+/* The file of the store at s_shc_path opened for reading, its header this build's, and indexed (s_fpb_lock held).
+ * Again a few seconds later while there is none: the first session's build makes it as the game plays. */
+static void fpb_open(void)
+{
+    s_fpb_seen = perf_now();
+    if (s_fpb_h != INVALID_HANDLE_VALUE || !s_shc_path[0] || !fp_dyn_on()) return;
+    snprintf(s_fpb_path, sizeof s_fpb_path, "%s.prebuilt", s_shc_path);
+    HANDLE h = CreateFileA(s_fpb_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    u8 hd[FPB_HDR], mine[FPB_HDR];
+    fpb_header(mine);
+    u32 ds = 0;
+    if (!fpb_read_at(h, 0, hd, FPB_HDR) || memcmp(hd, mine, FPB_ID)) { CloseHandle(h); return; }
+    memcpy(&ds, hd + FPB_ID, 4);
+    if (ds) {
+        void* d = ds <= FPB_DICT ? malloc(ds) : NULL;
+        if (d && fpb_read_at(h, FPB_HDR, d, ds)) s_fpb_ddict = ZSTD_createDDict(d, ds);
+        free(d);
+        if (!s_fpb_ddict) { CloseHandle(h); return; }
+    }
+    s_fpb_h = h;
+    s_fpb_end = fpb_first(ds);
+    fpb_index(h, &s_fpb_end);
+    printf("[d3d12] pixel shaders built ahead: %u in %s%c", s_fpb_n, s_fpb_path, 10);
+}
+
+/* A program built ahead for this source, or NULL. Any thread. */
+static ID3DBlob* fpb_find(u64 key, u32 srclen)
+{
+    if (!fp_dyn_on()) return NULL;
+    AcquireSRWLockExclusive(&s_fpb_lock);
+    FpbEnt e;
+    memset(&e, 0, sizeof e);
+    FpbEnt* s = s_fpb_cap ? fpb_slot(key, srclen) : NULL;
+    if (s && s->srclen) e = *s;
+    else if (perf_now() - s_fpb_seen >= 1.0) {   /* the build may have added it, or made the file, since */
+        if (s_fpb_h == INVALID_HANDLE_VALUE) fpb_open();
+        else { s_fpb_seen = perf_now(); fpb_index(s_fpb_h, &s_fpb_end); }
+        s = s_fpb_cap ? fpb_slot(key, srclen) : NULL;
+        if (s && s->srclen) e = *s;
+    }
+    const HANDLE h = s_fpb_h;
+    ReleaseSRWLockExclusive(&s_fpb_lock);
+    if (!e.srclen) { InterlockedIncrement(&s_fpb_misses); return NULL; }
+    void* packed = malloc(e.plen);
+    ID3DBlob* b = NULL;
+    if (packed && fpb_read_at(h, e.off, packed, e.plen) && SUCCEEDED(D3DCreateBlob(e.rawlen, &b)) && b) {
+        ZSTD_DCtx* dc = ZSTD_createDCtx();
+        const size_t r = !dc ? (size_t)-1
+            : s_fpb_ddict ? ZSTD_decompress_usingDDict(dc, b->lpVtbl->GetBufferPointer(b), e.rawlen, packed, e.plen, s_fpb_ddict)
+                          : ZSTD_decompressDCtx(dc, b->lpVtbl->GetBufferPointer(b), e.rawlen, packed, e.plen);
+        if (dc) ZSTD_freeDCtx(dc);
+        if (ZSTD_isError(r) || r != e.rawlen) { b->lpVtbl->Release(b); b = NULL; }
+    }
+    free(packed);
+    if (!b) { InterlockedIncrement(&s_fpb_misses); return NULL; }
+    const LONG n = InterlockedIncrement(&s_fpb_hits);
+    if (n == 1 || !(n & (n - 1)))
+        printf("[d3d12] pixel shaders taken from the ones built ahead: %ld, %ld compiled here%c", (long)n,
+               (long)s_fpb_misses, 10);
+    return b;
+}
+
 /* graphics.shader_cache (D3D12_SHADER_CACHE): the cache file, or off. The
  * store is read from the pack, the files from before it, and the journal
  * from where the pack's part of it ends. s_shc_lock held. */
@@ -2036,6 +2225,9 @@ static void shc_open(void)
     s_shc_old_pso = old_pso;
     s_shc_why = stuck ? NULL : why;
     if (why && !stuck && !s_shc_ro && !s_shc_fold_late) shc_fold_start(why, old_pso, (u64)jend, 0);
+    AcquireSRWLockExclusive(&s_fpb_lock);
+    fpb_open();
+    ReleaseSRWLockExclusive(&s_fpb_lock);
 }
 
 /* A guest program (entry "main") through the disk cache. */
@@ -2059,6 +2251,19 @@ static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
         }
     }
     ReleaseSRWLockExclusive(&s_shc_lock);
+    /* A pixel shader built ahead of play: into the store as a compiled one would go. */
+    if (key && !strcmp(name, "guest_fp")) {
+        ID3DBlob* pb = fpb_find(key, (u32)len);
+        if (pb) {
+            *out = pb;
+            if (err) *err = NULL;
+            AcquireSRWLockExclusive(&s_shc_lock);
+            s_shc_stat_hits++;
+            shc_keep(key, (u32)len, pb);
+            ReleaseSRWLockExclusive(&s_shc_lock);
+            return S_OK;
+        }
+    }
     const double t0 = perf_now();
     HRESULT hr = s_shc_dxc ? rsx_dxc_compile(src, len, target, shc_dxc_level(flags), out, err)
                            : D3DCompile(src, len, name, NULL, NULL, "main", target, flags, 0, out, err);
@@ -9145,6 +9350,380 @@ static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
     if (!RS_ON) ts[FPCB_ALPHA * 4 + 3] = 1.0f;
 }
 
+/* RSX_FP_DYNAMIC: a buffered program's whole text, from the program, its control bits (SET_SHADER_CONTROL's
+ * export bits, 0x4E), the units it compares depth on, its sign-expanding lanes (NULL: none) and its alpha test
+ * function (0: none). The draw's pipeline lookup (vp_get_fp_pso) and the build ahead of play
+ * (rsx_d3d12_prebuild_fragment_programs) both make it here, so a program has the one text, and the one source key,
+ * in both. Returns the instruction count, or 0 or less when it does not translate. */
+static int fp_dyn_text(const u8* prog, u32 prog_max, u32 fp_ctrl, u32 dshadow, const u8* exp_masks, u32 atest,
+                       u32 fp_addr, char* hlsl, size_t cap, u32* nk_out)
+{
+    u32 nk = 0;
+    const int n = rsx_fp_decompile_buffered_state_ex(prog, prog_max, fp_ctrl, dshadow, exp_masks, hlsl, (u32)cap, &nk);
+    if (n > 0 && rsx_fp_apply_srgb_output_if(hlsl, (u32)cap, "asuint(fp_state.x) & 1u") < 0) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: sRGB output not applied (shape)%c", fp_addr, 10);
+    }
+    if (n <= 0) {
+        static int _e = 0;
+        if (PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr);
+        return n;
+    }
+    /* fp_constants[] after the fixed members, as the static texts have it, and fp_state with them (c17). */
+    char from[192], to[256];
+    const u32 nd = nk ? nk : 1u;
+    snprintf(from, sizeof from, "cbuffer PSConstants : register(b1) {\n    float4 fp_constants[%u];\n"
+                                "    float4 fp_alpha;\n};\n", nd);
+    snprintf(to, sizeof to, "cbuffer PSConstants : register(b1) {\n    float4 fp_tcscale[16];\n"
+                            "    float4 fp_alpha;\n    float4 fp_state;\n    float4 fp_constants[%u];\n};\n", nd);
+    if (!strstr(hlsl, from)) {
+        static int _e = 0;
+        if (PS3_LOG_FIRST(_e, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: PSConstants not in the expected form, not drawn%c", fp_addr, 10);
+        return -1;
+    }
+    hlsl_replace_all(hlsl, cap, from, to);
+    hlsl_replace_all(hlsl, cap, "#define _rsx_gamma_mask(u) 0u\n",
+                     "#define _rsx_gamma_mask(u) ((uint)fp_tcscale[u].z)\n");
+    if (rsx_fp_apply_wpos_grid_expr(hlsl, (u32)cap, "fp_state.zw") < 0) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: WPOS sample grid not applied (shape)%c", fp_addr, 10);
+    }
+    /* WPOS back in guest pixels: fp_alpha.w (1 with the render scale off), the ultrawide factor from fp_state.y. */
+    hlsl_replace_all(hlsl, cap,
+                     "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,",
+                     "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? fp_state.y : 1.0) + fp_alpha.z, "
+                     "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + "
+                     "fp_alpha.z,");
+    if (atest && rsx_fp_apply_alpha_test_buffered(hlsl, (u32)cap, atest & 0xFFFFu) < 0) {
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 8))
+            fprintf(stderr, "[FP] fp=0x%08X: alpha test 0x%X not applied (shape)%c", fp_addr, atest & 0xFFFFu, 10);
+    }
+    if (nk_out) *nk_out = nk;
+    return n;
+}
+
+/* RSX_CENSUS: why a draw's pixel shader is not among those built ahead, once a text: its alpha test, sign expansion
+ * or depth comparison (fp_dyn_text's variants, which the build does not make), else none of them (a program not in
+ * the game's files, or not as they hold it). A text can count under more than one. */
+static volatile LONG s_fpb_why[4];
+static void fpb_note_variant(const char* hlsl, u32 atest, int expand, u32 dshadow)
+{
+    enum { NSEEN = 8192 };
+    static u64 seen[NSEEN];
+    if (!rsx_census_secs() || !s_fpb_n) return;
+    const size_t len = strlen(hlsl);
+    const u64 key = shc_key(hlsl, len, "ps_5_0", shc_flags());
+    const u64 sk = (key ^ (u64)len * 0x9E3779B97F4A7C15ull) | 1u;
+    int fresh = 0;
+    AcquireSRWLockExclusive(&s_fpb_lock);
+    if (!(s_fpb_cap && fpb_slot(key, (u32)len)->srclen)) {
+        u32 s = (u32)(sk ^ (sk >> 32)) & (NSEEN - 1);
+        for (u32 k = 0; k < NSEEN; k++, s = (s + 1) & (NSEEN - 1)) {
+            if (seen[s] == sk) break;
+            if (!seen[s]) { seen[s] = sk; fresh = 1; break; }
+        }
+    }
+    ReleaseSRWLockExclusive(&s_fpb_lock);
+    if (!fresh) return;
+    if (atest) InterlockedIncrement(&s_fpb_why[0]);
+    if (expand) InterlockedIncrement(&s_fpb_why[1]);
+    if (dshadow) InterlockedIncrement(&s_fpb_why[2]);
+    if (!atest && !expand && !dshadow) InterlockedIncrement(&s_fpb_why[3]);
+}
+
+/* rsx_d3d12_prebuild_fragment_programs: a batch of texts and the threads that compile them into the file. */
+typedef struct { char* src; u32 len; u64 key; ID3DBlob* blob; } FpbJob;
+static FpbJob* s_fpbj;
+static LONG s_fpbj_n;
+static volatile LONG s_fpbj_next, s_fpbj_done, s_fpbj_failed, s_fpbj_wrote, s_fpbj_stop;
+static HANDLE s_fpbw_h = INVALID_HANDLE_VALUE;   /* the build's handle, writing */
+static u64 s_fpbw_end;                           /* where the next record goes */
+static UINT s_fpbw_flags;
+static int s_fpbw_idle;                          /* in the background: its threads at the idle priority */
+static int s_fpbw_keep;                          /* a new file's first batch: kept for the dictionary, written after it */
+static ZSTD_CDict* s_fpbw_cdict;                 /* the file's dictionary, for packing */
+static SRWLOCK s_fpbw_lock = SRWLOCK_INIT;
+
+static int fpb_write_at(HANDLE h, u64 off, const void* p, u32 n)
+{
+    OVERLAPPED o;
+    memset(&o, 0, sizeof o);
+    o.Offset = (DWORD)off;
+    o.OffsetHigh = (DWORD)(off >> 32);
+    DWORD put = 0;
+    return WriteFile(h, p, n, &put, &o) && put == n;
+}
+
+/* A compressing context for the records: FPB_LEVEL, and a checksum in every frame, so that a reader's decompression
+ * fails, rather than gives a wrong program, on any record or dictionary it did not read whole. */
+static ZSTD_CCtx* fpb_cctx(void)
+{
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    if (cc && (ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, FPB_LEVEL)) ||
+               ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_checksumFlag, 1)))) {
+        ZSTD_freeCCtx(cc);
+        cc = NULL;
+    }
+    return cc;
+}
+
+/* A program's record at the file's end: the record, then its tag, so a reader meets a whole one or none. 1 written,
+ * 0 not packed (memory), -1 the file past writing: then no record after a gap, the build stops. */
+static int fpb_put_record(ZSTD_CCtx* cc, const FpbJob* j, ID3DBlob* b)
+{
+    const u32 raw = (u32)b->lpVtbl->GetBufferSize(b);
+    const size_t cap = ZSTD_compressBound(raw);
+    u8* rec = (u8*)malloc(FPB_HEAD + cap + 4);
+    if (!rec) return 0;
+    const void* src = b->lpVtbl->GetBufferPointer(b);
+    size_t pl = ZSTD_CCtx_refCDict(cc, s_fpbw_cdict);   /* NULL: none, before the first batch's is made */
+    if (!ZSTD_isError(pl)) pl = ZSTD_compress2(cc, rec + FPB_HEAD, cap, src, raw);
+    if (ZSTD_isError(pl)) { free(rec); return 0; }
+    const u32 plen = (u32)pl, rest = (FPB_HEAD - 8u + plen + 3u) & ~3u, untagged = 0, tag = FPB_TAG;
+    memcpy(rec, &untagged, 4); memcpy(rec + 4, &rest, 4); memcpy(rec + 8, &j->key, 8);
+    memcpy(rec + 16, &j->len, 4); memcpy(rec + 20, &raw, 4); memcpy(rec + 24, &plen, 4);
+    memset(rec + FPB_HEAD + plen, 0, 8u + rest - FPB_HEAD - plen);
+    AcquireSRWLockExclusive(&s_fpbw_lock);
+    const u64 at = s_fpbw_end;
+    const int ok = !s_fpbj_stop && fpb_write_at(s_fpbw_h, at, rec, 8u + rest) && fpb_write_at(s_fpbw_h, at, &tag, 4);
+    if (ok) s_fpbw_end += 8u + rest;
+    else InterlockedExchange(&s_fpbj_stop, 1);
+    ReleaseSRWLockExclusive(&s_fpbw_lock);
+    free(rec);
+    return ok ? 1 : -1;
+}
+
+static DWORD WINAPI fpbj_worker(LPVOID arg)
+{
+    (void)arg;
+    ps3_thread_name("prebuild");
+    if (s_fpbw_idle) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    ZSTD_CCtx* cc = fpb_cctx();
+    for (;;) {
+        const LONG i = InterlockedIncrement(&s_fpbj_next) - 1;
+        if (i >= s_fpbj_n || s_fpbj_stop) break;
+        FpbJob* j = &s_fpbj[i];
+        ID3DBlob* b = NULL;
+        ID3DBlob* e = NULL;
+        const HRESULT hr = rsx_dxc_compile(j->src, j->len, "ps_5_0", shc_dxc_level(s_fpbw_flags), &b, &e);
+        if (e) e->lpVtbl->Release(e);
+        if (SUCCEEDED(hr) && b && s_fpbw_keep) {   /* written once the dictionary is */
+            j->blob = b;
+        } else {
+            const int r = SUCCEEDED(hr) && b && cc ? fpb_put_record(cc, j, b) : 0;
+            InterlockedIncrement(r > 0 ? &s_fpbj_wrote : &s_fpbj_failed);
+            if (b) b->lpVtbl->Release(b);
+        }
+        InterlockedIncrement(&s_fpbj_done);
+    }
+    if (cc) ZSTD_freeCCtx(cc);
+    return 0;
+}
+
+/* A new file's start, after its first batch: the header, the dictionary made of that batch's programs, then their
+ * records. 0 when the file cannot be written. */
+static int fpb_begin_file(void)
+{
+    u8* dict = (u8*)malloc(FPB_DICT);
+    u32 ds = 0;
+    for (LONG k = 0; dict && k < s_fpbj_n && ds < FPB_DICT; k++) {
+        const FpbJob* j = &s_fpbj[k];
+        if (!j->blob) continue;
+        const u32 n = (u32)j->blob->lpVtbl->GetBufferSize(j->blob);
+        const u32 take = n < FPB_DICT - ds ? n : FPB_DICT - ds;
+        memcpy(dict + ds, j->blob->lpVtbl->GetBufferPointer(j->blob), take);
+        ds += take;
+    }
+    u8 hd[FPB_HDR];
+    fpb_header(hd);
+    memcpy(hd + FPB_ID, &ds, 4);
+    static const u8 pad[4] = { 0, 0, 0, 0 };
+    /* The header last: a reader that finds it finds the whole dictionary (and before it, zeros it passes over). */
+    int ok = (!ds || fpb_write_at(s_fpbw_h, FPB_HDR, dict, ds)) &&
+             fpb_write_at(s_fpbw_h, FPB_HDR + ds, pad, (u32)(fpb_first(ds) - FPB_HDR - ds)) &&
+             fpb_write_at(s_fpbw_h, 0, hd, FPB_HDR);
+    if (ok && ds && !(s_fpbw_cdict = ZSTD_createCDict(dict, ds, FPB_LEVEL))) ok = 0;
+    free(dict);
+    s_fpbw_end = fpb_first(ds);
+    s_fpbw_keep = 0;
+    ZSTD_CCtx* cc = fpb_cctx();
+    for (LONG k = 0; k < s_fpbj_n; k++) {
+        FpbJob* j = &s_fpbj[k];
+        if (!j->blob) { InterlockedIncrement(&s_fpbj_failed); continue; }
+        const int r = ok && cc ? fpb_put_record(cc, j, j->blob) : 0;
+        InterlockedIncrement(r > 0 ? &s_fpbj_wrote : &s_fpbj_failed);
+        if (r < 0) ok = 0;
+        j->blob->lpVtbl->Release(j->blob);
+        j->blob = NULL;
+    }
+    if (cc) ZSTD_freeCCtx(cc);
+    return ok;
+}
+
+int rsx_d3d12_prebuild_fragment_programs(const uint8_t* const* ucode, const uint32_t* bytes, const uint32_t* ctrl,
+                                         uint32_t n, int threads, int background,
+                                         void (*progress)(uint32_t done, uint32_t total),
+                                         uint32_t stats[3], char* why, size_t why_len)
+{
+    stats[0] = stats[1] = stats[2] = 0;
+    if (!s_d3d.device) {   /* for the compiler's choice, as the game's (shc_pick_compiler) */
+        IDXGIFactory4* f = NULL;
+        const int ok = SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&f)) && d3d_device_create(f) == 0;
+        if (f) f->lpVtbl->Release(f);
+        if (!ok) { snprintf(why, why_len, "no Direct3D 12 device"); return -1; }
+    }
+    if (!fp_dyn_on()) {
+        snprintf(why, why_len, "graphics.shader_prebuild is off, or the guest programs do not come from DXC");
+        return -1;
+    }
+    const char* sc = ps3_settings_str("graphics", "shader_cache", "D3D12_SHADER_CACHE", NULL);
+    if (!sc || !*sc || !strcmp(sc, "0") || ps3_settings_ieq(sc, "off")) {
+        snprintf(why, why_len, "no shader cache in the settings (graphics.shader_cache)");
+        return -1;
+    }
+    char path[1120];
+    snprintf(path, sizeof path, "%s.dxil.prebuilt", sc);
+    /* One build a file. */
+    char full[1200];
+    if (!GetFullPathNameA(path, sizeof full, full, NULL)) snprintf(full, sizeof full, "%s", path);
+    u64 ph = 1469598103934665603ull;
+    for (const char* c = full; *c; c++) {
+        const u8 ch = (u8)(*c == '/' ? '\\' : (*c >= 'A' && *c <= 'Z') ? *c + 32 : *c);
+        ph ^= ch; ph *= 1099511628211ull;
+    }
+    char mname[64];
+    snprintf(mname, sizeof mname, "Local\\ps3recomp-prebuild-%016llx", (unsigned long long)ph);
+    HANDLE mx = CreateMutexA(NULL, FALSE, mname);
+    if (!mx || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (mx) CloseHandle(mx);
+        snprintf(why, why_len, "another build of the pixel shaders is running");
+        return -1;
+    }
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        CloseHandle(mx);
+        snprintf(why, why_len, "cannot open %s (error %lu)", path, (unsigned long)GetLastError());
+        return -1;
+    }
+    /* What it has, if it is this build's: passed over, and its dictionary taken again; else begun again, its header
+     * and dictionary written after the first batch. A tail cut short goes. */
+    u8 hd[FPB_HDR], mine[FPB_HDR];
+    fpb_header(mine);
+    u64 end = 0;
+    u32 ds = 0;
+    int same = fpb_read_at(h, 0, hd, FPB_HDR) && !memcmp(hd, mine, FPB_ID);
+    if (same) {
+        memcpy(&ds, hd + FPB_ID, 4);
+        void* d = ds && ds <= FPB_DICT ? malloc(ds) : NULL;
+        if (ds && !(d && fpb_read_at(h, FPB_HDR, d, ds) && (s_fpbw_cdict = ZSTD_createCDict(d, ds, FPB_LEVEL)) != NULL))
+            same = 0;
+        free(d);
+    }
+    if (same) {
+        end = fpb_first(ds);
+        AcquireSRWLockExclusive(&s_fpb_lock);
+        fpb_index(h, &end);
+        ReleaseSRWLockExclusive(&s_fpb_lock);
+    }
+    LARGE_INTEGER at;
+    at.QuadPart = (LONGLONG)end;
+    if (!SetFilePointerEx(h, at, NULL, FILE_BEGIN) || !SetEndOfFile(h)) {
+        CloseHandle(h); CloseHandle(mx);
+        snprintf(why, why_len, "cannot write %s (error %lu)", path, (unsigned long)GetLastError());
+        return -1;
+    }
+    s_fpbw_h = h;
+    s_fpbw_end = end;
+    s_fpbw_keep = !same;
+    s_fpbw_flags = shc_flags();
+    s_fpbw_idle = background;
+    s_fpbj_wrote = s_fpbj_failed = s_fpbj_stop = 0;
+
+    /* The texts a batch at a time, on this thread (fp_dyn_text as a draw's: no alpha test, sign expansion or
+     * comparison), then compiled on the threads; texts this run or the file has already passed over. */
+    enum { BATCH = 256 };
+    static char text[RSX_FP_HLSL_BUFFER_SIZE];
+    s_fpbj = (FpbJob*)calloc(BATCH, sizeof *s_fpbj);
+    u32 kcap = 1024;
+    while (kcap < n * 2 + 16) kcap *= 2;
+    u64* seen = (u64*)calloc(kcap, sizeof *seen);
+    if (!s_fpbj || !seen) {
+        free(s_fpbj); free(seen); s_fpbj = NULL;
+        CloseHandle(h); CloseHandle(mx); s_fpbw_h = INVALID_HANDLE_VALUE;
+        snprintf(why, why_len, "out of memory");
+        return -1;
+    }
+    const int nt = threads < 1 ? 1 : threads > 32 ? 32 : threads;
+    u32 done = 0, i = 0, failed_text = 0;
+    while (i < n && !s_fpbj_stop) {
+        s_fpbj_n = 0;
+        u32 skipped = 0;
+        for (; i < n && s_fpbj_n < BATCH; i++) {
+            const u32 c = ctrl[i] & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT);
+            if (fp_dyn_text(ucode[i], bytes[i], c, 0, NULL, 0, 0, text, sizeof text, NULL) <= 0) {
+                failed_text++; skipped++;
+                continue;
+            }
+            const u32 len = (u32)strlen(text);
+            const u64 key = shc_key(text, len, "ps_5_0", s_fpbw_flags);
+            const u64 sk = (key ^ (u64)len * 0x9E3779B97F4A7C15ull) | 1u;
+            u32 s = (u32)(sk ^ (sk >> 32)) & (kcap - 1);
+            while (seen[s] && seen[s] != sk) s = (s + 1) & (kcap - 1);
+            AcquireSRWLockShared(&s_fpb_lock);
+            const int have = seen[s] || (s_fpb_cap && fpb_slot(key, len)->srclen);
+            ReleaseSRWLockShared(&s_fpb_lock);
+            seen[s] = sk;
+            if (have) { stats[1]++; skipped++; continue; }
+            FpbJob* j = &s_fpbj[s_fpbj_n];
+            j->src = (char*)malloc(len + 1);
+            if (!j->src) { failed_text++; skipped++; continue; }
+            memcpy(j->src, text, len + 1);
+            j->len = len;
+            j->key = key;
+            j->blob = NULL;
+            s_fpbj_n++;
+        }
+        done += skipped;
+        s_fpbj_next = s_fpbj_done = 0;
+        HANDLE th[32];
+        int nh = 0;
+        for (int t = 0; t < nt && s_fpbj_n; t++) {
+            HANDLE th1 = CreateThread(NULL, 0, fpbj_worker, NULL, 0, NULL);
+            if (th1) th[nh++] = th1;
+        }
+        if (nh) {
+            while (WaitForMultipleObjects((DWORD)nh, th, TRUE, 250) == WAIT_TIMEOUT)
+                if (progress) progress(done + (u32)s_fpbj_done, n);
+            for (int t = 0; t < nh; t++) CloseHandle(th[t]);
+        } else if (s_fpbj_n) {
+            fpbj_worker(NULL);
+        }
+        if (s_fpbw_keep && s_fpbj_n && !fpb_begin_file()) InterlockedExchange(&s_fpbj_stop, 1);
+        done += (u32)s_fpbj_n;
+        for (LONG k = 0; k < s_fpbj_n; k++) {
+            free(s_fpbj[k].src);
+            if (s_fpbj[k].blob) { s_fpbj[k].blob->lpVtbl->Release(s_fpbj[k].blob); s_fpbj[k].blob = NULL; }
+        }
+        if (progress) progress(done, n);
+    }
+    free(s_fpbj); s_fpbj = NULL;
+    free(seen);
+    if (s_fpbw_cdict) { ZSTD_freeCDict(s_fpbw_cdict); s_fpbw_cdict = NULL; }
+    stats[0] = (u32)s_fpbj_wrote;
+    stats[2] = (u32)s_fpbj_failed + failed_text;
+    const int stopped = s_fpbj_stop != 0;
+    CloseHandle(h);
+    s_fpbw_h = INVALID_HANDLE_VALUE;
+    CloseHandle(mx);
+    if (stopped) { snprintf(why, why_len, "cannot write %s", path); return -1; }
+    return 0;
+}
+
 /* A texture's shape as the cache keys it (VPTexSlot.cube). */
 static int tex_shape_vol(u32 depth) { return (int)((depth << 8) | 2u); }
 static u32 tex_shape_depth(int shape) { return (shape & 2) ? ((u32)shape >> 8) : 1u; }
@@ -9472,10 +10051,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     u8 gamma_masks[16] = {0};
     for (int u = 0; u < VP_TEX_UNITS; u++) gamma_masks[u] = (u8)((gamma >> (4 * u)) & 15u);
     u32 nk = 0;
-    int n = dyn
-        ? rsx_fp_decompile_buffered_state_ex(prog, prog_max, fp_ctrl, dshadow, expand ? exp_masks : NULL,
-                                             hlsl, sizeof(hlsl), &nk)
-        : (buffered && shadow)
+    int n = 0;
+    if (dyn) {
+        n = fp_dyn_text(prog, prog_max, fp_ctrl, dshadow, expand ? exp_masks : NULL, atest, fp_addr,
+                        hlsl, sizeof hlsl, &nk);
+        if (n <= 0) return NULL;
+    } else {
+    n = (buffered && shadow)
         ? rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, prog_max, fp_ctrl,
                                                     cube_units, vol_units, shd, gamma_masks,
                                                     expand ? exp_masks : NULL,
@@ -9497,10 +10079,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
     /* SET_SHADER_PACKER: encode the colour outputs to sRGB, as the RSX does
-     * before they reach an integer target. Dynamic: when fp_state's flag says so. */
-    if (n > 0 && (dyn ? rsx_fp_apply_srgb_output_if(hlsl, sizeof(hlsl), "asuint(fp_state.x) & 1u") < 0
-                      : (!ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
-                         rsx_fp_apply_srgb_output(hlsl, sizeof(hlsl)) < 0))) {
+     * before they reach an integer target. */
+    if (n > 0 && !ctrl_auto && (ctrl & FP_CTRL_SRGB_OUT) &&
+        rsx_fp_apply_srgb_output(hlsl, sizeof(hlsl)) < 0) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 8))
             fprintf(stderr, "[FP] fp=0x%08X: sRGB output not applied (shape)%c", fp_addr, 10);
@@ -9516,8 +10097,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         snprintf(from, sizeof from, "cbuffer PSConstants : register(b1) {\n    float4 fp_constants[%u];\n"
                                     "    float4 fp_alpha;\n};\n", nd);
         snprintf(to, sizeof to, "cbuffer PSConstants : register(b1) {\n    float4 fp_tcscale[16];\n"
-                                "    float4 fp_alpha;\n%s    float4 fp_constants[%u];\n};\n",
-                 dyn ? "    float4 fp_state;\n" : "", nd);
+                                "    float4 fp_alpha;\n    float4 fp_constants[%u];\n};\n", nd);
         if (!strstr(hlsl, from)) {
             static int _e = 0;
             if (PS3_LOG_FIRST(_e, 8))
@@ -9527,15 +10107,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         hlsl_replace_all(hlsl, sizeof hlsl, from, to);
         hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_gamma_mask(u) 0u\n",
                          "#define _rsx_gamma_mask(u) ((uint)fp_tcscale[u].z)\n");
-        if (!dyn) fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~(cube_units | vol_units), NULL);
+        fp_apply_coord_scale(hlsl, sizeof(hlsl), 0xFFFFu & ~(cube_units | vol_units), NULL);
         if (shadow) fp_shadow_scale(hlsl, sizeof(hlsl), shd);
     } else if (unnorm && udr) {
         float sc[VP_TEX_UNITS][2];
         const u32 mask = dr_coord_scales(udr, sc);
         fp_apply_coord_scale(hlsl, sizeof(hlsl), mask & ~(cube_units | vol_units), (const float (*)[2])sc);
     }
-    if (dyn ? rsx_fp_apply_wpos_grid_expr(hlsl, sizeof(hlsl), "fp_state.zw") < 0
-            : aa && rsx_fp_apply_wpos_grid(hlsl, sizeof(hlsl), aax, aay) < 0) {
+    if (aa && rsx_fp_apply_wpos_grid(hlsl, sizeof(hlsl), aax, aay) < 0) {
         static int _w = 0;
         if (PS3_LOG_FIRST(_w, 8))
             fprintf(stderr, "[FP] fp=0x%08X: WPOS sample grid not applied (shape)%c", fp_addr, 10);
@@ -9553,15 +10132,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         hlsl_replace_all(hlsl, sizeof hlsl, "#define _rsx_wpos(p) (p)\n", def);
     }
     /* Internal resolution: WPOS back in guest pixels by the target's own factor, which replay
-     * puts in fp_alpha.w. Only when it is on, so that at 1 every program is the text it was.
-     * Dynamic: always, the ultrawide factor from fp_state.y and fp_alpha.w 1 with it off. */
-    if (dyn)
-        hlsl_replace_all(hlsl, sizeof hlsl,
-                         "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,",
-                         "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? fp_state.y : 1.0) + fp_alpha.z, "
-                         "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + "
-                         "fp_alpha.z,");
-    else if (buffered && s_wide != 1.0f) {
+     * puts in fp_alpha.w. Only when it is on, so that at 1 every program is the text it was. */
+    if (buffered && s_wide != 1.0f) {
         /* A target drawn wider has -1/sy in fp_alpha.w; x is then that much further. */
         char wp[256];
         snprintf(wp, sizeof wp, "float4((p).x * abs(fp_alpha.w) * (fp_alpha.w < 0.0 ? %.7f : 1.0) + fp_alpha.z, (fp_alpha.y != 0.0 ? "
@@ -9585,6 +10157,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 fprintf(stderr, "[FP] fp=0x%08X: alpha test 0x%X not applied (shape)%c", fp_addr, atest & 0xFFFFu, 10);
         }
     }
+    }   /* the text of a program read with the draw's state compiled in */
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -9773,6 +10346,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         char* rp = strstr(hlsl, "return r[0];");
         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
     }
+    if (dyn) fpb_note_variant(hlsl, atest, expand, dshadow);
     /* With workers, the program is compiled and the pipeline created by one
      * (sj_build), from the description below. */
     const int async = sj_workers() > 0;
@@ -12510,6 +13084,11 @@ static void rsx_census_present(void)
         s_cen_gpu_n = 0; s_cen_gpu_max = 0.0;
         memset(s_cen_gpu_ms, 0, sizeof s_cen_gpu_ms);
     }
+    if (s_fpb_hits || s_fpb_misses)
+        fprintf(stderr, "[census] pixel shaders so far: %ld taken from the ones built ahead, %ld not among them; "
+                        "texts not among them: %ld with an alpha test, %ld sign expansion, %ld depth comparison, "
+                        "%ld none of these%c", (long)s_fpb_hits, (long)s_fpb_misses, (long)s_fpb_why[0],
+                (long)s_fpb_why[1], (long)s_fpb_why[2], (long)s_fpb_why[3], 10);
     if (s_psoc_mode == 1)
         fprintf(stderr, "[census] pipeline cache: %ld built from the file, %ld found built by a draw, %ld new%c",
                 (long)s_psoc_built, (long)s_psoc_hits, (long)s_psoc_added, 10);

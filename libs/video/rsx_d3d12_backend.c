@@ -8055,13 +8055,25 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                       if (fo != 0xFFFFFFFFu) fpm = rsx_fp_texture_units(vm_base + fo, FP_MAX_BYTES);
                   } }
                 for (int u = 0; u < VP_TEX_UNITS; u++)
-                    if (r->tex[u].set && ((fpm >> u) & 1u))
-                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X addr=0x%X filter=0x%X border=0x%08X\n", u,
+                    if (r->tex[u].set && ((fpm >> u) & 1u)) {
+                        /* The id the textures layer knows it by (rsx_tex_replace.h), from the guest's bytes as
+                         * they are at the capture: which mod picture or dumped texture a draw sampled. */
+                        char tid[32] = "";
+                        { extern uint8_t* vm_base;
+                          if (vm_base && r->tex[u].off && rsx_tex_replaceable(r->tex[u].fmt) &&
+                              r->tex[u].w && r->tex[u].h && r->tex[u].w <= 8192u && r->tex[u].h <= 8192u) {
+                              rsx_tex_layout ctl;
+                              rsx_texture_layout(r->tex[u].fmt, r->tex[u].w, r->tex[u].h, &ctl);
+                              snprintf(tid, sizeof tid, " id=%016llx", (unsigned long long)rsx_tex_id(
+                                  vm_base + r->tex[u].off, r->tex[u].w, r->tex[u].h, r->tex[u].fmt, &ctl));
+                          } }
+                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X addr=0x%X filter=0x%X border=0x%08X%s\n", u,
                                 r->tex[u].off, r->tex[u].fmt,
                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
                                 r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF,
-                                r->tex[u].addr, r->tex[u].filter, r->tex[u].border);
+                                r->tex[u].addr, r->tex[u].filter, r->tex[u].border, tid);
+                    }
             }
         }
         /* Per-draw VP constant banks for the first few offscreen-RT geometry

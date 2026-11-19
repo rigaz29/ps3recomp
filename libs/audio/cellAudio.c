@@ -443,6 +443,26 @@ static void wasapi_close(void)
     s_wasapi_buf_frames = 0;
 }
 
+static int audio_pace_ms(void);
+
+/* The open stream's part of the delay, for a report of sound behind the picture: the queue the mixer keeps, the
+ * audio engine's period and the stream's latency (GetDevicePeriod, GetStreamLatency; the latter is 0 on many
+ * shared-mode streams). What the device adds after that (USB, S/PDIF, a receiver) Windows does not say. */
+static void wasapi_report_latency(void)
+{
+    if (!s_wasapi_client) return;
+    REFERENCE_TIME lat = 0, def = 0, least = 0;
+    const int has_lat = SUCCEEDED(s_wasapi_client->lpVtbl->GetStreamLatency(s_wasapi_client, &lat));
+    const int has_per = SUCCEEDED(s_wasapi_client->lpVtbl->GetDevicePeriod(s_wasapi_client, &def, &least));
+    const int pace = audio_pace_ms();
+    char latency[32] = "unknown", per[64] = "unknown", queue[48] = "paced on the device's room";
+    if (has_lat) snprintf(latency, sizeof latency, "%.1f ms", lat / 10000.0);
+    if (has_per) snprintf(per, sizeof per, "%.1f ms (%.1f ms at least)", def / 10000.0, least / 10000.0);
+    if (pace) snprintf(queue, sizeof queue, "kept near %d ms", pace);
+    fprintf(stderr, "[cellAudio] the way out: the queue %s, the engine's period %s, the stream's latency %s as "
+                    "Windows gives it; what the device adds after that Windows does not say%c", queue, per, latency, 10);
+}
+
 /* The default output device's stream, in the layout PS3_AUDIO_CHANNELS asks for, else the device's own. A
  * multichannel stream the device refuses falls back to stereo. why: the log's word. 0 on success. */
 static int wasapi_open(const char* why)
@@ -489,6 +509,7 @@ static int wasapi_open(const char* why)
                     "%u frames; category %s; %s\n",
             why, name, dev_ch, (unsigned long)dev_mask, ch == 8 ? "7.1" : ch == 6 ? "5.1" : "stereo",
             s_wasapi_buf_frames, props & 1 ? "game" : "none", fx);
+    wasapi_report_latency();
     return 0;
 }
 
@@ -835,19 +856,24 @@ static void audio_notify_event_queues(void)
 static unsigned long long g_audio_underruns;
 
 /* Take a block every 5.33 ms by the performance counter, as the hardware
- * does, and keep the device queue near AUDIO_PACE_MS (default 30) as the
- * jitter buffer. Paced on the device's room alone the blocks went in pairs:
- * shared-mode WASAPI frees about 10 ms at a time, so two were read at once,
- * and a guest mixer one block ahead found the second already due. God of War:
- * Ascension's first level: short gaps inside sound 27-35 per 5 s -> 8-9.
- * AUDIO_PACE=0 paces on the device's room again. */
+ * does, and keep the device queue near AUDIO_PACE_MS (default 15, the least
+ * taken) as the jitter buffer. Paced on the device's room alone the blocks went
+ * in pairs: shared-mode WASAPI frees about 10 ms at a time, so two were read at
+ * once, and a guest mixer one block ahead found the second already due. God of
+ * War: Ascension's first level: short gaps inside sound 27-35 per 5 s -> 8-9.
+ * AUDIO_PACE=0 paces on the device's room again.
+ * The queue is heard as delay on top of the title's own ring: 30 ms at first,
+ * which put the impacts of God of War: Ascension's opening fight audibly behind
+ * the picture (Ascension-R #31). 15 ms on an i5-12400F: no gap in the title's
+ * ring, no device underrun, nothing dropped, in the opening cinematic and in 145 s
+ * of the parasites' fight, as with 30. */
 static int audio_pace_ms(void)
 {
     static int ms = -1;
     if (ms < 0) {
         const char* e = getenv("AUDIO_PACE");
         const char* t = getenv("AUDIO_PACE_MS");
-        ms = (!e || atoi(e) != 0) ? (t ? atoi(t) : 30) : 0;
+        ms = (!e || atoi(e) != 0) ? (t ? atoi(t) : 15) : 0;
         if (ms && ms < 15) ms = 15;
     }
     return ms;

@@ -499,6 +499,8 @@ static struct SpursInst {
     u8 active[SPURS_MAX_WID], idle[SPURS_MAX_WID];
     u8 is2;   /* CellSpurs2: 32 workloads */
     u32 cursor, pass_no;
+    u32 taken_n[SPURS_MAX_WID];          /* for spurs_debug_dump: how often a worker took each workload, */
+    ULONGLONG taken_ms[SPURS_MAX_WID];   /* and when last (GetTickCount64) */
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 
@@ -2636,10 +2638,12 @@ static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, int lane, u3
  * whether it can be picked -- enabled bit, state (2 = runnable), contention
  * (active against maximum: a run that never gave its count back stops the
  * workload for good), the kick sources (ready count, signal bit, the flag),
- * the idle back-off, and its priority on each SPU. Read without locks: a
- * diagnostic, called when something has already stood still for seconds. */
+ * the idle back-off, its priority on each SPU, and how often a worker took it
+ * and how long ago. Read without locks: a diagnostic, called when something
+ * has already stood still for seconds. */
 void spurs_debug_dump(const char* why)
 {
+    const ULONGLONG now = GetTickCount64();
     for (int i = 0; i < MAX_SPURS_INST; i++) {
         struct SpursInst* si = &s_inst[i];
         const u32 ea = si->ea;
@@ -2660,14 +2664,20 @@ void spurs_debug_dump(const char* why)
                 o += snprintf(prio + o, sizeof prio - (size_t)o, "%02X", vm_read8(ea + wkl_info_off(wid) + 0x18 + sn));
             prio[o] = 0;
             const u32 maxc = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
+            char taken[48];
+            if (si->taken_n[wid])
+                snprintf(taken, sizeof taken, "taken %u, last %.1f s ago", si->taken_n[wid],
+                         (double)(now - si->taken_ms[wid]) / 1000.0);
+            else
+                snprintf(taken, sizeof taken, "never taken");
             fprintf(stderr, "[spurs-dump]   w%-2u en %d state %u max %u (used %u) active %u cur %u ready %u signal %d "
-                            "flag %d idle %u prio %s\n",
+                            "flag %d idle %u prio %s, %s\n",
                     wid, !!(enabled & (0x80000000u >> wid)), vm_read8(ea + wkl_state_off(wid)), maxc,
                     spurs_maxcont_override(wid, maxc), si->active[wid],
                     wkl_count_get(ea, SPURS_WKL_CURCONT, wid, si->is2), vm_read8(ea + wkl_ready_off(wid)),
                     !!(vm_read16(ea + wkl_signal_off(wid)) & wkl_signal_bit(wid)),
                     vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid && vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0,
-                    si->idle[wid], prio);
+                    si->idle[wid], prio, taken);
         }
     }
     const LONG n = s_pm_now_n < PM_NOW_MAX ? s_pm_now_n : PM_NOW_MAX;
@@ -2729,6 +2739,8 @@ static void spurs_take(struct SpursInst* si, struct SpursPmSlot* slot, u32 wid, 
           slot->boosted = b;
       } }
     si->active[wid]++;
+    si->taken_n[wid]++;
+    si->taken_ms[wid] = GetTickCount64();
     ef_line_begin(ea);
     wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
     ef_line_end(ea);

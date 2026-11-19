@@ -4716,7 +4716,8 @@ static void wait_for_gpu_once(void)
 #define PP_SLOT_HUD_E    33u   /* and SMAA's tables for it */
 #define PP_SLOT_HUD_N    36u
 #define PP_SLOT_UP(out, fi) (40u + 3u * ((out) * 2u + (fi)))   /* the upscaler's output, the frame, the picture */
-#define PP_SRV_SLOTS     52u
+#define PP_SLOT_GRADE(out) (52u + (out))   /* the upscaler's output as a UAV, for the grade (s_grade) */
+#define PP_SRV_SLOTS     54u
 
 /* RTVs for the swap chain's buffers, made again after each resize. */
 static void bb_views(void)
@@ -4810,6 +4811,155 @@ static void pp_tmp_create(void)
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.pp_tmp, NULL, h);
 }
 
+/* graphics.vibrance and graphics.contrast = off | low | medium | high | max (issue #26): a grade at the end of the
+ * presentation pass, on the scaled picture, before the port's overlay. The game's HUD and menus are in the picture
+ * and go through it too. Both are read once and put in the shaders as constants:
+ *   contrast  an S-curve on the luminance (smoothstep, by K), the colour scaled with it: darks a little darker,
+ *             lights a little lighter, black and white kept;
+ *   vibrance  the colour away from its luminance by 1 + V * (1 - its saturation): dull colours most, strong ones
+ *             (and skin, already saturated) little.
+ * Bilinear, sharp bilinear and FSR 1 run it in their last pixel shader. FSR 3.1 runs it on the upscaler's output in
+ * place, a compute pass, before the HUD goes on: frame generation's picture without the HUD is that output, so the
+ * two stay alike. Off, the shaders are the same as before. */
+static struct {
+    float v, k;                    /* V and K above; 0 off */
+    char prefix[1400];             /* the defines and grade(), put before each shader that ends the pass */
+    ID3D12RootSignature* root;     /* the compute pass for FSR 3.1: one UAV */
+    ID3D12PipelineState* pso;
+} s_grade;
+
+static const char k_grade_fn[] =
+    "float3 grade(float3 c) {\n"
+    "#if GRADE_ON\n"
+    "  const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+    "  float l = dot(c, lw);\n"
+    "  const float l2 = lerp(l, l * l * (3.0 - 2.0 * l), GRADE_K);\n"
+    "  c *= (l2 + 0.0001) / (l + 0.0001);\n"
+    "  l = dot(c, lw);\n"
+    "  const float s = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));\n"
+    "  c = saturate(lerp(l.xxx, c, 1.0 + GRADE_V * (1.0 - saturate(s))));\n"
+    "#endif\n"
+    "  return c; }\n";
+
+static float grade_level(const char* key, const float lv[5])
+{
+    static const char* const names[5] = { "off", "low", "medium", "high", "max" };
+    const char* v = ps3_settings_str("graphics", key, NULL, "off");
+    for (int i = 0; i < 5; i++)
+        if (ps3_settings_ieq(v, names[i])) return lv[i];
+    printf("[D3D12] graphics.%s = %s is not off, low, medium, high or max; off%c", key, v, 10);
+    return 0.0f;
+}
+
+static void grade_read(void)
+{
+    static const float vib[5] = { 0.0f, 0.2f, 0.4f, 0.6f, 0.9f };
+    static const float con[5] = { 0.0f, 0.15f, 0.3f, 0.45f, 0.65f };
+    s_grade.v = grade_level("vibrance", vib);
+    s_grade.k = grade_level("contrast", con);
+    const int on = s_grade.v > 0.0f || s_grade.k > 0.0f;
+    snprintf(s_grade.prefix, sizeof s_grade.prefix, "#define GRADE_ON %d\n#define GRADE_V %.4f\n#define GRADE_K %.4f\n%s",
+             on, s_grade.v, s_grade.k, k_grade_fn);
+    if (on) printf("[D3D12] colour grade: vibrance %.2f, contrast %.2f%c", s_grade.v, s_grade.k, 10);
+}
+
+/* body with the grade before it, malloc'd; NULL when out of memory. */
+static char* grade_src(const char* body, size_t len, size_t* n)
+{
+    const size_t np = strlen(s_grade.prefix);
+    char* src = (char*)malloc(np + len + 1);
+    if (!src) return NULL;
+    memcpy(src, s_grade.prefix, np);
+    memcpy(src + np, body, len);
+    src[np + len] = 0;
+    *n = np + len;
+    return src;
+}
+
+/* The compute pass for FSR 3.1's output: the grade in place, in 8x8 groups. Needs typed UAV loads of RGBA8, which
+ * D3D12 hardware has (an option all the same: without it, FSR 3.1's picture is not graded, and the log says so). */
+static int grade_init(void)
+{
+    if (!(s_grade.v > 0.0f || s_grade.k > 0.0f)) return 0;
+    ID3D12Device* dev = s_d3d.device;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+    memset(&o, 0, sizeof o);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs;
+    memset(&fs, 0, sizeof fs);
+    fs.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) ||
+        !o.TypedUAVLoadAdditionalFormats ||
+        FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ||
+        !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
+        printf("[D3D12] colour grade: no typed UAV loads of RGBA8; FSR 3.1's picture is not graded%c", 10);
+        return -1;
+    }
+    D3D12_DESCRIPTOR_RANGE range;
+    memset(&range, 0, sizeof range);
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp;
+    memset(&rp, 0, sizeof rp);
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable.NumDescriptorRanges = 1;
+    rp.DescriptorTable.pDescriptorRanges = &range;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.NumParameters = 1;
+    rd.pParameters = &rp;
+    ID3DBlob *sig = NULL, *err = NULL;
+    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (SUCCEEDED(hr))
+        hr = dev->lpVtbl->CreateRootSignature(dev, 0, sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
+                                              &IID_ID3D12RootSignature, (void**)&s_grade.root);
+    if (sig) sig->lpVtbl->Release(sig);
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    if (FAILED(hr)) return -1;
+    static const char cs[] =
+        "RWTexture2D<unorm float4> img : register(u0);\n"
+        "[numthreads(8, 8, 1)] void cs(uint3 p : SV_DispatchThreadID) {\n"
+        "  const float4 c = img[p.xy]; img[p.xy] = float4(grade(c.rgb), c.a); }\n";
+    size_t n = 0;
+    char* src = grade_src(cs, sizeof cs - 1, &n);
+    if (!src) return -1;
+    ID3DBlob* code = NULL;
+    hr = rsx_compile_own(src, n, "grade_cs", NULL, NULL, "cs", "cs_5_0", 0, 0, &code, &err);
+    free(src);
+    if (err) { if (FAILED(hr)) printf("[D3D12] %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10); err->lpVtbl->Release(err); }
+    if (FAILED(hr)) return -1;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd;
+    memset(&cd, 0, sizeof cd);
+    cd.pRootSignature = s_grade.root;
+    cd.CS.pShaderBytecode = code->lpVtbl->GetBufferPointer(code);
+    cd.CS.BytecodeLength = code->lpVtbl->GetBufferSize(code);
+    hr = dev->lpVtbl->CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void**)&s_grade.pso);
+    code->lpVtbl->Release(code);
+    return FAILED(hr) ? -1 : 0;
+}
+
+/* The grade on one of the upscaler's outputs (a UAV, after its writes), in place. */
+static void grade_dispatch(ID3D12Resource* img, u32 out)
+{
+    if (!s_grade.pso) return;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    D3D12_RESOURCE_BARRIER u;
+    memset(&u, 0, sizeof u);
+    u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    u.UAV.pResource = img;
+    cl->lpVtbl->ResourceBarrier(cl, 1, &u);
+    D3D12_GPU_DESCRIPTOR_HANDLE h;
+    s_d3d.pp_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &h);
+    h.ptr += PP_SLOT_GRADE(out) * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.pp_srv_heap);
+    cl->lpVtbl->SetComputeRootSignature(cl, s_grade.root);
+    cl->lpVtbl->SetComputeRootDescriptorTable(cl, 0, h);
+    cl->lpVtbl->SetPipelineState(cl, s_grade.pso);
+    cl->lpVtbl->Dispatch(cl, (s_d3d.bb_w + 7) / 8, (s_d3d.bb_h + 7) / 8, 1);
+    cl->lpVtbl->ResourceBarrier(cl, 1, &u);
+}
+
 /* One triangle over the whole target; the pixel shader samples the display
  * target, or for FSR 1, EASU into pp_tmp and RCAS from it (rsx_fsr1.c). */
 static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
@@ -4842,6 +4992,7 @@ static int pp_init(void)
         }
     }
 
+    grade_read();
     if (pp_root_create(1, &s_d3d.pp_root) != 0) return -1;
     ID3DBlob* err = NULL;
 
@@ -4863,13 +5014,17 @@ static int pp_init(void)
         "    float2 t = uv * p0.xy, s = max(p0.zw / p0.xy, 1.0), f = frac(t) - 0.5, r = 0.5 - 0.5 / s;\n"
         "    uv = (floor(t) + (f - clamp(f, -r, r)) * s + 0.5) / p0.xy;\n"
         "  }\n"
-        "  return float4(src.SampleLevel(lin, uv, 0).rgb, 1); }\n";
+        "  return float4(grade(src.SampleLevel(lin, uv, 0).rgb), 1); }\n";
     ID3DBlob *vsb = NULL, *psb = NULL;
-    hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "present_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
+    size_t glen = 0;
+    char* gsrc = grade_src(hlsl, sizeof hlsl - 1, &glen);
+    if (!gsrc) return -1;
+    hr = rsx_compile_own(gsrc, glen, "present_vs", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
     if (SUCCEEDED(hr)) {
         if (err) { err->lpVtbl->Release(err); err = NULL; }
-        hr = rsx_compile_own(hlsl, sizeof hlsl - 1, "present_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
+        hr = rsx_compile_own(gsrc, glen, "present_ps", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
     }
+    free(gsrc);
     if (FAILED(hr)) {
         printf("[D3D12] ERROR: presentation shader: %s\n", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
         if (err) err->lpVtbl->Release(err);
@@ -4926,7 +5081,7 @@ static int pp_init(void)
     if (s_d3d.pp_mode == 2) {
         for (int pass = 0; pass < 2; pass++) {
             if (pass == 1 && s_d3d.pp_stops < 0.0f) break;
-            ID3DBlob* fb = (ID3DBlob*)rsx_fsr1_compile(pass);
+            ID3DBlob* fb = (ID3DBlob*)rsx_fsr1_compile(pass, s_grade.prefix);
             if (!fb) break;
             pd.PS.pShaderBytecode = fb->lpVtbl->GetBufferPointer(fb);
             pd.PS.BytecodeLength  = fb->lpVtbl->GetBufferSize(fb);
@@ -6976,6 +7131,10 @@ static int up_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
     pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_up.pso);
     ps->lpVtbl->Release(ps);
+    if (SUCCEEDED(hr) && grade_init() != 0 && s_grade.pso) {
+        s_grade.pso->lpVtbl->Release(s_grade.pso);
+        s_grade.pso = NULL;
+    }
     return FAILED(hr) ? -1 : 0;
 }
 
@@ -7026,6 +7185,7 @@ static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DE
     ID3D12Resource* out = s_fg.hud_out[s_fg.hud_i];
     pp_barrier(out, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     rsx_fsr3_up_frame(s_d3d.cmd_list, &f, s_fg.copied ? s_fg.hud_src : disp, out, fg_ms(perf_now()));
+    grade_dispatch(out, s_fg.hud_i);
     pp_barrier(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     pp_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     up_draw(PP_SLOT_UP(s_fg.hud_i, fi), s_fg.copied, bb_rtv);
@@ -13791,6 +13951,11 @@ static int fg_targets(void)
         if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, read, NULL,
                 &IID_ID3D12Resource, (void**)&s_fg.hud_out[i])))
             return 0;
+        if (s_up.want && s_grade.pso) {
+            D3D12_CPU_DESCRIPTOR_HANDLE hu = base;
+            hu.ptr += PP_SLOT_GRADE(i) * inc;
+            dev->lpVtbl->CreateUnorderedAccessView(dev, s_fg.hud_out[i], NULL, NULL, hu);
+        }
         for (u32 fi = 0; s_up.want && fi < FRAME_COUNT; fi++) {
             ID3D12Resource* const t[3] = { s_fg.hud_out[i], s_d3d.render_targets[fi], s_fg.hud_src };
             for (u32 k = 0; k < 3; k++) {
@@ -21085,6 +21250,8 @@ void rsx_d3d12_backend_shutdown(void)
     }
     {
         if (s_d3d.pp_pso) s_d3d.pp_pso->lpVtbl->Release(s_d3d.pp_pso);
+        if (s_grade.pso) { s_grade.pso->lpVtbl->Release(s_grade.pso); s_grade.pso = NULL; }
+        if (s_grade.root) { s_grade.root->lpVtbl->Release(s_grade.root); s_grade.root = NULL; }
         if (s_d3d.pp_pso_easu) s_d3d.pp_pso_easu->lpVtbl->Release(s_d3d.pp_pso_easu);
         if (s_d3d.pp_pso_rcas) s_d3d.pp_pso_rcas->lpVtbl->Release(s_d3d.pp_pso_rcas);
         if (s_d3d.pp_tmp) s_d3d.pp_tmp->lpVtbl->Release(s_d3d.pp_tmp);

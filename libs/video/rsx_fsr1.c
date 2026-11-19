@@ -92,23 +92,27 @@ static const char s_easu[] =
     "AF4 FsrEasuBF(AF2 p) { return src.GatherBlue(lin, p); }\n"
     "#include \"ffx_fsr1.h\"\n"
     "float4 main(V i) : SV_TARGET {\n"
-    "  AF3 c; FsrEasuF(c, AU2(i.pos.xy), con0, con1, con2, con3); return float4(c, 1); }\n";
+    "  AF3 c; FsrEasuF(c, AU2(i.pos.xy), con0, con1, con2, con3); return float4(grade(c), 1); }\n";
 static const char s_rcas[] =
     "#define FSR_RCAS_F 1\n"
     "AF4 FsrRcasLoadF(ASU2 p) { return src.Load(int3(p, 0)); }\n"
     "void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}\n"
     "#include \"ffx_fsr1.h\"\n"
     "float4 main(V i) : SV_TARGET {\n"
-    "  AF3 c; FsrRcasF(c.r, c.g, c.b, AU2(i.pos.xy), con0); return float4(c, 1); }\n";
+    "  AF3 c; FsrRcasF(c.r, c.g, c.b, AU2(i.pos.xy), con0); return float4(grade(c), 1); }\n";
 
-void* rsx_fsr1_compile(int pass)
+void* rsx_fsr1_compile(int pass, const char* prefix)
 {
+    static const char none[] = "float3 grade(float3 c) { return c; }\n";
+    const char* pre = prefix ? prefix : none;
     const char* body = pass ? s_rcas : s_easu;
-    const size_t n = sizeof s_head - 1 + strlen(body);
+    const size_t np = strlen(pre);
+    const size_t n = np + sizeof s_head - 1 + strlen(body);
     char* src = (char*)malloc(n + 1);
     if (!src) return NULL;
-    memcpy(src, s_head, sizeof s_head - 1);
-    memcpy(src + sizeof s_head - 1, body, strlen(body) + 1);
+    memcpy(src, pre, np);
+    memcpy(src + np, s_head, sizeof s_head - 1);
+    memcpy(src + np + sizeof s_head - 1, body, strlen(body) + 1);
     ID3DBlob *code = NULL, *err = NULL;
     const HRESULT hr = rsx_compile_own(src, n, pass ? "fsr1_rcas" : "fsr1_easu", NULL, &s_fsr1_include,
                                        "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);

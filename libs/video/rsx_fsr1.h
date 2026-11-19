@@ -20,8 +20,10 @@ void rsx_fsr1_rcas_con(uint32_t con[4], float stops);
 /* The pixel shader of a pass (0 = EASU, 1 = RCAS), compiled for ps_5_0: an
  * ID3DBlob*, or NULL with the compiler's message printed. Its input is the
  * presentation pass's vertex output (SV_POSITION, TEXCOORD0); it reads t0 with
- * s0 and takes its constants as the root constants at b0. */
-void* rsx_fsr1_compile(int pass);
+ * s0 and takes its constants as the root constants at b0. prefix, put before
+ * the pass's own code, defines float3 grade(float3), which its colour goes
+ * through last (NULL: none). */
+void* rsx_fsr1_compile(int pass, const char* prefix);
 
 #ifdef __cplusplus
 }

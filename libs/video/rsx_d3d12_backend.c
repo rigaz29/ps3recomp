@@ -532,9 +532,10 @@ typedef struct {
     int heap;           /* the texture heap res is placed in + 1, 0 = its own allocation */
     u64 hoff, hsize;    /* its block in that heap */
     /* Views of res made in the view cache (srvc_tex), up to SRVC_VARIANTS
-     * format/swizzle/cube combinations; cleared when res goes (vp_tex_drop). */
-    u32 srv_fmt[4], srv_map[4];
-    u8 srv_cube[4], srv_n, srv_next;
+     * format/swizzle/shape combinations, the shape with the level of detail
+     * the view keeps to (srv_create_at); cleared when res goes (vp_tex_drop). */
+    u32 srv_fmt[4], srv_map[4], srv_cube[4];
+    u8 srv_n, srv_next;
     u8 repl;            /* res holds a port's picture (rsx_tex_replace.h): res_w x res_h, a full chain */
     u8 churn;           /* uploads again for a change of its bytes, up to 255: one that keeps changing (a copy of
                          * the frame, a video) is not named for a picture any more */
@@ -9039,7 +9040,8 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
      * 2 LINEAR; 7 the convolution filter) reads level 0 only -- D3D12 has no
      * such filter, a MIP_POINT one with MaxLOD 0 is the same. The mipmapped
      * ones (3-6) keep to TEXTURE_CONTROL0's minimum [30:19] and maximum
-     * [18:7] level of detail, 4.8 fixed point. While only level 0 was
+     * [18:7] level of detail, 4.8 fixed point: the maximum here, the minimum
+     * in the draw's view (vp_sampler_ctrl0, vp_unit_lod). While only level 0 was
      * uploaded neither mattered; with the chains uploaded, the cut-out
      * textures a title samples unmipmapped came out as blocky lower levels. */
     float lo = 0.0f, hi = 0.0f;
@@ -9060,10 +9062,26 @@ static void vp_sampler_write(u32 i, const D3D12_SAMPLER_DESC* s)
     s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, s, h);
 }
 
+/* The guest sampler states made so far, by key: the descriptor index, 0 for an
+ * empty place (0 and 1 are the defaults, never in it). Open addressing over
+ * twice the heap, so a search always meets an empty place. The draws ask
+ * ~365,000 times a second in a fight, and with the maximum level of detail in
+ * the key there are twice the states there were (43 against ~20): a walk over
+ * them all would have doubled too. */
+static u16 s_samp_hash[4096];
+
+static u32 vp_sampler_slot(const u32 k[4])
+{
+    u32 h = 2166136261u;
+    for (int j = 0; j < 4; j++) { h ^= k[j]; h *= 16777619u; }
+    return (h ^ (h >> 15)) & 4095u;
+}
+
 /* Descriptors 0 and 1: what the four static samplers were, for units the
  * guest gave no state (s0 point/clamp for the dbgfont atlas, else linear/wrap). */
 static void vp_sampler_defaults(void)
 {
+    memset(s_samp_hash, 0, sizeof s_samp_hash);
     D3D12_SAMPLER_DESC s = {0};
     s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -9075,18 +9093,69 @@ static void vp_sampler_defaults(void)
     s_d3d.samp_n = 2;
 }
 
+/* RSX_TEX_LOD=0: every sampler reads level 0 only, as before 2026-11-20 (issue #9). */
+static int rsx_tex_lod_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_TEX_LOD"); v = e ? (atoi(e) != 0) : 1; }
+    return v;
+}
+
+/* What of TEXTURE_CONTROL0 a sampler is made from: the anisotropy [6:4] and,
+ * for a mipmapped min filter (3-6), the maximum level of detail [18:7]. The
+ * minimum [30:19] is kept by the draw's view instead (vp_unit_lod).
+ *
+ * The key held only the anisotropy, so every sampler read level 0 alone: the
+ * chains were uploaded and never sampled, and a texture whose top levels were
+ * not in memory was drawn from whatever was there. God of War: Ascension
+ * streams its textures in, keeps a texture to its lower levels with the
+ * minimum until the top ones are loaded (or after they were dropped for room),
+ * then fades them in by lowering the minimum a little every frame: striped and
+ * blocky walls in Sparta's prison, Kratos's skin flat, flickering as levels
+ * came and went (issue #9, docs/notes/2026-11-20-texture-lod.md). The fades
+ * give the minimum any value: in the sampler's key, a 150 s fight made 1,951
+ * samplers in 135 s, and still 295 and climbing with it taken to an eighth of
+ * a level, against the 2,048 a D3D12 heap holds. With the maximum alone, 43. */
+static u32 vp_sampler_ctrl0(u32 filter, u32 ctrl0)
+{
+    const u32 minf = (filter >> 16) & 7u;
+    if (minf < 3 || minf > 6 || !rsx_tex_lod_on()) return ctrl0 & 0x70u;
+    return ctrl0 & 0x0007FFF0u;
+}
+
+/* The level of detail a unit's view keeps to (srv_create_at), 4.8 fixed
+ * point: TEXTURE_CONTROL0's minimum for a mipmapped min filter, within the
+ * levels the slot's resource has; 0 for the other filters. */
+static u32 vp_unit_lod(const D3D12DrawRecord* dr, int u, int ts)
+{
+    const u32 minf = (dr->tex[u].filter >> 16) & 7u;
+    if (minf < 3 || minf > 6 || !rsx_tex_lod_on()) return 0;
+    const u32 levels = s_d3d.vp_tex[ts].levels;
+    if (levels <= 1) return 0;
+    const u32 lo = (dr->tex[u].ctrl0 >> 19) & 0xFFFu;
+    return lo < (levels - 1u) << 8 ? lo : (levels - 1u) << 8;
+}
+
 /* The descriptor index for a draw's unit: one per distinct guest state, made
  * on first use. A full heap falls back to the defaults. */
 static int vp_sampler(const D3D12DrawRecord* dr, int u)
 {
     if (!dr->tex[u].set) return u == 0 ? 0 : 1;
     const u32 k[4] = { dr->tex[u].addr & 0x000F0F0Fu, (dr->tex[u].filter & 0x07071FFFu) | (s_up.want && dr->blend ? 1u << 31 : 0u),
-                       dr->tex[u].ctrl0 & 0x70u, dr->tex[u].border };
-    for (u32 i = 2; i < s_d3d.samp_n; i++)
-        if (!memcmp(s_d3d.samp_key[i], k, sizeof k)) return (int)i;
-    if (s_d3d.samp_n >= 2048) return u == 0 ? 0 : 1;
+                       vp_sampler_ctrl0(dr->tex[u].filter, dr->tex[u].ctrl0), dr->tex[u].border };
+    u32 slot = vp_sampler_slot(k);
+    for (u32 e; (e = s_samp_hash[slot]) != 0; slot = (slot + 1u) & 4095u)
+        if (!memcmp(s_d3d.samp_key[e], k, sizeof k)) return (int)e;
+    if (s_d3d.samp_n >= 2048) {
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1))
+            fprintf(stderr, "[D3D12] the sampler heap is full (2048 guest sampler states): later ones take the "
+                            "defaults%c", 10);
+        return u == 0 ? 0 : 1;
+    }
     const u32 i = s_d3d.samp_n++;
     memcpy(s_d3d.samp_key[i], k, sizeof k);
+    s_samp_hash[slot] = (u16)i;
     D3D12_SAMPLER_DESC s;
     rsx_sampler_desc(k, &s);
     vp_sampler_write(i, &s);
@@ -13573,7 +13642,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE srvc_tex(int ts, const SrvKey* k)
         if (t->srv_fmt[v] == k->fmt && t->srv_map[v] == k->mapping && t->srv_cube[v] == k->cube)
             return srvc_at(1u + (u32)ts * SRVC_VARIANTS + (u32)v);
     const int v = t->srv_n < SRVC_VARIANTS ? t->srv_n++ : (t->srv_next++ % SRVC_VARIANTS);
-    t->srv_fmt[v] = k->fmt; t->srv_map[v] = k->mapping; t->srv_cube[v] = (u8)k->cube;
+    t->srv_fmt[v] = k->fmt; t->srv_map[v] = k->mapping; t->srv_cube[v] = k->cube;
     const D3D12_CPU_DESCRIPTOR_HANDLE h = srvc_at(1u + (u32)ts * SRVC_VARIANTS + (u32)v);
     srv_create_at(h, t->res, (DXGI_FORMAT)k->fmt, k->mapping, (int)k->cube);
     s_srvq_made++;
@@ -13701,24 +13770,31 @@ static void srv_write_tex(u32 heap_slot, int ts, DXGI_FORMAT fmt, UINT mapping, 
     srv_write_ex(heap_slot, s_d3d.vp_tex[ts].res, fmt, mapping, cube);
 }
 
+/* `cube`: the view's shape (0 2D, 1 cube, 2 volume) and, from bit 8, the level
+ * of detail it keeps to, 4.8 fixed point (vp_unit_lod): no sample reads a
+ * level finer than that. */
 static void srv_create_at(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* res, DXGI_FORMAT fmt,
                           UINT mapping, int cube)
 {
+    const int shape = cube & 0xFF;
+    const float lod = (float)(((u32)cube >> 8) & 0xFFFu) / 256.0f;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = mapping;
     sv.Texture2D.MipLevels = (UINT)-1;   /* every level the resource has */
-    if (cube == 2) {   /* a volume: must match the Texture3D declaration */
+    if (shape == 2) {   /* a volume: must match the Texture3D declaration */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         sv.Texture3D.MipLevels = (UINT)-1;
         sv.Texture3D.MostDetailedMip = 0;
-        sv.Texture3D.ResourceMinLODClamp = 0.0f;
-    } else if (cube) {   /* must match the TextureCube declaration in the HLSL */
+        sv.Texture3D.ResourceMinLODClamp = lod;
+    } else if (shape) {   /* must match the TextureCube declaration in the HLSL */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         sv.TextureCube.MipLevels = (UINT)-1;
         sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
+        sv.TextureCube.ResourceMinLODClamp = lod;
+    } else {
+        sv.Texture2D.ResourceMinLODClamp = lod;
     }
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
 }
@@ -16239,7 +16315,7 @@ static void rf_prepass(u32 from, u32 to)
                         srv_write_tex(wslot, ts, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
-                                  _cube ? 1 : _vol ? 2 : 0);
+                                  (_cube ? 1 : _vol ? 2 : 0) | (int)(vp_unit_lod(dr, _u, ts) << 8));
                         continue;
                     }
                 }

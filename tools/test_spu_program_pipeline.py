@@ -91,6 +91,20 @@ class Pipeline(unittest.TestCase):
             self.assertTrue((self.output / p['name'] / 'spu_recomp.c').exists())
         self.assertTrue((self.output / 'sources.cmake').exists())
 
+    def test_sources_cmake_is_utf8_for_any_path(self):
+        # A player's folder with a letter outside ASCII: the list is UTF-8 even when Python writes text in the
+        # locale's code page (UTF-8 mode off), as CMake and the Kit's gowa.py read it.
+        self.output = self.root / 'jogos á é' / 'generated'
+        path = self.root / 'input.bin'
+        path.write_bytes(elf(7))
+        command = [sys.executable, '-X', 'utf8=0', str(TOOLS / 'build_spu_workloads.py'), '--lifted', str(self.output),
+                   '--out', str(self.output / 'spu_workloads.c'), '--input', str(path)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        text = (self.output / 'sources.cmake').read_bytes().decode('utf-8')
+        self.assertIn('jogos á é/generated/', text)
+        self.assertTrue(self.manifest()['complete'])
+
     def test_bad_bounds_and_unsupported_are_reported_without_registration(self):
         for blob, status in [(elf(bad_bounds=True), 'invalid'), (elf(unsupported=True), 'unsupported'),
                              (elf(multi=True), 'unsupported')]:

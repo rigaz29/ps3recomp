@@ -70,7 +70,7 @@ def build_programs(args, registry_writer):
         raise SystemExit('--input --out must be directly inside the owned --lifted directory')
     if destination.exists() and any(destination.iterdir()):
         try:
-            previous = json.loads((destination / 'inventory.json').read_text())
+            previous = json.loads((destination / 'inventory.json').read_text(encoding='utf-8'))
             owned = previous.get('generator') == 'build_spu_workloads' and previous.get('schema_version') == 1
         except (OSError, ValueError):
             owned = False
@@ -203,7 +203,7 @@ def build_programs(args, registry_writer):
                     if getattr(args, 'merge_chunks', False):
                         command += ['--merge-chunks']
                     result = subprocess.run(command, capture_output=True, text=True)
-                    (outdir / 'lift.log').write_text(result.stdout + result.stderr)
+                    (outdir / 'lift.log').write_text(result.stdout + result.stderr, encoding='utf-8', errors='replace')
                     if result.returncode:
                         raise ValueError('lifter failed; see ' + name + '/lift.log')
                     diagnostics = json.loads((outdir / 'lift.json').read_text())
@@ -226,9 +226,9 @@ def build_programs(args, registry_writer):
                         raise ValueError('lifter output missing ' + filename)
                     debase_includes(str(outdir / filename))
                 expected = f"{prefix}spu_func_{info['entry']:08X}("
-                if '/* TODO spu:' in (outdir / 'spu_recomp.c').read_text():
+                if '/* TODO spu:' in (outdir / 'spu_recomp.c').read_text(encoding='utf-8', errors='replace'):
                     raise ValueError('unresolved instruction or branch emitted by lifter')
-                if expected not in (outdir / 'spu_recomp.h').read_text():
+                if expected not in (outdir / 'spu_recomp.h').read_text(encoding='utf-8', errors='replace'):
                     raise ValueError('generated header is missing entry symbol')
             except (ValueError, OSError, KeyError, SystemExit) as error:
                 program.update(status='unsupported', reason=str(error))
@@ -253,7 +253,8 @@ def build_programs(args, registry_writer):
             sources = [destination / name / 'spu_recomp.c' for name, _, _, _ in imgs] + [registry]
             # Bracket arguments preserve spaces and avoid expansion of $ in paths.
             cmake = 'set(SPU_GENERATED_SOURCES\n' + ''.join(f'  [==[{p.as_posix()}]==]\n' for p in sources) + ')\n'
-            (stage / 'sources.cmake').write_text(cmake)
+            # UTF-8 whatever the locale: CMake and the Kit's gowa.py read it so, and a path may have any letter in it.
+            (stage / 'sources.cmake').write_text(cmake, encoding='utf-8')
         if not usable:
             for program in report['programs']:
                 if program['status'] == 'registered':
@@ -266,7 +267,7 @@ def build_programs(args, registry_writer):
                                           for p in sorted(outdir.iterdir()) if p.is_file()}
         report['outputs'] = {filename: sha256((stage / filename).read_bytes())
                              for filename in [registry.name, 'sources.cmake'] if (stage / filename).is_file()}
-        (stage / 'inventory.json').write_text(json.dumps(report, indent=2) + '\n')
+        (stage / 'inventory.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         publish(stage, destination)
         print(f"[build_spu_workloads] {len(imgs) if usable else 0}/{len(report['programs'])} candidates registered; "
               f"complete={report['complete']}; report={destination / 'inventory.json'}")
@@ -276,7 +277,7 @@ def build_programs(args, registry_writer):
         report['errors'].append(str(error))
         for filename in [registry.name, 'sources.cmake']:
             (stage / filename).unlink(missing_ok=True)
-        (stage / 'inventory.json').write_text(json.dumps(report, indent=2) + '\n')
+        (stage / 'inventory.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         publish(stage, destination)
         print('[build_spu_workloads] generation failed: ' + str(error), file=sys.stderr)
         return 1

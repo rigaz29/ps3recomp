@@ -25,10 +25,13 @@
 extern "C" {
 #endif
 
-/* A picture: RGBA8, rows top down and tightly packed. */
+/* A picture: RGBA8, rows top down and tightly packed. key: the same for the same texels (w, h and rgba alike),
+ * whichever id asked; the backend then uploads it once and every texture it stands in for draws from that one
+ * upload. 0: no key, uploaded for each texture (a picture made over the guest's own, which differs with it). */
 typedef struct {
     u32 w, h;
     const u8* rgba;
+    u64 key;
 } rsx_tex_picture;
 
 typedef struct {

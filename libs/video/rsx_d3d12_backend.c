@@ -541,6 +541,8 @@ typedef struct {
                          * the frame, a video) is not named for a picture any more */
     u32 res_w, res_h;   /* res's size: the guest's (w, h) unless repl */
     u32 res_fmt;        /* res's DXGI format when repl */
+    int pic;            /* res is a shared picture's (s_tex_pics, + 1), held with every other slot of that picture:
+                         * its heap block and bytes are the picture's, never this slot's; 0 = res is its own */
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -11234,10 +11236,12 @@ static void vp_tex_release_staging(void)
     s_tex_staging_n = 0;
 }
 
+static void tex_pics_reset(void);
 static void vp_tex_cache_reset(void)
 {
     memset(s_tex_head, 0, sizeof s_tex_head);
     s_tex_hw = 0; s_tex_bytes = 0; s_tex_staging_n = 0;
+    tex_pics_reset();
 }
 
 static u32 vp_tex_hash(u32 key, u32 w, u32 h, u32 fmt, int cube)
@@ -11408,15 +11412,68 @@ static ID3D12Resource* tex_place(const D3D12_RESOURCE_DESC* td, int* heap, u64* 
     return r;
 }
 
+/* A port's picture uploaded once for every texture it stands in for (rsx_tex_replace.h: the picture's key). A mod
+ * gives one picture to many of the guest's textures, an atlas to each texture of a character: each held its own
+ * upload of it, 85 MB for a 4096x4096 RGBA8 chain, and a mod of 35 such files filled the texture cache's 2 GB; the
+ * cache then evicted and uploaded again 6-8 textures a frame, each picture's chain made again. The slots of one
+ * picture hold its resource together: the first to upload it gives the picture its heap block and bytes, the others
+ * take a reference, and the last to go gives them back. */
+typedef struct {
+    u64 key;            /* the port's key for the picture; 0 = a free entry */
+    u32 kind;           /* the channels it was packed into (rsx_tex_channels) */
+    u32 w, h, levels;   /* its size and chain */
+    DXGI_FORMAT fmt;
+    ID3D12Resource* res;   /* one reference held by each slot of it */
+    int heap;           /* its heap block, as a slot's (VPTexSlot.heap) */
+    u64 hoff, hsize;
+    u64 bytes;          /* counted against vp_tex_budget() once */
+    int refs;           /* the slots holding it */
+} VPTexPic;
+#define VP_TEX_PICS 1024
+static VPTexPic s_tex_pics[VP_TEX_PICS];
+static u64 s_ts_share;  /* texture stats: binds that took a picture another texture holds */
+
+static void tex_pics_reset(void)
+{
+    memset(s_tex_pics, 0, sizeof s_tex_pics);
+}
+
+static int tex_pic_find(u64 key, u32 kind, u32 w, u32 h, u32 levels)
+{
+    for (int i = 0; i < VP_TEX_PICS; i++) {
+        const VPTexPic* p = &s_tex_pics[i];
+        if (p->key == key && p->res && p->kind == kind && p->w == w && p->h == h && p->levels == levels) return i;
+    }
+    return -1;
+}
+
 /* Release a slot's resources. Only ever a slot this batch has not bound: the
  * batches before it have run (rf_open waits for the GPU), so nothing in flight
- * reads them. */
+ * reads them. A shared picture's resource stays while another slot holds it. */
 static u32 s_srvq_gen = 1;
 static void srvq_forget(ID3D12Resource* res);
+static void srvq_forget_slot(int ts);
 static void vp_tex_drop(VPTexSlot* t)
 {
     t->srv_n = 0;
     s_srvq_gen++;
+    if (t->pic) {
+        VPTexPic* p = &s_tex_pics[t->pic - 1];
+        const int last = --p->refs <= 0;
+        srvq_forget_slot((int)(t - s_d3d.vp_tex));
+        if (last) srvq_forget(p->res);
+        if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+        if (last) {
+            if (p->heap) tex_heap_give(&s_theap[p->heap - 1], p->hoff, p->hsize);
+            s_tex_bytes -= p->bytes;
+            memset(p, 0, sizeof *p);
+        }
+        t->pic = 0;
+        t->heap = 0;
+        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+        s_tex_bytes -= t->bytes; t->bytes = 0;
+        return;
+    }
     if (t->res) srvq_forget(t->res);
     if (t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
     if (t->heap) { tex_heap_give(&s_theap[t->heap - 1], t->hoff, t->hsize); t->heap = 0; }
@@ -11480,7 +11537,7 @@ static int vp_tex_alloc(u64 need, u32 w, u32 h, u32 fmt, int cube, u32 levels)
         int best = -1;
         for (int i = 0; i < s_tex_hw; i++) {
             const VPTexSlot* c = &s_d3d.vp_tex[i];
-            if (c->res && !c->used && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube &&
+            if (c->res && !c->used && !c->pic && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube &&
                 c->levels == levels && now - c->last_frame >= VP_TEX_REUSE_AGE &&
                 (best < 0 || c->last_frame < s_d3d.vp_tex[best].last_frame)) best = i;
         }
@@ -11523,16 +11580,17 @@ static void tex_stats_note(double dt)
         for (int k = 1; k < TS_N; k++)
             fprintf(stderr, " %s %.0f (%.2f ms)", name[k], s_ts_n[k] / nf, s_ts_t[k] * 1000.0 / nf);
         static double cr_prev, ev_prev, dc_prev;
-        fprintf(stderr, "; evicted %.1f (%.2f ms), created %.1f (%.2f ms), taken over %.1f; decode %.2f ms; "
+        fprintf(stderr, "; evicted %.1f (%.2f ms), created %.1f (%.2f ms), taken over %.1f, a picture shared %.1f; "
+                        "decode %.2f ms; "
                         "%d textures held, %.0f of %.0f MB, %d heaps\n",
                 s_ts_evict / nf, (s_tex_evict_s - ev_prev) * 1000.0 / nf,
-                s_ts_create / nf, (s_tex_create_s - cr_prev) * 1000.0 / nf, s_ts_reuse / nf,
+                s_ts_create / nf, (s_tex_create_s - cr_prev) * 1000.0 / nf, s_ts_reuse / nf, s_ts_share / nf,
                 (s_tex_decode_s - dc_prev) * 1000.0 / nf, live,
                 s_tex_bytes / 1048576.0, vp_tex_budget() / 1048576.0, s_theap_n);
         cr_prev = s_tex_create_s; ev_prev = s_tex_evict_s; dc_prev = s_tex_decode_s;
         fflush(stderr);
         for (int k = 0; k < TS_N; k++) { s_ts_n[k] = 0; s_ts_t[k] = 0; }
-        s_ts_evict = s_ts_create = s_ts_reuse = 0; f0 = fc;
+        s_ts_evict = s_ts_create = s_ts_reuse = s_ts_share = 0; f0 = fc;
     }
 }
 
@@ -11870,6 +11928,43 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     const u32 res_lev = repl ? rsx_tex_chain_levels(pic.w, pic.h) : nlev;
     /* RGBA8, or the texture's own one or two channels (R8, R8G8, R16) filled from the picture's R and G. */
     const DXGI_FORMAT res_fmt = repl_kind == RSX_TEXREP_RGBA8 ? DXGI_FORMAT_R8G8B8A8_UNORM : dxfmt;
+    /* A picture another texture already holds (the port's key for it): this texture takes that resource. Nothing
+     * staged, no chain made, no bytes counted again, so the slot is asked for with none. */
+    int alloc_new = 0;   /* a slot given here for a picture whose last holder that then let go: new to this texture */
+    if (repl && pic.key) {
+        int pi = tex_pic_find(pic.key, repl_kind, res_w, res_h, res_lev);
+        const int sh_new = slot < 0;
+        if (pi >= 0 && slot < 0) {
+            slot = vp_tex_alloc(0, w, h, fmt, cube, nlev);
+            if (slot < 0) return -1;
+            /* Over the budget, the allocation lets textures go: maybe the picture's last holder. Uploaded then. */
+            if (!s_tex_pics[pi].res || s_tex_pics[pi].key != pic.key) { pi = -1; alloc_new = 1; }
+        }
+        if (pi >= 0) {
+            VPTexSlot* t = &s_d3d.vp_tex[slot];
+            if (t->pic != pi + 1) {
+                if (t->res) vp_tex_drop(t);
+                VPTexPic* p = &s_tex_pics[pi];
+                p->res->lpVtbl->AddRef(p->res);
+                p->refs++;
+                t->res = p->res; t->pic = pi + 1; t->heap = 0; t->bytes = 0; t->srv_n = 0;
+            }
+            t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+            t->cube = cube; t->used = 1; t->levels = nlev; t->last_frame = s_d3d.frame_count;
+            t->repl = 1; t->res_w = res_w; t->res_h = res_h; t->res_fmt = (u32)res_fmt;
+            if (sh_new) t->churn = 0;
+            if (!t->linked) vp_tex_link(slot);
+            /* The guest's bytes it stands for, checked at each bind as an upload's are (src_bytes below). */
+            const u32 sb = nlev > 1 ? s_lv[nlev - 1].offset + s_lv[nlev - 1].tl.face_bytes
+                                    : (dxt ? blkrow * blkrows : w * h * bpp);
+            t->csum_bytes = sb;
+            t->again = 0;
+            for (u32 i = 0; i < TEX_CSUM_PARTS; i++) t->csum[i] = tex_csum_part(vm_base + off, sb, i);
+            s_ts_share++;
+            s_ts_out = sh_new ? TS_NEW : TS_CHANGED;
+            return slot;
+        }
+    }
     const u32 nsub = (is_cube ? 6u : 1u) * res_lev;   /* a volume: one per level */
     D3D12_RESOURCE_DESC fd = {0};
     fd.Dimension = vol ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -11884,7 +11979,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     if (nlev > 1 && !repl) tex_mipcheck(off, w, h, fmt, nlev, s_lv);
     /* A texture not held gets a slot from vp_tex_alloc; its size there is the
      * staged chain's, in the 64 KB units a committed resource takes. */
-    const int ts_new = slot < 0;
+    const int ts_new = slot < 0 || alloc_new;
     const u64 need = ((u64)lay_total + 0xFFFFu) & ~(u64)0xFFFFu;
     if (slot < 0) slot = vp_tex_alloc(need, w, h, fmt, cube, nlev);
     if (slot < 0) return -1;
@@ -11901,8 +11996,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
     if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->levels != nlev ||
-                   t->repl != (u8)repl || t->res_w != res_w || t->res_h != res_h))
-        vp_tex_drop(t);
+                   t->repl != (u8)repl || t->res_w != res_w || t->res_h != res_h || t->pic))
+        vp_tex_drop(t);   /* a shared picture's resource is never written again: other slots draw with it */
     if (!t->res) {
         s_ts_create++;
         const double cr0 = perf_now();
@@ -12399,6 +12494,20 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     t->repl = (u8)repl; t->res_w = res_w; t->res_h = res_h; t->res_fmt = (u32)res_fmt;
     if (ts_new) t->churn = 0;   /* a slot new to this texture */
     if (!t->linked) vp_tex_link(slot);
+    /* A picture with a key: its resource becomes the picture's, for the next texture it stands in for. The slot's
+     * reference is the first; its heap block and bytes move to the picture. */
+    if (repl && pic.key && !t->pic) {
+        for (int i = 0; i < VP_TEX_PICS; i++) {
+            VPTexPic* p = &s_tex_pics[i];
+            if (p->key) continue;
+            p->key = pic.key; p->kind = repl_kind; p->w = res_w; p->h = res_h; p->levels = res_lev;
+            p->fmt = res_fmt; p->res = t->res;
+            p->heap = t->heap; p->hoff = t->hoff; p->hsize = t->hsize; p->bytes = t->bytes;
+            p->refs = 1;
+            t->heap = 0; t->bytes = 0; t->pic = i + 1;
+            break;
+        }
+    }
     if (t->up && s_tex_staging_n < (int)(sizeof s_tex_staging / sizeof s_tex_staging[0])) {
         s_tex_staging[s_tex_staging_n++] = t->up;   /* the copy above reads it */
         t->up = NULL;
@@ -13675,6 +13784,20 @@ static void srvq_forget(ID3D12Resource* res)
     if (!s_srvq_on) return;
     for (int u = 0; u < VP_TEX_UNITS; u++)
         if (s_srvq_keys[u].res == res) {
+            s_srvq_keys[u].res = NULL;
+            s_srvq_keys[u].fmt = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
+            s_srvq_keys[u].mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            s_srvq_keys[u].cube = 0;
+            s_srvq_keys[u].ts = -1;
+        }
+}
+/* The same for what the draw named through one slot: a slot letting go of a shared picture, whose resource another
+ * slot of this draw may still be bound through. */
+static void srvq_forget_slot(int ts)
+{
+    if (!s_srvq_on) return;
+    for (int u = 0; u < VP_TEX_UNITS; u++)
+        if (s_srvq_keys[u].ts == ts) {
             s_srvq_keys[u].res = NULL;
             s_srvq_keys[u].fmt = (u32)DXGI_FORMAT_R8G8B8A8_UNORM;
             s_srvq_keys[u].mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;

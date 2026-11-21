@@ -161,6 +161,7 @@ static uint32_t spu_ft_who(const spu_context* ctx)
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 volatile int g_spu_rt_turn = 1;      /* spu_context.h */
+spu_get_hook_fn g_spu_get_hook;       /* spu_dma.h: set by a program before the guest runs */
 /* SPU_RT_TURNS=<ovl,coh,lift>: which of the runtime's switches follow the turns, so that one is measured
  * alone; every one unless set (spu_context.h). */
 int spu_rt_follows(int which)

@@ -237,13 +237,8 @@ static inline int spu_dma_diag(void)
     return v;
 }
 
-#ifdef PS3_SPU_JOBCAP
 static inline int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t ea,
                                         uint32_t size, uint32_t cmd)
-#else
-static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
-                                   uint32_t size, uint32_t cmd)
-#endif
 {
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
@@ -934,14 +929,29 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     return 0;
 }
 
+/* A program that changes what a job reads (a mod's proportions: the hero's joints as the animation job takes them)
+ * sets g_spu_get_hook (spu_channels.c) before the guest runs: it is called after each GET that went through, with
+ * the transfer's local-store address, EA, size and command, on the thread running the SPU. NULL: no call, and the
+ * path costs one load. */
+typedef void (*spu_get_hook_fn)(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+extern spu_get_hook_fn g_spu_get_hook;
+
+static inline int mfc_cmd_is_get(uint32_t cmd)
+{
+    const uint32_t c = cmd & 0xFFu, hi = c & 0xF0u;
+    return c != 0x64u && (hi == 0x40u || hi == 0x50u);
+}
+
 #ifdef PS3_SPU_JOBCAP
 /* SPU_JOB_CAPTURE / SPU_JOB_REPLAY (spu_jobcap.c): a replay serves the
  * transfer from its record; a capture records it once it is done (its bytes
- * read from the local store, whichever way they went). */
+ * read from the local store, whichever way they went, after the GET hook). */
 void spu_jobcap_transfer_done(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+#endif
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+#ifdef PS3_SPU_JOBCAP
     { const uint32_t c = cmd & 0xFFu, hi = c & 0xF0u;
       if (c != 0x64u && (hi == 0x40u || hi == 0x50u)) { SPU_JS_ADD(SPU_JS_GET, 1); SPU_JS_ADD(SPU_JS_GET_B, size); }
       else if (c != 0x64u) { SPU_JS_ADD(SPU_JS_PUT, 1); SPU_JS_ADD(SPU_JS_PUT_B, size); } }
@@ -949,13 +959,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (spu_jobcap_transfer(spu, lsa, ea, size, cmd))
             return 0;
         const int rc = mfc_do_transfer_body(spu, lsa, ea, size, cmd);
-        if (rc == 0)
+        if (rc == 0) {
+            if (g_spu_get_hook && mfc_cmd_is_get(cmd))
+                g_spu_get_hook(spu, lsa, ea, size, cmd);
             spu_jobcap_transfer_done(spu, lsa, ea, size, cmd);
+        }
         return rc;
     }
-    return mfc_do_transfer_body(spu, lsa, ea, size, cmd);
-}
 #endif
+    const int rc = mfc_do_transfer_body(spu, lsa, ea, size, cmd);
+    if (__builtin_expect(g_spu_get_hook != NULL, 0) && rc == 0 && mfc_cmd_is_get(cmd))
+        g_spu_get_hook(spu, lsa, ea, size, cmd);
+    return rc;
+}
 
 /*
  * Execute a DMA list command (scatter/gather).

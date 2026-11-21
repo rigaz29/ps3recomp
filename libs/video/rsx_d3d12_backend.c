@@ -1126,6 +1126,7 @@ static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
 static struct {
     int want;                   /* asked for, and the DLLs are there */
     int ready;                  /* the context is up: frames are jittered */
+    char version[16];           /* graphics.fsr_version: the start of the version to use, "" the newest the GPU takes */
     u32 frame;
     float jx, jy;               /* the frame's jitter, in pixels, */
     float cx, cy;               /* in clip space */
@@ -3833,7 +3834,7 @@ static void rs_init(void)
     if (s > 4.0f) s = 4.0f;
     if (s > fit && (s_fg_mode || (ps3_settings_ieq(ps3_settings_str("graphics", "scaling", NULL, "bilinear"), "fsr3") &&
                                   !s_fsr3_refused && rsx_fsr3_available()))) {
-        printf("[D3D12] render scale %.3g: held to the display's %.3g for FSR 3%c", s, fit < 1.0f ? 1.0f : fit, 10);
+        printf("[D3D12] render scale %.3g: held to the display's %.3g for FSR%c", s, fit < 1.0f ? 1.0f : fit, 10);
         s = fit < 1.0f ? 1.0f : fit;
     }
     s_rs = s;
@@ -4821,13 +4822,13 @@ static void pp_tmp_create(void)
  *             lights a little lighter, black and white kept;
  *   vibrance  the colour away from its luminance by 1 + V * (1 - its saturation): dull colours most, strong ones
  *             (and skin, already saturated) little.
- * Bilinear, sharp bilinear and FSR 1 run it in their last pixel shader. FSR 3.1 runs it on the upscaler's output in
+ * Bilinear, sharp bilinear and FSR 1 run it in their last pixel shader. AMD FSR runs it on the upscaler's output in
  * place, a compute pass, before the HUD goes on: frame generation's picture without the HUD is that output, so the
  * two stay alike. Off, the shaders are the same as before. */
 static struct {
     float v, k;                    /* V and K above; 0 off */
     char prefix[1400];             /* the defines and grade(), put before each shader that ends the pass */
-    ID3D12RootSignature* root;     /* the compute pass for FSR 3.1: one UAV */
+    ID3D12RootSignature* root;     /* the compute pass for FSR's output: one UAV */
     ID3D12PipelineState* pso;
 } s_grade;
 
@@ -4879,8 +4880,8 @@ static char* grade_src(const char* body, size_t len, size_t* n)
     return src;
 }
 
-/* The compute pass for FSR 3.1's output: the grade in place, in 8x8 groups. Needs typed UAV loads of RGBA8, which
- * D3D12 hardware has (an option all the same: without it, FSR 3.1's picture is not graded, and the log says so). */
+/* The compute pass for FSR's output: the grade in place, in 8x8 groups. Needs typed UAV loads of RGBA8, which
+ * D3D12 hardware has (an option all the same: without it, FSR's picture is not graded, and the log says so). */
 static int grade_init(void)
 {
     if (!(s_grade.v > 0.0f || s_grade.k > 0.0f)) return 0;
@@ -4894,7 +4895,7 @@ static int grade_init(void)
         !o.TypedUAVLoadAdditionalFormats ||
         FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ||
         !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
-        printf("[D3D12] colour grade: no typed UAV loads of RGBA8; FSR 3.1's picture is not graded%c", 10);
+        printf("[D3D12] colour grade: no typed UAV loads of RGBA8; FSR's picture is not graded%c", 10);
         return -1;
     }
     D3D12_DESCRIPTOR_RANGE range;
@@ -5070,6 +5071,14 @@ static int pp_init(void)
             if (!s_up.want)
                 printf("[D3D12] graphics.scaling = fsr3: %s; FSR 1%c",
                        s_fsr3_refused ? s_fsr3_refused : "no amd_fidelityfx_loader_dx12.dll beside the exe", 10);
+            /* graphics.fsr_version = auto, the newest the GPU and its driver take (4.1 on AMD's RX 6000 and newer, 3.1
+             * on the rest), or the start of a version: 3.1 asks less of the GPU. */
+            const char* fv = ps3_settings_str("graphics", "fsr_version", "D3D12_FSR_VERSION", "auto");
+            s_up.version[0] = 0;
+            if (fv[0] >= '0' && fv[0] <= '9' && strlen(fv) < sizeof s_up.version)
+                snprintf(s_up.version, sizeof s_up.version, "%s", fv);
+            else if (!ps3_settings_ieq(fv, "auto"))
+                printf("[D3D12] graphics.fsr_version = %s is not auto or a version such as 3.1; auto%c", fv, 10);
         }
         static const struct { const char* name; float stops; } k[] = {
             { "off", -1.0f }, { "low", 1.0f }, { "medium", 0.5f }, { "high", 0.2f }, { "max", 0.0f } };
@@ -5630,9 +5639,16 @@ static void ovs_lines(char line[OVS_LINES][96])
     snprintf(line[0], sizeof line[0], "%s", s_ovs_gpu_name);
     ovs_tidy(line[0]);
     snprintf(line[1], sizeof line[1], "%s", ovs_cpu_name());
-    snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s",
-             s_up.want ? "FSR 3.1" : s_d3d.pp_mode == 2 ? "FSR 1" : s_d3d.pp_mode == 1 ? "Sharp" : "Off",
-             s_fg_mode == 2 ? " + FG" : "", s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
+    /* FSR's versions as the API names them once their contexts are up ("FSR 4.1.2 + FG 3.1.6"), before that "FSR". */
+    char up[48], fg[48];
+    const char* uv = rsx_fsr3_version(0);
+    const char* gv = rsx_fsr3_version(1);
+    if (s_up.want) snprintf(up, sizeof up, "FSR%s%s", uv[0] ? " " : "", uv);
+    else snprintf(up, sizeof up, "%s", s_d3d.pp_mode == 2 ? "FSR 1" : s_d3d.pp_mode == 1 ? "Sharp" : "Off");
+    if (s_fg_mode == 2) snprintf(fg, sizeof fg, " + FG%s%s", gv[0] ? " " : "", gv);
+    else fg[0] = 0;
+    snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s", up, fg,
+             s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
     snprintf(line[3], sizeof line[3], "%u x %u -> %u x %u", s_d3d.pw, s_d3d.ph, s_d3d.bb_w, s_d3d.bb_h);
 }
 
@@ -7173,7 +7189,7 @@ static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DE
     if (!s_up.ready) {
         /* graphics.sharpening on FSR's own scale: high is the 0.8 of AMD's sample. */
         const float sharp = s_d3d.pp_stops < 0.0f ? -1.0f : 1.0f - s_d3d.pp_stops;
-        if (!rsx_fsr3_up_create(s_d3d.device, s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, sharp)) {
+        if (!rsx_fsr3_up_create(s_d3d.device, s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, sharp, s_up.version)) {
             s_up.want = 0;
             return 0;
         }

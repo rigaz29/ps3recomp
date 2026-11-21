@@ -1,10 +1,14 @@
 /*
- * ps3recomp - AMD FSR 3.1 through the FSR API
+ * ps3recomp - AMD FSR through the FSR API
  *
  * The API's three DLLs come with the FSR SDK and are looked for beside the exe:
  * amd_fidelityfx_loader_dx12.dll, which finds the effects' next to itself. On a
  * GPU that is not AMD's it selects Super Resolution 3.1.6, Frame Generation
- * 3.1.6 and its swapchain 3.1.7. Without them the backend stays as it is.
+ * 3.1.6 and its swapchain 3.1.7. The upscaler is the newest the device takes:
+ * SDK 2.4.0's 4.1.2 (its machine-learned model) on AMD Radeon RX 6000 and newer
+ * with a driver that has it (26.10.1 for the RX 6000), unless the caller asks
+ * for another (rsx_fsr3_up_create's version). Without the DLLs the backend
+ * stays as it is.
  *
  * C++, as the API's DX12 header is. Its headers are in third_party/fsr_api.
  */
@@ -36,6 +40,7 @@ static ffxContext s_fg_ctx;     /* frame generation's */
 static ffxContext s_up_ctx;     /* the upscaler's */
 static float s_up_sharp;
 static int s_up_phases;
+static char s_up_name[32], s_fg_name[32];   /* the versions in use, as the API names them: rsx_fsr3_version */
 static void* s_swap;
 static int s_generate;
 static unsigned s_dw, s_dh, s_rw, s_rh;
@@ -94,12 +99,20 @@ static void fsr3_message(uint32_t type, const wchar_t* message)
     fprintf(stderr, "[fsr3] %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
 }
 
-static void fsr3_version(ffxContext* ctx, const char* what)
+/* The context's version into the log ("[fsr3] upscaler: 4.1.2", which the port's launcher and reports read), with
+ * note after it, and into keep (32 bytes) if given. */
+static void fsr3_version(ffxContext* ctx, const char* what, char* keep, const char* note)
 {
     ffxQueryGetProviderVersion q{};
     q.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    if (s_ffx.Query(ctx, &q.header) == FFX_API_RETURN_OK && q.versionName)
-        printf("[fsr3] %s: %s\n", what, q.versionName);
+    if (s_ffx.Query(ctx, &q.header) != FFX_API_RETURN_OK || !q.versionName) return;
+    printf("[fsr3] %s: %s%s\n", what, q.versionName, note ? note : "");
+    if (keep) snprintf(keep, 32, "%s", q.versionName);
+}
+
+const char* rsx_fsr3_version(int which)
+{
+    return which == 0 ? s_up_name : which == 1 ? s_fg_name : "";
 }
 
 /* Left alone, the swapchain's two threads spin: 113% of a logical CPU at the gate.
@@ -149,7 +162,7 @@ int rsx_fsr3_wrap(void** swap_chain, void* queue)
         return 0;
     }
     s_swap = sc;
-    fsr3_version(&s_swap_ctx, "swapchain");
+    fsr3_version(&s_swap_ctx, "swapchain", nullptr, nullptr);
     fsr3_pacing();
     return 1;
 }
@@ -390,13 +403,61 @@ static int fsr3_targets(ID3D12Device* dev, unsigned render_w, unsigned render_h)
     return s_depth && s_motion && fsr3_inputs_init(dev);
 }
 
+/* The upscaler's versions this device takes, into the log once, and the id of the newest whose number starts with
+ * want ("3.1" takes 3.1.6, not 3.10): 0 when want is empty or none of them is. The names are copied at once: the API
+ * may keep them where its next version query writes (its docs). */
+static uint64_t fsr3_up_pick(ID3D12Device* dev, const char* want)
+{
+    enum { MAX_V = 16 };
+    uint64_t count = 0;
+    ffxQueryDescGetVersions q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    q.device = dev;
+    q.outputCount = &count;
+    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK || !count) return 0;
+    if (count > MAX_V) count = MAX_V;
+    uint64_t ids[MAX_V] = {};
+    const char* names[MAX_V] = {};
+    q.versionIds = ids;
+    q.versionNames = names;
+    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
+    char name[MAX_V][32];
+    for (uint64_t i = 0; i < count; i++) snprintf(name[i], sizeof name[i], "%s", names[i] ? names[i] : "?");
+    static bool said;
+    if (!said) {
+        said = true;
+        printf("[fsr3] upscaler versions on this GPU:");
+        for (uint64_t i = 0; i < count; i++) printf("%s %s", i ? "," : "", name[i]);
+        printf("\n");
+    }
+    if (!want || !*want) return 0;
+    const size_t wn = strlen(want);
+    uint64_t best = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        const char* v = name[i];
+        while (*v && (*v < '0' || *v > '9')) v++;          /* past a word before the number, if there is one */
+        if (strncmp(v, want, wn) || (v[wn] && v[wn] != '.' && v[wn] != ' ')) continue;
+        /* Bit 31 marks a driver's own; the rest is the version, so the newest of them is the largest. */
+        if (!best || (ids[i] & 0x7FFFFFFFull) > (best & 0x7FFFFFFFull)) best = ids[i];
+    }
+    return best;
+}
+
 int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
-                       unsigned render_w, unsigned render_h, float sharpness)
+                       unsigned render_w, unsigned render_h, float sharpness, const char* version)
 {
     ID3D12Device* dev = (ID3D12Device*)device;
     if (!fsr3_targets(dev, render_w, render_h)) return 0;
+    /* A version asked for goes on the chain as an override; with none, the API picks the newest the device takes. */
+    const uint64_t pin = fsr3_up_pick(dev, version);
+    if (version && *version && !pin) printf("[fsr3] upscaler %s: not among this GPU's; the newest it takes\n", version);
+    ffxOverrideVersion ov{};
+    ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    ov.versionId = pin;
     ffxCreateContextDescUpscaleVersion ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    ver.header.pNext = pin ? &ov.header : nullptr;
     ver.version = FFX_UPSCALER_VERSION;
     ffxCreateBackendDX12Desc be{};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
@@ -413,13 +474,23 @@ int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
     d.maxUpscaleSize.width = display_w;
     d.maxUpscaleSize.height = display_h;
     d.fpMessage = fsr3_message;
-    const ffxReturnCode_t rc = s_ffx.CreateContext(&s_up_ctx, &d.header, nullptr);
+    ffxReturnCode_t rc = s_ffx.CreateContext(&s_up_ctx, &d.header, nullptr);
+    bool pinned = pin != 0;
+    if (rc != FFX_API_RETURN_OK && pinned) {
+        printf("[fsr3] upscaler %s: no context (%u); the newest the GPU takes\n", version, (unsigned)rc);
+        s_up_ctx = nullptr;
+        ver.header.pNext = nullptr;
+        pinned = false;
+        rc = s_ffx.CreateContext(&s_up_ctx, &d.header, nullptr);
+    }
     if (rc != FFX_API_RETURN_OK) {
         printf("[fsr3] upscaler: no context (%u)\n", (unsigned)rc);
         s_up_ctx = nullptr;
         return 0;
     }
-    fsr3_version(&s_up_ctx, "upscaler");
+    char note[48] = "";
+    if (pinned) snprintf(note, sizeof note, ", as asked (%s)", version);
+    fsr3_version(&s_up_ctx, "upscaler", s_up_name, note);
     ffxQueryDescUpscaleGetJitterPhaseCount q{};
     q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
     q.renderWidth = render_w;
@@ -439,6 +510,7 @@ void rsx_fsr3_up_destroy(void)
     if (!s_up_ctx) return;
     s_ffx.DestroyContext(&s_up_ctx, nullptr);
     s_up_ctx = nullptr;
+    s_up_name[0] = 0;
 }
 
 void rsx_fsr3_up_jitter(unsigned frame, float* x, float* y)
@@ -489,7 +561,7 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     dbg.fpMessage = fsr3_message;
     dbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
     s_ffx.Configure(&s_fg_ctx, &dbg.header);
-    fsr3_version(&s_fg_ctx, "frame generation");
+    fsr3_version(&s_fg_ctx, "frame generation", s_fg_name, nullptr);
     s_swap = swap_chain;
     s_generate = generate;
     s_dw = display_w; s_dh = display_h;
@@ -522,6 +594,7 @@ void rsx_fsr3_fg_destroy(void)
     fsr3_configure(false, nullptr);
     s_ffx.DestroyContext(&s_fg_ctx, nullptr);
     s_fg_ctx = nullptr;
+    s_fg_name[0] = 0;
 }
 
 /* A frame rate over 1.5 s, which a single hitch does not bring under the floor, and two of

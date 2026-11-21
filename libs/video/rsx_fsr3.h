@@ -1,5 +1,5 @@
 /*
- * ps3recomp - AMD FSR 3.1 through the FSR API (Windows only, see rsx_fsr3.cpp)
+ * ps3recomp - AMD FSR through the FSR API: 3.1, or 4 where the GPU takes it (Windows only, see rsx_fsr3.cpp)
  */
 #ifndef RSX_FSR3_H
 #define RSX_FSR3_H
@@ -50,9 +50,15 @@ int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* frame);
 /* Every presented frame, before the command list closes. */
 void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* frame, float frame_ms);
 
-/* The upscaler, from render_w x render_h to the display's size. sharpness 0 to 1, below 0 none. */
+/* The upscaler, from render_w x render_h to the display's size. sharpness 0 to 1, below 0 none.
+ * version: the start of the version to use ("3.1" takes 3.1.6), or NULL or "" for the API's own choice,
+ * the newest the device takes (4.1 on AMD Radeon RX 6000 and newer, with a driver that has it). */
 int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
-                       unsigned render_w, unsigned render_h, float sharpness);
+                       unsigned render_w, unsigned render_h, float sharpness, const char* version);
+
+/* The version in use, as the API names it ("4.1.2", a driver's own with " *"): which 0 the upscaler,
+ * 1 frame generation. "" while there is none. */
+const char* rsx_fsr3_version(int which);
 
 /* Destroys it, for another rsx_fsr3_up_create after a resize. */
 void rsx_fsr3_up_destroy(void);

@@ -73,6 +73,15 @@ void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* frame, void* color,
 /* Frames a second under which frames are shown as they are, until it recovers. 0: never. */
 void rsx_fsr3_fg_floor(double fps);
 
+/* ANR FG (beta, PS3RECOMP_ANR): its DLL makes the generated frames in place of FSR's, and the same
+ * swap chain presents and paces them. After rsx_fsr3_fg_create; 1 if it is used. */
+int rsx_fsr3_fg_anr(const char* dll);
+
+/* The start of the version frame generation and its swap chain are to have ("3.1"), or NULL or ""
+ * for the newest the GPU takes. Before rsx_fsr3_wrap: ANR keeps them at 3.1, whose callback it has
+ * been tried with. */
+void rsx_fsr3_fg_version(const char* version);
+
 #ifdef __cplusplus
 }
 #endif

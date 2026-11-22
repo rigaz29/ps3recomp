@@ -33,6 +33,9 @@
 
 #include "rsx_fsr3.h"
 #include "rsx_dxc.h"
+#ifdef PS3RECOMP_ANR
+#include "rsx_anr.h"
+#endif
 
 static ffxFunctions s_ffx;
 static ffxContext s_swap_ctx;   /* the proxy's */
@@ -41,6 +44,7 @@ static ffxContext s_up_ctx;     /* the upscaler's */
 static float s_up_sharp;
 static int s_up_phases;
 static char s_up_name[32], s_fg_name[32];   /* the versions in use, as the API names them: rsx_fsr3_version */
+static char s_fg_want[16];          /* frame generation's and its swap chain's version asked for: rsx_fsr3_fg_version */
 static void* s_swap;
 static int s_generate;
 static unsigned s_dw, s_dh, s_rw, s_rh;
@@ -77,6 +81,9 @@ static bool s_fg_told;              /* the context has been told once whether to
 static double s_floor, s_rate_ms;   /* see fsr3_rate */
 static int s_rate_n, s_rate_streak;
 static bool s_under;
+#ifdef PS3RECOMP_ANR
+static bool s_anr;                  /* ANR FG makes the generated frames: rsx_fsr3_fg_anr */
+#endif
 
 int rsx_fsr3_available(void)
 {
@@ -112,7 +119,60 @@ static void fsr3_version(ffxContext* ctx, const char* what, char* keep, const ch
 
 const char* rsx_fsr3_version(int which)
 {
+#ifdef PS3RECOMP_ANR
+    if (which == 1 && s_anr) return "ANR";
+#endif
     return which == 0 ? s_up_name : which == 1 ? s_fg_name : "";
+}
+
+/* The versions this device has of an effect (type: its create description's), into the log once an effect ("[fsr3]
+ * upscaler versions on this GPU: 4.1.2, 3.1.6, 2.3.4"), and the id of the newest whose number starts with want ("3.1"
+ * takes 3.1.6, not 3.10): 0 when want is empty or none of them is. The names are copied at once: the API may keep them
+ * where its next version query writes (its docs). */
+static uint64_t fsr3_pick(ID3D12Device* dev, uint64_t type, const char* what, const char* want)
+{
+    enum { MAX_V = 16 };
+    uint64_t count = 0;
+    ffxQueryDescGetVersions q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = type;
+    q.device = dev;
+    q.outputCount = &count;
+    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK || !count) return 0;
+    if (count > MAX_V) count = MAX_V;
+    uint64_t ids[MAX_V] = {};
+    const char* names[MAX_V] = {};
+    q.versionIds = ids;
+    q.versionNames = names;
+    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
+    char name[MAX_V][32];
+    for (uint64_t i = 0; i < count; i++) snprintf(name[i], sizeof name[i], "%s", names[i] ? names[i] : "?");
+    static uint64_t said[4];
+    static int nsaid;
+    bool told = false;
+    for (int i = 0; i < nsaid; i++) told = told || said[i] == type;
+    if (!told && nsaid < 4) {
+        said[nsaid++] = type;
+        printf("[fsr3] %s versions on this GPU:", what);
+        for (uint64_t i = 0; i < count; i++) printf("%s %s", i ? "," : "", name[i]);
+        printf("\n");
+    }
+    if (!want || !*want) return 0;
+    const size_t wn = strlen(want);
+    uint64_t best = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        const char* v = name[i];
+        while (*v && (*v < '0' || *v > '9')) v++;          /* past a word before the number, if there is one */
+        if (strncmp(v, want, wn) || (v[wn] && v[wn] != '.' && v[wn] != ' ')) continue;
+        /* Bit 31 marks a driver's own; the rest is the version, so the newest of them is the largest. */
+        if (!best || (ids[i] & 0x7FFFFFFFull) > (best & 0x7FFFFFFFull)) best = ids[i];
+    }
+    return best;
+}
+
+void rsx_fsr3_fg_version(const char* version)
+{
+    snprintf(s_fg_want, sizeof s_fg_want, "%s", version ? version : "");
 }
 
 /* Left alone, the swapchain's two threads spin: 113% of a logical CPU at the gate.
@@ -146,8 +206,23 @@ int rsx_fsr3_wrap(void** swap_chain, void* queue)
     if (FAILED(sc3->QueryInterface(IID_PPV_ARGS(&sc)))) return 0;
     sc3->Release();                         /* sc is the only reference now */
 
+    /* Pinned when rsx_fsr3_fg_version asked: ANR's frames come from the callback this swap chain makes inside its
+     * Present (fsr3_anr_generate), which 3.1.7 has been read and tried for. */
+    uint64_t pin = 0;
+    if (s_fg_want[0]) {
+        ID3D12Device* qdev = nullptr;
+        if (SUCCEEDED(((ID3D12CommandQueue*)queue)->GetDevice(IID_PPV_ARGS(&qdev))) && qdev) {
+            pin = fsr3_pick(qdev, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12, "swapchain", s_fg_want);
+            qdev->Release();
+        }
+        if (!pin) printf("[fsr3] swapchain %s: not among this GPU's; the newest it takes\n", s_fg_want);
+    }
+    ffxOverrideVersion ov{};
+    ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    ov.versionId = pin;
     ffxCreateContextDescFrameGenerationSwapChainVersionDX12 ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12;
+    ver.header.pNext = pin ? &ov.header : nullptr;
     ver.version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
     ffxCreateContextDescFrameGenerationSwapChainWrapDX12 d{};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12;
@@ -162,7 +237,9 @@ int rsx_fsr3_wrap(void** swap_chain, void* queue)
         return 0;
     }
     s_swap = sc;
-    fsr3_version(&s_swap_ctx, "swapchain", nullptr, nullptr);
+    char note[48] = "";
+    if (pin) snprintf(note, sizeof note, ", as asked (%s)", s_fg_want);
+    fsr3_version(&s_swap_ctx, "swapchain", nullptr, note);
     fsr3_pacing();
     return 1;
 }
@@ -403,54 +480,13 @@ static int fsr3_targets(ID3D12Device* dev, unsigned render_w, unsigned render_h)
     return s_depth && s_motion && fsr3_inputs_init(dev);
 }
 
-/* The upscaler's versions this device takes, into the log once, and the id of the newest whose number starts with
- * want ("3.1" takes 3.1.6, not 3.10): 0 when want is empty or none of them is. The names are copied at once: the API
- * may keep them where its next version query writes (its docs). */
-static uint64_t fsr3_up_pick(ID3D12Device* dev, const char* want)
-{
-    enum { MAX_V = 16 };
-    uint64_t count = 0;
-    ffxQueryDescGetVersions q{};
-    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    q.device = dev;
-    q.outputCount = &count;
-    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK || !count) return 0;
-    if (count > MAX_V) count = MAX_V;
-    uint64_t ids[MAX_V] = {};
-    const char* names[MAX_V] = {};
-    q.versionIds = ids;
-    q.versionNames = names;
-    if (s_ffx.Query(nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
-    char name[MAX_V][32];
-    for (uint64_t i = 0; i < count; i++) snprintf(name[i], sizeof name[i], "%s", names[i] ? names[i] : "?");
-    static bool said;
-    if (!said) {
-        said = true;
-        printf("[fsr3] upscaler versions on this GPU:");
-        for (uint64_t i = 0; i < count; i++) printf("%s %s", i ? "," : "", name[i]);
-        printf("\n");
-    }
-    if (!want || !*want) return 0;
-    const size_t wn = strlen(want);
-    uint64_t best = 0;
-    for (uint64_t i = 0; i < count; i++) {
-        const char* v = name[i];
-        while (*v && (*v < '0' || *v > '9')) v++;          /* past a word before the number, if there is one */
-        if (strncmp(v, want, wn) || (v[wn] && v[wn] != '.' && v[wn] != ' ')) continue;
-        /* Bit 31 marks a driver's own; the rest is the version, so the newest of them is the largest. */
-        if (!best || (ids[i] & 0x7FFFFFFFull) > (best & 0x7FFFFFFFull)) best = ids[i];
-    }
-    return best;
-}
-
 int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
                        unsigned render_w, unsigned render_h, float sharpness, const char* version)
 {
     ID3D12Device* dev = (ID3D12Device*)device;
     if (!fsr3_targets(dev, render_w, render_h)) return 0;
     /* A version asked for goes on the chain as an override; with none, the API picks the newest the device takes. */
-    const uint64_t pin = fsr3_up_pick(dev, version);
+    const uint64_t pin = fsr3_pick(dev, FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, "upscaler", version);
     if (version && *version && !pin) printf("[fsr3] upscaler %s: not among this GPU's; the newest it takes\n", version);
     ffxOverrideVersion ov{};
     ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
@@ -533,8 +569,14 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     ID3D12Device* dev = (ID3D12Device*)device;
     if (!fsr3_targets(dev, render_w, render_h)) return 0;
 
+    const uint64_t pin = s_fg_want[0] ? fsr3_pick(dev, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, "frame generation",
+                                                  s_fg_want) : 0;
+    ffxOverrideVersion ov{};
+    ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    ov.versionId = pin;
     ffxCreateContextDescFrameGenerationVersion ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+    ver.header.pNext = pin ? &ov.header : nullptr;
     ver.version = FFX_FRAMEGENERATION_VERSION;
     ffxCreateBackendDX12Desc be{};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
@@ -549,7 +591,13 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     d.maxRenderSize.height = render_h;
     d.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
     if (getenv("D3D12_FG_CHECK")) d.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
-    const ffxReturnCode_t rc = s_ffx.CreateContext(&s_fg_ctx, &d.header, nullptr);
+    ffxReturnCode_t rc = s_ffx.CreateContext(&s_fg_ctx, &d.header, nullptr);
+    if (rc != FFX_API_RETURN_OK && pin) {
+        printf("[fsr3] frame generation %s: no context (%u); the newest the GPU takes\n", s_fg_want, (unsigned)rc);
+        s_fg_ctx = nullptr;
+        ver.header.pNext = nullptr;
+        rc = s_ffx.CreateContext(&s_fg_ctx, &d.header, nullptr);
+    }
     if (rc != FFX_API_RETURN_OK) {
         printf("[fsr3] frame generation: no context (%u)\n", (unsigned)rc);
         s_fg_ctx = nullptr;
@@ -561,7 +609,9 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     dbg.fpMessage = fsr3_message;
     dbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
     s_ffx.Configure(&s_fg_ctx, &dbg.header);
-    fsr3_version(&s_fg_ctx, "frame generation", s_fg_name, nullptr);
+    char note[48] = "";
+    if (pin && ver.header.pNext) snprintf(note, sizeof note, ", as asked (%s)", s_fg_want);
+    fsr3_version(&s_fg_ctx, "frame generation", s_fg_name, note);
     s_swap = swap_chain;
     s_generate = generate;
     s_dw = display_w; s_dh = display_h;
@@ -571,6 +621,70 @@ int rsx_fsr3_fg_create(void* device, void* swap_chain, unsigned display_w, unsig
     return 1;
 }
 
+#ifdef PS3RECOMP_ANR
+static rsx_anr_frame s_anr_in;      /* this frame's, for the swap chain's callback at its Present */
+
+static D3D12_RESOURCE_STATES fsr3_d3d12_state(uint32_t s)
+{
+    D3D12_RESOURCE_STATES d = D3D12_RESOURCE_STATE_COMMON;     /* PRESENT as well */
+    if (s & FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) d |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (s & FFX_API_RESOURCE_STATE_COMPUTE_READ) d |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (s & FFX_API_RESOURCE_STATE_PIXEL_READ) d |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (s & FFX_API_RESOURCE_STATE_COPY_SRC) d |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (s & FFX_API_RESOURCE_STATE_COPY_DEST) d |= D3D12_RESOURCE_STATE_COPY_DEST;
+    if (s & FFX_API_RESOURCE_STATE_INDIRECT_ARGUMENT) d |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    if (s & FFX_API_RESOURCE_STATE_RENDER_TARGET) d |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+    return d;
+}
+
+/* The swap chain asks for the generated frame from its Present, on the thread that presents, and
+ * runs the list on the game's queue right after the frame's own (FidelityFX SDK 1.1.4,
+ * dispatchInterpolationCommands): the frame's depth and motion are still there. */
+static ffxReturnCode_t fsr3_anr_generate(ffxDispatchDescFrameGeneration* p, void*)
+{
+    rsx_anr_frame f = s_anr_in;
+    f.backbuffer = (ID3D12Resource*)p->presentColor.resource;
+    f.backbuffer_state = fsr3_d3d12_state(p->presentColor.state);
+    f.output = (ID3D12Resource*)p->outputs[0].resource;
+    f.output_state = fsr3_d3d12_state(p->outputs[0].state);
+    f.reset = f.reset || p->reset;
+    rsx_anr_generate((ID3D12GraphicsCommandList*)p->commandList, &f);
+    if (!rsx_anr_usable()) {
+        /* FSR's own from the next frame, configured and prepared as usual, from a reset. */
+        s_anr = false;
+        s_fg_was = false;
+        printf("[fsr3] ANR stopped: FSR's own frame generation from the next frame\n");
+    }
+    return FFX_API_RETURN_OK;
+}
+
+/* What the callback reads: this frame's, taken while the frame is recorded. */
+static void fsr3_anr_inputs(const rsx_fsr3_frame* f, bool reset)
+{
+    rsx_anr_frame& a = s_anr_in;
+    memset(&a, 0, sizeof a);
+    a.hudless = (ID3D12Resource*)f->hudless;
+    a.depth = s_depth;
+    a.motion = s_motion;
+    a.display_w = s_dw;
+    a.display_h = s_dh;
+    a.render_w = s_rw;
+    a.render_h = s_rh;
+    a.jitter_x = f->jitter_x;
+    a.jitter_y = f->jitter_y;
+    a.znear = (float)s_cam.znear;
+    a.zfar = (float)s_cam.zfar;
+    a.fov = (float)s_cam.fov;
+    for (int i = 0; i < 3; i++) {
+        a.pos[i] = (float)s_cam.pos[i];
+        a.up[i] = (float)s_cam.up[i];
+        a.right[i] = (float)s_cam.right[i];
+        a.fwd[i] = (float)s_cam.fwd[i];
+    }
+    a.reset = reset;
+}
+#endif
+
 static void fsr3_configure(bool enabled, void* hudless)
 {
     ffxConfigureDescFrameGeneration c{};
@@ -579,8 +693,16 @@ static void fsr3_configure(bool enabled, void* hudless)
     c.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* ctx) -> ffxReturnCode_t {
         return s_ffx.Dispatch((ffxContext*)ctx, &params->header);
     };
+#ifdef PS3RECOMP_ANR
+    if (s_anr) c.frameGenerationCallback = fsr3_anr_generate;
+#endif
     c.frameGenerationCallbackUserContext = &s_fg_ctx;
     c.frameGenerationEnabled = enabled;
+    /* D3D12_FG_ONLY_GENERATED=1: the swap chain shows only the generated frames, so that whatever a screen capture
+     * takes is one (comparing FSR's with ANR's). */
+    static int only = -1;
+    if (only < 0) { const char* e = getenv("D3D12_FG_ONLY_GENERATED"); only = e && !strcmp(e, "1"); }
+    c.onlyPresentGenerated = only != 0;
     if (hudless) c.HUDLessColor = ffxApiGetResourceDX12((ID3D12Resource*)hudless, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     c.generationRect.width = (int32_t)s_dw;
     c.generationRect.height = (int32_t)s_dh;
@@ -592,6 +714,9 @@ void rsx_fsr3_fg_destroy(void)
 {
     if (!s_fg_ctx) return;
     fsr3_configure(false, nullptr);
+#ifdef PS3RECOMP_ANR
+    rsx_anr_release();
+#endif
     s_ffx.DestroyContext(&s_fg_ctx, nullptr);
     s_fg_ctx = nullptr;
     s_fg_name[0] = 0;
@@ -601,6 +726,19 @@ void rsx_fsr3_fg_destroy(void)
  * those in a row to change: over the floor by a margin to come back, as generation costs some
  * of the rate it is judged on. */
 void rsx_fsr3_fg_floor(double fps) { s_floor = fps; }
+
+int rsx_fsr3_fg_anr(const char* dll)
+{
+#ifdef PS3RECOMP_ANR
+    if (!s_fg_ctx || !s_dev) return 0;
+    s_anr = rsx_anr_open(s_dev, dll) != 0;
+    return s_anr;
+#else
+    (void)dll;
+    printf("[fsr3] ANR: not in this build (PS3RECOMP_ANR)\n");
+    return 0;
+#endif
+}
 
 static void fsr3_rate(float frame_ms)
 {
@@ -713,6 +851,10 @@ void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* f, float frame_ms)
      * it disabled on every one of its frames, its GPU queue stopped behind the swap chain (2026-11-10). */
     if (on || s_fg_was || !s_fg_told) fsr3_configure(on, on ? f->hudless : nullptr);
     s_fg_told = true;
+#ifdef PS3RECOMP_ANR
+    if (on && s_anr) fsr3_anr_inputs(f, reset);
+    else
+#endif
     if (on) {
         ffxDispatchDescFrameGenerationPrepareV2 p{};
         p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;

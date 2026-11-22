@@ -163,6 +163,18 @@ if(WIN32)
     target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib")
 endif()
 
+# ANR FG (beta): Apex Neural Rendering's frame generation through its DLSS-G (NGX) interface, in
+# FSR's swap chain (libs/video/rsx_anr.cpp, with our own declarations of the interface in
+# rsx_ngx.h). Its DLL is the player's own and is never kept here.
+option(PS3RECOMP_ANR "ANR frame generation, beta: graphics.frame_generation = anr" OFF)
+if(WIN32 AND PS3RECOMP_ANR)
+    target_sources(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_anr.cpp")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ANR=1)
+    # The DLL's Authenticode signer (WinVerifyTrust, CertGetNameString) and its SHA-256 for the log.
+    target_link_libraries(ps3recomp_runtime PRIVATE wintrust crypt32 bcrypt)
+    message(STATUS "ANR frame generation: on")
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

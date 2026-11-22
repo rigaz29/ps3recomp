@@ -7,6 +7,7 @@
 
 #include "sceNp.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -299,11 +300,73 @@ s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
  * was in its buffer. Checks and offline answers as RPCS3's sceNp.cpp:
  * without a psnr server the manager is OFFLINE and so are these. Signed in
  * to psnr, which issues no tickets, a request gets a failed GOT_TICKET at
- * once and there is never a ticket to read; the region is the fake
- * account's (US, English) and the time is the host's. */
+ * once and there is never a ticket to read (unless PS3_NP_TEST_TICKET, below);
+ * the region is the fake account's (US, English) and the time is the host's. */
 #define SCE_NP_COOKIE_MAX_SIZE 1024
 #define SCE_NP_TICKET_PARAM_SERIAL_ID   0
 #define SCE_NP_TICKET_PARAM_SUBJECT_DOB 11
+
+/* PS3_NP_TEST_TICKET=1 (signed in to psnr): a ticket of our own making in
+ * place of the failed GOT_TICKET, laid out as an NP ticket 2.1 (a body
+ * section of typed fields, a footer with an empty signature). Nothing on
+ * this side checks it: it is what a title sends to servers of its own,
+ * which then have to be stand-ins of ours. For tracing what a title does
+ * once it holds a ticket. */
+static u8  s_ticket[512];
+static u32 s_ticket_len;
+static u64 s_ticket_acct;
+static u64 s_ticket_issued, s_ticket_expire;   /* CellRtcTick microseconds */
+static char s_ticket_service[25];
+
+static u64 np_test_account(void)
+{
+    u64 h = 1469598103934665603ull;              /* FNV-1a of the online id: steady per player */
+    for (const char* p = np_psnr_online_id(); *p; p++) { h ^= (u8)*p; h *= 1099511628211ull; }
+    return h & 0x7FFFFFFFFFFFFFFFull;
+}
+
+static u8* tk_put16(u8* p, u32 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; return p + 2; }
+static u8* tk_put32(u8* p, u32 v) { p = tk_put16(p, v >> 16); return tk_put16(p, v & 0xFFFF); }
+static u8* tk_put64(u8* p, u64 v) { p = tk_put32(p, (u32)(v >> 32)); return tk_put32(p, (u32)v); }
+static u8* tk_field(u8* p, u32 type, const void* data, u32 len)
+{
+    p = tk_put16(p, type); p = tk_put16(p, len);
+    memcpy(p, data, len);
+    return p + len;
+}
+
+static void np_test_ticket_build(void)
+{
+    u8 body[384], *b = body, v[32];
+    const u64 now = (u64)time(NULL) * 1000000ull + 62135596800000000ull;
+    s_ticket_acct = np_test_account();
+    s_ticket_issued = now;
+    s_ticket_expire = now + 3600ull * 1000000ull;
+    memset(v, 0, sizeof(v)); memcpy(v, "ascension-r-test", 16);
+    b = tk_field(b, 0x0008, v, 20);                                    /* serial id */
+    tk_put32(v, 0x100); b = tk_field(b, 0x0001, v, 4);                 /* issuer id */
+    tk_put64(v, s_ticket_issued); b = tk_field(b, 0x0007, v, 8);       /* issued */
+    tk_put64(v, s_ticket_expire); b = tk_field(b, 0x0007, v, 8);       /* expires */
+    tk_put64(v, s_ticket_acct); b = tk_field(b, 0x0002, v, 8);         /* account id */
+    memset(v, 0, sizeof(v)); strncpy((char*)v, np_psnr_online_id(), 31);
+    b = tk_field(b, 0x0004, v, 32);                                    /* online id */
+    memset(v, 0, 4); memcpy(v, "us", 2); b = tk_field(b, 0x0008, v, 4); /* region */
+    memset(v, 0, 4); memcpy(v, "un", 2); b = tk_field(b, 0x0004, v, 4); /* domain */
+    memset(v, 0, 24); memcpy(v, s_ticket_service, strlen(s_ticket_service));
+    b = tk_field(b, 0x0008, v, 24);                                    /* service id */
+    tk_put32(v, 0); b = tk_field(b, 0x0001, v, 4);                     /* status */
+    b = tk_field(b, 0x0010, v, 0); b = tk_field(b, 0x0000, v, 0);      /* no dob, no entitlements */
+    const u32 blen = (u32)(b - body);
+    u8* t = s_ticket;
+    t = tk_put32(t, 0x21010000u);                                      /* version 2.1 */
+    u8* size_at = t; t += 4;
+    t = tk_put16(t, 0x3000); t = tk_put16(t, blen); memcpy(t, body, blen); t += blen;
+    t = tk_put16(t, 0x3002); t = tk_put16(t, 4 + 4 + 4 + 56);          /* footer: cipher id, signature */
+    memset(v, 0, 8); t = tk_field(t, 0x0008, v, 4);
+    u8 sig[56]; memset(sig, 0, sizeof(sig)); t = tk_field(t, 0x0008, sig, 56);
+    s_ticket_len = (u32)(t - s_ticket);
+    tk_put32(size_at, s_ticket_len - 8);
+}
 
 s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
                                u32 cookieSize, u32 entitlementId, u32 consumedCount)
@@ -316,6 +379,20 @@ s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
         printf("[sceNp] ManagerRequestTicket2() -> OFFLINE\n");
         return SCE_NP_ERROR_OFFLINE;
     }
+    if (getenv("PS3_NP_TEST_TICKET")) {
+        snprintf(s_ticket_service, sizeof(s_ticket_service), "%s", GUEST_PTR(serviceId, const char*));
+        np_test_ticket_build();
+        if (s_npmgr_cb) {
+            const u64 args[8] = { SCE_NP_MANAGER_EVENT_GOT_TICKET, (u64)s_ticket_len,
+                                  (u64)(u32)(uintptr_t)s_npmgr_cb_arg, 0, 0, 0, 0, 0 };
+            cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)s_npmgr_cb, args);
+        }
+        printf("[sceNp] ManagerRequestTicket2(service \"%s\", entitlement %s, consumed %u) -> test ticket, %u bytes, "
+               "account %llu\n", s_ticket_service,
+               entitlementId ? GUEST_PTR(entitlementId, const char*) : "-", consumedCount,
+               s_ticket_len, (unsigned long long)s_ticket_acct);
+        return CELL_OK;
+    }
     if (s_npmgr_cb) {
         const u64 args[8] = { SCE_NP_MANAGER_EVENT_GOT_TICKET, (u64)(u32)SCE_NP_ERROR_INVALID_STATE,
                               (u64)(u32)(uintptr_t)s_npmgr_cb_arg, 0, 0, 0, 0, 0 };
@@ -327,9 +404,18 @@ s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
 
 s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize)
 {
-    (void)buffer;
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!bufferSize) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (s_ticket_len) {
+        const u32 room = vm_read32(bufferSize);
+        if (buffer) {
+            if (room < s_ticket_len) return SCE_NP_ERROR_INVALID_ARGUMENT;
+            memcpy(vm_ptr8(buffer), s_ticket, s_ticket_len);
+        }
+        vm_write32(bufferSize, s_ticket_len);
+        printf("[sceNp] ManagerGetTicket(buffer %s, room %u) -> %u bytes\n", buffer ? "set" : "NULL", room, s_ticket_len);
+        return CELL_OK;
+    }
     vm_write32(bufferSize, 0);   /* no ticket: nothing to copy */
     return CELL_OK;
 }
@@ -339,7 +425,26 @@ s32 sceNpManagerGetTicketParam(s32 paramId, u32 param)
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!param || paramId < SCE_NP_TICKET_PARAM_SERIAL_ID || paramId > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
-    return SCE_NP_ERROR_INVALID_STATE;   /* no ticket was ever issued */
+    if (!s_ticket_len) return SCE_NP_ERROR_INVALID_STATE;   /* no ticket was ever issued */
+    /* SceNpTicketParam: a 256-byte union, big-endian values at its start. */
+    u8* p = vm_ptr8(param);
+    memset(p, 0, 256);
+    switch (paramId) {
+    case 0:  memcpy(p, "ascension-r-test", 16); break;                         /* serial id */
+    case 1:  tk_put32(p, 0x100); break;                                          /* issuer id */
+    case 2:  tk_put64(p, s_ticket_issued); break;
+    case 3:  tk_put64(p, s_ticket_expire); break;
+    case 4:  tk_put64(p, s_ticket_acct); break;                                  /* subject account id */
+    case 5:  strncpy((char*)p, np_psnr_online_id(), 31); break;                  /* subject online id */
+    case 6:  memcpy(p, "us", 2); break;                                          /* subject region */
+    case 7:  memcpy(p, "un", 2); break;                                          /* subject domain */
+    case 8:  memcpy(p, s_ticket_service, strlen(s_ticket_service)); break;       /* service id */
+    case 9:  break;                                                              /* subject status */
+    case 10: break;                                                              /* status duration */
+    case 11: tk_put16(p, 1990); p[2] = 1; p[3] = 1; break;                       /* subject dob */
+    }
+    printf("[sceNp] ManagerGetTicketParam(%d)\n", paramId);
+    return CELL_OK;
 }
 
 s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language)

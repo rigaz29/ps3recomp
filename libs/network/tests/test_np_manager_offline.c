@@ -91,6 +91,34 @@ int main(void)
     /* After 2020-01-01 (63713433600 s after 0001-01-01), in microseconds. */
     assert(vm_read64(TICK) > 63713433600ull * 1000000ull);
 
+    /* PS3_NP_TEST_TICKET=1: a ticket of our own, its size in GOT_TICKET,
+     * its bytes from GetTicket, its fields from GetTicketParam. */
+#ifdef _WIN32
+    _putenv_s("PS3_NP_TEST_TICKET", "1");
+#else
+    setenv("PS3_NP_TEST_TICKET", "1", 1);
+#endif
+    memcpy(vm_base + SVC, "EP9000-BCES01741_00", 20);
+    queued = 0;
+    assert(sceNpManagerRequestTicket2(NPID, 0, SVC, 0, 0, 0, 0) == CELL_OK);
+    assert(queued == 1 && queued_args[0] == SCE_NP_MANAGER_EVENT_GOT_TICKET);
+    const u32 size = (u32)queued_args[1];
+    assert(size > 64 && size <= 512);
+    vm_write32(SIZE, 0);
+    assert(sceNpManagerGetTicket(0, SIZE) == CELL_OK && vm_read32(SIZE) == size);   /* size query */
+    vm_write32(SIZE, 16);
+    assert((u32)sceNpManagerGetTicket(BUF, SIZE) == SCE_NP_ERROR_INVALID_ARGUMENT);  /* too small */
+    vm_write32(SIZE, 4096);
+    assert(sceNpManagerGetTicket(BUF, SIZE) == CELL_OK && vm_read32(SIZE) == size);
+    assert(vm_read32(BUF) == 0x21010000u && vm_read32(BUF + 4) == size - 8);          /* 2.1, length */
+    assert(sceNpManagerGetTicketParam(4, PARAM) == CELL_OK && vm_read64(PARAM) != 0);  /* account id */
+    const u64 acct = vm_read64(PARAM);
+    assert(sceNpManagerGetTicketParam(5, PARAM) == CELL_OK && strcmp((char*)vm_base + PARAM, "PS3Player") == 0);
+    assert(sceNpManagerGetTicketParam(8, PARAM) == CELL_OK
+           && strcmp((char*)vm_base + PARAM, "EP9000-BCES01741_00") == 0);
+    assert(sceNpManagerRequestTicket2(NPID, 0, SVC, 0, 0, 0, 0) == CELL_OK);            /* same player, same id */
+    assert(sceNpManagerGetTicketParam(4, PARAM) == CELL_OK && vm_read64(PARAM) == acct);
+
     assert(sceNpTerm() == CELL_OK);
     free(vm_base);
     puts("NP manager offline/psnr checks passed");

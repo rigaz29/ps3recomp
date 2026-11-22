@@ -8,10 +8,10 @@
  * still creatable after the runtime's own sceNpSignalingInit.
  *
  * Built with test_np_basic_after_np_init_np.c (sceNp.c and the runtime
- * symbols) as its second file:
+ * symbols) as its second file, and the signaling client:
  *   cc -std=gnu17 -I include -o test_np_signaling_after_np_init \
  *      libs/network/tests/test_np_signaling_after_np_init.c \
- *      libs/network/tests/test_np_basic_after_np_init_np.c
+ *      libs/network/tests/test_np_basic_after_np_init_np.c libs/network/np_signal_client.c
  * Driven by tools/test_np_signaling_after_np_init.py.
  */
 #include "../sceNpSignaling.c"
@@ -22,7 +22,6 @@ s32 sceNpTerm(void);
 
 #define NOTINIT ((s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED)
 #define CTX_EA 0x1000u                                   /* guest word the context id goes to */
-#define CTXID ((SceNpSignalingCtxId*)(uintptr_t)CTX_EA)
 
 static int fails = 0;
 #define CHECK(expr, want, what) do { s32 got_ = (s32)(expr); int ok_ = got_ == (s32)(want);              \
@@ -35,24 +34,24 @@ int main(void)
     vm_base = calloc(1, 65536);
     if (!vm_base) return 2;
 
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, CTXID), NOTINIT, "before sceNpInit: CreateCtx");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, CTX_EA), NOTINIT, "before sceNpInit: CreateCtx");
 
     CHECK(sceNpInit(131072, (void*)0x2000), CELL_OK, "sceNpInit");
     vm_write32(CTX_EA, 0xFFFFFFFFu);
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, CTXID), CELL_OK, "after sceNpInit: CreateCtx");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, CTX_EA), CELL_OK, "after sceNpInit: CreateCtx");
     u32 id = vm_read32(CTX_EA);
-    CHECK(id < SCE_NP_SIGNALING_CTX_MAX, 1, "after sceNpInit: context id written");
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, NULL), SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT,
+    CHECK(id >= 1 && id <= SCE_NP_SIGNALING_CTX_MAX, 1, "after sceNpInit: context id written (1-based)");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, 0), SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT,
           "after sceNpInit: CreateCtx without a place for the id");
     CHECK(sceNpSignalingDestroyCtx(id), CELL_OK, "after sceNpInit: DestroyCtx");
 
     CHECK(sceNpTerm(), CELL_OK, "sceNpTerm");
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, CTXID), NOTINIT, "after sceNpTerm: CreateCtx");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, CTX_EA), NOTINIT, "after sceNpTerm: CreateCtx");
 
     CHECK(sceNpSignalingInit(), CELL_OK, "sceNpSignalingInit alone");
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, CTXID), CELL_OK, "sceNpSignalingInit alone: CreateCtx");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, CTX_EA), CELL_OK, "sceNpSignalingInit alone: CreateCtx");
     CHECK(sceNpSignalingTerm(), CELL_OK, "sceNpSignalingTerm");
-    CHECK(sceNpSignalingCreateCtx(NULL, NULL, NULL, CTXID), NOTINIT, "after sceNpSignalingTerm: CreateCtx");
+    CHECK(sceNpSignalingCreateCtx(0, 0, 0, CTX_EA), NOTINIT, "after sceNpSignalingTerm: CreateCtx");
 
     printf("%s\n", fails ? "FAILED" : "all passed");
     return fails ? 1 : 0;

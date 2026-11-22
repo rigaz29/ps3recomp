@@ -986,6 +986,18 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
     return ea;
 }
 
+/* God of War: Ascension calls it as a match starts, for the peer's address. */
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size)
+{
+    char text[16];
+    if (family != SYS_NET_AF_INET || !src || !dst) { (void)fail(SYS_NET_EAFNOSUPPORT); return 0; }
+    const uint8_t* a = vm_ptr8(EA(src));
+    int n = snprintf(text, sizeof(text), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
+    if (n < 0 || (uint32_t)n + 1 > size) { (void)fail(SYS_NET_ENOSPC); return 0; }
+    memcpy(vm_ptr8(EA(dst)), text, (size_t)n + 1);
+    return EA(dst);
+}
+
 uint32_t sys_net_bnet_gethostbyname(const char* name)
 {
     const char* host = GUEST_PTR(EA(name), const char*);
@@ -1059,6 +1071,7 @@ static void h_inet_pton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_pton(S32(3
 static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3), PTR(4))); }
 static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
 static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
+static void h_inet_ntop(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntop(S32(3), PTR(4), PTR(5), R32(6))); }
 static void h_gethostbyname(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyname(PTR(3))); }
 static void h_errno_loc(ppu_context* ctx)   { RET_U(sys_net_errno_loc()); }
 static void h_h_errno_loc(ppu_context* ctx) { RET_U(scratch(&s_h_errno_ea, 4)); }
@@ -1079,7 +1092,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
         { "getpeername", h_getpeername }, { "socketpoll", h_poll },
         { "socketselect", h_select },     { "inet_aton", h_inet_aton },
         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
-        { "inet_pton", h_inet_pton },
+        { "inet_pton", h_inet_pton },     { "inet_ntop", h_inet_ntop },
         { "gethostbyname", h_gethostbyname },
         { "_sys_net_errno_loc", h_errno_loc },
         { "_sys_net_h_errno_loc", h_h_errno_loc },

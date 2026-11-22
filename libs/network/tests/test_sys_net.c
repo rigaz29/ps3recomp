@@ -181,6 +181,12 @@ int main(void)
     assert((uint32_t)call("inet_addr", STR, 0, 0, 0, 0, 0) == 0x01020304u);
     uint32_t s = (uint32_t)call("inet_ntoa", LOOP, 0, 0, 0, 0, 0);
     assert(strcmp((const char*)vm_base + s, "127.0.0.1") == 0);
+    /* inet_ntop: raw network bytes to text in the caller's buffer, which it
+     * returns; a buffer too small gives 0. */
+    vm_base[BUF] = 192; vm_base[BUF + 1] = 168; vm_base[BUF + 2] = 0; vm_base[BUF + 3] = 7;
+    assert((uint32_t)call("inet_ntop", SYS_NET_AF_INET, BUF, STR, 16, 0, 0) == STR);
+    assert(strcmp((const char*)vm_base + STR, "192.168.0.7") == 0);
+    assert(call("inet_ntop", SYS_NET_AF_INET, BUF, STR, 11, 0, 0) == 0);
     /* Real retail NID8AF3825E: AF_INET, source string, raw network bytes.
      * Guard bytes catch host-endian stores and output-length mistakes. */
     assert(ps3_compute_nid("inet_pton") == 0x8AF3825Eu);

@@ -184,6 +184,16 @@ void np_psnr_on_tick(void (*fn)(void))
     s_tick_fn = fn;
 }
 
+#define TICKS_MAX 4
+static void (*s_ticks[TICKS_MAX])(void);
+void np_psnr_add_tick(void (*fn)(void))
+{
+    LOCK();
+    for (int i = 0; i < TICKS_MAX; i++)
+        if (s_ticks[i] == fn || !s_ticks[i]) { s_ticks[i] = fn; break; }
+    UNLOCK();
+}
+
 /* ---- NAT traversal and the relay, on the title's P2P socket ---- */
 
 #define PUNCHES      5      /* per peer */
@@ -424,6 +434,7 @@ void np_psnr_pump(void)
 {
     psnr_msg m;
     if (s_tick_fn) s_tick_fn();
+    for (int i = 0; i < TICKS_MAX && s_ticks[i]; i++) s_ticks[i]();
     nat_tick();
     if (!s_client) return;
 

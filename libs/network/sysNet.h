@@ -32,6 +32,7 @@ extern "C" {
 #define SYS_NET_ENOMEM              12
 #define SYS_NET_EFAULT              14
 #define SYS_NET_EINVAL              22
+#define SYS_NET_ENOSPC              28
 #define SYS_NET_EPIPE               32
 #define SYS_NET_EWOULDBLOCK         35
 #define SYS_NET_EINPROGRESS         36
@@ -177,6 +178,8 @@ int32_t  sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst);
 int32_t  sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
 uint32_t sys_net_bnet_inet_addr(const char* cp);
 uint32_t sys_net_bnet_inet_ntoa(uint32_t addr);
+/* inet_ntop(AF_INET, src, dst, size): dst's guest address, or 0 with errno set. */
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size);
 uint32_t sys_net_bnet_gethostbyname(const char* name);
 
 /* Guest address of the errno cell. */

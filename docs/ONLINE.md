@@ -28,7 +28,8 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NP_ONLINE_ID=name` | The player's name, if `--username` isn't given. The name also gives the instance its own console identity: the OpenPSID (`sys_ss_get_open_psid`) and MAC are derived from it. Titles tell consoles apart by these, so two instances with the same name count as one player. Offline with no name, both stay at their old fixed values, so offline saves are untouched. |
 | `PS3_OPEN_PSID=<32 hex>` | Set the OpenPSID outright instead. |
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
-| `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000. |
+| `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000 (Matching2); for sceNpSignaling, how long after the signaling server answers, default 500. |
+| `PS3_NP_SIGNALING_SERVER=host[:port]` | The signaling server for sceNpSignaling (`tools/np_signaling_server.py`, port 36101 by default): where a peer named by its NP ID is, for titles that find their players through servers of their own. Unset, an activated connection ends DEAD (PEER_UNREACHABLE). |
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
 | `PS3_NET_HOSTS=name=ip;*.suffix=ip;*=ip` | A host name the title looks up (gethostbyname, cellHttp) gets the address of the first entry that matches it: the exact name, any name under `.suffix`, or `*` for all. Names nothing matches resolve as before. How a title's own servers are pointed at stand-ins. |
 | `PS3_NET_LOOPBACK_ONLY=1` | Connects, datagrams and HTTP requests to anything outside 127.0.0.0/8 fail as unreachable, each destination logged once. For traces that must reach nothing but local stand-ins. |
@@ -49,6 +50,29 @@ Redirect stderr to a file and the runtime logs every wait (see
 stage starts, and the title drops the peer as "not responding". Set
 `PS3_VERBOSE=0` for play; at that setting both hold 40-50 fps.
 
+## Signaling for titles with their own matchmaking
+
+Some titles find their players through servers of their own and then connect
+to each one with sceNpSignaling, by NP ID (God of War: Ascension's SAM
+matchmaker hands every player the others' NP IDs). On PSN the NP server told
+a console where that peer was and told the peer about it.
+`tools/np_signaling_server.py` does that here: each instance says who it is
+and which P2P port it takes peer traffic on; activating a connection returns
+the peer's address and P2P port and tells the peer (the extended handler's
+EXT_PEER_ACTIVATED, then EXT_MUTUAL_ACTIVATED when both have). The title's own
+traffic then goes straight between the two P2P ports. The protocol is in
+`libs/network/np_signal_client.h`.
+
+```
+python3 tools/np_signaling_server.py                    # listens on :36101
+PS3_NP_SIGNALING_SERVER=127.0.0.1 PS3_NET_P2P_PORT=3658 PS3_NP_ONLINE_ID=PlayerA ...
+PS3_NP_SIGNALING_SERVER=127.0.0.1 PS3_NET_P2P_PORT=3659 PS3_NP_ONLINE_ID=PlayerB ...
+```
+
+A peer's address is the one the server sees it at, so players behind
+different routers need their P2P port reachable (forwarded); there is no NAT
+traversal or relay on this path yet.
+
 ## What is implemented
 
 | Module | State |
@@ -58,6 +82,7 @@ stage starts, and the title drops the peer as "not responding". Set
 | sceNpLookup | Profiles are answered locally from the online ID. There is no avatar. |
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
 | sceNp manager | Reports ONLINE when psnr is set, and fires the manager callback once. Tickets, the account region and the network time answer OFFLINE without psnr; with it a ticket request gets a failed GOT_TICKET at once (psnr issues none), or with `PS3_NP_TEST_TICKET=1` a ticket of our own, and the region (`us`) and the time are local. |
+| sceNpSignaling | Contexts with both handlers and the bandwidth-probe option; connections activated, deactivated and terminated by NP ID through the signaling server; ESTABLISHED, EXT_PEER_ACTIVATED, EXT_MUTUAL_ACTIVATED, EXT_PEER_DEACTIVATED and DEAD (TIMEOUT after 15 s, TERMINATED_BY_PEER when the peer leaves) delivered from `cellSysutilCheckCallback`; connection status and info (peer address and NP ID, RTT and bandwidth are fixed values), local and peer net info. Contexts can be made after sceNpInit alone, as on a console. |
 | sys_net | P2P sockets map to plain UDP/TCP on `PS3_NET_P2P_PORT`. There is no vport multiplexing. |
 | sceNpTus | Title and transaction contexts and data slots as the SDK has them (Get/Set/DeleteMultiSlot data, sync and async), each slot a file under `PS3_NP_TUS_DIR`, so a player's data lasts from run to run. Requests finish at the call. Variables keep in-memory stand-ins. |
 | sceNpLookup (TSS) | Title Small Storage from `PS3_NP_TSS_FILE`. |

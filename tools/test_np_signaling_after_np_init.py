@@ -25,7 +25,8 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 TESTS = os.path.join(ROOT, "libs", "network", "tests")
 SOURCES = [os.path.join(TESTS, "test_np_signaling_after_np_init.c"),
-           os.path.join(TESTS, "test_np_basic_after_np_init_np.c")]
+           os.path.join(TESTS, "test_np_basic_after_np_init_np.c"),
+           os.path.join(ROOT, "libs", "network", "np_signal_client.c")]
 
 
 def _cc():
@@ -44,7 +45,7 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         exe = os.path.join(td, "test_np_signaling_after_np_init")
         cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
-               "-o", exe] + SOURCES
+               "-o", exe] + SOURCES + (["-lws2_32"] if os.name == "nt" else ["-lpthread"])
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")

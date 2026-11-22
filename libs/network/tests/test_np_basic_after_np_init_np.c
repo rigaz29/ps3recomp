@@ -17,5 +17,7 @@ void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 int np_psnr_enabled(void) { return 0; }
 const char* np_psnr_online_id(void) { return "PS3Player"; }
+uint16_t np_psnr_p2p_port(void) { return 3658; }                  /* test_np_signaling_after_np_init */
+void np_psnr_add_tick(void (*fn)(void)) { (void)fn; }
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
 void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }   /* sceNpDrmIsAvailable (#274) */

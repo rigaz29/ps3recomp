@@ -63,6 +63,10 @@ void np_psnr_on_push(void (*fn)(const psnr_msg* push));
  * time rather than on a message (Matching2's deferred signaling). */
 void np_psnr_on_tick(void (*fn)(void));
 
+/* More of those, run after it, psnr or not: sceNpSignaling reads its
+ * signaling server from here. Up to four; adding one twice adds it once. */
+void np_psnr_add_tick(void (*fn)(void));
+
 void np_psnr_pump(void);
 
 /* NAT traversal (psnr docs/api.md, "UDP"). A player behind a router has a

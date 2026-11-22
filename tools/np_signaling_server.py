@@ -83,6 +83,14 @@ class Player:
         except Exception:
             pass
 
+    # The relay's two ends, so a player of another kind (one behind another server, which carries its messages and
+    # datagrams there) takes the same path: whether a relayed datagram can be brought to this player, and bringing it.
+    def relay_ready(self):
+        return self.udp is not None
+
+    def relayed_from(self, sender, payload, transport):
+        transport.sendto(UDP_MAGIC + bytes([U_RELAYED]) + oid(sender.name) + payload, self.udp)
+
     def address_for(self, viewer):
         return self.where_for(viewer)[0]
 
@@ -218,14 +226,14 @@ class Udp(asyncio.DatagramProtocol):
         elif kind == U_RELAY and len(data) >= 21 and srv.relay:
             sender = srv.by_udp.get(ep)
             to = srv.players.get(name_of(data[5:21]).lower())
-            if sender is None or to is None or to.udp is None or not linked(sender, to):
+            if sender is None or to is None or not to.relay_ready() or not linked(sender, to):
                 return
             pair = (sender.name, to.name)
             if pair not in srv.relaying:
                 srv.relaying.add(pair)
                 srv.log("relaying %s -> %s" % pair)
             srv.relayed += len(data) - 21
-            self.t.sendto(UDP_MAGIC + bytes([U_RELAYED]) + oid(sender.name) + data[21:], to.udp)
+            to.relayed_from(sender, data[21:], self.t)
 
 
 class Server:

@@ -9,12 +9,14 @@ its peers), and datagrams are relayed between players linked by an activation.
 Usage:
     python3 tools/test_np_signaling_server.py
 """
+import asyncio
 import os
 import socket
 import struct
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import np_signaling_server as srvmod  # noqa: E402
@@ -59,6 +61,45 @@ def peer(p):
 def endpoint(p):
     """ACTIVATED and MOVED: online id, address, port."""
     return p[:16].split(b"\0")[0].decode(), ".".join(str(b) for b in p[16:20]), struct.unpack(">H", p[20:22])[0]
+
+
+def refusing_udp(first_only, tried):
+    """create_datagram_endpoint that refuses a socket on 127.0.0.1 as Windows does a port it keeps for something else
+    (WinError 10013): the first one asked for, or every one. tried: the ports asked for there."""
+    real = asyncio.BaseEventLoop.create_datagram_endpoint
+
+    async def endpoint(loop, *a, **k):
+        addr = k.get("local_addr")
+        if addr and addr[0] == "127.0.0.1":
+            tried.append(addr[1])
+            if not first_only or len(tried) == 1:
+                raise PermissionError(13, "An attempt was made to access a socket in a way forbidden by its access "
+                                          "permissions")
+        return await real(loop, *a, **k)
+    return mock.patch.object(asyncio.BaseEventLoop, "create_datagram_endpoint", endpoint)
+
+
+class Ports(unittest.TestCase):
+    def test_another_number_when_udp_cannot_have_the_one_tcp_got(self):
+        tried = []
+        with refusing_udp(True, tried):
+            srv = srvmod.start(port=0, log=lambda t: None)
+        self.addCleanup(srv.stop)
+        self.assertEqual(len(tried), 2)
+        self.assertEqual((tried[1], srv.srv.udp_port), (srv.port, srv.port))
+        c = Client(srv.port, "PlayerA", 3658)
+        self.addCleanup(c.close)
+        self.assertEqual(c.recv()[0], srvmod.WELCOME)
+
+    def test_a_port_asked_for_stays(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        tried = []
+        with refusing_udp(False, tried), self.assertRaises(PermissionError):
+            srvmod.start(port=port, log=lambda t: None)
+        self.assertEqual(tried, [port])
 
 
 class Signaling(unittest.TestCase):

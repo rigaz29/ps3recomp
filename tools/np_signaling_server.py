@@ -272,9 +272,21 @@ class Running:
         ready = threading.Event()
 
         async def start():
-            self.server = await asyncio.start_server(lambda r, w: Player(self.srv, r, w).run(), host, port)
-            self.port = self.server.sockets[0].getsockname()[1]
-            self.udp, _ = await self.loop.create_datagram_endpoint(lambda: Udp(self.srv), local_addr=(host, self.port))
+            # TCP and UDP on one number. With a port of the system's choosing (0) the number TCP got may be one UDP
+            # cannot have (Windows keeps ranges of ports by protocol, for Hyper-V and the like): then another. A port
+            # asked for is not changed: players elsewhere are told it.
+            for attempt in range(1 if port else 20):
+                self.server = await asyncio.start_server(lambda r, w: Player(self.srv, r, w).run(), host, port)
+                self.port = self.server.sockets[0].getsockname()[1]
+                try:
+                    self.udp, _ = await self.loop.create_datagram_endpoint(lambda: Udp(self.srv),
+                                                                           local_addr=(host, self.port))
+                    break
+                except OSError:
+                    self.server.close()
+                    await self.server.wait_closed()
+                    if port or attempt == 19:
+                        raise
             self.srv.udp_port = self.port
 
         def run():

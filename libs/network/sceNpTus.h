@@ -78,20 +78,31 @@ s32 sceNpTusAddAndGetVariable(SceNpTusCtx ctx, u32 slotId,
 s32 sceNpTusDeleteMultiSlotVariable(SceNpTusCtx ctx, const u32* slotIds,
                                       u32 slotNum, void* option);
 
-/* Data operations (binary blobs) */
-s32 sceNpTusSetData(SceNpTusCtx ctx, u32 slotId,
-                      const void* data, u32 dataSize,
-                      const SceNpTusDataInfo* info, void* option);
-s32 sceNpTusGetData(SceNpTusCtx ctx, const void* npId, u32 slotId,
-                      void* data, u32 dataSize, u32* outDataSize,
-                      SceNpTusDataInfo* outInfo, void* option);
-s32 sceNpTusDeleteMultiSlotData(SceNpTusCtx ctx, const u32* slotIds,
-                                  u32 slotNum, void* option);
+/* Title and transaction contexts, and data slots: the SDK's API. Every pointer is a guest address. A slot's data
+ * is a file of its own (sceNpTus.c), so it lasts from run to run. */
+s32 sceNpTusCreateTitleCtx(u32 communicationId, u32 passphrase, u32 selfNpId);
+s32 sceNpTusDestroyTitleCtx(s32 titleCtxId);
+s32 sceNpTusCreateTransactionCtx(s32 titleCtxId);
+s32 sceNpTusDestroyTransactionCtx(s32 transId);
+s32 sceNpTusSetTimeout(s32 ctxId, u32 timeout);
+s32 sceNpTusAbortTransaction(s32 transId);
+s32 sceNpTusPollAsync(s32 transId, u32 result);
+s32 sceNpTusWaitAsync(s32 transId, u32 result);
 
-/* Poll for async completion */
-s32 sceNpTusPollAsync(SceNpTusRequestId reqId, s32* result);
-s32 sceNpTusWaitAsync(SceNpTusRequestId reqId, s32* result);
-s32 sceNpTusAbortRequest(SceNpTusRequestId reqId);
+/* (transId, targetNpId*, slotId, dataStatus*, dataStatusSize, data*, recvSize, option*) */
+s32 sceNpTusGetData(s32 transId, u32 targetNpId, s32 slotId, u32 dataStatus, u32 dataStatusSize,
+                    u32 data, u32 recvSize, u32 option);
+s32 sceNpTusGetDataAsync(s32 transId, u32 targetNpId, s32 slotId, u32 dataStatus, u32 dataStatusSize,
+                         u32 data, u32 recvSize, u32 option);
+/* (transId, targetNpId*, slotId, totalSize, sendSize, data*, info*, infoStructSize, option*): the ninth argument is
+ * on the guest stack and goes unread; it is reserved (NULL) in the SDK. */
+s32 sceNpTusSetData(s32 transId, u32 targetNpId, s32 slotId, u32 totalSize, u32 sendSize, u32 data,
+                    u32 info, u32 infoStructSize);
+s32 sceNpTusSetDataAsync(s32 transId, u32 targetNpId, s32 slotId, u32 totalSize, u32 sendSize, u32 data,
+                         u32 info, u32 infoStructSize);
+/* (transId, targetNpId*, slotIdArray*, arrayNum, option*) */
+s32 sceNpTusDeleteMultiSlotData(s32 transId, u32 targetNpId, u32 slotIdArray, s32 arrayNum, u32 option);
+s32 sceNpTusDeleteMultiSlotDataAsync(s32 transId, u32 targetNpId, u32 slotIdArray, s32 arrayNum, u32 option);
 
 #ifdef __cplusplus
 }

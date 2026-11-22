@@ -583,6 +583,13 @@ static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
 }
 static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
 
+/* For HLE modules that hand the title a small struct of their own (cellGameUpdate's result): the same scratch
+ * region, never freed. */
+extern "C" unsigned int ps3_hle_guest_alloc(unsigned int size, unsigned int align)
+{
+    return gcm_guest_alloc(size, align);
+}
+
 /* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
  * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
  * gcmReserve calls context->callback(context, count) on ring wrap, which the

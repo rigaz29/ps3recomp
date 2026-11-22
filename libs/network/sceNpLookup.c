@@ -19,9 +19,12 @@
 #include "sceNp.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOOKUP_ERROR_INVALID_ID   0x8002A106u
+#define LOOKUP_ERROR_SERVICE_UNAVAILABLE 0x8002A409u   /* SCE_NP_COMMUNITY_SERVER_ERROR_SERVICE_UNAVAILABLE */
 #define AVATAR_IMAGE_DATA_SIZE    (200u * 1024u)
 
 #define TITLE_MAX 8
@@ -30,6 +33,7 @@
 static int s_lookup_init;
 static int s_titles[TITLE_MAX + 1];
 static int s_trans[TRANS_MAX + 1];   /* 0 free, else owning title */
+static s32 s_trans_result[TRANS_MAX + 1];   /* what PollAsync/WaitAsync report for it */
 
 s32 sceNpLookupInit(void)  { s_lookup_init = 1; return CELL_OK; }
 s32 sceNpLookupTerm(void)  { s_lookup_init = 0; return CELL_OK; }
@@ -55,7 +59,7 @@ s32 sceNpLookupCreateTransactionCtx(s32 titleCtxId)
     if (titleCtxId < 1 || titleCtxId > TITLE_MAX || !s_titles[titleCtxId])
         return (s32)LOOKUP_ERROR_INVALID_ID;
     for (int i = 1; i <= TRANS_MAX; i++)
-        if (!s_trans[i]) { s_trans[i] = titleCtxId; return i; }
+        if (!s_trans[i]) { s_trans[i] = titleCtxId; s_trans_result[i] = 0; return i; }
     return (s32)SCE_NP_ERROR_OUT_OF_MEMORY;
 }
 
@@ -74,11 +78,11 @@ s32 sceNpLookupAbortTransaction(s32 transId)
     return trans_ok(transId) ? CELL_OK : (s32)LOOKUP_ERROR_INVALID_ID;
 }
 
-/* Everything completes at the call. */
+/* Everything completes at the call; the result is the request's own. */
 s32 sceNpLookupPollAsync(s32 transId, u32 result)
 {
     if (!trans_ok(transId)) return (s32)LOOKUP_ERROR_INVALID_ID;
-    if (result) vm_write32(result, 0);
+    if (result) vm_write32(result, (u32)s_trans_result[transId]);
     return 0;
 }
 
@@ -134,4 +138,47 @@ s32 sceNpLookupAvatarImageAsync(s32 transId, u32 avatarUrl, u32 avatarImage, s32
 s32 sceNpLookupAvatarImage(s32 transId, u32 avatarUrl, u32 avatarImage, u32 option)
 {
     return sceNpLookupAvatarImageAsync(transId, avatarUrl, avatarImage, 0, option);
+}
+
+/* Title Small Storage: one small file per title that PSN serves to every player, which titles read their online
+ * settings from. psnr keeps none, so it comes from the file PS3_NP_TSS_FILE names; without one the request fails
+ * as a service that is not there. The title gets the file's bytes as they are (God of War: Ascension's is
+ * encrypted with a key of its own; its writer is that port's business).
+ * (transId, data*, maxSize, contentLength* (a size_t, 32-bit), prio, option) */
+static s32 tss_read(u32 data, u32 maxSize, u32 contentLength)
+{
+    const char* path = getenv("PS3_NP_TSS_FILE");
+    FILE* f = (path && *path) ? fopen(path, "rb") : NULL;
+    if (!f) {
+        printf("[sceNpLookup] TitleSmallStorage: %s\n",
+               (path && *path) ? "PS3_NP_TSS_FILE cannot be opened" : "none here (PS3_NP_TSS_FILE not set)");
+        return (s32)LOOKUP_ERROR_SERVICE_UNAVAILABLE;
+    }
+    fseek(f, 0, SEEK_END);
+    const long whole = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    const u32 n = whole < 0 ? 0 : ((u32)whole > maxSize ? maxSize : (u32)whole);
+    const size_t got = (data && n) ? fread(vm_ptr8(data), 1, n, f) : 0;
+    fclose(f);
+    if (contentLength) vm_write32(contentLength, (u32)got);
+    printf("[sceNpLookup] TitleSmallStorage: %u bytes from %s%s\n", (unsigned)got, path,
+           (u32)whole > maxSize ? " (cut to the title's buffer)" : "");
+    return CELL_OK;
+}
+
+s32 sceNpLookupTitleSmallStorageAsync(s32 transId, u32 data, u32 maxSize, u32 contentLength, s32 prio, u32 option)
+{
+    (void)prio; (void)option;
+    if (!trans_ok(transId)) return (s32)LOOKUP_ERROR_INVALID_ID;
+    if (!data || !maxSize) return (s32)SCE_NP_ERROR_INVALID_ARGUMENT;
+    s_trans_result[transId] = tss_read(data, maxSize, contentLength);
+    return CELL_OK;
+}
+
+s32 sceNpLookupTitleSmallStorage(s32 transId, u32 data, u32 maxSize, u32 contentLength, u32 option)
+{
+    (void)option;
+    if (!trans_ok(transId)) return (s32)LOOKUP_ERROR_INVALID_ID;
+    if (!data || !maxSize) return (s32)SCE_NP_ERROR_INVALID_ARGUMENT;
+    return tss_read(data, maxSize, contentLength);
 }

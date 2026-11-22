@@ -293,6 +293,27 @@ s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
     return CELL_OK;
 }
 
+/* Entitlements: what the account bought on PSN, carried by its ticket. There is no store here, so the account has
+ * none: the list is empty and a lookup by id finds nothing (SCE_NP_ERROR_ID_NOT_FOUND, which titles take as "not
+ * owned"). Unimplemented, both answered CELL_OK with nothing written, and a title read whatever its buffer held as
+ * an entitlement it owned. (entIdList: SceNpEntitlementId[len], 32 bytes each; ent: SceNpEntitlement, 64 bytes) */
+s32 sceNpManagerGetEntitlementIdList(u32 entIdList, u32 len)
+{
+    (void)entIdList; (void)len;
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    return 0;   /* how many there are */
+}
+
+s32 sceNpManagerGetEntitlementById(u32 entId, u32 ent)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!entId) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (ent) memset(vm_ptr8(ent), 0, 64);
+    static int logged;
+    if (logged++ < 16) printf("[sceNp] ManagerGetEntitlementById(\"%.32s\") -> not owned\n", GUEST_PTR(entId, const char*));
+    return SCE_NP_ERROR_ID_NOT_FOUND;
+}
+
 /* Tickets, the account region and the network time come from the PSN
  * servers. Unimplemented, these imports answered CELL_OK with nothing
  * written: a title that requested a ticket waited for a GOT_TICKET event

@@ -32,6 +32,8 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
 | `PS3_NET_HOSTS=name=ip;*.suffix=ip;*=ip` | A host name the title looks up (gethostbyname, cellHttp) gets the address of the first entry that matches it: the exact name, any name under `.suffix`, or `*` for all. Names nothing matches resolve as before. How a title's own servers are pointed at stand-ins. |
 | `PS3_NET_LOOPBACK_ONLY=1` | Connects, datagrams and HTTP requests to anything outside 127.0.0.0/8 fail as unreachable, each destination logged once. For traces that must reach nothing but local stand-ins. |
+| `PS3_NP_TSS_FILE=path` | The title's Title Small Storage (sceNpLookupTitleSmallStorage[Async]): the file's bytes as they are, cut to the title's buffer. Unset, the request fails (SERVICE_UNAVAILABLE). psnr keeps none. |
+| `PS3_NP_TUS_DIR=path` | Where TUS data slots live, one file each: `<dir>/<communication id>/<online id>/slot<n>.tus`. Default `np_tus` beside the exe. |
 | `PS3_NP_TEST_TICKET=1` | Signed in to psnr, a ticket request gets a ticket of our own (NP ticket 2.1 layout, unsigned; account id from the online ID) instead of a failed GOT_TICKET, and sceNpManagerGetTicket / GetTicketParam read it. Nothing on this side checks it, so it only goes to servers of ours. |
 
 ## Two players on one machine
@@ -57,6 +59,10 @@ stage starts, and the title drops the peer as "not responding". Set
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
 | sceNp manager | Reports ONLINE when psnr is set, and fires the manager callback once. Tickets, the account region and the network time answer OFFLINE without psnr; with it a ticket request gets a failed GOT_TICKET at once (psnr issues none), or with `PS3_NP_TEST_TICKET=1` a ticket of our own, and the region (`us`) and the time are local. |
 | sys_net | P2P sockets map to plain UDP/TCP on `PS3_NET_P2P_PORT`. There is no vport multiplexing. |
+| sceNpTus | Title and transaction contexts and data slots as the SDK has them (Get/Set/DeleteMultiSlot data, sync and async), each slot a file under `PS3_NP_TUS_DIR`, so a player's data lasts from run to run. Requests finish at the call. Variables keep in-memory stand-ins. |
+| sceNpLookup (TSS) | Title Small Storage from `PS3_NP_TSS_FILE`. |
+| sceNp entitlements | No store here: the list is empty and a lookup by id finds nothing (`SCE_NP_ERROR_ID_NOT_FOUND`). |
+| cellGameUpdate | Every check finds no update (NO_UPDATE; a finish reports FINISHED), through the title's callback on the next sysutil poll, as RPCS3 answers. |
 | cellSysutilNpEula | The terms-of-service check answers through its callback on the next sysutil poll: ERROR offline (the terms cannot be fetched), ALREADY_ACCEPTED with `PS3_NET_ONLINE=1` or psnr (as RPCS3). "Show the terms" closes at once. |
 
 ## How it was verified

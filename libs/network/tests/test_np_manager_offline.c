@@ -119,6 +119,14 @@ int main(void)
     assert(sceNpManagerRequestTicket2(NPID, 0, SVC, 0, 0, 0, 0) == CELL_OK);            /* same player, same id */
     assert(sceNpManagerGetTicketParam(4, PARAM) == CELL_OK && vm_read64(PARAM) == acct);
 
+    /* No store here: no entitlements, and a lookup finds nothing (its record cleared, not left as it was). */
+    assert(sceNpManagerGetEntitlementIdList(BUF, 10) == 0);
+    memcpy(vm_base + SVC, "EP9000-BCES01741_00-JUDGE0", 27);
+    memset(vm_base + BUF, 0x5A, 64);
+    assert((u32)sceNpManagerGetEntitlementById(SVC, BUF) == SCE_NP_ERROR_ID_NOT_FOUND);
+    for (int i = 0; i < 64; i++) assert(vm_base[BUF + i] == 0);
+    assert((u32)sceNpManagerGetEntitlementById(0, BUF) == SCE_NP_ERROR_INVALID_ARGUMENT);
+
     assert(sceNpTerm() == CELL_OK);
     free(vm_base);
     puts("NP manager offline/psnr checks passed");

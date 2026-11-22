@@ -136,6 +136,15 @@ jobs:
           .\test_net_guard.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # TUS data slots kept as files, Title Small Storage from PS3_NP_TSS_FILE,
+      # and the game update check answering NO_UPDATE.
+      - name: Run the TUS, TSS and game update test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_tus_tss.exe libs/network/tests/test_np_tus_tss.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_tus_tss.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test

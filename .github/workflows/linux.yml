@@ -181,6 +181,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # PS3_NET_HOSTS names and PS3_NET_LOOPBACK_ONLY destinations.
+      - name: Run the net guard test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_net_guard libs/network/tests/test_net_guard.c
+          /tmp/test_net_guard
+
       # The net-start dialog ends cancelled offline and connected with
       # PS3_NET_ONLINE=1, its result word big-endian.
       - name: Run the net-start dialog test

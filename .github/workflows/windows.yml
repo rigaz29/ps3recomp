@@ -128,6 +128,14 @@ jobs:
           .\test_np_identity.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # PS3_NET_HOSTS names and PS3_NET_LOOPBACK_ONLY destinations.
+      - name: Run the net guard test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_net_guard.exe libs/network/tests/test_net_guard.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_guard.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test

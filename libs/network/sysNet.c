@@ -52,6 +52,7 @@
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
 #include "np_psnr.h"   /* np_psnr_p2p_port, NAT traversal on the P2P socket */
+#include "net_guard.h" /* PS3_NET_HOSTS, PS3_NET_LOOPBACK_ONLY */
 
 #include <stdio.h>
 #include <string.h>
@@ -523,6 +524,7 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
 
     char ip[16];
     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
+    if (net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "connect")) return fail(SYS_NET_ENETUNREACH);
     if (s_sockets[s].p2p && s_sockets[s].stream) {
         /* A peer that can't take a direct connection (behind its router):
          * the stream goes through psnr's relay, and its socket replaces
@@ -619,6 +621,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
+    if (net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "sendto")) return fail(SYS_NET_ENETUNREACH);
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
@@ -992,7 +995,10 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+    char given[16];
+    const int mapped = net_guard_host(host, given);
+    if (mapped) hints.ai_flags = AI_NUMERICHOST;
+    if (getaddrinfo(mapped ? given : host, NULL, &hints, &res) != 0 || !res) {
         printf("[sys_net] gethostbyname('%s') failed\n", host);
         if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
         return 0;
@@ -1010,7 +1016,8 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
 
     char ip[16];
-    printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
+    printf("[sys_net] gethostbyname('%s') -> %s%s\n", host, ip_str(&sa->sin_addr, ip),
+           mapped ? " (PS3_NET_HOSTS)" : "");
     freeaddrinfo(res);
     return h;
 }

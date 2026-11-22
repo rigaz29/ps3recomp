@@ -34,6 +34,7 @@ typedef int http_socket_t;
 #define http_closesocket close
 #endif
 #include "host_socket_send.h"
+#include "net_guard.h"   /* PS3_NET_HOSTS, PS3_NET_LOOPBACK_ONLY */
 
 /* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
  * pointer arguments are guest effective addresses, not host pointers. Translate
@@ -496,13 +497,31 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
+    /* The Host header below keeps the title's own name either way. */
+    char given[16];
+    const int mapped = net_guard_host(t->hostname, given);
+    if (mapped) {
+        hints.ai_family = AF_INET;
+        hints.ai_flags  = AI_NUMERICHOST;
+        printf("[cellHttp]   %s -> %s (PS3_NET_HOSTS)\n", t->hostname, given);
+    }
     struct addrinfo* result = NULL;
-    int gai = getaddrinfo(t->hostname, port_str, &hints, &result);
+    int gai = getaddrinfo(mapped ? given : t->hostname, port_str, &hints, &result);
     if (gai != 0 || !result) {
         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
+    }
+    {
+        static const unsigned char not_v4[4] = { 0, 0, 0, 0 };
+        const void* a4 = result->ai_family == AF_INET
+                       ? (const void*)&((const struct sockaddr_in*)result->ai_addr)->sin_addr : (const void*)not_v4;
+        if (net_guard_blocked(a4, t->port, "HTTP request")) {
+            freeaddrinfo(result);
+            if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+            return CELL_HTTP_ERROR_CONNECTION_FAILED;
+        }
     }
 
     /* ---- Create socket and connect ---- */

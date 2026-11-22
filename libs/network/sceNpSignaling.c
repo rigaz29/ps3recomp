@@ -22,6 +22,12 @@ typedef struct {
 
 static SignalingCtx s_ctx[SCE_NP_SIGNALING_CTX_MAX];
 
+/* There is no sceNpSignalingInit in the firmware's export list; titles create
+ * contexts right after sceNpInit (God of War: Ascension's SAM transport does),
+ * so a context is allowed once either has run. */
+int np_is_initialized(void);
+static int sig_ready(void) { return s_initialized || np_is_initialized(); }
+
 /* Lifecycle */
 
 s32 sceNpSignalingInit(void)
@@ -49,7 +55,7 @@ s32 sceNpSignalingCreateCtx(const void* npId, SceNpSignalingHandler handler,
     (void)npId;
     printf("[sceNpSignaling] CreateCtx()\n");
 
-    if (!s_initialized) return (s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+    if (!sig_ready()) return (s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED;
     if (!ctxId) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < SCE_NP_SIGNALING_CTX_MAX; i++) {

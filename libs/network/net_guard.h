@@ -12,6 +12,11 @@
  * PS3_NET_LOOPBACK_ONLY=1: connects, datagrams and HTTP requests to anything
  * outside 127.0.0.0/8 fail as unreachable, each destination reported once.
  * For runs that must reach nothing but local stand-ins.
+ *
+ * PS3_NET_ALLOW="a.b.c.d,e.f.g.0/24": with PS3_NET_LOOPBACK_ONLY, these may
+ * be reached as well -- the servers a player plays through when they are on
+ * another machine. sysNet lets the peers signaling names through on the P2P
+ * sockets too (sys_net_allow_peer).
  */
 #ifndef NET_GUARD_H
 #define NET_GUARD_H
@@ -62,8 +67,36 @@ static inline int net_guard_host(const char* name, char ip[16])
     return 0;
 }
 
+/* 1 when addr (four bytes, network order) is in PS3_NET_ALLOW. */
+static inline int net_guard_listed(const unsigned char* b)
+{
+    static int parsed;
+    static unsigned nets[16], masks[16];
+    static int n;
+    if (!parsed) {
+        const char* e = getenv("PS3_NET_ALLOW");
+        while (e && *e && n < 16) {
+            unsigned q[4] = {0, 0, 0, 0}, bits = 32;
+            int got = sscanf(e, "%u.%u.%u.%u/%u", &q[0], &q[1], &q[2], &q[3], &bits);
+            if (got >= 4 && q[0] < 256 && q[1] < 256 && q[2] < 256 && q[3] < 256 && bits <= 32) {
+                masks[n] = bits ? 0xFFFFFFFFu << (32 - bits) : 0;
+                nets[n] = (q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3]) & masks[n];
+                n++;
+            }
+            const char* comma = strchr(e, ',');
+            e = comma ? comma + 1 : NULL;
+        }
+        parsed = 1;
+    }
+    const unsigned a = (unsigned)b[0] << 24 | (unsigned)b[1] << 16 | (unsigned)b[2] << 8 | b[3];
+    for (int i = 0; i < n; i++)
+        if ((a & masks[i]) == nets[i]) return 1;
+    return 0;
+}
+
 /* 1 (and a report, once per destination) when PS3_NET_LOOPBACK_ONLY is set
- * and addr -- four bytes in network order -- is outside 127.0.0.0/8. */
+ * and addr -- four bytes in network order -- is outside 127.0.0.0/8 and not
+ * in PS3_NET_ALLOW. */
 static inline int net_guard_blocked(const void* addr, unsigned port, const char* what)
 {
     static int on = -1;
@@ -72,7 +105,7 @@ static inline int net_guard_blocked(const void* addr, unsigned port, const char*
     if (on < 0) on = getenv("PS3_NET_LOOPBACK_ONLY") ? 1 : 0;
     if (!on) return 0;
     const unsigned char* b = (const unsigned char*)addr;
-    if (b[0] == 127) return 0;
+    if (b[0] == 127 || net_guard_listed(b)) return 0;
     const unsigned key = ((unsigned)b[0] << 24 | (unsigned)b[1] << 16 | (unsigned)b[2] << 8 | b[3]) ^ (port * 2654435761u);
     for (int i = 0; i < nseen; i++)
         if (seen[i] == key) return 1;

@@ -360,6 +360,34 @@ static int relayed_pending(int32_t s)
  * title's own traffic. ponytail: the first one bound; titles have one. */
 static int s_p2p_dgram = -1;
 
+/* Peers sceNpSignaling hands the title: their addresses pass the network
+ * guard on the P2P sockets (net_guard.h). ponytail: a short list, kept for
+ * the process; titles meet a handful of players. */
+#define GUARD_PEERS 64
+static uint32_t s_guard_peers[GUARD_PEERS];
+static volatile int s_guard_npeers;
+
+void sys_net_allow_peer(const uint8_t ip[4])
+{
+    uint32_t a;
+    memcpy(&a, ip, 4);
+    for (int i = 0; i < s_guard_npeers; i++)
+        if (s_guard_peers[i] == a) return;
+    if (s_guard_npeers < GUARD_PEERS) {
+        s_guard_peers[s_guard_npeers] = a;
+        s_guard_npeers = s_guard_npeers + 1;
+    }
+}
+
+static int guard_peer(const void* addr)
+{
+    uint32_t a;
+    memcpy(&a, addr, 4);
+    for (int i = 0; i < s_guard_npeers; i++)
+        if (s_guard_peers[i] == a) return 1;
+    return 0;
+}
+
 static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
 {
     struct sockaddr_in a;
@@ -524,7 +552,8 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
 
     char ip[16];
     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
-    if (net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "connect")) return fail(SYS_NET_ENETUNREACH);
+    if (!(s_sockets[s].p2p && guard_peer(&a.sin_addr)) && net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "connect"))
+        return fail(SYS_NET_ENETUNREACH);
     if (s_sockets[s].p2p && s_sockets[s].stream) {
         /* A peer that can't take a direct connection (behind its router):
          * the stream goes through psnr's relay, and its socket replaces
@@ -621,7 +650,8 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
-    if (net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "sendto")) return fail(SYS_NET_ENETUNREACH);
+    if (!(s_sockets[s].p2p && guard_peer(&a.sin_addr)) && net_guard_blocked(&a.sin_addr, ntohs(a.sin_port), "sendto"))
+        return fail(SYS_NET_ENETUNREACH);
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */

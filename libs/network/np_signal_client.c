@@ -56,6 +56,9 @@ struct npsig_client {
     size_t   rx_len;
     uint64_t last_send;
     int      dead;
+    uint32_t welcome_token;
+    uint16_t welcome_udp;
+    uint8_t  welcome_flags;
 };
 
 static uint64_t now_ms(void)
@@ -140,7 +143,7 @@ static void parse(const uint8_t* f, size_t n, npsig_msg* out)
     if (out->type == NPSIG_WELCOME && left >= 4) memcpy(out->ip, p, 4);
     if (out->type == NPSIG_REFUSED && left >= 1) out->found = p[0];
     if ((out->type == NPSIG_PEER || out->type == NPSIG_ACTIVATED || out->type == NPSIG_DEACTIVATED ||
-         out->type == NPSIG_GONE) && left >= 16) {
+         out->type == NPSIG_GONE || out->type == NPSIG_MOVED) && left >= 16) {
         memcpy(out->peer, p, 16);
         p += 16;
         left -= 16;
@@ -149,7 +152,7 @@ static void parse(const uint8_t* f, size_t n, npsig_msg* out)
             memcpy(out->ip, p + 1, 4);
             out->port = (uint16_t)(p[5] << 8 | p[6]);
         }
-        if (out->type == NPSIG_ACTIVATED && left >= 6) {
+        if ((out->type == NPSIG_ACTIVATED || out->type == NPSIG_MOVED) && left >= 6) {
             memcpy(out->ip, p, 4);
             out->port = (uint16_t)(p[4] << 8 | p[5]);
         }
@@ -176,7 +179,7 @@ static void drop_front(npsig_client* c, size_t n)
 }
 
 npsig_client* npsig_connect(const char* host, uint16_t port, const char* online_id, uint16_t p2p_port,
-                            int timeout_ms, uint8_t out_ip[4], int* refused)
+                            int timeout_ms, npsig_welcome* out, int* refused)
 {
     struct addrinfo hints, *res = NULL;
     char service[8];
@@ -206,10 +209,20 @@ npsig_client* npsig_connect(const char* host, uint16_t port, const char* online_
     npsig_client* c = calloc(1, sizeof(*c));
     if (!c) { sock_close(s); return NULL; }
     c->s = s;
-    uint8_t hello[18];
+    /* Both ends of the connection: ours is this machine's address toward
+     * the server (what a peer behind the same router reaches us at), theirs
+     * where UDP probes and the relay go. */
+    struct sockaddr_in me, srv;
+    socklen_t ml = sizeof(me), sl = sizeof(srv);
+    memset(&me, 0, sizeof(me));
+    memset(&srv, 0, sizeof(srv));
+    getsockname(s, (struct sockaddr*)&me, &ml);
+    getpeername(s, (struct sockaddr*)&srv, &sl);
+    uint8_t hello[22];
     put_id(hello, online_id);
     hello[16] = (uint8_t)(p2p_port >> 8);
     hello[17] = (uint8_t)p2p_port;
+    memcpy(hello + 18, &me.sin_addr, 4);
     if (send_msg(c, NPSIG_HELLO, hello, sizeof(hello)) < 0) { npsig_close(c); return NULL; }
 
     uint64_t end = now_ms() + (uint64_t)timeout_ms;
@@ -218,9 +231,22 @@ npsig_client* npsig_connect(const char* host, uint16_t port, const char* online_
         if (n) {
             npsig_msg m;
             parse(c->rx, n, &m);
+            if (m.type == NPSIG_WELCOME && n >= 3 + 11) {
+                const uint8_t* w = c->rx + 3 + 4;
+                c->welcome_token = (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3];
+                c->welcome_udp = (uint16_t)(w[4] << 8 | w[5]);
+                c->welcome_flags = w[6];
+            }
             drop_front(c, n);
             if (m.type == NPSIG_WELCOME) {
-                if (out_ip) memcpy(out_ip, m.ip, 4);
+                if (out) {
+                    memset(out, 0, sizeof(*out));
+                    memcpy(out->ip, m.ip, 4);
+                    out->token = c->welcome_token;
+                    out->udp_port = c->welcome_udp;
+                    out->flags = c->welcome_flags;
+                    memcpy(out->server_ip, &srv.sin_addr, 4);
+                }
                 return c;
             }
             if (m.type == NPSIG_REFUSED && refused) *refused = m.found ? m.found : -1;
@@ -264,4 +290,59 @@ void npsig_close(npsig_client* c)
     if (!c) return;
     if (c->s != BAD_SOCK) sock_close(c->s);
     free(c);
+}
+
+/* ---- UDP datagrams ---- */
+
+static size_t udp_head(uint8_t* out, size_t cap, uint8_t type, const char* online_id)
+{
+    if (cap < NPSIG_UDP_HEAD) return 0;
+    memcpy(out, "NPSG", 4);
+    out[4] = type;
+    put_id(out + 5, online_id);
+    return NPSIG_UDP_HEAD;
+}
+
+size_t npsig_udp_probe(uint8_t* out, size_t cap, const char* online_id, uint32_t token)
+{
+    if (cap < NPSIG_UDP_HEAD + 4 || !udp_head(out, cap, NPSIG_U_PROBE, online_id)) return 0;
+    out[21] = (uint8_t)(token >> 24);
+    out[22] = (uint8_t)(token >> 16);
+    out[23] = (uint8_t)(token >> 8);
+    out[24] = (uint8_t)token;
+    return NPSIG_UDP_HEAD + 4;
+}
+
+size_t npsig_udp_punch(uint8_t* out, size_t cap, uint8_t type, const char* online_id)
+{
+    return udp_head(out, cap, type, online_id);
+}
+
+size_t npsig_udp_relay(uint8_t* out, size_t cap, const char* to_online_id, const void* payload, size_t len)
+{
+    if (cap < NPSIG_UDP_HEAD + len || !udp_head(out, cap, NPSIG_U_RELAY, to_online_id)) return 0;
+    memcpy(out + NPSIG_UDP_HEAD, payload, len);
+    return NPSIG_UDP_HEAD + len;
+}
+
+int npsig_udp_parse(const void* buf, size_t len, npsig_udp* out)
+{
+    const uint8_t* b = (const uint8_t*)buf;
+    memset(out, 0, sizeof(*out));
+    if (len < 5 || memcmp(b, "NPSG", 4) != 0) return 0;
+    uint8_t type = b[4];
+    if (type == NPSIG_U_PROBE_REPLY && len >= 11) {
+        memcpy(out->ip, b + 5, 4);
+        out->port = (uint16_t)(b[9] << 8 | b[10]);
+        out->type = type;
+    } else if ((type == NPSIG_U_PUNCH || type == NPSIG_U_PUNCH_ACK || type == NPSIG_U_RELAYED) &&
+               len >= NPSIG_UDP_HEAD) {
+        memcpy(out->peer, b + 5, 16);
+        if (type == NPSIG_U_RELAYED) {
+            out->payload = b + NPSIG_UDP_HEAD;
+            out->len = len - NPSIG_UDP_HEAD;
+        }
+        out->type = type;
+    }
+    return 1;
 }

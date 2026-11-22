@@ -19,5 +19,10 @@ int np_psnr_enabled(void) { return 0; }
 const char* np_psnr_online_id(void) { return "PS3Player"; }
 uint16_t np_psnr_p2p_port(void) { return 3658; }                  /* test_np_signaling_after_np_init */
 void np_psnr_add_tick(void (*fn)(void)) { (void)fn; }
+void np_psnr_set_p2p_hooks(int (*f)(void*, uint32_t*, uint8_t*, uint16_t*),
+                           int (*r)(const void*, uint32_t, const uint8_t*, uint16_t)) { (void)f; (void)r; }
+int np_psnr_p2p_send(const void* b, uint32_t n, const uint8_t ip[4], uint16_t port)
+{ (void)b; (void)n; (void)ip; (void)port; return -1; }
+void sys_net_allow_peer(const uint8_t ip[4]) { (void)ip; }
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
 void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }   /* sceNpDrmIsAvailable (#274) */

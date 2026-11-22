@@ -259,6 +259,21 @@ void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)
     s_stream_sink = fn;
 }
 
+static np_p2p_filter_fn s_extra_filter;
+static np_p2p_route_fn  s_extra_route;
+
+void np_psnr_set_p2p_hooks(np_p2p_filter_fn filter, np_p2p_route_fn route)
+{
+    s_extra_filter = filter;
+    s_extra_route = route;
+}
+
+int np_psnr_p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
+{
+    np_psnr_p2p_send_fn fn = s_p2p_send;
+    return fn ? fn(buf, len, ip, port) : -1;
+}
+
 int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port)
 {
     uint8_t ip[4];
@@ -268,6 +283,7 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
     size_t plen;
     int drop = 1;
 
+    if (s_extra_filter && s_extra_filter(buf, len, from_ip, from_port)) return 1;
     if (!psnr_is_control(buf, *len)) {
         LOCK();
         struct peer* p = peer_at(from_ip, *from_port);
@@ -334,6 +350,7 @@ int np_psnr_p2p_route(const void* buf, uint32_t len, const uint8_t ip[4], uint16
     uint8_t stack[1536], *pkt = stack, sip[4];
     uint16_t sport;
     uint32_t to = 0;
+    if (s_extra_route && s_extra_route(buf, len, ip, port)) return 1;
     LOCK();
     struct peer* p = peer_at(ip, port);
     if (p && p->relay_udp) to = p->user;

@@ -29,10 +29,12 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_OPEN_PSID=<32 hex>` | Set the OpenPSID outright instead. |
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
 | `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000 (Matching2); for sceNpSignaling, how long after the signaling server answers, default 500. |
+| `PS3_NP_SIGNALING_RELAY=1` | sceNpSignaling sends every peer's datagrams through the signaling server's relay, never directly. |
 | `PS3_NP_SIGNALING_SERVER=host[:port]` | The signaling server for sceNpSignaling (`tools/np_signaling_server.py`, port 36101 by default): where a peer named by its NP ID is, for titles that find their players through servers of their own. Unset, an activated connection ends DEAD (PEER_UNREACHABLE). |
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
 | `PS3_NET_HOSTS=name=ip;*.suffix=ip;*=ip` | A host name the title looks up (gethostbyname, cellHttp) gets the address of the first entry that matches it: the exact name, any name under `.suffix`, or `*` for all. Names nothing matches resolve as before. How a title's own servers are pointed at stand-ins. |
 | `PS3_NET_LOOPBACK_ONLY=1` | Connects, datagrams and HTTP requests to anything outside 127.0.0.0/8 fail as unreachable, each destination logged once. For traces that must reach nothing but local stand-ins. |
+| `PS3_NET_ALLOW=a.b.c.d,e.f.g.0/24` | With `PS3_NET_LOOPBACK_ONLY`, these addresses may be reached too: the servers a player plays through on another machine. The peers sceNpSignaling introduces pass on the P2P sockets as well. |
 | `PS3_NP_TSS_FILE=path` | The title's Title Small Storage (sceNpLookupTitleSmallStorage[Async]): the file's bytes as they are, cut to the title's buffer. Unset, the request fails (SERVICE_UNAVAILABLE). psnr keeps none. |
 | `PS3_NP_TUS_DIR=path` | Where TUS data slots live, one file each: `<dir>/<communication id>/<online id>/slot<n>.tus`. Default `np_tus` beside the exe. |
 | `PS3_NP_TEST_TICKET=1` | Signed in to psnr, a ticket request gets a ticket of our own (NP ticket 2.1 layout, unsigned; account id from the online ID) instead of a failed GOT_TICKET, and sceNpManagerGetTicket / GetTicketParam read it. Nothing on this side checks it, so it only goes to servers of ours. |
@@ -69,9 +71,22 @@ PS3_NP_SIGNALING_SERVER=127.0.0.1 PS3_NET_P2P_PORT=3658 PS3_NP_ONLINE_ID=PlayerA
 PS3_NP_SIGNALING_SERVER=127.0.0.1 PS3_NET_P2P_PORT=3659 PS3_NP_ONLINE_ID=PlayerB ...
 ```
 
-A peer's address is the one the server sees it at, so players behind
-different routers need their P2P port reachable (forwarded); there is no NAT
-traversal or relay on this path yet.
+Players on other networks: the title's P2P socket probes the server's UDP
+port (the same number), so the server can hand peers that socket's public
+endpoint; both sides then punch toward each other, and a punch answered both
+ways makes the path direct. A peer that has not answered after 3 seconds gets
+the title's datagrams through the server's relay (or always, with
+`PS3_NP_SIGNALING_RELAY=1`), and ESTABLISHED waits for one path or the other.
+Players behind the same router get each other's own network address, and a
+player on the server's own machine is handed out at the address the other
+player reaches the server at (never as loopback). A server
+behind a router takes `--public-ip` and needs TCP and UDP 36101 forwarded;
+`--no-relay` turns the relay off.
+
+```
+python3 tools/np_signaling_server.py --public-ip 203.0.113.10
+PS3_NP_SIGNALING_SERVER=203.0.113.10 PS3_NET_LOOPBACK_ONLY=1 PS3_NET_ALLOW=203.0.113.10 ...
+```
 
 ## What is implemented
 

@@ -88,6 +88,16 @@ void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
  * the sender, become the peer's payload and address. */
 int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port);
 
+/* Another user of the P2P socket: sceNpSignaling's NAT traversal and relay.
+ * Its filter sees each datagram first (1: drop it; 0: the title's, maybe
+ * unwrapped in place), its router each one the title sends (1: it went
+ * through the relay). np_psnr_p2p_send sends from the socket (-1 while
+ * none is bound). */
+typedef int (*np_p2p_filter_fn)(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port);
+typedef int (*np_p2p_route_fn)(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port);
+void np_psnr_set_p2p_hooks(np_p2p_filter_fn filter, np_p2p_route_fn route);
+int  np_psnr_p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port);
+
 /* A peer's P2P endpoint became known (Matching2 member entries): punch toward
  * it a few times. Our own entry is skipped. */
 void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port);

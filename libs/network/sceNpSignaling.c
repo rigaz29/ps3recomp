@@ -11,6 +11,15 @@
  * peer that cannot be found within 15 seconds gives DEAD (TIMEOUT), one
  * that leaves DEAD (TERMINATED_BY_PEER).
  *
+ * Players on other networks: the title's P2P socket probes the server's UDP
+ * port (so the server can tell peers how that socket looks from outside),
+ * and once a peer's address is known both sides punch toward each other. A
+ * punch answered both ways makes the path direct; a peer still silent after
+ * 3 seconds gets our datagrams through the server's relay (always, with
+ * PS3_NP_SIGNALING_RELAY=1). ESTABLISHED waits for one or the other; with
+ * neither after 15 seconds the connection is DEAD (PEER_UNREACHABLE). The
+ * signaling datagrams never reach the title (np_psnr's P2P hooks).
+ *
  * Handler calls are queued for the title's next cellSysutilCheckCallback,
  * which also runs np_signaling_pump through np_psnr's ticks.
  */
@@ -39,12 +48,19 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
 int np_is_initialized(void);
+void sys_net_allow_peer(const uint8_t ip[4]);   /* sysNet.c: the network guard lets peers through */
 
 #define ACTIVATE_TIMEOUT_MS 15000
 #define ACTIVATE_RETRY_MS   1000
 #define RTT_US              20000u      /* GetConnectionInfo: what we report */
 #define BANDWIDTH_BPS       10000000u
 #define NETINFO_REQ_MAX     8
+#define PROBE_MS            500         /* until the server answers a probe */
+#define REPROBE_MS          20000       /* then now and then: routers forget idle mappings */
+#define PUNCH_MS            200
+#define PUNCHES_FAST        10          /* then one a second */
+#define DIRECT_WAIT_MS      3000        /* no answer to our punches by then: the relay */
+#define GIVE_UP_MS          15000       /* no path at all by then: DEAD */
 
 static int s_initialized = 0;
 
@@ -70,6 +86,13 @@ typedef struct {
     int established_sent, mutual_sent;
     uint64_t due;              /* when ESTABLISHED (and MUTUAL) may go out */
     uint64_t deadline, retry_at;
+    /* the path to the peer's P2P socket */
+    int direct;                /* a punch of ours was answered */
+    int relay;                 /* our datagrams to it go through the server */
+    int punches;
+    uint64_t next_punch, path_since;
+    u8 prev_ip[4];             /* where it was before a MOVED, for datagrams already on their way */
+    u16 prev_port;
 } SignalingConn;
 
 typedef struct {
@@ -85,8 +108,12 @@ static SignalingCtx  s_ctx[SCE_NP_SIGNALING_CTX_MAX];      /* ctx id = index + 1
 static SignalingConn s_conn[SCE_NP_SIGNALING_CONN_MAX];    /* conn id = index + 1 */
 static NetInfoReq    s_req[NETINFO_REQ_MAX];               /* req id = index + 1 */
 static npsig_client* s_server;
-static u8  s_mapped_ip[4] = {127, 0, 0, 1};
-static int s_tick_added;
+static npsig_welcome s_welcome;
+static u8  s_mapped_ip[4] = {127, 0, 0, 1};   /* our P2P socket as the server sees it */
+static u16 s_mapped_port;
+static int s_probed;
+static uint64_t s_next_probe;
+static int s_tick_added, s_hooks_added;
 
 static int sig_ready(void) { return s_initialized || np_is_initialized(); }
 
@@ -155,6 +182,41 @@ static SignalingConn* new_conn(u32 ctx, const char* peer)
 
 static void free_conn(SignalingConn* c) { memset(c, 0, sizeof(*c)); }
 
+static int force_relay(void)
+{
+    const char* v = getenv("PS3_NP_SIGNALING_RELAY");
+    return v && *v && *v != '0';
+}
+
+static int relay_available(void)
+{
+    return s_server && s_welcome.udp_port && (s_welcome.flags & NPSIG_WELCOME_RELAY) && s_probed;
+}
+
+/* The peer's P2P socket is (now) at c->ip:c->port: find the path to it. */
+static void start_path(SignalingConn* c)
+{
+    uint64_t now = now_ms();
+    c->direct = 0;
+    c->relay = 0;
+    c->punches = 0;
+    c->next_punch = now;
+    c->path_since = now;
+    sys_net_allow_peer(c->ip);
+}
+
+static SignalingConn* conn_by_peer(const char* peer)
+{
+    for (int i = 0; i < SCE_NP_SIGNALING_CONN_MAX; i++)
+        if (s_conn[i].in_use && strncmp(s_conn[i].peer, peer, 16) == 0) return &s_conn[i];
+    return NULL;
+}
+
+static int at(const SignalingConn* c, const uint8_t ip[4], uint16_t port)
+{
+    return (memcmp(c->ip, ip, 4) == 0 && c->port == port) || (memcmp(c->prev_ip, ip, 4) == 0 && c->prev_port == port);
+}
+
 /* Queue the handlers' call: the main handler takes DEAD, ESTABLISHED and
  * the net-info events; the extended handler takes every event. */
 static void emit(u32 ctx, u32 subject, s32 event, s32 error)
@@ -195,11 +257,16 @@ static void server_connect(void)
     char* colon = strrchr(host, ':');
     if (colon) { *colon = 0; port = (uint16_t)atoi(colon + 1); }
     int refused = 0;
-    s_server = npsig_connect(host, port, np_psnr_online_id(), np_psnr_p2p_port(), 3000, s_mapped_ip, &refused);
-    if (s_server)
-        printf("[sceNpSignaling] signaling server %s:%u: \"%s\", P2P port %u, seen from %u.%u.%u.%u\n", host, port,
-               np_psnr_online_id(), np_psnr_p2p_port(), s_mapped_ip[0], s_mapped_ip[1], s_mapped_ip[2],
-               s_mapped_ip[3]);
+    s_server = npsig_connect(host, port, np_psnr_online_id(), np_psnr_p2p_port(), 3000, &s_welcome, &refused);
+    if (s_server) {
+        memcpy(s_mapped_ip, s_welcome.ip, 4);
+        s_probed = 0;
+        s_next_probe = 0;
+        printf("[sceNpSignaling] signaling server %s:%u: \"%s\", P2P port %u, seen from %u.%u.%u.%u%s%s\n", host,
+               port, np_psnr_online_id(), np_psnr_p2p_port(), s_mapped_ip[0], s_mapped_ip[1], s_mapped_ip[2],
+               s_mapped_ip[3], s_welcome.udp_port ? "" : " (no UDP: no probes, no relay)",
+               (s_welcome.flags & NPSIG_WELCOME_RELAY) ? ", relays" : "");
+    }
     else if (refused == NPSIG_REFUSED_NAME_TAKEN)
         printf("[sceNpSignaling] signaling server %s:%u: another player is \"%s\"\n", host, port,
                np_psnr_online_id());
@@ -216,6 +283,7 @@ static void make_active(SignalingConn* c, const u8 ip[4], u16 port)
     c->known = 1;
     c->status = SCE_NP_SIGNALING_CONN_STATUS_ACTIVE;
     if (!c->due) c->due = now_ms() + delay_ms();
+    start_path(c);
 }
 
 /* The peer activated first: its address is known, the connection ACTIVE. */
@@ -226,6 +294,7 @@ static void peer_opened(SignalingConn* c, const npsig_msg* m)
     c->port = m->port;
     c->known = 1;
     c->status = SCE_NP_SIGNALING_CONN_STATUS_ACTIVE;
+    start_path(c);
     emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_EXT_PEER_ACTIVATED, 0);
 }
 
@@ -258,6 +327,17 @@ static void on_message(const npsig_msg* m)
             emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_EXT_PEER_DEACTIVATED, 0);
             if (!c->we_active) free_conn(c);
             break;
+        case NPSIG_MOVED:
+            if (!c->known || (memcmp(c->ip, m->ip, 4) == 0 && c->port == m->port)) break;
+            printf("[sceNpSignaling] \"%s\" is at %u.%u.%u.%u:%u from here\n", c->peer, m->ip[0], m->ip[1], m->ip[2],
+                   m->ip[3], m->port);
+            memcpy(c->prev_ip, c->ip, 4);
+            c->prev_port = c->port;
+            memcpy(c->ip, m->ip, 4);
+            c->port = m->port;
+            if (!c->direct) start_path(c);
+            else sys_net_allow_peer(c->ip);
+            break;
         case NPSIG_GONE:
             if (c->status != SCE_NP_SIGNALING_CONN_STATUS_INACTIVE)
                 emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_DEAD, (s32)SCE_NP_SIGNALING_ERROR_TERMINATED_BY_PEER);
@@ -288,6 +368,101 @@ static void on_message(const npsig_msg* m)
         }
 }
 
+/* Every datagram on the title's P2P socket, first (np_psnr's hook): ours
+ * are kept from the title, a relayed one becomes the peer's own. */
+static int signal_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port)
+{
+    npsig_udp u;
+    uint8_t ack[NPSIG_UDP_HEAD];
+    if (!npsig_udp_parse(buf, *len, &u)) return 0;
+    LOCK();
+    SignalingConn* c = u.peer[0] ? conn_by_peer(u.peer) : NULL;
+    switch (u.type) {
+    case NPSIG_U_PROBE_REPLY:
+        if (memcmp(from_ip, s_welcome.server_ip, 4) == 0 && *from_port == s_welcome.udp_port) {
+            if (!s_probed || memcmp(s_mapped_ip, u.ip, 4) != 0 || s_mapped_port != u.port)
+                printf("[sceNpSignaling] our P2P socket is %u.%u.%u.%u:%u from the server\n", u.ip[0], u.ip[1],
+                       u.ip[2], u.ip[3], u.port);
+            s_probed = 1;
+            memcpy(s_mapped_ip, u.ip, 4);
+            s_mapped_port = u.port;
+            s_next_probe = now_ms() + REPROBE_MS;
+        }
+        break;
+    case NPSIG_U_PUNCH:
+        /* Answer, whoever it is: the peer learns its datagrams reach us and
+         * ours reach it. A peer seen at another port than we were told
+         * (its router's doing) is answered, and reached, there. */
+        if (c && c->known && !at(c, from_ip, *from_port)) {
+            memcpy(c->prev_ip, c->ip, 4);
+            c->prev_port = c->port;
+            memcpy(c->ip, from_ip, 4);
+            c->port = *from_port;
+            sys_net_allow_peer(c->ip);
+        }
+        np_psnr_p2p_send(ack, (uint32_t)npsig_udp_punch(ack, sizeof(ack), NPSIG_U_PUNCH_ACK, np_psnr_online_id()),
+                         from_ip, *from_port);
+        break;
+    case NPSIG_U_PUNCH_ACK:
+        if (c && !c->direct) {
+            c->direct = 1;
+            if (c->relay && !force_relay()) c->relay = 0;
+            printf("[sceNpSignaling] \"%s\" at %u.%u.%u.%u:%u: direct\n", c->peer, from_ip[0], from_ip[1],
+                   from_ip[2], from_ip[3], *from_port);
+        }
+        break;
+    case NPSIG_U_RELAYED:
+        if (c && c->known && memcmp(from_ip, s_welcome.server_ip, 4) == 0) {
+            memmove(buf, u.payload, u.len);
+            *len = (uint32_t)u.len;
+            memcpy(from_ip, c->ip, 4);
+            *from_port = c->port;
+            UNLOCK();
+            return 0;
+        }
+        break;
+    }
+    UNLOCK();
+    return 1;
+}
+
+/* Every datagram the title sends from its P2P socket (np_psnr's hook): to a
+ * peer on the relay, it goes to the server wrapped; to a peer's old address
+ * (before its router showed another), to the new one. */
+static int signal_route(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
+{
+    char peer[17];
+    uint8_t now_ip[4];
+    uint16_t now_port = 0;
+    peer[0] = 0;
+    LOCK();
+    for (int i = 0; i < SCE_NP_SIGNALING_CONN_MAX && !peer[0] && !now_port; i++) {
+        const SignalingConn* c = &s_conn[i];
+        if (!c->in_use || !at(c, ip, port)) continue;
+        if (c->relay) memcpy(peer, c->peer, 17);
+        else if (c->direct && (memcmp(c->ip, ip, 4) != 0 || c->port != port)) {
+            memcpy(now_ip, c->ip, 4);
+            now_port = c->port;
+        }
+    }
+    uint8_t sip[4];
+    memcpy(sip, s_welcome.server_ip, 4);
+    uint16_t sport = s_welcome.udp_port;
+    UNLOCK();
+    if (now_port) {
+        np_psnr_p2p_send(buf, len, now_ip, now_port);
+        return 1;
+    }
+    if (!peer[0]) return 0;
+    uint8_t stack[1600], *pkt = stack;
+    size_t cap = NPSIG_UDP_HEAD + (size_t)len;
+    if (cap > sizeof(stack) && !(pkt = (uint8_t*)malloc(cap))) return 0;
+    size_t n = npsig_udp_relay(pkt, cap, peer, buf, len);
+    np_psnr_p2p_send(pkt, (uint32_t)n, sip, sport);
+    if (pkt != stack) free(pkt);
+    return 1;
+}
+
 void np_signaling_pump(void)
 {
     npsig_msg m;
@@ -299,9 +474,37 @@ void np_signaling_pump(void)
         on_message(&m);
     }
     uint64_t now = now_ms();
+    uint8_t pkt[NPSIG_UDP_HEAD + 8];
+    /* Probe the server from the P2P socket (once the title has bound it). */
+    if (s_server && s_welcome.udp_port && now >= s_next_probe) {
+        size_t n = npsig_udp_probe(pkt, sizeof(pkt), np_psnr_online_id(), s_welcome.token);
+        if (np_psnr_p2p_send(pkt, (uint32_t)n, s_welcome.server_ip, s_welcome.udp_port) >= 0)
+            s_next_probe = now + (s_probed ? REPROBE_MS : PROBE_MS);
+    }
     for (int i = 0; i < SCE_NP_SIGNALING_CONN_MAX; i++) {
         SignalingConn* c = &s_conn[i];
         if (!c->in_use) continue;
+        if (c->known && !c->direct) {
+            /* Punch toward the peer until one is answered (the relay too: a
+             * direct path found later takes over). */
+            if (now >= c->next_punch && !force_relay()) {
+                size_t n = npsig_udp_punch(pkt, sizeof(pkt), NPSIG_U_PUNCH, np_psnr_online_id());
+                if (np_psnr_p2p_send(pkt, (uint32_t)n, c->ip, c->port) >= 0) c->punches++;
+                c->next_punch = now + (c->punches < PUNCHES_FAST ? PUNCH_MS : 1000);
+            }
+            if (!c->relay && (force_relay() || now - c->path_since >= DIRECT_WAIT_MS) && relay_available()) {
+                c->relay = 1;
+                printf("[sceNpSignaling] \"%s\" at %u.%u.%u.%u:%u: %s, through the relay\n", c->peer, c->ip[0],
+                       c->ip[1], c->ip[2], c->ip[3], c->port, force_relay() ? "PS3_NP_SIGNALING_RELAY" : "no answer");
+            }
+            if (!c->relay && now - c->path_since >= GIVE_UP_MS) {
+                printf("[sceNpSignaling] \"%s\" at %u.%u.%u.%u:%u never answered\n", c->peer, c->ip[0], c->ip[1],
+                       c->ip[2], c->ip[3], c->port);
+                emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_DEAD, (s32)SCE_NP_SIGNALING_ERROR_PEER_UNREACHABLE);
+                free_conn(c);
+                continue;
+            }
+        }
         if (c->we_active && !c->known && (!s_server || now >= c->deadline)) {
             emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_DEAD,
                  (s32)(s_server ? SCE_NP_SIGNALING_ERROR_TIMEOUT : SCE_NP_SIGNALING_ERROR_PEER_UNREACHABLE));
@@ -316,7 +519,7 @@ void np_signaling_pump(void)
             c->retry_at = now + ACTIVATE_RETRY_MS;
         }
         if (c->we_active && !c->known) continue;
-        if (c->we_active && c->due && now >= c->due) {
+        if (c->we_active && c->due && now >= c->due && (c->direct || c->relay)) {
             if (!c->established_sent) {
                 c->established_sent = 1;
                 emit(c->ctx, conn_id(c), SCE_NP_SIGNALING_EVENT_ESTABLISHED, 0);
@@ -371,6 +574,10 @@ s32 sceNpSignalingCreateCtx(u32 npId, u32 handler, u32 arg, u32 ctxId)
         if (!s_tick_added) {
             s_tick_added = 1;
             np_psnr_add_tick(np_signaling_pump);
+        }
+        if (s_server && !s_hooks_added) {
+            s_hooks_added = 1;
+            np_psnr_set_p2p_hooks(signal_filter, signal_route);
         }
         UNLOCK();
         vm_write32(ctxId, (u32)i + 1);
@@ -537,7 +744,7 @@ s32 sceNpSignalingGetConnectionInfo(u32 ctxId, u32 connId, s32 code, u32 info)
         break;
     case SCE_NP_SIGNALING_CONN_INFO_MAPPED_ADDRESS:
         vm_write32(info, ip_word(s_mapped_ip));
-        vm_write16(info + 4, np_psnr_p2p_port());
+        vm_write16(info + 4, s_probed ? s_mapped_port : np_psnr_p2p_port());
         break;
     default:
         return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
@@ -602,7 +809,7 @@ s32 sceNpSignalingGetLocalNetInfo(u32 ctxId, u32 info)
     memcpy(ip, s_mapped_ip, 4);
     UNLOCK();
     if (!ok_ctx) return (s32)SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
-    write_netinfo(info, ip, np_psnr_p2p_port());
+    write_netinfo(info, ip, s_probed ? s_mapped_port : np_psnr_p2p_port());
     return CELL_OK;
 }
 

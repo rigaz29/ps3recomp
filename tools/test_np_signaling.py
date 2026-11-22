@@ -2,9 +2,11 @@
 """sceNpSignaling between two players, through tools/np_signaling_server.py.
 
 Builds libs/network/tests/test_np_signaling.c with the signaling client, starts the server on a free port, and runs
-the test twice at once, as PlayerA (P2P port 3658) and PlayerB (3659): each activates a connection to the other,
-both see ESTABLISHED and EXT_MUTUAL_ACTIVATED with the other's address and port, and A sees B leave (DEAD,
-TERMINATED_BY_PEER). A third run with no server ends its activation DEAD (PEER_UNREACHABLE).
+the test twice at once, as PlayerA (P2P port 37658) and PlayerB (37659: a game running here keeps 3658), each with a real UDP socket for its P2P
+socket: each activates a connection to the other, both see ESTABLISHED and EXT_MUTUAL_ACTIVATED with the other's
+address and port once the punches are answered, datagrams go both ways, and A sees B leave (DEAD,
+TERMINATED_BY_PEER). Then the same pair with PS3_NP_SIGNALING_RELAY=1, the datagrams through the server's relay. A
+last run with no server ends its activation DEAD (PEER_UNREACHABLE).
 
 It needs a host C compiler (under CI=1 a missing one fails instead of skipping).
 
@@ -53,28 +55,36 @@ def main():
             print((r.stdout + r.stderr)[-4000:])
             return 1
 
-        log = []
-        srv = np_signaling_server.start(port=0, log=log.append)
-        try:
-            base = dict(os.environ, PS3_NP_SIGNALING_SERVER="127.0.0.1:%d" % srv.port, PS3_NP_SIGNALING_DELAY_MS="100")
-            runs = {
-                "a": dict(base, PS3_NP_ONLINE_ID="PlayerA", PS3_NET_P2P_PORT="3658", PEER_NAME="PlayerB",
-                          PEER_PORT="3659"),
-                "b": dict(base, PS3_NP_ONLINE_ID="PlayerB", PS3_NET_P2P_PORT="3659", PEER_NAME="PlayerA",
-                          PEER_PORT="3658"),
-            }
-            procs = {k: subprocess.Popen([exe, k], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True) for k, env in runs.items()}
-            rc = 0
-            for k, p in procs.items():
-                out, _ = p.communicate(timeout=60)
-                print("--- %s ---" % k)
-                sys.stdout.write(out)
-                rc = rc or p.returncode
-        finally:
-            srv.stop()
-        print("--- server ---")
-        print("\n".join(log))
+        rc = 0
+        for relay in (False, True):
+            log = []
+            srv = np_signaling_server.start(port=0, log=log.append)
+            try:
+                base = dict(os.environ, PS3_NP_SIGNALING_SERVER="127.0.0.1:%d" % srv.port,
+                            PS3_NP_SIGNALING_DELAY_MS="100")
+                base.pop("PS3_NP_SIGNALING_RELAY", None)
+                if relay:
+                    base["PS3_NP_SIGNALING_RELAY"] = "1"
+                runs = {
+                    "a": dict(base, PS3_NP_ONLINE_ID="PlayerA", PS3_NET_P2P_PORT="37658", PEER_NAME="PlayerB",
+                              PEER_PORT="37659"),
+                    "b": dict(base, PS3_NP_ONLINE_ID="PlayerB", PS3_NET_P2P_PORT="37659", PEER_NAME="PlayerA",
+                              PEER_PORT="37658"),
+                }
+                procs = {k: subprocess.Popen([exe, k], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             text=True) for k, env in runs.items()}
+                for k, p in procs.items():
+                    out, _ = p.communicate(timeout=90)
+                    print("--- %s%s ---" % (k, " (relay)" if relay else ""))
+                    sys.stdout.write(out)
+                    rc = rc or p.returncode
+            finally:
+                srv.stop()
+            print("--- server%s ---" % (" (relay)" if relay else ""))
+            print("\n".join(log))
+            if relay and not any(line.startswith("relaying") for line in log):
+                print("FAIL: the server relayed nothing")
+                rc = 1
         env = {k: v for k, v in os.environ.items() if k != "PS3_NP_SIGNALING_SERVER"}
         env.update(PS3_NP_ONLINE_ID="PlayerA")
         p = subprocess.run([exe, "offline"], env=env, capture_output=True, text=True, timeout=60)

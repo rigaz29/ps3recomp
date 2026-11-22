@@ -46,11 +46,17 @@ int main(void)
     assert(map("example.org") == NULL);
     assert(strcmp(map("x.scea.com"), "127.0.0.1") == 0);
 
-    /* Loopback only: 127.0.0.0/8 passes, anything else is refused every time (reported once). */
+    /* Loopback only: 127.0.0.0/8 passes, and the servers PS3_NET_ALLOW lists (one address, one network);
+     * anything else is refused every time (reported once). */
     put("PS3_NET_LOOPBACK_ONLY", "1");
+    put("PS3_NET_ALLOW", "11.22.33.44,192.168.7.0/24");
     const unsigned char lo[4] = { 127, 0, 0, 1 }, lo2[4] = { 127, 9, 9, 9 }, far[4] = { 8, 8, 8, 8 };
+    const unsigned char server[4] = { 11, 22, 33, 44 }, lan[4] = { 192, 168, 7, 20 }, other_lan[4] = { 192, 168, 8, 20 };
     assert(!net_guard_blocked(lo, 80, "connect"));
     assert(!net_guard_blocked(lo2, 3658, "sendto"));
+    assert(!net_guard_blocked(server, 10070, "connect"));
+    assert(!net_guard_blocked(lan, 3658, "sendto"));
+    assert(net_guard_blocked(other_lan, 3658, "sendto"));
     assert(net_guard_blocked(far, 443, "connect"));
     assert(net_guard_blocked(far, 443, "connect"));
     assert(net_guard_blocked(far, 53, "sendto"));

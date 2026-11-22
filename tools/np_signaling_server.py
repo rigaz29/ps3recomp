@@ -8,24 +8,35 @@ activate a signaling connection to each one; this server does PSN's part. Every 
 P2P port it takes peer traffic on; activating a connection to a peer answers with the peer's address and tells the
 peer.
 
-Usage:
-    python3 tools/np_signaling_server.py [--host 0.0.0.0] [--port 36101] [--log FILE]
+Players on other networks: the runtime sends a probe from its P2P socket to this server's UDP port (the same number
+as the TCP one), so the server learns how that socket looks from outside its router, and hands that to the player's
+peers; both sides then punch toward each other. Peers that still cannot reach each other have their datagrams
+relayed through this server's UDP port (unless --no-relay).
 
-Each runtime instance: PS3_NP_SIGNALING_SERVER=<this host>[:36101], and a P2P port of its own
-(PS3_NET_P2P_PORT) when two run on one machine. A player's address is the one this server sees it at; one on this
-server's own machine, seen as 127.0.0.1, is given to players elsewhere as the address they reached the server at.
+Usage:
+    python3 tools/np_signaling_server.py [--host 0.0.0.0] [--port 36101] [--public-ip A.B.C.D] [--no-relay]
+                                         [--log FILE]
+
+--public-ip: the address players elsewhere reach this server at, when it runs behind a router (its own network's
+players are then given that address, with their P2P ports forwarded there). A player's address otherwise is the
+one this server sees it at: players on one machine get 127.0.0.1, players behind one router their own network's
+addresses, players elsewhere their routers' public endpoints.
 """
 import argparse
 import asyncio
 import ipaddress
+import os
 import struct
 import sys
 import threading
 import time
 
 HELLO, PING, ACTIVATE, DEACTIVATE, LOOKUP = 0x01, 0x02, 0x03, 0x04, 0x05
-WELCOME, REFUSED, PEER, ACTIVATED, DEACTIVATED, GONE = 0x81, 0x8F, 0x83, 0xA1, 0xA2, 0xA3
+WELCOME, REFUSED, PEER, ACTIVATED, DEACTIVATED, GONE, MOVED = 0x81, 0x8F, 0x83, 0xA1, 0xA2, 0xA3, 0xA4
 REFUSED_NAME_TAKEN = 1
+WELCOME_RELAY = 1
+UDP_MAGIC = b"NPSG"
+U_PROBE, U_PROBE_REPLY, U_PUNCH, U_RELAY, U_RELAYED = 0x01, 0x02, 0x03, 0x04, 0x05
 DEFAULT_PORT = 36101
 
 
@@ -41,6 +52,18 @@ def name_of(raw):
     return raw[:16].split(b"\0")[0].decode("ascii", "replace")
 
 
+def ip4(text):
+    return bytes(int(x) for x in text.split("."))
+
+
+def local_or_private(text):
+    try:
+        a = ipaddress.ip_address(text)
+        return a.is_loopback or a.is_private or a.is_link_local
+    except ValueError:
+        return False
+
+
 class Player:
     def __init__(self, srv, reader, writer):
         self.srv, self.r, self.w = srv, reader, writer
@@ -48,8 +71,11 @@ class Player:
         local = writer.get_extra_info("sockname") or ("0.0.0.0", 0)
         self.ip, self.server_ip = peer[0], local[0]
         self.name = None
-        self.port = 0
-        self.activated = set()   # players this one activated a connection to
+        self.port = 0              # the P2P port it binds
+        self.local_ip = None       # its own idea of its address (HELLO), for players behind the same router
+        self.udp = None            # its P2P socket as this server's UDP port sees it (a probe)
+        self.token = struct.unpack(">I", os.urandom(4))[0]
+        self.activated = set()     # players this one activated a connection to
 
     def send(self, kind, payload=b""):
         try:
@@ -58,16 +84,28 @@ class Player:
             pass
 
     def address_for(self, viewer):
-        """This player's address as viewer should use it."""
-        try:
-            if ipaddress.ip_address(self.ip).is_loopback and not ipaddress.ip_address(viewer.ip).is_loopback:
-                return viewer.server_ip
-        except ValueError:
-            pass
-        return self.ip
+        return self.where_for(viewer)[0]
+
+    def where_for(self, viewer):
+        """(address, port) of this player's P2P socket, as viewer should use them."""
+        if self.ip == viewer.ip:                     # one machine, or one router
+            if ipaddress.ip_address(self.ip).is_loopback:
+                return "127.0.0.1", self.port
+            if self.local_ip and self.local_ip != "0.0.0.0":
+                return self.local_ip, self.port
+            return self.ip, self.port
+        a, port = self.udp if self.udp is not None else (self.ip, self.port)
+        # On this server's own machine (seen at loopback) for a viewer that is not, or on its network for a viewer
+        # elsewhere: the viewer reaches it where it reaches the server (from elsewhere, at the address the server was
+        # given, if any).
+        on_server = ipaddress.ip_address(a).is_loopback and not ipaddress.ip_address(viewer.ip).is_loopback
+        if on_server or (local_or_private(a) and not local_or_private(viewer.ip)):
+            a = (None if local_or_private(viewer.ip) else self.srv.public_ip) or viewer.server_ip
+        return a, port
 
     def endpoint_for(self, viewer):
-        return bytes(int(x) for x in self.address_for(viewer).split(".")) + struct.pack(">H", self.port)
+        a, port = self.where_for(viewer)
+        return ip4(a) + struct.pack(">H", port)
 
     async def run(self):
         try:
@@ -105,9 +143,13 @@ class Player:
                 except Exception:
                     pass
             self.name, self.port = name, port
+            if len(p) >= 22:
+                self.local_ip = ".".join(str(b) for b in p[18:22])
             srv.players[name.lower()] = self
-            srv.log("%s from %s, P2P port %d" % (name, self.ip, port))
-            self.send(WELCOME, bytes(int(x) for x in self.ip.split(".")))
+            srv.log("%s from %s, P2P port %d%s" % (name, self.ip, port,
+                                                    ", here %s" % self.local_ip if self.local_ip else ""))
+            self.send(WELCOME, ip4(self.ip) + struct.pack(">IHB", self.token, srv.udp_port,
+                                                            WELCOME_RELAY if srv.relay else 0))
             return True
         if self.name is None:
             return False
@@ -129,22 +171,80 @@ class Player:
                 return True
             self.send(PEER, oid(other.name) + b"\1" + other.endpoint_for(self))
             if kind == ACTIVATE and other not in self.activated:
-                srv.log("%s activates %s (%s:%d)" % (self.name, other.name, other.address_for(self), other.port))
+                a, port = other.where_for(self)
+                srv.log("%s activates %s (%s:%d)" % (self.name, other.name, a, port))
                 self.activated.add(other)
                 other.send(ACTIVATED, oid(self.name) + self.endpoint_for(other))
             return True
         return True
 
 
+def linked(a, b):
+    return b in a.activated or a in b.activated
+
+
+class Udp(asyncio.DatagramProtocol):
+    """Probes (a P2P socket's outside endpoint) and the relay."""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def connection_made(self, transport):
+        self.t = transport
+
+    def datagram_received(self, data, addr):
+        srv = self.srv
+        if len(data) < 5 or data[:4] != UDP_MAGIC:
+            return
+        kind, ep = data[4], (addr[0], addr[1])
+        if kind == U_PROBE and len(data) >= 25:
+            p = srv.players.get(name_of(data[5:21]).lower())
+            if p is None or p.token != struct.unpack(">I", data[21:25])[0]:
+                return
+            self.t.sendto(UDP_MAGIC + bytes([U_PROBE_REPLY]) + ip4(addr[0]) + struct.pack(">H", addr[1]), addr)
+            if p.udp == ep:
+                return
+            viewers = [o for o in srv.players.values() if o is not p and linked(o, p)]
+            before = {o: p.endpoint_for(o) for o in viewers}
+            if p.udp is not None:
+                srv.by_udp.pop(p.udp, None)
+            p.udp = ep
+            srv.by_udp[ep] = p
+            srv.log("%s's P2P socket is %s:%d from here" % (p.name, ep[0], ep[1]))
+            for o in viewers:
+                now = p.endpoint_for(o)
+                if now != before[o]:
+                    o.send(MOVED, oid(p.name) + now)
+        elif kind == U_RELAY and len(data) >= 21 and srv.relay:
+            sender = srv.by_udp.get(ep)
+            to = srv.players.get(name_of(data[5:21]).lower())
+            if sender is None or to is None or to.udp is None or not linked(sender, to):
+                return
+            pair = (sender.name, to.name)
+            if pair not in srv.relaying:
+                srv.relaying.add(pair)
+                srv.log("relaying %s -> %s" % pair)
+            srv.relayed += len(data) - 21
+            self.t.sendto(UDP_MAGIC + bytes([U_RELAYED]) + oid(sender.name) + data[21:], to.udp)
+
+
 class Server:
-    def __init__(self, log):
+    def __init__(self, log, public_ip=None, relay=True):
         self.log = log
+        self.public_ip = public_ip
+        self.relay = relay
         self.players = {}
+        self.by_udp = {}
+        self.relaying = set()
+        self.relayed = 0
+        self.udp_port = 0
 
     def left(self, p):
         if p.name is None or self.players.get(p.name.lower()) is not p:
             return
         del self.players[p.name.lower()]
+        if p.udp is not None:
+            self.by_udp.pop(p.udp, None)
         self.log("%s left" % p.name)
         for other in list(self.players.values()):
             if other in p.activated or p in other.activated:
@@ -154,11 +254,11 @@ class Server:
 
 
 class Running:
-    """The server on an event loop of its own (a thread); port the one it took."""
+    """The server on an event loop of its own (a thread); port the one it took (TCP and UDP)."""
 
-    def __init__(self, host, port, log):
+    def __init__(self, host, port, log, public_ip=None, relay=True):
         self.loop = asyncio.new_event_loop()
-        self.srv = Server(log)
+        self.srv = Server(log, public_ip, relay)
         self.port = None
         self.error = None
         ready = threading.Event()
@@ -166,6 +266,8 @@ class Running:
         async def start():
             self.server = await asyncio.start_server(lambda r, w: Player(self.srv, r, w).run(), host, port)
             self.port = self.server.sockets[0].getsockname()[1]
+            self.udp, _ = await self.loop.create_datagram_endpoint(lambda: Udp(self.srv), local_addr=(host, self.port))
+            self.srv.udp_port = self.port
 
         def run():
             asyncio.set_event_loop(self.loop)
@@ -187,6 +289,7 @@ class Running:
     def stop(self):
         async def shut():
             self.server.close()
+            self.udp.close()
             for p in list(self.srv.players.values()):
                 p.w.close()
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -203,14 +306,16 @@ class Running:
                 self.loop.close()
 
 
-def start(host="127.0.0.1", port=DEFAULT_PORT, log=print):
-    return Running(host, port, log)
+def start(host="127.0.0.1", port=DEFAULT_PORT, log=print, public_ip=None, relay=True):
+    return Running(host, port, log, public_ip, relay)
 
 
 def main(argv):
     ap = argparse.ArgumentParser(description="Signaling server for sceNpSignaling (ps3recomp).")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--public-ip", help="the address players elsewhere reach this server at, behind a router")
+    ap.add_argument("--no-relay", action="store_true", help="never relay datagrams between players")
     ap.add_argument("--log", help="also write the log here")
     a = ap.parse_args(argv)
     out = open(a.log, "a", encoding="utf-8") if a.log else None
@@ -222,8 +327,8 @@ def main(argv):
             out.write(line + "\n")
             out.flush()
 
-    srv = start(a.host, a.port, log)
-    log("signaling server on %s:%d" % (a.host, srv.port))
+    srv = start(a.host, a.port, log, a.public_ip, not a.no_relay)
+    log("signaling server on %s:%d (TCP and UDP)%s" % (a.host, srv.port, "" if not a.no_relay else ", no relay"))
     try:
         while True:
             time.sleep(1)

@@ -5113,10 +5113,16 @@ static int pp_init(void)
             const char* dd = getenv("D3D12_DLSS_DIR");
             if (dd && *dd) MultiByteToWideChar(CP_UTF8, 0, dd, -1, dir, MAX_PATH);
             else _snwprintf(dir, MAX_PATH - 1, L"%ls\\dlss", exe);
+            /* NGX's data folder must be one it can write to (the guide's 3.19): the temp folder's own. */
+            wchar_t data[MAX_PATH] = L"";
+            if (GetTempPathW(MAX_PATH - 16, data)) {
+                wcscat_s(data, MAX_PATH, L"ps3recomp-ngx");
+                CreateDirectoryW(data, NULL);
+            }
             if (s_fsr3_refused) snprintf(why, sizeof why, "%s", s_fsr3_refused);
             /* D3D12_DLSS_ANY_GPU=1: NGX asked on any card, to try its failing path where there is no NVIDIA one. */
             else if (s_gpu_vendor != 0x10DE && !getenv("D3D12_DLSS_ANY_GPU")) snprintf(why, sizeof why, "not an NVIDIA GPU");
-            else if (rsx_dlss_init(s_d3d.device, dir, exe, why, sizeof why)) {
+            else if (rsx_dlss_init(s_d3d.device, dir, data[0] ? data : exe, why, sizeof why)) {
                 s_up.want = s_up.dlss = 1;
                 const char* pr = ps3_settings_str("graphics", "dlss_preset", "D3D12_DLSS_PRESET", "auto");
                 if (!ps3_settings_ieq(pr, "auto") && !(pr[0] && !pr[1] && strchr("JKLMjklm", pr[0])))
@@ -7251,11 +7257,11 @@ static void up_draw(u32 table, int hud, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 }
 
 #ifdef PS3RECOMP_DLSS
-/* DLSS cannot go on: FSR 3's upscaler from the next frame, where it is there, else none. */
+/* DLSS cannot go on: FSR 3's upscaler from the next frame, where it is there, else none. Its feature stays until the
+ * end (rsx_dlss_shutdown, after the GPU is done): this frame's list, not yet run, may name it. */
 static void up_dlss_off(const char* why)
 {
     printf("[D3D12] DLSS: %s; FSR 3%c", why, 10);
-    rsx_dlss_up_destroy();
     s_up.dlss = 0;
     s_up.ready = 0;
     s_up.jx = s_up.jy = s_up.cx = s_up.cy = 0.0f;

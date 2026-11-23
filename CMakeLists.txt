@@ -175,6 +175,64 @@ if(WIN32 AND PS3RECOMP_ANR)
     message(STATUS "ANR frame generation: on")
 endif()
 
+# NVIDIA DLSS Super Resolution and DLAA (graphics.scaling = dlss, libs/video/rsx_dlss.cpp). The NGX headers and the
+# static library that finds the driver's NGX come from NVIDIA's DLSS SDK on GitHub, at the commit of tag v310.9.16,
+# each checked by its SHA-256, into the build folder: they are NVIDIA's (LicenseRef-NvidiaProprietary, the NVIDIA RTX
+# SDKs license) and never kept in this repository. The DLSS DLL is not built in either: the player's launcher fetches
+# nvngx_dlss.dll from the same place. Without the files (offline, a changed file) the build goes on without DLSS.
+option(PS3RECOMP_DLSS "NVIDIA DLSS Super Resolution: graphics.scaling = dlss" OFF)
+if(WIN32 AND PS3RECOMP_DLSS)
+    set(DLSS_SDK_COMMIT "9981c6350dc58c0ce21f024fd65e31e851c31689")   # tag v310.9.16
+    set(DLSS_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvidia_dlss_sdk/${DLSS_SDK_COMMIT}")
+    # nvsdk_ngx_d.lib: the one for the DLL C runtime (/MD), which this build uses.
+    set(DLSS_SDK_FILES
+        "include/nvsdk_ngx.h|dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
+        "include/nvsdk_ngx_defs.h|ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e"
+        "include/nvsdk_ngx_params.h|943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
+        "include/nvsdk_ngx_helpers.h|5bcbadfe7478b802cf6d3aca4dc5ddd7d0889b99726e69c63f9e9bd555f44471"
+        "include/nvsdk_ngx_helpers_d3d.h|ec75224f36ed6580baaf250fa83620405ad81a1d98c2c436654a0c9cf6a6b8ba"
+        "include/nvsdk_ngx_helpers_cuda.h|f2851a76107bdf4fbcb7b261f3c35573c312d8ecb4bc18fb02d9e2cec7705042"
+        "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c")
+    set(DLSS_SDK_OK ON)
+    foreach(entry IN LISTS DLSS_SDK_FILES)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 rel)
+        list(GET parts 1 want)
+        set(dst "${DLSS_SDK_DIR}/${rel}")
+        set(have "")
+        if(EXISTS "${dst}")
+            file(SHA256 "${dst}" have)
+        endif()
+        if(NOT have STREQUAL want)
+            message(STATUS "DLSS SDK: fetching ${rel}")
+            file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA/DLSS/${DLSS_SDK_COMMIT}/${rel}" "${dst}.part"
+                 TLS_VERIFY ON STATUS st)
+            list(GET st 0 code)
+            set(have "")
+            if(code EQUAL 0)
+                file(SHA256 "${dst}.part" have)
+            endif()
+            if(NOT have STREQUAL want)
+                file(REMOVE "${dst}.part")
+                message(WARNING "DLSS SDK: ${rel} not fetched or not the expected file (${st}); building without DLSS")
+                set(DLSS_SDK_OK OFF)
+                break()
+            endif()
+            file(RENAME "${dst}.part" "${dst}")
+        endif()
+    endforeach()
+    if(DLSS_SDK_OK)
+        set(DLSS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_dlss.cpp")
+        target_sources(ps3recomp_runtime PRIVATE "${DLSS_SOURCE}")
+        # NVIDIA's headers for this one file only.
+        set_source_files_properties("${DLSS_SOURCE}" PROPERTIES INCLUDE_DIRECTORIES "${DLSS_SDK_DIR}/include")
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_DLSS=1)
+        # version: the DLSS DLL's file version, for the log and the panel.
+        target_link_libraries(ps3recomp_runtime PRIVATE "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" version)
+        message(STATUS "DLSS: on (NVIDIA DLSS SDK 310.9.16)")
+    endif()
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

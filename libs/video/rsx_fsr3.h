@@ -46,6 +46,13 @@ typedef struct rsx_fsr3_frame {
 /* The frame's camera, and depth and motion into the form the API takes. 1 if the frame has a
  * camera to go by. rsx_fsr3_fg_frame does this itself if it was not done. */
 int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* frame);
+/* The depth and motion targets and their pass for another upscaler (DLSS, rsx_dlss.cpp), without FSR's own
+ * contexts or DLLs: 1 if they are there. At the render's size, which stays. */
+int rsx_fsr3_inputs_create(void* device, unsigned render_w, unsigned render_h);
+/* After rsx_fsr3_prepare: the ID3D12Resource*s it made, depth (R32_FLOAT, 0 at the near plane) and motion (R16G16_FLOAT,
+ * in UV units, from a pixel to where it was), both in PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE, and whether the
+ * history means nothing (a cut, a scene's first frame). 1 if the frame had a camera. */
+int rsx_fsr3_inputs_get(void** depth, void** motion, int* reset);
 
 /* Every presented frame, before the command list closes. */
 void rsx_fsr3_fg_frame(void* cmd_list, const rsx_fsr3_frame* frame, float frame_ms);

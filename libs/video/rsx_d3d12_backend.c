@@ -61,6 +61,9 @@
 #include <d3dcompiler.h>
 #include "rsx_dxc.h"
 #include "rsx_fsr3.h"
+#ifdef PS3RECOMP_DLSS
+#include "rsx_dlss.h"
+#endif
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -1037,6 +1040,7 @@ static double s_hl_gpu_ms[4];
 static double s_hl_miss_s, s_hl_upbuf_s, s_hl_rt_s, s_hl_waits_s;
 static IDXGIAdapter3* s_adapter3;   /* local memory use and budget, for the hitch log */
 static char s_ovs_gpu_name[64];     /* the adapter's name, for the stats panel */
+static UINT s_gpu_vendor;           /* its PCI vendor id: 0x10DE NVIDIA */
 static int perf_on(void)
 {
     static int v = -1;
@@ -1130,9 +1134,12 @@ static void rdoc_request(void)
 #define FG_OBJ_BIAS  (-64)     /* their depth against the scene's, from another program's arithmetic */
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
 static int s_fg_anr;        /* frame_generation = anr */
-/* graphics.scaling = fsr3: FSR's upscaler on scene frames, FSR 1 on the rest. */
+/* graphics.scaling = fsr3: FSR's upscaler on scene frames, FSR 1 on the rest. dlss: NVIDIA DLSS's in FSR's place
+ * (rsx_dlss.cpp), with the same inputs; FSR's where DLSS cannot run. */
 static struct {
     int want;                   /* asked for, and the DLLs are there */
+    int dlss;                   /* the upscaler is DLSS: NGX is up and has it */
+    int dlss_fails;             /* evaluates failed in a row */
     int ready;                  /* the context is up: frames are jittered */
     char version[16];           /* graphics.fsr_version: the start of the version to use, "" the newest the GPU takes */
     u32 frame;
@@ -1297,6 +1304,10 @@ static void fg_frame(void)
     s_fg.obj_n = 0;
     s_fg.obj_drawn = 0;
     if (s_up.ready) {
+#ifdef PS3RECOMP_DLSS
+        if (s_up.dlss) rsx_dlss_up_jitter(++s_up.frame, &s_up.jx, &s_up.jy);
+        else
+#endif
         rsx_fsr3_up_jitter(++s_up.frame, &s_up.jx, &s_up.jy);
         s_up.cx = 2.0f * s_up.jx / (float)s_d3d.pw;
         s_up.cy = -2.0f * s_up.jy / (float)s_d3d.ph;
@@ -3801,6 +3812,7 @@ static int d3d_device_create(IDXGIFactory4* factory)
                 printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
                        (unsigned long long)(ad.DedicatedVideoMemory >> 20));
                 s_vram_mb = (u32)(ad.DedicatedVideoMemory >> 20);
+                s_gpu_vendor = ad.VendorId;
                 for (int ni = 0; ni < (int)sizeof s_ovs_gpu_name - 1 && ad.Description[ni]; ni++)
                     s_ovs_gpu_name[ni] = (char)(ad.Description[ni] < 128 ? ad.Description[ni] : '?');
                 /* An integrated GPU's textures are in the PC's memory: the little it
@@ -5083,10 +5095,41 @@ static int pp_init(void)
      * off | low | medium | high | max (FSR 1's RCAS; high is AMD's 0.2). */
     {
         const char* sc = ps3_settings_str("graphics", "scaling", NULL, "bilinear");
-        s_d3d.pp_mode = ps3_settings_ieq(sc, "fsr1") || ps3_settings_ieq(sc, "fsr3") ? 2 : ps3_settings_ieq(sc, "sharp") ? 1 : 0;
+        s_d3d.pp_mode = ps3_settings_ieq(sc, "fsr1") || ps3_settings_ieq(sc, "fsr3") || ps3_settings_ieq(sc, "dlss") ? 2
+                      : ps3_settings_ieq(sc, "sharp") ? 1 : 0;
         if (!s_d3d.pp_mode && !ps3_settings_ieq(sc, "bilinear"))
-            printf("[D3D12] graphics.scaling = %s is not bilinear, sharp, fsr1 or fsr3; bilinear\n", sc);
-        if (ps3_settings_ieq(sc, "fsr3")) {
+            printf("[D3D12] graphics.scaling = %s is not bilinear, sharp, fsr1, fsr3 or dlss; bilinear\n", sc);
+        /* dlss: NGX and DLSS on this device now, so that what cannot run falls back to FSR 3 before anything is made
+         * for it. The DLL is looked for beside the exe and in its dlss folder (D3D12_DLSS_DIR), where the launcher
+         * puts it. */
+        if (ps3_settings_ieq(sc, "dlss")) {
+            char why[192] = "this build has no DLSS";
+#ifdef PS3RECOMP_DLSS
+            wchar_t exe[MAX_PATH] = L"", dir[MAX_PATH] = L"";
+            if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+                wchar_t* slash = wcsrchr(exe, L'\\');
+                if (slash) *slash = 0;
+            }
+            const char* dd = getenv("D3D12_DLSS_DIR");
+            if (dd && *dd) MultiByteToWideChar(CP_UTF8, 0, dd, -1, dir, MAX_PATH);
+            else _snwprintf(dir, MAX_PATH - 1, L"%ls\\dlss", exe);
+            if (s_fsr3_refused) snprintf(why, sizeof why, "%s", s_fsr3_refused);
+            /* D3D12_DLSS_ANY_GPU=1: NGX asked on any card, to try its failing path where there is no NVIDIA one. */
+            else if (s_gpu_vendor != 0x10DE && !getenv("D3D12_DLSS_ANY_GPU")) snprintf(why, sizeof why, "not an NVIDIA GPU");
+            else if (rsx_dlss_init(s_d3d.device, dir, exe, why, sizeof why)) {
+                s_up.want = s_up.dlss = 1;
+                const char* pr = ps3_settings_str("graphics", "dlss_preset", "D3D12_DLSS_PRESET", "auto");
+                if (!ps3_settings_ieq(pr, "auto") && !(pr[0] && !pr[1] && strchr("JKLMjklm", pr[0])))
+                    printf("[D3D12] graphics.dlss_preset = %s is not auto, j, k, l or m; auto%c", pr, 10);
+                rsx_dlss_preset(ps3_settings_ieq(pr, "auto") ? 0 : pr[0]);
+            }
+#endif
+            if (!s_up.dlss) {
+                printf("[D3D12] graphics.scaling = dlss: %s; FSR 3%c", why, 10);
+                sc = "fsr3";
+            }
+        }
+        if (ps3_settings_ieq(sc, "fsr3") && !s_up.dlss) {
             s_up.want = !s_fsr3_refused && rsx_fsr3_available();
             if (!s_up.want)
                 printf("[D3D12] graphics.scaling = fsr3: %s; FSR 1%c",
@@ -5169,6 +5212,10 @@ static void bb_resize(void)
     for (u32 i = 0; i < FRAME_COUNT; i++)
         if (s_d3d.backbuffers[i]) { s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]); s_d3d.backbuffers[i] = NULL; }
     if (s_up.ready) {
+#ifdef PS3RECOMP_DLSS
+        if (s_up.dlss) rsx_dlss_up_destroy();
+        else
+#endif
         rsx_fsr3_up_destroy();
         s_up.ready = 0;
         s_up.jx = s_up.jy = s_up.cx = s_up.cy = 0.0f;
@@ -5663,12 +5710,16 @@ static void ovs_lines(char line[OVS_LINES][96])
     char up[48], fg[48];
     const char* uv = rsx_fsr3_version(0);
     const char* gv = rsx_fsr3_version(1);
+#ifdef PS3RECOMP_DLSS
+    if (s_up.dlss) snprintf(up, sizeof up, "%s", rsx_dlss_name());
+    else
+#endif
     if (s_up.want) snprintf(up, sizeof up, "FSR%s%s", uv[0] ? " " : "", uv);
     else snprintf(up, sizeof up, "%s", s_d3d.pp_mode == 2 ? "FSR 1" : s_d3d.pp_mode == 1 ? "Sharp" : "Off");
     if (s_fg_mode == 2) snprintf(fg, sizeof fg, " + FG%s%s", gv[0] ? " " : "", gv);
     else fg[0] = 0;
     snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s", up, fg,
-             s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
+             s_up.dlss ? "DLSS" : s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
     snprintf(line[3], sizeof line[3], "%u x %u -> %u x %u", s_d3d.pw, s_d3d.ph, s_d3d.bb_w, s_d3d.bb_h);
 }
 
@@ -7199,6 +7250,20 @@ static void up_draw(u32 table, int hud, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
 }
 
+#ifdef PS3RECOMP_DLSS
+/* DLSS cannot go on: FSR 3's upscaler from the next frame, where it is there, else none. */
+static void up_dlss_off(const char* why)
+{
+    printf("[D3D12] DLSS: %s; FSR 3%c", why, 10);
+    rsx_dlss_up_destroy();
+    s_up.dlss = 0;
+    s_up.ready = 0;
+    s_up.jx = s_up.jy = s_up.cx = s_up.cy = 0.0f;
+    s_up.version[0] = 0;
+    s_up.want = !s_fsr3_refused && rsx_fsr3_available();
+}
+#endif
+
 /* The frame through the upscaler and into the back buffer, left as a render target. 0 if it
  * cannot take this one: not a scene, or the context not there. */
 static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv)
@@ -7207,6 +7272,20 @@ static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DE
         s_d3d.bb_w < s_d3d.pw || s_d3d.bb_h < s_d3d.ph)
         return 0;
     if (!s_up.ready) {
+#ifdef PS3RECOMP_DLSS
+        if (s_up.dlss) {
+            char why[192] = "its depth and motion targets were not made";
+            if (rsx_fsr3_inputs_create(s_d3d.device, s_d3d.pw, s_d3d.ph) &&
+                rsx_dlss_up_create(s_d3d.cmd_list, s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, why, sizeof why)) {
+                s_up.ready = 1;
+                printf("[D3D12] upscaler on: %ux%u from %ux%u, %s%c", s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph,
+                       rsx_dlss_name(), 10);
+            } else {
+                up_dlss_off(why);
+            }
+            return 0;
+        }
+#endif
         /* graphics.sharpening on FSR's own scale: high is the 0.8 of AMD's sample. */
         const float sharp = s_d3d.pp_stops < 0.0f ? -1.0f : 1.0f - s_d3d.pp_stops;
         if (!rsx_fsr3_up_create(s_d3d.device, s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, sharp, s_up.version)) {
@@ -7223,6 +7302,21 @@ static int up_run(u32 fi, ID3D12Resource* disp, ID3D12Resource* bb, D3D12_CPU_DE
     s_fg.hud_i ^= 1;
     ID3D12Resource* out = s_fg.hud_out[s_fg.hud_i];
     pp_barrier(out, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#ifdef PS3RECOMP_DLSS
+    if (s_up.dlss) {
+        void *depth = NULL, *motion = NULL;
+        int reset = 0;
+        rsx_fsr3_inputs_get(&depth, &motion, &reset);
+        if (!rsx_dlss_up_frame(s_d3d.cmd_list, s_fg.copied ? s_fg.hud_src : disp, depth, motion, out, f.jitter_x,
+                               f.jitter_y, reset, fg_ms(perf_now()))) {
+            pp_barrier(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+            s_fg.hud_i ^= 1;
+            if (++s_up.dlss_fails >= 3) up_dlss_off("its evaluate failed three times in a row");
+            return 0;
+        }
+        s_up.dlss_fails = 0;
+    } else
+#endif
     rsx_fsr3_up_frame(s_d3d.cmd_list, &f, s_fg.copied ? s_fg.hud_src : disp, out, fg_ms(perf_now()));
     grade_dispatch(out, s_fg.hud_i);
     pp_barrier(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
@@ -21474,6 +21568,9 @@ void rsx_d3d12_backend_shutdown(void)
 
     wait_for_gpu();
     sj_stop();   /* a worker may be creating a pipeline on the device */
+#ifdef PS3RECOMP_DLSS
+    rsx_dlss_shutdown();
+#endif
 
     /* Release D3D12 resources */
     if (s_d3d.vertex_buffer) {

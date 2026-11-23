@@ -480,6 +480,19 @@ static int fsr3_targets(ID3D12Device* dev, unsigned render_w, unsigned render_h)
     return s_depth && s_motion && fsr3_inputs_init(dev);
 }
 
+int rsx_fsr3_inputs_create(void* device, unsigned render_w, unsigned render_h)
+{
+    return fsr3_targets((ID3D12Device*)device, render_w, render_h);
+}
+
+int rsx_fsr3_inputs_get(void** depth, void** motion, int* reset)
+{
+    *depth = s_depth;
+    *motion = s_motion;
+    *reset = s_reset;
+    return s_on;
+}
+
 int rsx_fsr3_up_create(void* device, unsigned display_w, unsigned display_h,
                        unsigned render_w, unsigned render_h, float sharpness, const char* version)
 {

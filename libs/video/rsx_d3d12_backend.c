@@ -71,7 +71,12 @@
  * Constants
  * -----------------------------------------------------------------------*/
 
-#define FRAME_COUNT         2   /* double buffering */
+#define FRAME_COUNT         3   /* the most frames in flight; s_bufs of them are */
+/* The swap chain's buffers, and with them the frames in flight (frame_index is the back buffer's): 2, or 3 with
+ * D3D12_SWAP_BUFFERS=3. With two, a frame that missed a refresh under VSync waited for the next one before the next
+ * frame could begin: a title past 60 on a 120 Hz display went 120 -> 60 flips a second as soon as a frame took over
+ * 8.3 ms. A port that lets a title run past the vblanks sets three. Arrays per frame hold FRAME_COUNT. */
+static unsigned s_bufs = 2;
 #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
 /* Per-frame index buffer of indexed VP draws, x2 parity. God of War: Ascension's gate takes
@@ -3965,7 +3970,9 @@ static int init_d3d12(u32 width, u32 height)
     sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sc_desc.SampleDesc.Count = 1;
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sc_desc.BufferCount = FRAME_COUNT;
+    { const char* e = getenv("D3D12_SWAP_BUFFERS"); s_bufs = e && atoi(e) == 3 ? 3u : 2u; }
+    if (s_bufs != 2) printf("[D3D12] swap chain: %u buffers\n", s_bufs);
+    sc_desc.BufferCount = s_bufs;
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     /* D3D12_VSYNC=0 presents with a sync interval of 0, but a windowed
      * flip-model swap chain still waits for the compositor, which runs at the
@@ -4027,7 +4034,7 @@ static int init_d3d12(u32 width, u32 height)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
 
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
+    for (u32 i = 0; i < s_bufs; i++) {
         hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
             s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
         if (FAILED(hr)) return -1;
@@ -4721,24 +4728,27 @@ static void wait_for_gpu_once(void)
  * -----------------------------------------------------------------------*/
 /* pp_srv_heap: the display targets at 0..FRAME_COUNT-1, then pp_tmp, ov_tex
  * and aa_out; then SMAA's tables of three, one per pass (and per display
- * target for the passes that read it). */
+ * target for the passes that read it). Every per-target run is FRAME_COUNT
+ * long, whatever s_bufs uses of it. */
 #define PP_SLOT_AA_OUT   (FRAME_COUNT + 2)
 #define PP_SLOT_AA_E(fi) (8u + 3u * (fi))
-#define PP_SLOT_AA_W     16u
+#define PP_SLOT_AA_W     (8u + 3u * FRAME_COUNT)
 #define PP_SLOT_AA_N(fi) (20u + 3u * (fi))
 #define PP_SLOT_HUD      32u   /* frame generation's picture without its HUD, */
 #define PP_SLOT_HUD_E    33u   /* and SMAA's tables for it */
 #define PP_SLOT_HUD_N    36u
-#define PP_SLOT_UP(out, fi) (40u + 3u * ((out) * 2u + (fi)))   /* the upscaler's output, the frame, the picture */
-#define PP_SLOT_GRADE(out) (52u + (out))   /* the upscaler's output as a UAV, for the grade (s_grade) */
-#define PP_SRV_SLOTS     54u
+#define PP_SLOT_UP(out, fi) (40u + 3u * ((out) * FRAME_COUNT + (fi)))   /* the upscaler's output, the frame, the picture */
+#define PP_SLOT_GRADE(out) (40u + 6u * FRAME_COUNT + (out))   /* the upscaler's output as a UAV, for the grade (s_grade) */
+#define PP_SRV_SLOTS     (42u + 6u * FRAME_COUNT)
+_Static_assert(PP_SLOT_AA_OUT < 8u && PP_SLOT_AA_W + 3u <= 20u && PP_SLOT_AA_N(FRAME_COUNT) <= PP_SLOT_HUD,
+               "pp_srv_heap: the SMAA tables of FRAME_COUNT display targets overlap");
 
 /* RTVs for the swap chain's buffers, made again after each resize. */
 static void bb_views(void)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.bb_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.bb_rtv_heap, &h);
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
+    for (u32 i = 0; i < s_bufs; i++) {
         s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.backbuffers[i], NULL, h);
         h.ptr += s_d3d.rtv_descriptor_size;
     }
@@ -5000,7 +5010,7 @@ static int pp_init(void)
             s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE h;
         s_d3d.pp_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.pp_srv_heap, &h);
-        for (u32 i = 0; i < FRAME_COUNT; i++) {
+        for (u32 i = 0; i < s_bufs; i++) {
             s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[i], NULL, h);
             h.ptr += inc;
         }
@@ -5169,13 +5179,13 @@ static void bb_resize(void)
         for (int i = 0; i < 2; i++)
             if (s_fg.hud_out[i]) { s_fg.hud_out[i]->lpVtbl->Release(s_fg.hud_out[i]); s_fg.hud_out[i] = NULL; }
     }
-    HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, FRAME_COUNT, w, h,
+    HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, s_bufs, w, h,
                                                          DXGI_FORMAT_R8G8B8A8_UNORM,
                                                          s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (SUCCEEDED(hr)) { s_d3d.bb_w = w; s_d3d.bb_h = h; }
     else printf("[D3D12] swap chain resize to %ux%u failed (0x%08lX)\n", w, h, hr);
     if (s_d3d.pp_tmp) pp_tmp_create();
-    for (u32 i = 0; i < FRAME_COUNT; i++)
+    for (u32 i = 0; i < s_bufs; i++)
         s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
     bb_views();
     /* The buffer index may have moved. The GPU is idle: every fence value is
@@ -7000,7 +7010,7 @@ static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd)
         hh.ptr += views[i].slot * inc;
         s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, views[i].res, NULL, hh);
     }
-    for (u32 fi = 0; fi < FRAME_COUNT; fi++) {
+    for (u32 fi = 0; fi < s_bufs; fi++) {
         ID3D12Resource* const e[3] = { s_d3d.render_targets[fi], NULL, NULL };
         ID3D12Resource* const n[3] = { s_d3d.render_targets[fi], s_d3d.aa_blend, NULL };
         for (u32 k = 0; k < 3; k++) {
@@ -12063,7 +12073,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = (u64)TEX_RING_PART * FRAME_COUNT;
+        bd.Width = (u64)TEX_RING_PART * s_bufs;
         bd.Height = 1; bd.DepthOrArraySize = 1;
         bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         void* rp = NULL; D3D12_RANGE nr0 = {0, 0};
@@ -12077,7 +12087,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         }
         /* Each frame index's first spill chunk with the ring, at the first
          * texture (boot), not at the first burst that outgrows the ring. */
-        for (u32 _i = 0; _i < FRAME_COUNT && s_d3d.tex_ring; _i++) {
+        for (u32 _i = 0; _i < s_bufs && s_d3d.tex_ring; _i++) {
             u64 _at = 0;
             TexSpill* _c = tex_spill_take(_i, 0, &_at);
             if (_c) _c->used = 0;
@@ -14193,7 +14203,7 @@ static int fg_targets(void)
             hu.ptr += PP_SLOT_GRADE(i) * inc;
             dev->lpVtbl->CreateUnorderedAccessView(dev, s_fg.hud_out[i], NULL, NULL, hu);
         }
-        for (u32 fi = 0; s_up.want && fi < FRAME_COUNT; fi++) {
+        for (u32 fi = 0; s_up.want && fi < s_bufs; fi++) {
             ID3D12Resource* const t[3] = { s_fg.hud_out[i], s_d3d.render_targets[fi], s_fg.hud_src };
             for (u32 k = 0; k < 3; k++) {
                 D3D12_CPU_DESCRIPTOR_HANDLE hv = base;

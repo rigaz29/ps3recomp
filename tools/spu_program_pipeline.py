@@ -94,6 +94,15 @@ def build_programs(args, registry_writer):
                       'find_spu_functions.py', 'spu_disasm.py']
         tool_paths = [Path(__file__).with_name(n) for n in tool_names] + [Path(args.lifter).resolve()]
         handled = json.loads(Path(args.handled).read_text()) if getattr(args, 'handled', None) else {}
+        # --insn-patches: {"patches": [{"image": sha256 or a 12+ digit prefix, "addr", "orig", "new", "guard",
+        # "optional", "note"}]}; a program's own go to its lift (spu_lifter.py --insn-patches), which checks
+        # each original word and lifts both forms behind the guard.
+        insn_patches = []
+        if getattr(args, 'insn_patches', None):
+            insn_patches = json.loads(Path(args.insn_patches).read_text()).get('patches', [])
+            for e in insn_patches:
+                if not re.fullmatch(r'[0-9a-f]{12,64}', str(e.get('image', ''))):
+                    raise ValueError('--insn-patches: "image" must be a sha256 or a prefix of 12+ lowercase hex digits')
         pinned_ids = json.loads(Path(args.image_ids).read_text()) if getattr(args, 'image_ids', None) else None
         if not all(isinstance(v, str) and v for v in handled.values()):
             raise ValueError('--handled maps sha256 to a non-empty reason')
@@ -104,7 +113,7 @@ def build_programs(args, registry_writer):
         report['provenance'] = dict(tools={str(p): sha256(p.read_bytes()) for p in tool_paths},
                                     python=sys.version, options=dict(register_fn=args.register_fn, constructor=args.constructor,
                                                  extra_funcs=args.extra_funcs, allow_partial=args.allow_partial,
-                                                 handled=handled, image_ids=pinned_ids))
+                                                 handled=handled, image_ids=pinned_ids, insn_patches=insn_patches))
         unique = {}
         blobs = {}
         layouts = {}
@@ -162,6 +171,10 @@ def build_programs(args, registry_writer):
         if stale:
             report['errors'].append('--handled/--image-ids name programs that were not discovered: ' +
                                     ', '.join(sorted(stale)))
+        lost = sorted({e['image'] for e in insn_patches
+                       if not e.get('optional') and not any(d.startswith(e['image']) for d in unique)})
+        if lost:
+            report['errors'].append('--insn-patches name programs that were not discovered: ' + ', '.join(lost))
         extra = {}
         for spec in args.extra_funcs:
             name, sep, value = spec.partition('=')
@@ -202,6 +215,11 @@ def build_programs(args, registry_writer):
                         command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
                     if getattr(args, 'merge_chunks', False):
                         command += ['--merge-chunks']
+                    own = [{k: v for k, v in e.items() if k != 'image'} for e in insn_patches
+                           if digest.startswith(e['image'])]
+                    if own:
+                        (outdir / 'insn_patches.json').write_text(json.dumps({'patches': own}, indent=1))
+                        command += ['--insn-patches', str(outdir / 'insn_patches.json')]
                     result = subprocess.run(command, capture_output=True, text=True)
                     (outdir / 'lift.log').write_text(result.stdout + result.stderr, encoding='utf-8', errors='replace')
                     if result.returncode:
@@ -234,6 +252,7 @@ def build_programs(args, registry_writer):
                 program.update(status='unsupported', reason=str(error))
                 continue
             program['status'] = 'registered'
+            program['insn_patches'] = sum(1 for e in insn_patches if digest.startswith(e['image']))
             imgs.append((name, prefix, int(program['fingerprint'], 16), info['entry']))
             image_ids[name] = program['image_id']
             text_fps[name] = int(program['text_fingerprint'], 16)

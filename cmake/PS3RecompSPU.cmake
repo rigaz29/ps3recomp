@@ -4,12 +4,19 @@
 # PS3RECOMP_SPU_MERGE_CHUNKS=ON lifts with --merge-chunks: the chunks of one SPU
 # function become one C function, and branches between them gotos rather than
 # trampoline round trips through the drain loop.
+# PS3RECOMP_SPU_INSN_PATCHES=<json>: instruction edits of the discovered programs,
+# by their sha256 (build_spu_workloads.py --insn-patches); a change to the file
+# generates again.
 function(ps3recomp_generate_spu output_dir)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(command "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"
         --lifted "${output_dir}" --out "${output_dir}/spu_workloads.c" --constructor)
     if(PS3RECOMP_SPU_MERGE_CHUNKS)
         list(APPEND command --merge-chunks)
+    endif()
+    if(PS3RECOMP_SPU_INSN_PATCHES)
+        list(APPEND command --insn-patches "${PS3RECOMP_SPU_INSN_PATCHES}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS3RECOMP_SPU_INSN_PATCHES}")
     endif()
     foreach(input IN LISTS ARGN)
         get_filename_component(input "${input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")

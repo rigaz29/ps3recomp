@@ -135,6 +135,12 @@ def main():
                     help="With --input: {sha256: reason} for discovered programs another path "
                          "already provides (an existing registration, an interpreter route). They "
                          "are not lifted here, count as covered, and the reason is recorded")
+    ap.add_argument("--insn-patches", metavar="JSON",
+                    help="With --input: instruction edits of discovered programs, lifted both ways behind a guard "
+                         "(spu_lifter.py --insn-patches): {\"patches\": [{\"image\": <the program's sha256, or a "
+                         "prefix of 12 or more hex digits>, \"addr\", \"orig\", \"new\", \"guard\", "
+                         "\"optional\", \"note\"}]}. An edit of a program not discovered stops the run unless "
+                         "it is optional")
     ap.add_argument("--image-ids", metavar="JSON",
                     help="With --input: {sha256: image_id} pinning every registered program's "
                          "image id. A registered program missing from the map is an error, so "

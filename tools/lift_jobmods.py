@@ -284,7 +284,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     with open(tmp_elf, "wb") as f:
         f.write(elf)
 
-    cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
+    cmd = [sys.executable, "-X", "utf8", LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
            "--symbol-prefix", prefix, "-o", outsub,
            "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
     end = code_end or CODE_END.get(name)
@@ -295,7 +295,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     cmd += LIFTER_ARGS
     if patches:                            # --insn-patches: this module's
         pfile = os.path.join(outdir, f"_insn_patches_{name}.json")
-        with open(pfile, "w") as f:
+        with open(pfile, "w", encoding="utf-8") as f:
             json.dump({"patches": patches}, f, indent=1)
         cmd += ["--insn-patches", pfile]
     inside = module_seeds(raw, base, name)
@@ -303,16 +303,16 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         inside = [a for a in inside if int(a, 0) < code_end]
     if inside:
         cmd += ["--extra-funcs", ",".join(inside)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
+        say(f"  FAIL {name}\n{r.stderr or ''}", sys.stderr)
         return None
-    for line in r.stdout.splitlines():     # --insn-patches: what landed, what did not
+    for line in (r.stdout or "").splitlines():     # --insn-patches: what landed, what did not
         if "insn patch" in line:
             say(f"  {name}: {line.strip()}")
     # parse stats from lifter stdout
     funcs = unsup = 0
-    for line in r.stdout.splitlines():
+    for line in (r.stdout or "").splitlines():
         s = line.strip()
         if s.endswith("function(s) lifted"):
             funcs = int(s.split()[0])
@@ -443,9 +443,10 @@ def main():
         LIFTER_ARGS.append("--ijmp-local")
     MERGE_SKIP.update(n.strip() for spec in args.merge_skip for n in spec.split(",") if n.strip())
     if args.insn_patches:
-        for e in json.load(open(args.insn_patches)).get("patches", []):
-            INSN_PATCHES.setdefault(e["module"], []).append(
-                {k: e[k] for k in ("addr", "orig", "new", "guard", "optional") if k in e})
+        with open(args.insn_patches, "r", encoding="utf-8") as f:
+            for e in json.load(f).get("patches", []):
+                INSN_PATCHES.setdefault(e["module"], []).append(
+                    {k: e[k] for k in ("addr", "orig", "new", "guard", "optional") if k in e})
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
@@ -480,7 +481,7 @@ def main():
 
     if os.path.exists(tmp_elf):
         os.remove(tmp_elf)
-    with open(os.path.join(OUTDIR, "jobmods_manifest.json"), "w") as f:
+    with open(os.path.join(OUTDIR, "jobmods_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     emit_register(manifest, register_c, args.symbol_prefix)
     tot_unsup = sum(m["unsupported"] for m in manifest)
@@ -543,7 +544,7 @@ def lift_engine_elf(args, register_c):
             m.update(ea=eas[0], eas=eas, code_end=code_end)
             code[name] = raw[0x30:code_end - BASE]
             manifest.append(m)
-    with open(os.path.join(args.out, "jobmods_manifest.json"), "w") as f:
+    with open(os.path.join(args.out, "jobmods_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     emit_register_verified(manifest, code, register_c, args.symbol_prefix)
     tot_unsup = sum(m["unsupported"] for m in manifest)
@@ -605,7 +606,7 @@ def emit_register(manifest, REGISTER_C, sym_prefix):
     L.append("}")
     L.append("")
     os.makedirs(os.path.dirname(REGISTER_C), exist_ok=True)
-    with open(REGISTER_C, "w") as f:
+    with open(REGISTER_C, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
     print(f"Wrote {REGISTER_C} ({len(manifest)} modules, image ids "
           f"{JOBMOD_IMAGE_BASE}..{JOBMOD_IMAGE_BASE + len(manifest) - 1})")
@@ -698,7 +699,7 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
     L.append("}")
     L.append("")
     os.makedirs(os.path.dirname(REGISTER_C) or ".", exist_ok=True)
-    with open(REGISTER_C, "w") as f:
+    with open(REGISTER_C, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
     print(f"Wrote {REGISTER_C} ({len(manifest)} modules as verified regions, image ids "
           f"{JOBMOD_IMAGE_BASE}..{JOBMOD_IMAGE_BASE + len(manifest) - 1})")

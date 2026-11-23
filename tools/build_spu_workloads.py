@@ -175,7 +175,7 @@ def main():
 
         if not args.skip_lift and (args.relift or not os.path.exists(srcc)):
             os.makedirs(outdir, exist_ok=True)
-            cmd = [sys.executable, args.lifter, e, "--auto-functions", e,
+            cmd = [sys.executable, "-X", "utf8", args.lifter, e, "--auto-functions", e,
                    "--symbol-prefix", prefix, "-o", outdir]
             if img in extra_funcs:
                 cmd += ["--extra-funcs", extra_funcs[img]]

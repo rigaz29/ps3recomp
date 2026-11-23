@@ -93,17 +93,17 @@ def build_programs(args, registry_writer):
         tool_names = ['spu_program_pipeline.py', 'build_spu_workloads.py', 'spu_elf.py',
                       'find_spu_functions.py', 'spu_disasm.py']
         tool_paths = [Path(__file__).with_name(n) for n in tool_names] + [Path(args.lifter).resolve()]
-        handled = json.loads(Path(args.handled).read_text()) if getattr(args, 'handled', None) else {}
+        handled = json.loads(Path(args.handled).read_text(encoding='utf-8')) if getattr(args, 'handled', None) else {}
         # --insn-patches: {"patches": [{"image": sha256 or a 12+ digit prefix, "addr", "orig", "new", "guard",
         # "optional", "note"}]}; a program's own go to its lift (spu_lifter.py --insn-patches), which checks
         # each original word and lifts both forms behind the guard.
         insn_patches = []
         if getattr(args, 'insn_patches', None):
-            insn_patches = json.loads(Path(args.insn_patches).read_text()).get('patches', [])
+            insn_patches = json.loads(Path(args.insn_patches).read_text(encoding='utf-8')).get('patches', [])
             for e in insn_patches:
                 if not re.fullmatch(r'[0-9a-f]{12,64}', str(e.get('image', ''))):
                     raise ValueError('--insn-patches: "image" must be a sha256 or a prefix of 12+ lowercase hex digits')
-        pinned_ids = json.loads(Path(args.image_ids).read_text()) if getattr(args, 'image_ids', None) else None
+        pinned_ids = json.loads(Path(args.image_ids).read_text(encoding='utf-8')) if getattr(args, 'image_ids', None) else None
         if not all(isinstance(v, str) and v for v in handled.values()):
             raise ValueError('--handled maps sha256 to a non-empty reason')
         if pinned_ids is not None:
@@ -207,8 +207,8 @@ def build_programs(args, registry_writer):
                             raise ValueError('extra function address is outside executable ranges')
                     program['executable_ranges'] = ranges
                     (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
-                    (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
-                    command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
+                    (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]), encoding='utf-8')
+                    command = [sys.executable, "-X", "utf8", args.lifter, str(outdir / 'code.bin'), '--base', str(base),
                                '--functions', str(outdir / 'functions.json'), '--symbol-prefix', prefix,
                                '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
                     if extra.get(name):
@@ -218,13 +218,13 @@ def build_programs(args, registry_writer):
                     own = [{k: v for k, v in e.items() if k != 'image'} for e in insn_patches
                            if digest.startswith(e['image'])]
                     if own:
-                        (outdir / 'insn_patches.json').write_text(json.dumps({'patches': own}, indent=1))
+                        (outdir / 'insn_patches.json').write_text(json.dumps({'patches': own}, indent=1), encoding='utf-8')
                         command += ['--insn-patches', str(outdir / 'insn_patches.json')]
-                    result = subprocess.run(command, capture_output=True, text=True)
-                    (outdir / 'lift.log').write_text(result.stdout + result.stderr, encoding='utf-8', errors='replace')
+                    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+                    (outdir / 'lift.log').write_text((result.stdout or '') + (result.stderr or ''), encoding='utf-8', errors='replace')
                     if result.returncode:
                         raise ValueError('lifter failed; see ' + name + '/lift.log')
-                    diagnostics = json.loads((outdir / 'lift.json').read_text())
+                    diagnostics = json.loads((outdir / 'lift.json').read_text(encoding='utf-8'))
                     if not diagnostics['unsupported']:
                         break
                 if reachable:

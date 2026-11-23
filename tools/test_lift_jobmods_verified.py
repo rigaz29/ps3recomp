@@ -101,8 +101,8 @@ def check(ok, what):
 
 
 def run(*argv, env=None):
-    r = subprocess.run([sys.executable, str(TOOL), *argv], capture_output=True, text=True,
-                       env=env)
+    r = subprocess.run([sys.executable, "-X", "utf8", str(TOOL), *argv], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env)
     if r.returncode:
         print(r.stdout, r.stderr)
         raise SystemExit("lift_jobmods failed")
@@ -171,9 +171,9 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
                          "unsupported"} for m in sig_manifest), "--jobmods manifest unchanged")
     check(sorted(m["name"] for m in sig_manifest) == sorted(m["name"] for m in manifest),
           "both sources name a module identically")
-    both = subprocess.run([sys.executable, str(TOOL), "--jobmods", str(tmp / "bins"),
+    both = subprocess.run([sys.executable, "-X", "utf8", str(TOOL), "--jobmods", str(tmp / "bins"),
                            "--engine-elf", str(tmp / "engine.elf"), "--out", str(tmp / "x")],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
     check(both.returncode != 0, "--jobmods and --engine-elf are mutually exclusive")
 
     # Residency against the real runtime: link the registration TU + lifted C.

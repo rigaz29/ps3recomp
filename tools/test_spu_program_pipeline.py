@@ -105,6 +105,21 @@ class Pipeline(unittest.TestCase):
         self.assertIn('jogos á é/generated/', text)
         self.assertTrue(self.manifest()['complete'])
 
+    def test_pipeline_utf8_mode_with_special_characters_in_path(self):
+        # When Python runs in UTF-8 mode (-X utf8, as in the Kit), lifting inside a folder with
+        # accented letters (e.g. C:\Users\Usuário) succeeds without UnicodeDecodeError or NoneType errors.
+        self.output = self.root / 'Usuário' / 'generated'
+        path = self.root / 'Usuário' / 'input.bin'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(elf(7))
+        command = [sys.executable, '-X', 'utf8', str(TOOLS / 'build_spu_workloads.py'), '--lifted', str(self.output),
+                   '--out', str(self.output / 'spu_workloads.c'), '--input', str(path)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        self.assertEqual(result.returncode, 0, (result.stderr or '') + (result.stdout or ''))
+        text = (self.output / 'sources.cmake').read_bytes().decode('utf-8')
+        self.assertIn('Usuário/generated/', text)
+        self.assertTrue(self.manifest()['complete'])
+
     def test_bad_bounds_and_unsupported_are_reported_without_registration(self):
         for blob, status in [(elf(bad_bounds=True), 'invalid'), (elf(unsupported=True), 'unsupported'),
                              (elf(multi=True), 'unsupported')]:

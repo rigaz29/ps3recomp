@@ -89,18 +89,18 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix, log=None):
         sys.exit(f"{name}: an entry is in the constant pool (0x{end:X})")
     with open(tmp_elf, "wb") as f:
         f.write(wrap(raw, base=LIFT_BASE, entry=LIFT_BASE + entries[0]))
-    cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(LIFT_BASE),
+    cmd = [sys.executable, "-X", "utf8", LIFTER, "--auto-functions", tmp_elf, "--base", hex(LIFT_BASE),
            "--pic", "--symbol-prefix", prefix, "-o", os.path.join(outdir, name),
            "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h",
            "--code-end", hex(LIFT_BASE + end)] + LIFTER_ARGS
     if len(entries) > 1:
         cmd += ["--extra-funcs", ",".join(hex(LIFT_BASE + e) for e in entries[1:])]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
+        say(f"  FAIL {name}\n{r.stderr or ''}", sys.stderr)
         return None
     funcs = unsup = 0
-    for line in r.stdout.splitlines():
+    for line in (r.stdout or "").splitlines():
         t = line.strip()
         if t.endswith("function(s) lifted"):
             funcs = int(t.split()[0])
@@ -181,7 +181,7 @@ def emit_register(pieces, register_c, sym_prefix):
     L.append("}")
     L.append("")
     os.makedirs(os.path.dirname(register_c) or ".", exist_ok=True)
-    with open(register_c, "w") as f:
+    with open(register_c, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
 
 
@@ -217,7 +217,8 @@ def main():
             LIFTER_ARGS.extend(["--loop-locals-max", str(args.loop_locals_max)])
 
     segs = elf_load_segments(open(args.elf, "rb").read())
-    listed = json.load(open(args.list))
+    with open(args.list, "r", encoding="utf-8") as f:
+        listed = json.load(f)
     os.makedirs(args.out, exist_ok=True)
     by_content = {}
     order = []
@@ -266,7 +267,7 @@ def main():
     manifest = [{"name": p["name"], "image": p["image"], "eas": [hex(e) for e in p["eas"]],
                  "size": len(p["raw"]), "code_end": hex(p["code_end"]),
                  "entries": [hex(e) for e in p["entries"]]} for p in order]
-    with open(os.path.join(args.out, "pic_manifest.json"), "w") as f:
+    with open(os.path.join(args.out, "pic_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     register_c = args.register or os.path.join(args.out, "pic_register.c")
     emit_register(order, register_c, args.symbol_prefix)

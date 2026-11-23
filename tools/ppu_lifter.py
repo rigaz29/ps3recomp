@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import ppu_dead_saves
 import ppu_lazy_flags
+import ppu_cache_regs
 
 # ---------------------------------------------------------------------------
 # We import the disassembler from the same directory.
@@ -1144,6 +1145,7 @@ class PPULifter:
     def __init__(self, prefix: str = "", weak_emit: bool = False):
         self.lazy_flags = ""        # --lazy-flags: "", "on" or "check"
         self.dead_saves = ""        # --dead-saves: "", "on" or "poison"
+        self.cache_regs = ""        # --cache-regs: "", "wt" or "wb"
         self._ds_done = False
         self._lf = None
         self.functions: list[LiftedFunction] = []
@@ -4352,6 +4354,8 @@ class PPULifter:
             body, done = ppu_lazy_flags.rewrite(func.name, self._lf, self.lazy_flags == "check")
         if not done:
             body = _fuse_cr(func.body_lines) + ([tail] if tail else [])
+        if self.cache_regs:
+            body = ppu_cache_regs.rewrite(body, self.cache_regs)
         for bline in body:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -5251,6 +5255,10 @@ def main() -> None:
     parser.add_argument("--dead-saves", choices=("off", "on", "poison"), default="off",
                         help="no guest stores for register saves nothing reads, in each function "
                              "(ppu_dead_saves.py); poison writes a poison value there instead")
+    parser.add_argument("--cache-regs", choices=("off",) + ppu_cache_regs.MODES, default="off",
+                        help="the GPRs, FPRs and CTR each function uses in C locals (ppu_cache_regs.py): "
+                             "wt writes every change through to the context, wb only where the context "
+                             "is handed out or the function returns")
     parser.add_argument("--insn-patches", metavar="FILE", default=None,
                         help="JSON list of instruction patches to lift as "
                              "run-time switches: each {addr, orig, new, guard} "
@@ -5694,6 +5702,7 @@ def main() -> None:
     lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
     lifter.lazy_flags = "" if args.lazy_flags == "off" else args.lazy_flags
     lifter.dead_saves = "" if args.dead_saves == "off" else args.dead_saves
+    lifter.cache_regs = "" if args.cache_regs == "off" else args.cache_regs
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has

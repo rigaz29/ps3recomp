@@ -483,6 +483,15 @@ static int s_wide_flip = -1;            /* replay: the last flip's frame drew a 
  * at a wider view the backdrop covered the middle only, and that frame showed beside it. With fewer than this the frame
  * is a menu, 16:9 between black bars. */
 #define WIDE_SCENE_MIN 8
+/* The upscaler's jitter as the batch is recorded (vp_record_cb): on the scene's draws only. The title draws its HUD
+ * through the camera too, after a clear of the display's depth alone (fg_marker finds the same clear at the replay,
+ * which is too late for the constants): jittered, the HUD shook by the jitter at the window's scale, three quarters of
+ * a pixel at 720p in a 1080p window (#39). A menu's frame is not upscaled, so its few camera draws are not jittered
+ * either: the last flip's frame says whether this one is likely a scene. */
+static int s_rec_hud;          /* recording: the HUD's clear has been recorded this frame */
+static int s_rec_scene_n;      /* recording: this frame's draws of the scene, as WIDE_SCENE_MIN counts them */
+static int s_rec_scene_last;   /* recording: the last flip's frame drew a scene */
+static int s_rec_hud_cam;      /* recording: this frame's camera draws after the HUD's clear, for the log once */
 #define RS_ON (s_rs != 1.0f || s_wide != 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
  * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
@@ -13019,12 +13028,18 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
     /* The frame's first draw at the render's size through a perspective has its camera: a
      * shadow pass goes through the same constants at another size, a screen of 2D through
      * a flat matrix. */
-    if (s_up.ready && dr && dr->rt_w * 9u == dr->rt_h * 16u && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n &&
-        s_d3d.vp_vs[vs_idx].uses_cam) {
-        /* The upscaler's jitter, on what draws the scene at any of its sizes: a shadow atlas
-         * is not 16:9. */
-        vpx[4] += s_up.cx;
-        vpx[5] += s_up.cy;
+    {
+        const int cam = dr && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam;
+        if (cam && !s_rec_hud && dr->zeta_off && !(dr->rt_off & DISP_RT_TAG) && dr->rt_w == s_d3d.width &&
+            dr->rt_h == s_d3d.height)
+            s_rec_scene_n++;
+        if (cam && s_rec_hud) s_rec_hud_cam++;
+        /* The upscaler's jitter, on what draws the scene at any of its sizes (a shadow atlas is not 16:9), and not
+         * on the HUD or a menu: s_rec_hud. */
+        if (s_up.ready && cam && !s_rec_hud && s_rec_scene_last && dr->rt_w * 9u == dr->rt_h * 16u) {
+            vpx[4] += s_up.cx;
+            vpx[5] += s_up.cy;
+        }
     }
     if (s_wide != 1.0f && dr) {
         if (dr->zeta_off && !(dr->rt_off & DISP_RT_TAG) && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
@@ -14874,6 +14889,21 @@ static void d3d12_flip_observed(u32 buffer_id)
     const int wide_scene = s_wide_3d_n >= WIDE_SCENE_MIN;   /* the frame this flips drew a scene: on its FLIP record */
     s_wide_3d = 0;
     s_wide_3d_n = 0;
+    s_rec_scene_last = s_rec_scene_n >= WIDE_SCENE_MIN;
+    {
+        /* Said for the first frame, then for a frame with more of them than any before, four times at most: a menu's
+         * first, then the HUD of play. */
+        static int told, most;
+        if (s_rec_hud_cam > most && s_up.ready && told < 4) {
+            told++;
+            most = s_rec_hud_cam;
+            printf("[D3D12] upscaler: the HUD's clear found as it was recorded; %d camera draws after it, not jittered%c",
+                   s_rec_hud_cam, 10);
+        }
+    }
+    s_rec_scene_n = 0;
+    s_rec_hud = 0;
+    s_rec_hud_cam = 0;
     guest_peek_poke();
     if (on < 0) { const char* e = getenv("FLIP_AT_OP"); on = e ? atoi(e) : 1; }
     extern u32 cellGcm_display_buffer_offset(u32 id);
@@ -18296,6 +18326,8 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->clear_s = stencil;
             rec_scissor(dr);
         }
+        /* The display's depth alone, after a scene: the HUD comes next (fg_marker). */
+        if (flags == 1u && (rt & DISP_RT_TAG) && s_rec_scene_n >= WIDE_SCENE_MIN) s_rec_hud = 1;
         return;
     }
 

@@ -20,7 +20,8 @@
  *
  * Two levers for a tester, as the guide's jitter debugging has in the SDK's own DLL (3.18.1.1):
  * D3D12_DLSS_JITTER=x,y and D3D12_DLSS_MV=x,y multiply what DLSS is told of the jitter and the motion (1,1 as they are,
- * -1 turns one round). D3D12_DLSS_LOG=off|on|verbose: NGX's own lines in the log (on).
+ * -1 turns one round). D3D12_DLSS_LOG=on|verbose: NGX's own lines in the log, off by default (at on its start alone
+ * is some 220 lines, its model cache's misses among them).
  */
 #ifdef _WIN32
 
@@ -156,8 +157,8 @@ int rsx_dlss_init(void* device, const wchar_t* dll_dir, const wchar_t* data_dir,
     dlss_pair("D3D12_DLSS_MV", s_mvmul);
 
     const char* lv = getenv("D3D12_DLSS_LOG");
-    NVSDK_NGX_Logging_Level level = NVSDK_NGX_LOGGING_LEVEL_ON;
-    if (lv && !_stricmp(lv, "off")) level = NVSDK_NGX_LOGGING_LEVEL_OFF;
+    NVSDK_NGX_Logging_Level level = NVSDK_NGX_LOGGING_LEVEL_OFF;
+    if (lv && !_stricmp(lv, "on")) level = NVSDK_NGX_LOGGING_LEVEL_ON;
     else if (lv && !_stricmp(lv, "verbose")) level = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
 
     wchar_t* paths[1] = { s_dll_dir };

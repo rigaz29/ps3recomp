@@ -1797,6 +1797,15 @@ static int pad_rp_idle_at(unsigned ms)
     return 1;
 }
 
+/* How long the playback waits at a mark the run has not made yet (PAD_REPLAY_WAIT_MS, 5 s): longer for a
+ * recording spliced to start at a level's first file, which the run reaches through its own menus first. */
+static unsigned long long pad_rp_wait_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("PAD_REPLAY_WAIT_MS"); ms = e && atoll(e) > 0 ? atoll(e) : 5000; }
+    return (unsigned long long)ms;
+}
+
 /* A read of port 0 in playback: moves the playback's clock on and gives the
  * report the title gets now, NULL before the recording's first and while it
  * waits at a mark. */
@@ -1821,12 +1830,12 @@ static const PadRpReport* pad_rp_step(unsigned long long now)
         if (!s_rpm_hold) s_rpm_hold = now;
         const PadRpMark* m = &s_rpm[s_rpm_next];
         waiting = 1;
-        if (now - s_rpm_hold >= 5000) {
+        if (now - s_rpm_hold >= pad_rp_wait_ms()) {
             waiting = 0;
             const unsigned at = m->ms;
             int n = 0;
             s_rpt[m->text].shaky = 1;
-            printf("[cellPad] PAD_REPLAY: '%s' did not come in 5 s", s_rpt[m->text].s);
+            printf("[cellPad] PAD_REPLAY: '%s' did not come in %.0f s", s_rpt[m->text].s, pad_rp_wait_ms() / 1000.0);
             while (s_rpm_next < s_rpm_n && s_rpm[s_rpm_next].ms <= at + 1000) { s_rpm_next++; n++; }
             printf("; on without it and %d more, and no longer waiting for it\n", n - 1);
             fflush(stdout);

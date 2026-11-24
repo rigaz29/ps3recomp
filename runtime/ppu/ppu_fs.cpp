@@ -42,6 +42,9 @@ extern "C" void (*g_ps3_mark_hook)(const char* kind, const char* text);   /* sys
  * to stop a title that cannot go on without that file, rather than let it run into whatever it does next with the
  * error. NULL: not called. */
 extern "C" { void (*g_ps3_open_failed_hook)(const char* guest_path, const char* host_path) = nullptr; }
+/* Called for every file cellFsOpen is asked for, once it has tried: the title's path, and 1 if it opened. A port
+ * follows what a title loads by it. NULL: not called. */
+extern "C" { void (*g_ps3_open_hook)(const char* guest_path, int opened) = nullptr; }
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -314,6 +317,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (g_ps3_mark_hook) g_ps3_mark_hook("open", gpath);   /* found or not: the title got this far */
+    if (g_ps3_open_hook) g_ps3_open_hook(gpath, hfd >= 0);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         if (g_ps3_open_failed_hook) g_ps3_open_failed_hook(gpath, hpath);

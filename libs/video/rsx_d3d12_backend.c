@@ -64,6 +64,7 @@
 #ifdef PS3RECOMP_DLSS
 #include "rsx_dlss.h"
 #endif
+#include "rsx_sl.h"
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -3974,6 +3975,27 @@ static int init_d3d12(u32 width, u32 height)
         return -1;
     }
 
+    /* graphics.reflex: NVIDIA Reflex through Streamline (rsx_sl.h), started before the swap chain, which is then made
+     * through Streamline's factory so its present runs each frame. Not with frame generation: FSR makes its own swap
+     * chain from ours. */
+    {
+        const char* rx = ps3_settings_str("graphics", "reflex", "D3D12_REFLEX", "off");
+        const char* fgm = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
+        if (rx && !ps3_settings_ieq(rx, "off")) {
+            if (fgm && !ps3_settings_ieq(fgm, "off")) {
+                printf("[D3D12] reflex: off with frame generation\n");
+            } else {
+                LUID luid;
+                memset(&luid, 0, sizeof luid);
+                s_d3d.device->lpVtbl->GetAdapterLuid(s_d3d.device, &luid);
+                if (rsx_sl_start(s_d3d.device, &luid, s_gpu_vendor, rx)) {
+                    IDXGIFactory4* proxy = (IDXGIFactory4*)rsx_sl_factory(factory);
+                    if (proxy) factory = proxy;   /* it keeps the factory it stands for */
+                }
+            }
+        }
+    }
+
     /* Create swap chain, at the view's size: the display targets are scaled
      * into it (present_to_backbuffer), not stretched by DXGI. */
     {
@@ -4034,6 +4056,16 @@ static int init_d3d12(u32 width, u32 height)
     if (FAILED(hr)) {
         printf("[D3D12] ERROR: QueryInterface for SwapChain3 failed\n");
         return -1;
+    }
+    if (rsx_sl_on()) {
+        /* Its present is Streamline's, or Streamline does not run at all: what it keeps for a frame is let go there. */
+        if (!rsx_sl_presents_through(s_d3d.swap_chain)) {
+            printf("[D3D12] reflex: off, the swap chain is not Streamline's\n");
+            rsx_sl_shutdown();
+        } else {
+            extern void (*g_gcm_flip_release_hook)(int after);
+            g_gcm_flip_release_hook = rsx_sl_flip_release;
+        }
     }
 
     fg_start();
@@ -5735,7 +5767,9 @@ static void ovs_lines(char line[OVS_LINES][96])
     else fg[0] = 0;
     snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s", up, fg,
              s_up.dlss ? "DLSS" : s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");
-    snprintf(line[3], sizeof line[3], "%u x %u -> %u x %u", s_d3d.pw, s_d3d.ph, s_d3d.bb_w, s_d3d.bb_h);
+    const char* rx = rsx_sl_label();
+    snprintf(line[3], sizeof line[3], "%u x %u -> %u x %u%s%s", s_d3d.pw, s_d3d.ph, s_d3d.bb_w, s_d3d.bb_h,
+             rx[0] ? " | " : "", rx);
 }
 
 static void ov_render_panel(u32 font_px)
@@ -14920,6 +14954,7 @@ static unsigned s_fo_batch, s_fo_dropped, s_fo_failed;
 
 static void d3d12_flip_observed(u32 buffer_id)
 {
+    rsx_sl_flip_reached();   /* the title's frame is built */
     static int on = -1;
     const int wide_scene = s_wide_3d_n >= WIDE_SCENE_MIN;   /* the frame this flips drew a scene: on its FLIP record */
     s_wide_3d = 0;
@@ -18190,11 +18225,14 @@ skip_dump_consider: ;
     if (s_present_this_frame) {
         HRESULT phr;
         if (rsx_census_secs()) rsx_census_present();
+        rsx_sl_marker(RSX_SL_SUBMIT_END);
+        rsx_sl_marker(RSX_SL_PRESENT_START);
         if (!d3d12_vsync_off())
             phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
         else
             phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
                                                     s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        rsx_sl_marker(RSX_SL_PRESENT_END);
         /* The frame the device was lost at: every later D3D call fails, so
          * the screen just stops changing while the title runs on. */
         { static int said = 0;
@@ -21691,6 +21729,9 @@ void rsx_d3d12_backend_shutdown(void)
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
+    { extern void (*g_gcm_flip_release_hook)(int after);
+      g_gcm_flip_release_hook = NULL;
+      rsx_sl_shutdown(); }   /* before the device, as Streamline asks */
     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
 
@@ -21707,6 +21748,7 @@ int rsx_d3d12_backend_pump_messages(void)
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
+        rsx_sl_window_message(msg.message);   /* PCL's latency ping, a thread message */
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
@@ -21975,6 +22017,7 @@ static void rt_pump(void)
     if (s_rt_wm_quit) { PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE); return; }
     while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
         if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); s_rt_wm_quit = 1; return; }
+        rsx_sl_window_message(m.message);
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
@@ -22111,6 +22154,7 @@ void rsx_d3d12_backend_present(void)
 {
     /* RSX_RENDER_THREAD: the frame before is done, its composite source read */
     if (s_rt_mode > 0) rt_wait(&s_rt_done, rt_get(&s_rt_req));
+    rsx_sl_marker(RSX_SL_SUBMIT_START);   /* the frame's last records, its submission and its present follow */
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);

@@ -1103,6 +1103,11 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * and its handler runs code that puts the status back to WAITING, so the
  * poll never saw DONE and the game never rendered another frame. On hardware
  * the callback IS the flip interrupt -- no flip, no callback. */
+/* The renderer, around the completion of a flip the title waits on: 0 just before it, 1 just after. The title
+ * builds its next frame from there, so NVIDIA Reflex sleeps before it and marks the frame's start after it
+ * (rsx_sl.h). */
+void (*g_gcm_flip_release_hook)(int after) = NULL;
+
 void cellGcmTickFlip(void)
 {
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
@@ -1111,7 +1116,11 @@ void cellGcmTickFlip(void)
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
+    if (!waiting) return;
+    void (*hook)(int) = g_gcm_flip_release_hook;
+    if (hook) hook(0);
+    GCM_PENDING_SET(2);
+    if (hook) hook(1);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread

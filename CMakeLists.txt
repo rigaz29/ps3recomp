@@ -86,6 +86,12 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.c
 # AMD FSR 3.1 is C++, as the FSR API's DX12 header is, and loaded at run time.
 if(WIN32)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_fsr3.cpp")
+    # NVIDIA Reflex through Streamline (graphics.reflex), loaded at run time from the signed sl.interposer.dll beside
+    # the exe; Streamline's headers (MIT) are third_party/streamline's, for this one file.
+    set(SL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_sl.cpp")
+    list(APPEND HLE_SOURCES "${SL_SOURCE}")
+    set_source_files_properties("${SL_SOURCE}" PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/streamline/include")
 endif()
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
@@ -260,6 +266,8 @@ if(WIN32)
         ws2_32      # Winsock for network modules
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        wintrust    # sl.interposer.dll's signature (rsx_sl.cpp)
+        crypt32
     )
     # SDL3's include folder: cellPad then reads, beside XInput, the controllers XInput does not (DualShock 4,
     # DualSense, Switch, DirectInput pads) through SDL3.dll, which it loads at run time from the program's folder.

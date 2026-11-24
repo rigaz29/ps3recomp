@@ -494,6 +494,14 @@ static int s_rec_scene_n;      /* recording: this frame's draws of the scene, as
 static int s_rec_scene_last;   /* recording: the last flip's frame drew a scene */
 static int s_rec_hud_cam;      /* recording: this frame's camera draws after the HUD's clear, for the log once */
 #define RS_ON (s_rs != 1.0f || s_wide != 1.0f)
+/* graphics.shadow_resolution = 1, 2 or 4: shadow maps (depth surfaces of no size the display's, nor a fraction of it)
+ * drawn that many times larger, at any internal resolution. graphics.effects_resolution = internal: the post chain's
+ * targets (a half, quarter, eighth or sixteenth of the display: bloom, blur, depth of field) drawn at the internal
+ * resolution as the display's are, by the same factors. Both go by the rules of the internal resolution above: the
+ * guest goes on seeing its own sizes. TS_ON: some surface is drawn larger than the guest made it. */
+static float s_shadow = 1.0f;
+static int s_post_full;
+#define TS_ON (RS_ON || s_shadow > 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
  * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
  * earlier one already have: made anew there, those draws sample the old one through the views they
@@ -943,7 +951,7 @@ static void subvp_note(u32 x, u32 y, u32 w, u32 h)
 {
     if (!w || !h || w > s_d3d.width || h > s_d3d.height) return;
     if (w == s_d3d.width && h == s_d3d.height) return;      /* full-screen pass */
-    if (RS_ON) return;                                       /* its copies are in guest pixels */
+    if (TS_ON) return;                                       /* its copies are in guest pixels */
     for (int i = 0; i < s_subvp_n; i++)
         if (s_subvp[i].w == w && s_subvp[i].h == h) { s_subvp[i].x = x; s_subvp[i].y = y; return; }
     if (s_subvp_n >= SUBVP_SLOTS) return;
@@ -3922,12 +3930,61 @@ static void rs_init(void)
     s_d3d.pw = (u32)((float)s_d3d.width * s * s_wide + 0.5f);
     s_d3d.ph = (u32)((float)s_d3d.height * s + 0.5f);
     if (RS_ON) printf("[D3D12] internal resolution: %ux%u (%.3gx %ux%u)%c", s_d3d.pw, s_d3d.ph, s, s_d3d.width, s_d3d.height, 10);
+    const float sh = (float)atof(ps3_settings_str("graphics", "shadow_resolution", "D3D12_SHADOW_RES", "1"));
+    s_shadow = sh >= 4.0f ? 4.0f : sh >= 2.0f ? 2.0f : 1.0f;
+    if (s_shadow > 1.0f) printf("[D3D12] shadow maps: %gx their size%c", s_shadow, 10);
+    s_post_full = ps3_settings_ieq(ps3_settings_str("graphics", "effects_resolution", "D3D12_EFFECTS_RES", "game"),
+                                   "internal");
+    if (s_post_full && RS_ON)
+        printf("[D3D12] effects (bloom, blur, depth of field): at the internal resolution, %.3gx%c",
+               (float)s_d3d.ph / (float)s_d3d.height, 10);
 }
 
-/* Whether a surface of this guest size is drawn larger. */
-static int rs_class(u32 w, u32 h)
+static int off_ds_find(u32 off);
+
+/* k when a surface of this guest size is the display's divided by k (2, 4, 8 or 16), else 0. */
+static u32 rs_fraction(u32 w, u32 h)
 {
-    return RS_ON && w == s_d3d.width && h == s_d3d.height;
+    for (u32 k = 2; k <= 16; k *= 2)
+        if (w * k == s_d3d.width && h * k == s_d3d.height) return k;
+    return 0;
+}
+
+/* A surface's size in D3D12 pixels and its factors, by its guest size: the display's, at the internal resolution;
+ * the post chain's fractions of it, at the same factors (exactly: copies between targets need equal ones) with
+ * graphics.effects_resolution = internal, but for float colour targets (hdr): God of War: Ascension's are the
+ * luminance chain its exposure is measured on (640x360, then 160x180, 40x45 and 8x9), whose sampling offsets are
+ * the game's own, so they stay at its size and the exposure stays the game's; shadow maps by
+ * graphics.shadow_resolution, and a colour target that is the colour copy of a shadow map (the same offset and size)
+ * with it; anything else as the guest made it. */
+static void rs_dims(u32 off, u32 w, u32 h, int depth, int hdr, u32* pw, u32* ph, float* sx, float* sy)
+{
+    *pw = w; *ph = h;
+    const float fx = (float)s_d3d.pw / (float)s_d3d.width, fy = (float)s_d3d.ph / (float)s_d3d.height;
+    if (w == s_d3d.width && h == s_d3d.height) {   /* the display's: never a shadow map */
+        if (RS_ON) { *pw = s_d3d.pw; *ph = s_d3d.ph; }
+    } else if (rs_fraction(w, h)) {
+        if (RS_ON && s_post_full && !hdr) {
+            *pw = (u32)((float)w * fx + 0.5f); *ph = (u32)((float)h * fy + 0.5f);
+            *sx = fx; *sy = fy;
+            return;
+        }
+    } else if (s_shadow > 1.0f && w && h) {
+        int shadow = depth;
+        if (!depth) {
+            const int z = off_ds_find(off);
+            shadow = z >= 0 && s_d3d.off_ds[z].w == w && s_d3d.off_ds[z].h == h && s_d3d.off_ds[z].sx > 1.0f &&
+                     s_d3d.off_ds[z].sx == s_d3d.off_ds[z].sy;
+        }
+        float f = s_shadow;
+        while (f > 1.0f && ((float)w * f > 16384.0f || (float)h * f > 16384.0f)) f *= 0.5f;   /* D3D12's largest */
+        if (shadow && f > 1.0f) {
+            *pw = (u32)((float)w * f); *ph = (u32)((float)h * f);
+            *sx = f; *sy = f;
+            return;
+        }
+    }
+    *sx = (float)*pw / (float)w; *sy = (float)*ph / (float)h;
 }
 
 /* A guest coordinate in the pixels of a target drawn f times larger. */
@@ -9987,7 +10044,7 @@ static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
     fs[1] = s_wide > 0.0f ? 1.0f / s_wide : 1.0f;
     fs[2] = (float)aax;
     fs[3] = (float)aay;
-    if (!RS_ON) ts[FPCB_ALPHA * 4 + 3] = 1.0f;
+    if (!TS_ON) ts[FPCB_ALPHA * 4 + 3] = 1.0f;
 }
 
 /* RSX_FP_DYNAMIC: a buffered program's whole text, from the program, its control bits (SET_SHADER_CONTROL's
@@ -10785,7 +10842,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                  "fp_alpha.y - (p).y * abs(fp_alpha.w) : (p).y * abs(fp_alpha.w)) + fp_alpha.z,", 1.0f / s_wide);
         hlsl_replace_all(hlsl, sizeof hlsl,
                          "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,", wp);
-    } else if (buffered && s_rs != 1.0f)
+    } else if (buffered && (s_rs != 1.0f || s_shadow > 1.0f))   /* shadow maps drawn larger: in their passes too */
         hlsl_replace_all(hlsl, sizeof hlsl,
                          "float4((p).x + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z,",
                          "float4((p).x * fp_alpha.w + fp_alpha.z, (fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * fp_alpha.w : "
@@ -13664,7 +13721,15 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td = {0};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    const u32 pw = rs_class(w, h) ? s_d3d.pw : w, ph = rs_class(w, h) ? s_d3d.ph : h;
+    u32 pw, ph;
+    float tsx, tsy;
+    const int hdr = want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT || want_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+                    want_fmt == DXGI_FORMAT_R32_FLOAT || want_fmt == DXGI_FORMAT_R16G16_FLOAT;
+    rs_dims(off, w, h, 0, hdr, &pw, &ph, &tsx, &tsy);
+    if (s_post_full && RS_ON && rs_fraction(w, h) && !hdr) {
+        static int said;
+        if (said++ < 8) printf("[D3D12] effects target 0x%08X %ux%u drawn at %ux%u%c", off, w, h, pw, ph, 10);
+    }
     td.Width = pw; td.Height = ph; td.DepthOrArraySize = 1; td.MipLevels = 1;
     td.Format = want_fmt; td.SampleDesc.Count = 1;
     td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -13677,7 +13742,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             &IID_ID3D12Resource, (void**)&r->res)))
         return -1;
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
-    r->pw = pw; r->ph = ph; r->sx = (float)pw / (float)w; r->sy = (float)ph / (float)h;
+    r->pw = pw; r->ph = ph; r->sx = tsx; r->sy = tsy;
     off_bit_set(s_ort_bits, off);
     r->grow_w = r->grow_h = 0;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -14574,7 +14639,13 @@ static int off_ds_get(u32 off, u32 w, u32 h)
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td = {0};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    const u32 pw = rs_class(w, h) ? s_d3d.pw : w, ph = rs_class(w, h) ? s_d3d.ph : h;
+    u32 pw, ph;
+    float tsx, tsy;
+    rs_dims(off, w, h, 1, 0, &pw, &ph, &tsx, &tsy);
+    if (s_shadow > 1.0f && tsx == tsy && tsx > 1.0f && !(w == s_d3d.width && h == s_d3d.height) && !rs_fraction(w, h)) {
+        static int said;
+        if (said++ < 8) printf("[D3D12] shadow map 0x%08X %ux%u drawn at %ux%u%c", off, w, h, pw, ph, 10);
+    }
     td.Width = pw; td.Height = ph; td.DepthOrArraySize = 1; td.MipLevels = 1;
     td.Format = DXGI_FORMAT_R24G8_TYPELESS; td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -14587,7 +14658,7 @@ static int off_ds_get(u32 off, u32 w, u32 h)
             &IID_ID3D12Resource, (void**)&z->res)))
         return -1;
     z->off = off; z->w = w; z->h = h;
-    z->pw = pw; z->ph = ph; z->sx = (float)pw / (float)w; z->sy = (float)ph / (float)h;
+    z->pw = pw; z->ph = ph; z->sx = tsx; z->sy = tsy;
     z->grow_w = z->grow_h = 0;
     z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     z->cleared = 0; z->gen = 0; z->conv_gen = 0xFFFFFFFFu;
@@ -17160,7 +17231,18 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                     gps_pass(d, want >= 0 ? s_d3d.off_rt[want].off : 0, (u32)vp.Width, (u32)vp.Height, dr->fp_addr);
                     { float rx, ry;
                       rs_target(want, wantz, dr->no_color, &rx, &ry);
-                      vp.Width *= rx; vp.Height *= ry; }
+                      vp.Width *= rx; vp.Height *= ry;
+                      /* graphics.shadow_resolution takes a depth surface of no size the display's for a shadow map;
+                       * one drawn with a colour target at another scale too is not one, and draws wrong. */
+                      if (s_shadow > 1.0f && !dr->no_color && want >= 0 && wantz >= 0 &&
+                          s_d3d.off_ds[wantz].sx != rx && s_d3d.off_ds[wantz].sx > 1.0f &&
+                          s_d3d.off_ds[wantz].sx == s_d3d.off_ds[wantz].sy &&
+                          !(s_d3d.off_ds[wantz].w == s_d3d.width && s_d3d.off_ds[wantz].h == s_d3d.height) &&
+                          !rs_fraction(s_d3d.off_ds[wantz].w, s_d3d.off_ds[wantz].h)) {
+                          static int said;
+                          if (!said++) fprintf(stderr, "[D3D12] depth surface 0x%X drawn larger as a shadow map (graphics.shadow_resolution) is drawn with a colour target 0x%X too: if something looks wrong, set Shadow resolution to the game's%c",
+                                               s_d3d.off_ds[wantz].off, s_d3d.off_rt[want].off, 10);
+                      } }
                     D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
                     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, dr->no_color ? 0 : nrt,
                                                                dr->no_color ? NULL : rh, FALSE, &cur_dsv);
@@ -17446,7 +17528,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                         ts[_u * 4 + 2] = (float)dr_gamma_mask(dr, _u);
                         ts[_u * 4 + 3] = 0.0f;
                     }
-                    if (RS_ON) {
+                    if (TS_ON) {
                         float rx, ry;
                         rs_target(cur_rt, cur_z, cur_nc, &rx, &ry);
                         ts[FPCB_ALPHA * 4 + 3] = rx != ry ? -1.0f / ry : 1.0f / rx;

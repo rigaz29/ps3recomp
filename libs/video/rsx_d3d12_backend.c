@@ -1136,6 +1136,8 @@ static void rdoc_request(void)
  * is the proxy swapchain and its threads with nothing generated, to measure them.
  * anr (beta): on, with ANR FG's DLL (graphics.anr_dll, D3D12_ANR_DLL) making the
  * generated frames in FSR's place; FSR's own where it cannot (rsx_anr.cpp).
+ * dlss (beta): NVIDIA DLSS Frame Generation through Streamline, whose swap chain
+ * presents the frames (rsx_sl.cpp), from the same inputs FSR's takes.
  * The swap chain goes behind the proxy before anything asks it for a buffer; the
  * context waits for the first frame, when the window's size is known. */
 #define FG_OBJ_MAX   1024      /* draws of what moves in a frame */
@@ -1144,6 +1146,7 @@ static void rdoc_request(void)
 #define FG_OBJ_BIAS  (-64)     /* their depth against the scene's, from another program's arithmetic */
 static int s_fg_mode;       /* 0 off, 1 passthrough, 2 on */
 static int s_fg_anr;        /* frame_generation = anr */
+static int s_fg_dlssg;      /* frame_generation = dlss, and Streamline has DLSS-G on the swap chain */
 /* graphics.scaling = fsr3: FSR's upscaler on scene frames, FSR 1 on the rest. dlss: NVIDIA DLSS's in FSR's place
  * (rsx_dlss.cpp), with the same inputs; FSR's where DLSS cannot run. */
 static struct {
@@ -1209,6 +1212,12 @@ static void fg_start(void)
     const int mode = ps3_settings_ieq(m, "on") || s_fg_anr ? 2 : ps3_settings_ieq(m, "passthrough") ? 1 : 0;
     if (!ps3_settings_bool("graphics", "frame_generation_objects", "D3D12_FG_OBJECTS", 1)) s_fg.prev_reg = -1;
     if (rsx_d3d12_backend_wide_ratio() != 1.0f) s_fg.prev_reg = -1;   /* 21:9: it left noise on Kratos in close-ups; cause not found */
+    if (ps3_settings_ieq(m, "dlss")) {
+        if (s_fsr3_refused) printf("[D3D12] frame generation: off, %s%c", s_fsr3_refused, 10);
+        else if (!rsx_sl_dlssg_on()) printf("[D3D12] frame generation: off, DLSS frame generation is not available here%c", 10);
+        else { s_fg_dlssg = 1; s_fg_mode = 2; }
+        return;
+    }
     if (!mode) return;
     if (s_fsr3_refused) {
         printf("[D3D12] frame generation: off, %s%c", s_fsr3_refused, 10);
@@ -1285,11 +1294,45 @@ static void fg_desc(rsx_fsr3_frame* f)
     if (s_up.ready) { f->jitter_x = s_up.jx; f->jitter_y = s_up.jy; }
 }
 
+/* DLSS-G's part of a presented frame: the depth and motion targets FSR's inputs' pass makes (once the upscaler has not
+ * made them this frame), the picture without its HUD, the camera; a frame with no scene turns it off. */
+static void fg_dlssg_frame(const rsx_fsr3_frame* f)
+{
+    static int inputs = -1;
+    if (inputs < 0) {
+        inputs = rsx_fsr3_inputs_create(s_d3d.device, s_d3d.pw, s_d3d.ph);
+        if (!inputs) printf("[D3D12] DLSS frame generation: its depth and motion targets were not made%c", 10);
+    }
+    rsx_sl_frame g;
+    memset(&g, 0, sizeof g);
+    rsx_fsr3_pose pose;
+    if (inputs > 0 && f->scene && f->hudless && rsx_fsr3_prepare_once(s_d3d.cmd_list, f) && rsx_fsr3_pose_get(&pose)) {
+        void *depth = NULL, *motion = NULL;
+        int reset = 0;
+        rsx_fsr3_inputs_get(&depth, &motion, &reset);
+        g.scene = 1;
+        g.depth = depth;
+        g.motion = motion;
+        g.hudless = f->hudless;
+        g.render_w = s_d3d.pw;
+        g.render_h = s_d3d.ph;
+        g.display_w = s_d3d.bb_w;
+        g.display_h = s_d3d.bb_h;
+        g.jitter_x = f->jitter_x;
+        g.jitter_y = f->jitter_y;
+        g.pose = &pose;
+    }
+    rsx_sl_dlssg_frame(s_d3d.cmd_list, &g);
+}
+
 /* Every presented frame, before the list closes. */
 static void fg_frame(void)
 {
     if (!s_fg_mode && !s_up.want) return;
-    if (s_fg_mode && !s_fg_ready) {
+    if (s_fg_dlssg && !s_fg_ready) {
+        s_fg_ready = 1;
+        printf("[D3D12] frame generation on, NVIDIA DLSS: %ux%u from %ux%u%c", s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, 10);
+    } else if (s_fg_mode && !s_fg_ready) {
         s_fg_ready = 1;
         if (!rsx_fsr3_fg_create(s_d3d.device, s_d3d.swap_chain, s_d3d.bb_w, s_d3d.bb_h,
                                 s_d3d.pw, s_d3d.ph, s_fg_mode == 2)) {
@@ -1307,7 +1350,8 @@ static void fg_frame(void)
         rsx_fsr3_frame f;
         fg_desc(&f);
         f.scene = s_fg.ready;
-        rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, fg_ms(now));
+        if (s_fg_dlssg) fg_dlssg_frame(&f);
+        else rsx_fsr3_fg_frame(s_d3d.cmd_list, &f, fg_ms(now));
     }
     s_fg_last = now;
     s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.depth_ok = s_fg.ready = 0;
@@ -3981,14 +4025,26 @@ static int init_d3d12(u32 width, u32 height)
     {
         const char* rx = ps3_settings_str("graphics", "reflex", "D3D12_REFLEX", "off");
         const char* fgm = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
-        if (rx && !ps3_settings_ieq(rx, "off")) {
-            if (fgm && !ps3_settings_ieq(fgm, "off")) {
+        /* frame_generation = dlss: DLSS-G, and Reflex with it (on at least). Its nvngx_dlssg.dll is looked for in the
+         * dlss folder beside the exe (D3D12_DLSS_DIR), where the launcher puts it, as DLSS's own DLL. */
+        const int dlssg = fgm && ps3_settings_ieq(fgm, "dlss");
+        if (rx && (dlssg || !ps3_settings_ieq(rx, "off"))) {
+            if (fgm && !ps3_settings_ieq(fgm, "off") && !dlssg) {
                 printf("[D3D12] reflex: off with frame generation\n");
             } else {
                 LUID luid;
                 memset(&luid, 0, sizeof luid);
                 s_d3d.device->lpVtbl->GetAdapterLuid(s_d3d.device, &luid);
-                if (rsx_sl_start(s_d3d.device, &luid, s_gpu_vendor, rx)) {
+                wchar_t dlss_dir[MAX_PATH] = L"";
+                const char* dd = getenv("D3D12_DLSS_DIR");
+                if (dd && *dd) {
+                    MultiByteToWideChar(CP_UTF8, 0, dd, -1, dlss_dir, MAX_PATH);
+                } else if (GetModuleFileNameW(NULL, dlss_dir, MAX_PATH - 8)) {
+                    wchar_t* slash = wcsrchr(dlss_dir, L'\\');
+                    if (slash) wcscpy(slash + 1, L"dlss");
+                    else dlss_dir[0] = 0;
+                }
+                if (rsx_sl_start(s_d3d.device, &luid, s_gpu_vendor, rx, dlssg, dlss_dir)) {
                     IDXGIFactory4* proxy = (IDXGIFactory4*)rsx_sl_factory(factory);
                     if (proxy) factory = proxy;   /* it keeps the factory it stands for */
                 }
@@ -5268,7 +5324,8 @@ static void bb_resize(void)
         s_up.jx = s_up.jy = s_up.cx = s_up.cy = 0.0f;
     }
     if (s_fg_mode || s_up.want) {        /* its size is the window's: made again at the next frame */
-        if (s_fg_mode) rsx_fsr3_fg_destroy();
+        if (s_fg_dlssg) rsx_sl_dlssg_pause();
+        else if (s_fg_mode) rsx_fsr3_fg_destroy();
         s_fg_ready = 0;
         for (int i = 0; i < 2; i++)
             if (s_fg.hud_out[i]) { s_fg.hud_out[i]->lpVtbl->Release(s_fg.hud_out[i]); s_fg.hud_out[i] = NULL; }
@@ -5763,7 +5820,8 @@ static void ovs_lines(char line[OVS_LINES][96])
 #endif
     if (s_up.want) snprintf(up, sizeof up, "FSR%s%s", uv[0] ? " " : "", uv);
     else snprintf(up, sizeof up, "%s", s_d3d.pp_mode == 2 ? "FSR 1" : s_d3d.pp_mode == 1 ? "Sharp" : "Off");
-    if (s_fg_mode == 2) snprintf(fg, sizeof fg, " + FG%s%s", gv[0] ? " " : "", gv);
+    if (s_fg_dlssg) snprintf(fg, sizeof fg, " + DLSS FG");
+    else if (s_fg_mode == 2) snprintf(fg, sizeof fg, " + FG%s%s", gv[0] ? " " : "", gv);
     else fg[0] = 0;
     snprintf(line[2], sizeof line[2], "Upscaler: %s%s | Anti-aliasing: %s", up, fg,
              s_up.dlss ? "DLSS" : s_up.want ? "FSR" : s_d3d.aa_on ? "SMAA" : ovs_mlaa() ? "MLAA" : "Off");

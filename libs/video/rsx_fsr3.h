@@ -80,6 +80,21 @@ void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* frame, void* color,
 /* Frames a second under which frames are shown as they are, until it recovers. 0: never. */
 void rsx_fsr3_fg_floor(double fps);
 
+/* For another frame generation (DLSS's, rsx_sl.cpp), with rsx_fsr3_inputs_create's targets: rsx_fsr3_prepare unless an
+ * upscaler had it done this frame, then the frame is done with. 1 if the frame had a camera. */
+int rsx_fsr3_prepare_once(void* cmd_list, const rsx_fsr3_frame* frame);
+
+/* The camera rsx_fsr3_prepare found, and the one of the frame before. */
+typedef struct rsx_fsr3_pose {
+    float znear, zfar, fov;         /* fov: vertical, radians */
+    float pos[3], up[3], right[3], fwd[3];
+    float clip[16];                 /* world to clip by rows, a point as a column: clip = M p */
+    float prev_clip[16];            /* the frame before's */
+    int reset;                      /* nothing to go by from the frame before (a cut, a scene's first frame) */
+} rsx_fsr3_pose;
+/* 1 if the last rsx_fsr3_prepare had a camera. */
+int rsx_fsr3_pose_get(rsx_fsr3_pose* out);
+
 /* ANR FG (beta, PS3RECOMP_ANR): its DLL makes the generated frames in place of FSR's, and the same
  * swap chain presents and paces them. After rsx_fsr3_fg_create; 1 if it is used. */
 int rsx_fsr3_fg_anr(const char* dll);

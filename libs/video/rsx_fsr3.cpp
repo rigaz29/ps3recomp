@@ -75,6 +75,7 @@ struct fsr3_camera {
 static fsr3_camera s_prev;
 static bool s_prev_ok;              /* the last frame was a scene */
 static fsr3_camera s_cam;           /* this frame's, from rsx_fsr3_prepare */
+static fsr3_camera s_cam_before;    /* the frame before's, for rsx_fsr3_pose_get */
 static bool s_on, s_reset, s_prepared;
 static bool s_fg_was;               /* generation ran on the last frame */
 static bool s_fg_told;              /* the context has been told once whether to generate */
@@ -806,6 +807,7 @@ int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* f)
                 printf("[fsr3] camera: near %.3f far %.1f fov %.1f at (%.1f %.1f %.1f)\n", cam.znear, cam.zfar,
                        cam.fov * 57.29578, cam.pos[0], cam.pos[1], cam.pos[2]);
         }
+        s_cam_before = reset ? cam : s_prev;
         s_prev = cam;
         s_cam = cam;
     }
@@ -814,6 +816,34 @@ int rsx_fsr3_prepare(void* cmd_list, const rsx_fsr3_frame* f)
     s_prev_ok = on;
     s_prepared = true;
     return on;
+}
+
+int rsx_fsr3_prepare_once(void* cmd_list, const rsx_fsr3_frame* f)
+{
+    if (!s_prepared) rsx_fsr3_prepare(cmd_list, f);
+    s_prepared = false;
+    return s_on;
+}
+
+int rsx_fsr3_pose_get(rsx_fsr3_pose* out)
+{
+    if (!s_on) return 0;
+    out->znear = (float)s_cam.znear;
+    out->zfar = (float)s_cam.zfar;
+    out->fov = (float)s_cam.fov;
+    for (int i = 0; i < 3; i++) {
+        out->pos[i] = (float)s_cam.pos[i];
+        out->up[i] = (float)s_cam.up[i];
+        out->right[i] = (float)s_cam.right[i];
+        out->fwd[i] = (float)s_cam.fwd[i];
+    }
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            out->clip[r * 4 + k] = (float)s_cam.m[r][k];
+            out->prev_clip[r * 4 + k] = (float)s_cam_before.m[r][k];
+        }
+    out->reset = s_reset;
+    return 1;
 }
 
 void rsx_fsr3_up_frame(void* cmd_list, const rsx_fsr3_frame* f, void* color, void* output, float frame_ms)

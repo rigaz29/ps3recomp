@@ -44,6 +44,7 @@ Usage:
 import argparse, concurrent.futures, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
+from child_python import python_cmd
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
@@ -284,9 +285,9 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     with open(tmp_elf, "wb") as f:
         f.write(elf)
 
-    cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
-           "--symbol-prefix", prefix, "-o", outsub,
-           "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
+    cmd = python_cmd(LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
+                     "--symbol-prefix", prefix, "-o", outsub,
+                     "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h")
     end = code_end or CODE_END.get(name)
     if end:
         cmd += ["--code-end", hex(end)]
@@ -303,7 +304,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         inside = [a for a in inside if int(a, 0) < code_end]
     if inside:
         cmd += ["--extra-funcs", ",".join(inside)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
         return None

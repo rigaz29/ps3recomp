@@ -44,6 +44,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap                     # noqa: E402
 from lift_jobmods import elf_load_segments        # noqa: E402
+from child_python import python_cmd               # noqa: E402
 
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 # Options every spu_lifter.py run gets (--float-spec).
@@ -89,13 +90,13 @@ def lift_piece(raw, name, entries, outdir, tmp_elf, prefix, log=None):
         sys.exit(f"{name}: an entry is in the constant pool (0x{end:X})")
     with open(tmp_elf, "wb") as f:
         f.write(wrap(raw, base=LIFT_BASE, entry=LIFT_BASE + entries[0]))
-    cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(LIFT_BASE),
-           "--pic", "--symbol-prefix", prefix, "-o", os.path.join(outdir, name),
-           "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h",
-           "--code-end", hex(LIFT_BASE + end)] + LIFTER_ARGS
+    cmd = python_cmd(LIFTER, "--auto-functions", tmp_elf, "--base", hex(LIFT_BASE),
+                     "--pic", "--symbol-prefix", prefix, "-o", os.path.join(outdir, name),
+                     "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h",
+                     "--code-end", hex(LIFT_BASE + end), *LIFTER_ARGS)
     if len(entries) > 1:
         cmd += ["--extra-funcs", ",".join(hex(LIFT_BASE + e) for e in entries[1:])]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         say(f"  FAIL {name}\n{r.stderr}", sys.stderr)
         return None

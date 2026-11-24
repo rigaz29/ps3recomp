@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 
+from child_python import python_cmd
 from spu_elf import fnv1a64, scan_spu_candidates
 
 
@@ -208,9 +209,9 @@ def build_programs(args, registry_writer):
                     program['executable_ranges'] = ranges
                     (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
                     (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
-                    command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
-                               '--functions', str(outdir / 'functions.json'), '--symbol-prefix', prefix,
-                               '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
+                    command = python_cmd(args.lifter, outdir / 'code.bin', '--base', base,
+                                         '--functions', outdir / 'functions.json', '--symbol-prefix', prefix,
+                                         '--report', outdir / 'lift.json', '--output', outdir)
                     if extra.get(name):
                         command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
                     if getattr(args, 'merge_chunks', False):
@@ -220,7 +221,7 @@ def build_programs(args, registry_writer):
                     if own:
                         (outdir / 'insn_patches.json').write_text(json.dumps({'patches': own}, indent=1))
                         command += ['--insn-patches', str(outdir / 'insn_patches.json')]
-                    result = subprocess.run(command, capture_output=True, text=True)
+                    result = subprocess.run(command, capture_output=True, text=True, errors='replace')
                     (outdir / 'lift.log').write_text(result.stdout + result.stderr, encoding='utf-8', errors='replace')
                     if result.returncode:
                         raise ValueError('lifter failed; see ' + name + '/lift.log')

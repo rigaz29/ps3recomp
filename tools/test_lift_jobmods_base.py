@@ -54,14 +54,18 @@ def main():
         if got != want:
             print(f"FAIL module_base({sha}: 0x{word:X}) = 0x{got:X}, want 0x{want:X}")
             fails += 1
-    with tempfile.TemporaryDirectory(prefix="lift-jobmods-base-") as tmp:
+    # A folder with a letter outside ASCII, the tool under -X utf8 as the Kit runs it, and PYTHONUTF8=0 so a child
+    # started without -X utf8 is in the locale's code page: the lifter printed the folder in it, and the tool's UTF-8
+    # read of that stopped the build (issue #41).
+    with tempfile.TemporaryDirectory(prefix="lift-jobmods-base-á-") as tmp:
         mods, out = Path(tmp) / "mods", Path(tmp) / "out"
         mods.mkdir()
         for sha in ("aaaaaaaaaaaa", "bbbbbbbbbbbb"):
             (mods / f"jobmod_{sha}_e30.bin").write_bytes(module(CASES[sha][0]))
-        r = subprocess.run([sys.executable, str(ROOT / "tools/lift_jobmods.py"),
+        r = subprocess.run([sys.executable, "-X", "utf8", str(ROOT / "tools/lift_jobmods.py"),
                             "--jobmods", str(mods), "--out", str(out)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env=dict(os.environ, PYTHONUTF8="0"))
         if r.returncode:
             print(r.stdout, r.stderr)
             print("FAIL lift_jobmods.py exited", r.returncode)

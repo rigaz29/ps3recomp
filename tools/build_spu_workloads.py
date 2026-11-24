@@ -175,8 +175,8 @@ def main():
 
         if not args.skip_lift and (args.relift or not os.path.exists(srcc)):
             os.makedirs(outdir, exist_ok=True)
-            cmd = [sys.executable, args.lifter, e, "--auto-functions", e,
-                   "--symbol-prefix", prefix, "-o", outdir]
+            from child_python import python_cmd
+            cmd = python_cmd(args.lifter, e, "--auto-functions", e, "--symbol-prefix", prefix, "-o", outdir)
             if img in extra_funcs:
                 cmd += ["--extra-funcs", extra_funcs[img]]
             if args.merge_chunks:

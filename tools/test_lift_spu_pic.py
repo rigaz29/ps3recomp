@@ -72,13 +72,17 @@ def check(ok, what):
         failures.append(what)
 
 
-with tempfile.TemporaryDirectory(prefix="lift-spu-pic-") as tmp:
+# The folder has a letter outside ASCII and the tool runs as the Kit runs it, under -X utf8, with PYTHONUTF8=0 so a
+# child started without -X utf8 is in the locale's code page: the lifter printed the folder in it, and the tool's
+# UTF-8 read of that stopped the build (issue #41).
+with tempfile.TemporaryDirectory(prefix="lift-spu-pic-á-") as tmp:
     tmp = Path(tmp)
     (tmp / "ppu.elf").write_bytes(ppu_elf())
     (tmp / "pieces.json").write_text(json.dumps([{"ea": hex(PIECE_EA), "size": len(PIECE), "entry": "0x0"}]))
-    r = subprocess.run([sys.executable, str(TOOL), "--elf", str(tmp / "ppu.elf"),
+    r = subprocess.run([sys.executable, "-X", "utf8", str(TOOL), "--elf", str(tmp / "ppu.elf"),
                         "--list", str(tmp / "pieces.json"), "--out", str(tmp / "out"),
-                        "--symbol-prefix", "synth"], capture_output=True, text=True)
+                        "--symbol-prefix", "synth"], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=dict(os.environ, PYTHONUTF8="0"))
     if r.returncode:
         print(r.stdout, r.stderr)
         raise SystemExit("lift_spu_pic failed")

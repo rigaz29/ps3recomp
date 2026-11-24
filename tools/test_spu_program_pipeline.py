@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic discovery -> generated registration coverage, no guest assets."""
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -103,6 +104,20 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         text = (self.output / 'sources.cmake').read_bytes().decode('utf-8')
         self.assertIn('jogos á é/generated/', text)
+        self.assertTrue(self.manifest()['complete'])
+
+    def test_lifter_output_reads_back_in_utf8_mode(self):
+        # The Kit runs its tools under -X utf8, which a child does not inherit: the lifter, started without it,
+        # printed this folder in the locale's code page and the tool's UTF-8 read of that stopped the build (issue
+        # #41). PYTHONUTF8=0 keeps a child started without -X utf8 in the locale's code page on any Python.
+        self.output = self.root / 'jogos á é' / 'generated'
+        path = self.root / 'input.bin'
+        path.write_bytes(elf(7))
+        command = [sys.executable, '-X', 'utf8', str(TOOLS / 'build_spu_workloads.py'), '--lifted', str(self.output),
+                   '--out', str(self.output / 'spu_workloads.c'), '--input', str(path)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                env=dict(os.environ, PYTHONUTF8='0'))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertTrue(self.manifest()['complete'])
 
     def test_bad_bounds_and_unsupported_are_reported_without_registration(self):

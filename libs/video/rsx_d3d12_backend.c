@@ -9173,6 +9173,17 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
     int bias = (int)(filter & 0x1FFFu);
     if (bias & 0x1000) bias -= 0x2000;
     s->MipLODBias = (float)bias / 256.0f;
+    /* RSX_TEX_LOD_BIAS=<levels>: added to every sampler's, to see coarser (or finer) levels than a GPU would pick:
+     * a texture's levels other than its top one, checked on a card that keeps to the top one (issue #9). */
+    {
+        static float extra = -1000.0f;
+        if (extra < -999.0f) {
+            const char* e = getenv("RSX_TEX_LOD_BIAS");
+            extra = e && *e ? (float)atof(e) : 0.0f;
+            if (extra != 0.0f) printf("[D3D12] RSX_TEX_LOD_BIAS: every sampler %+.2f levels%c", extra, 10);
+        }
+        s->MipLODBias += extra;
+    }
     /* What the upscaler is given to work with: AMD's formula. Not on what is blended, marked by
      * vp_sampler: those are drawn at their sample grid, a level finer than the title chose, and
      * a level finer again is noise. */

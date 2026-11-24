@@ -4947,8 +4947,11 @@ static void pp_tmp_create(void)
 /* graphics.vibrance and graphics.contrast = off | low | medium | high | max (issue #26): a grade at the end of the
  * presentation pass, on the scaled picture, before the port's overlay. The game's HUD and menus are in the picture
  * and go through it too. Both are read once and put in the shaders as constants:
- *   contrast  an S-curve on the luminance (smoothstep, by K), the colour scaled with it: darks a little darker,
- *             lights a little lighter, black and white kept;
+ *   contrast  an S-curve on the luminance through P (by K), the colour scaled with it: the tones above P lighter,
+ *             those just below it a little darker, deep shadows as they were, black and white kept. Its middle was
+ *             0.5 (a plain smoothstep) up to 0.3.1: in this game most of a frame is far below that, so Max halved
+ *             the shadows (0.05 to 0.022) and the picture went a third darker (issue #4's comparison); through 0.3
+ *             with the shadows left alone the frame keeps its brightness and its lit half gains the contrast;
  *   vibrance  the colour away from its luminance by 1 + V * (1 - its saturation): dull colours most, strong ones
  *             (and skin, already saturated) little.
  * Bilinear, sharp bilinear and FSR 1 run it in their last pixel shader. AMD FSR runs it on the upscaler's output in
@@ -4956,7 +4959,7 @@ static void pp_tmp_create(void)
  * two stay alike. Off, the shaders are the same as before. */
 static struct {
     float v, k;                    /* V and K above; 0 off */
-    char prefix[1400];             /* the defines and grade(), put before each shader that ends the pass */
+    char prefix[2048];             /* the defines and grade(), put before each shader that ends the pass */
     ID3D12RootSignature* root;     /* the compute pass for FSR's output: one UAV */
     ID3D12PipelineState* pso;
 } s_grade;
@@ -4966,7 +4969,11 @@ static const char k_grade_fn[] =
     "#if GRADE_ON\n"
     "  const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
     "  float l = dot(c, lw);\n"
-    "  const float l2 = lerp(l, l * l * (3.0 - 2.0 * l), GRADE_K);\n"
+    "  float g;\n"
+    "  if (l < GRADE_P) { const float x = 0.5 * l / GRADE_P; g = GRADE_P * 2.0 * x * x * (3.0 - 2.0 * x); }\n"
+    "  else { const float x = 0.5 + 0.5 * saturate((l - GRADE_P) / (1.0 - GRADE_P));\n"
+    "         g = GRADE_P + (1.0 - GRADE_P) * (2.0 * x * x * (3.0 - 2.0 * x) - 1.0); }\n"
+    "  const float l2 = l + GRADE_K * (g - l) * smoothstep(0.0, GRADE_P, l);\n"
     "  c *= (l2 + 0.0001) / (l + 0.0001);\n"
     "  l = dot(c, lw);\n"
     "  const float s = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));\n"
@@ -4991,7 +4998,8 @@ static void grade_read(void)
     s_grade.v = grade_level("vibrance", vib);
     s_grade.k = grade_level("contrast", con);
     const int on = s_grade.v > 0.0f || s_grade.k > 0.0f;
-    snprintf(s_grade.prefix, sizeof s_grade.prefix, "#define GRADE_ON %d\n#define GRADE_V %.4f\n#define GRADE_K %.4f\n%s",
+    snprintf(s_grade.prefix, sizeof s_grade.prefix,
+             "#define GRADE_ON %d\n#define GRADE_V %.4f\n#define GRADE_K %.4f\n#define GRADE_P 0.3\n%s",
              on, s_grade.v, s_grade.k, k_grade_fn);
     if (on) printf("[D3D12] colour grade: vibrance %.2f, contrast %.2f%c", s_grade.v, s_grade.k, 10);
 }

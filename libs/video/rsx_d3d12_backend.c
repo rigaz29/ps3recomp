@@ -14055,6 +14055,26 @@ static void srv_write_tex(u32 heap_slot, int ts, DXGI_FORMAT fmt, UINT mapping, 
     srv_write_ex(heap_slot, s_d3d.vp_tex[ts].res, fmt, mapping, cube);
 }
 
+/* RSX_TEX_LODTEST, a test for issue #9: striped and broken textures on an RX 7900 XT (and broken ones on an RTX
+ * 5060), never on an RX 6700 XT, with the levels' data as read from the game the same as here (TEX_MIPCHECK), and
+ * gone with RSX_TEX_LOD=0 (level 0 alone). The game keeps a texture whose top levels are not streamed in yet to its
+ * lower ones by its minimum level of detail, which the view asks of the card as a fractional ResourceMinLODClamp; a
+ * card that reads finer levels than that would read the ones not in yet. 1: the view starts at the minimum's whole
+ * level, rounded up (MostDetailedMip), so a finer level cannot be read at all, and the fade between two levels goes
+ * in whole steps. 2: no minimum, every level open, to see what those levels hold. 0, or not set: as above. */
+static int srv_lod_test(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("RSX_TEX_LODTEST");
+        v = e && (*e == '1' || *e == '2') ? *e - '0' : 0;
+        if (v)
+            printf("[D3D12] RSX_TEX_LODTEST=%d: %s%c", v, v == 1 ? "a view starts at the minimum's whole level"
+                                                             : "no minimum level of detail, every level open", 10);
+    }
+    return v;
+}
+
 /* `cube`: the view's shape (0 2D, 1 cube, 2 volume) and, from bit 8, the level
  * of detail it keeps to, 4.8 fixed point (vp_unit_lod): no sample reads a
  * level finer than that. */
@@ -14063,6 +14083,9 @@ static void srv_create_at(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* res, DX
 {
     const int shape = cube & 0xFF;
     const float lod = (float)(((u32)cube >> 8) & 0xFFFu) / 256.0f;
+    const int test = srv_lod_test();
+    const UINT first = test == 1 && lod > 0.0f ? (UINT)ceilf(lod) : 0u;   /* within the levels (vp_unit_lod) */
+    const float clamp = test ? 0.0f : lod;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -14071,15 +14094,16 @@ static void srv_create_at(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* res, DX
     if (shape == 2) {   /* a volume: must match the Texture3D declaration */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         sv.Texture3D.MipLevels = (UINT)-1;
-        sv.Texture3D.MostDetailedMip = 0;
-        sv.Texture3D.ResourceMinLODClamp = lod;
+        sv.Texture3D.MostDetailedMip = first;
+        sv.Texture3D.ResourceMinLODClamp = clamp;
     } else if (shape) {   /* must match the TextureCube declaration in the HLSL */
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         sv.TextureCube.MipLevels = (UINT)-1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = lod;
+        sv.TextureCube.MostDetailedMip = first;
+        sv.TextureCube.ResourceMinLODClamp = clamp;
     } else {
-        sv.Texture2D.ResourceMinLODClamp = lod;
+        sv.Texture2D.MostDetailedMip = first;
+        sv.Texture2D.ResourceMinLODClamp = clamp;
     }
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
 }

@@ -21457,6 +21457,22 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 
     if (!vm_base || width == 0 || height == 0) return;
 
+    /* A unit the title turned off (CONTROL0 bit 31 clear) samples nothing, as on the RSX: it is left unset, a null view,
+     * whatever it held before. Kept, the texture an earlier draw had there stayed in the unit: a cell door in God of
+     * War: Ascension's statue base (issue #34) went flat red from the X32_FLOAT depth target the draw before had at its
+     * unit 4, which its program multiplies its lighting by. RSX_TEX_ENABLE=0: units are bound whatever the bit says,
+     * as before. */
+    { static int obey = -1;
+      if (obey < 0) { const char* e = getenv("RSX_TEX_ENABLE"); obey = !(e && *e == '0'); }
+      if (obey && !(tex->control0 & 0x80000000u) && (format & 0x9Fu) != 0x81u /* B8: the font atlas path below */) {
+          static int said;
+          if (s_d3d.cur_texs[unit].set && !said++)
+              fprintf(stderr, "[D3D12] texture unit %u turned off by the title: it samples nothing (RSX_TEX_ENABLE=0: "
+                              "the old binding is kept)%c", unit, 10);
+          s_d3d.cur_texs[unit].set = 0;
+          return;
+      } }
+
     /* Record the currently-bound atlas so subsequent quad draws sample it. The
      * actual GPU upload happens in render_frame (we have no open command list
      * here). Only the 8-bit single-channel font atlas (B8, RSX fmt base 0x81 /

@@ -123,6 +123,29 @@ endif()
 add_test(NAME mutex_destroy COMMAND test_mutex_destroy)
 set_tests_properties(mutex_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 
+# sys_event_queue_destroy wakes a receive blocked on the queue, with CELL_ECANCELED, and the slot works again.
+add_executable(test_event_queue_destroy
+    test_event_queue_destroy.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+    "${RUNTIME_SYNC_DIR}/sys_cond.c"
+    "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
+    "${RUNTIME_SYNC_DIR}/sys_event.c"
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+if(NOT WIN32)
+    target_sources(test_event_queue_destroy PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_event_queue_destroy PRIVATE Threads::Threads)
+endif()
+target_include_directories(test_event_queue_destroy PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_definitions(test_event_queue_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
+set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
+
 # The focused condition tests use Win32 host threads. POSIX execution also
 # needs the waitable-handle implementation supplied by the native host port.
 if(WIN32)

@@ -65,6 +65,13 @@ typedef struct sys_event_queue_info {
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
 
+    /* Counted up each time the queue is destroyed. A receive notes it before it waits, and a change wakes it with
+     * CELL_ECANCELED, even when the slot was made into another queue before it ran again. A create keeps it, and keeps
+     * the lock and condition below: they are made once per slot (sync_ready) and live on, as a destroy wakes the
+     * waiters and they still take the lock to return. Everything above `gen` is cleared by a create. */
+    uint32_t     gen;
+    int          sync_ready;
+
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;

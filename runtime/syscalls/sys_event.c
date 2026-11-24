@@ -9,6 +9,7 @@
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
+#include <stddef.h>               /* offsetof */
 #include <stdlib.h>               /* getenv */
 #include "ps3emu/log_first.h"
 
@@ -97,6 +98,31 @@ static uint64_t bswap64(uint64_t v)
  * r5 = key (u64)
  * r6 = size (s32)
  * -----------------------------------------------------------------------*/
+/* A slot made into a new queue: the fields above `gen` cleared; its generation, and its lock and condition, made
+ * once per slot, kept. A receive that a destroy woke may still be taking the lock to return. */
+static void evt_queue_reset(sys_event_queue_info* q)
+{
+    if (!q->sync_ready) {
+#ifdef _WIN32
+        InitializeCriticalSection(&q->lock);
+        InitializeConditionVariable(&q->not_empty);
+#else
+        pthread_mutex_init(&q->lock, NULL);
+        pthread_cond_init(&q->not_empty, NULL);
+#endif
+        q->sync_ready = 1;
+    }
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    memset(q, 0, offsetof(sys_event_queue_info, gen));
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    memset(q, 0, offsetof(sys_event_queue_info, gen));
+    pthread_mutex_unlock(&q->lock);
+#endif
+}
+
 /* Create a queue directly, without a guest ppu_context.
  *
  * HLE libraries sometimes have to CREATE a queue rather than merely find one:
@@ -117,24 +143,16 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     if (slot < 0) { evt_table_unlock(); return 0; }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
+    /* The waiter primitives MUST be initialised here too (evt_queue_reset). A
+     * zeroed CRITICAL_SECTION is not a valid one, and the first
+     * EnterCriticalSection on it faults writing near offset 0x24 of a null
+     * internal pointer -- which is exactly how YDKJ's FMOD audio thread died the
+     * moment it was finally given a real queue to block on. */
+    evt_queue_reset(q);
     q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
-
-    /* The waiter primitives MUST be initialised here too. memset+fields is
-     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
-     * first EnterCriticalSection on it faults writing near offset 0x24 of a
-     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
-     * died the moment it was finally given a real queue to block on. */
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
 
     evt_table_unlock();
 
@@ -165,7 +183,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
+    evt_queue_reset(q);
     q->active   = 1;
     q->key      = key;
     q->capacity = size;
@@ -197,14 +215,6 @@ int64_t sys_event_queue_create(ppu_context* ctx)
         memcpy(q->name, attr_raw + 8, 8);
     }
 
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
-
     uint32_t queue_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, queue_id);
@@ -229,15 +239,32 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
+    /* lv2 wakes a receive blocked on a queue destroyed with
+     * SYS_EVENT_QUEUE_DESTROY_FORCE, with CELL_ECANCELED. This deleted the
+     * queue's lock under a thread asleep in it and woke nobody: God of War:
+     * Ascension's network client (brbClient) waits in a receive until its queue
+     * goes as the game leaves multiplayer, slept on, and the game's join of it
+     * never returned. Every waiter is woken now, whatever the mode (lv2 answers
+     * EBUSY without FORCE, where a title has no waiter), and the slot keeps its
+     * lock and condition for the waiters to return through. */
+    const uint32_t mode = LV2_ARG_U32(ctx, 1);
 #ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
-#else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
-#endif
-
+    EnterCriticalSection(&q->lock);
     q->active = 0;
+    q->count = 0;
+    q->gen++;
+    WakeAllConditionVariable(&q->not_empty);
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->active = 0;
+    q->count = 0;
+    q->gen++;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+#endif
     evt_table_unlock();
+    fprintf(stderr, "[evt] queue_destroy id=%u mode=%u\n", queue_id, mode);
     return CELL_OK;
 }
 
@@ -357,6 +384,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     }
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    /* A destroy from here on counts this up and wakes the wait below. */
+    const uint32_t gen = __atomic_load_n(&q->gen, __ATOMIC_ACQUIRE);
     if (!q->active) {
 #ifdef _WIN32
         SwitchToThread();
@@ -487,7 +516,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (s_kq < 0) { const char* e = getenv("EVT_RECV_KICK"); s_kq = 0;
         if (e) { s_kq = atoi(e); const char* c = strchr(e, ':'); s_kms = c ? (DWORD)atoi(c + 1) : 500; } }
     if (timeout_us == 0 && s_kq == (int)queue_id && s_have_last_evt[queue_id - 1]) {
-        while (q->count == 0 && q->active && !q->cancelled) {
+        while (q->count == 0 && q->active && !q->cancelled && q->gen == gen) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, s_kms) && q->count == 0) {
                 sys_event_t evt = s_last_evt[queue_id - 1];
                 LeaveCriticalSection(&q->lock);
@@ -506,7 +535,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
+        while (q->count == 0 && q->active && !q->cancelled && q->gen == gen) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
         if (q->count == 0 && q->cancelled) {
@@ -527,7 +556,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        while (q->count == 0 && q->active && !q->cancelled) {
+        while (q->count == 0 && q->active && !q->cancelled && q->gen == gen) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
@@ -537,6 +566,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->gen != gen) {   /* destroyed while this waited */
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (q->count == 0 && q->cancelled) {
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
@@ -555,7 +588,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_lock(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
+        while (q->count == 0 && q->active && !q->cancelled && q->gen == gen) {
             pthread_cond_wait(&q->not_empty, &q->lock);
         }
     } else {
@@ -567,7 +600,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (q->count == 0 && q->active && !q->cancelled) {
+        while (q->count == 0 && q->active && !q->cancelled && q->gen == gen) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&q->lock);
@@ -576,6 +609,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->gen != gen) {   /* destroyed while this waited */
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (q->count == 0 && q->cancelled) {
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;

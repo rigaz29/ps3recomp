@@ -385,6 +385,9 @@ typedef struct {
     int                   used;        /* referenced this frame */
     u64                   last;        /* frame_count it was last bound or sampled */
     u32                   grow_w, grow_h;   /* a size a batch that had bound it asked for: the next one makes it */
+    ID3D12Resource*       sub;         /* its twin at the guest's size (rt_sub_draw), made when first needed */
+    D3D12_RESOURCE_STATES sub_st;
+    int                   sub_cur;     /* the last draw into it went to the twin: reads take the twin */
 } OffRT;
 /* demosaic double-buffers its 6-surface pass chain. God of War: Ascension
  * holds 29 targets by the gate after its first fight when started from that
@@ -501,6 +504,7 @@ static int s_rec_hud_cam;      /* recording: this frame's camera draws after the
  * guest goes on seeing its own sizes. TS_ON: some surface is drawn larger than the guest made it. */
 static float s_shadow = 1.0f;
 static int s_post_full;
+static int s_rt_sub_bound = -1;   /* the target whose twin is bound now (rt_sub_draw), drawn 1:1 */
 #define TS_ON (RS_ON || s_shadow > 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
  * runs in parts as record-ahead goes, so a later part can ask for more of a target the draws of an
@@ -519,7 +523,8 @@ static int grow_later(void)
  * scene's, a 1408x1408 one, the half-size passes'). */
 #define MAX_OFF_DS   12
 #define RT_SRV_BASE  5   /* SRV heap slots 5.. hold the offscreen-RT SRVs, one per slot */
-#define DS_SRV_BASE  (RT_SRV_BASE + MAX_OFF_RTS)   /* then depth + stencil SRVs, 2 per OffDS */
+#define SUB_SRV_BASE (RT_SRV_BASE + MAX_OFF_RTS)   /* then their twins' (rt_sub_draw), one per slot */
+#define DS_SRV_BASE  (SUB_SRV_BASE + MAX_OFF_RTS)  /* then depth + stencil SRVs, 2 per OffDS */
 /* Per-draw SRV windows: each VP draw gets VP_TEX_UNITS consecutive
  * descriptors (t0-t15) so multi-unit fragment programs see all their
  * textures. */
@@ -4009,6 +4014,7 @@ static void rs_rect(D3D12_RECT* r, float sx, float sy)
 static void rs_target(int rt, int z, int depth_only, float* sx, float* sy)
 {
     if (depth_only && z >= 0) { *sx = s_d3d.off_ds[z].sx; *sy = s_d3d.off_ds[z].sy; }
+    else if (rt >= 0 && rt == s_rt_sub_bound) { *sx = 1.0f; *sy = 1.0f; }   /* its twin, at the guest's size */
     else if (rt >= 0)         { *sx = s_d3d.off_rt[rt].sx; *sy = s_d3d.off_rt[rt].sy; }
     else { *sx = (float)s_d3d.pw / (float)s_d3d.width; *sy = (float)s_d3d.ph / (float)s_d3d.height; }
 }
@@ -4626,7 +4632,7 @@ static int init_d3d12(u32 width, u32 height)
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
             hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            hd.NumDescriptors = MAX_OFF_RTS;
+            hd.NumDescriptors = 2 * MAX_OFF_RTS;   /* the targets', then their twins' (rt_sub_draw) */
             hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
                 s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.rt_rtv_heap);
             if (FAILED(hr)) printf("[D3D12] offscreen RTV heap creation failed (0x%08lX)\n", hr);
@@ -13674,6 +13680,9 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         wait_for_gpu();
         rf_release(r->res); r->res = NULL;   /* dims/format changed */
         if (r->up) { rf_release(r->up); r->up = NULL; }
+        if (r->sub) { rf_release(r->sub); r->sub = NULL; }
+        r->sub_cur = 0;
+        if (s_rt_sub_bound == slot) s_rt_sub_bound = -1;
     } else {
         const int cap = ort_cap();
         for (int i = 0; i < cap; i++)
@@ -13714,6 +13723,9 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                 rf_release(s_d3d.off_rt[slot].up);
                 s_d3d.off_rt[slot].up = NULL;
             }
+            if (s_d3d.off_rt[slot].sub) { rf_release(s_d3d.off_rt[slot].sub); s_d3d.off_rt[slot].sub = NULL; }
+            s_d3d.off_rt[slot].sub_cur = 0;
+            if (s_rt_sub_bound == slot) s_rt_sub_bound = -1;
         }
     }
     const double rt0 = perf_now();
@@ -13867,6 +13879,75 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
     rh.ptr += (u64)slot * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     return rh;
+}
+
+/* graphics.effects_resolution: a draw into a region of a post-chain target that is drawn larger goes to the target's
+ * twin at the guest's size, pixel for pixel as on the RSX, and the draws that read the target then read the twin,
+ * until a draw covers the target again. God of War: Ascension's exposure chain shrinks the frame's luminance into
+ * 160x180, 40x45 and 8x9 corners of the 640x360 and 320x180 targets its bloom and depth of field use whole, and reads
+ * them back point-sampled on texel edges (y16_convert): drawn at twice the size, each corner pixel became four
+ * computed a quarter texel off, the exposure the PPU takes from the 8x9 result came out ~2% off, and the frame 1-3%
+ * darker. A clear, or a draw with more than one colour target or a depth surface, keeps to the target itself. */
+static int rt_sub_draw(int rt, const D3D12DrawRecord* dr)
+{
+    if (rt < 0 || !s_post_full || dr->is_clear) return 0;
+    const OffRT* r = &s_d3d.off_rt[rt];
+    if (r->sx <= 1.0f || !rs_fraction(r->w, r->h) || !dr->vp_w || !dr->vp_h) return 0;
+    return dr->vp_w < r->w || dr->vp_h < r->h;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE rt_sub_rtv(int slot)
+{
+    return off_rt_rtv(MAX_OFF_RTS + slot);
+}
+
+static int rt_sub_make(int slot)
+{
+    OffRT* r = &s_d3d.off_rt[slot];
+    if (r->sub) return 1;
+    if (!r->res || !r->w || !r->h) return 0;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = r->w; td.Height = r->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = (DXGI_FORMAT)r->dxgi; td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void**)&r->sub))) {
+        r->sub = NULL;
+        return 0;
+    }
+    r->sub_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, r->sub, NULL, rt_sub_rtv(slot));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+    sv.Format = td.Format;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE sh;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
+    sh.ptr += (u64)(SUB_SRV_BASE + slot) * s_d3d.srv_inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, r->sub, &sv, sh);
+    rdoc_name((ID3D12Object*)r->sub, "rt 0x%08X %ux%u at the guest's size", r->off, r->w, r->h);
+    static int said;
+    if (said++ < 4)
+        printf("[D3D12] effects target 0x%08X %ux%u: its regions drawn at the game's size%c", r->off, r->w, r->h, 10);
+    return 1;
+}
+
+static void rt_sub_transition(int slot, D3D12_RESOURCE_STATES to)
+{
+    OffRT* r = &s_d3d.off_rt[slot];
+    if (!r->sub || r->sub_st == to) return;
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = r->sub;
+    b.Transition.StateBefore = r->sub_st;
+    b.Transition.StateAfter  = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    r->sub_st = to;
 }
 
 
@@ -14869,7 +14950,9 @@ static void y16_convert(int src, int dst, u32 tw, u32 th)
     if (src < 0 || dst < 0 || !y16_init()) return;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     OffRT* r = &s_d3d.off_rt[dst];
-    off_rt_transition(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const int sub = s_d3d.off_rt[src].sub_cur && s_d3d.off_rt[src].sub;   /* its twin has the last draw */
+    if (sub) rt_sub_transition(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    else off_rt_transition(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     off_rt_transition(dst, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = off_rt_rtv(dst);
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rh, FALSE, NULL);
@@ -14883,12 +14966,13 @@ static void y16_convert(int src, int dst, u32 tw, u32 th)
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, hp);
     D3D12_GPU_DESCRIPTOR_HANDLE gh;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
-    gh.ptr += (u64)(RT_SRV_BASE + src) * s_d3d.srv_inc;
+    gh.ptr += (u64)((sub ? SUB_SRV_BASE : RT_SRV_BASE) + src) * s_d3d.srv_inc;
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
     const OffRT* sr = &s_d3d.off_rt[src];
+    const float ssx = sub ? 1.0f : sr->sx, ssy = sub ? 1.0f : sr->sy;
     const struct { u32 w, h; float x, y; } ts = {
-        (u32)((float)(tw ? tw : r->w) * sr->sx + 0.5f), (u32)((float)(th ? th : r->h) * sr->sy + 0.5f),
-        sr->sx / r->sx, sr->sy / r->sy };
+        (u32)((float)(tw ? tw : r->w) * ssx + 0.5f), (u32)((float)(th ? th : r->h) * ssy + 0.5f),
+        ssx / r->sx, ssy / r->sy };
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, &ts, 0);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
@@ -15202,6 +15286,11 @@ static void blit_rt_copy(const D3D12DrawRecord* dr)
     if (dx + w > rd->w) w = rd->w - dx;
     if (dy + h > rd->h) h = rd->h - dy;
     if (!w || !h || w > 0x8000u || h > 0x8000u) return;
+    if (rs->sub_cur && rs->sub) {
+        static int said;
+        if (!said++) fprintf(stderr, "[blit-rt] 0x%X: its last draw is in its twin at the game's size; the copy takes the "
+                                     "larger surface%c", rs->off, 10);
+    }
     if (rs->sx != rd->sx || rs->sy != rd->sy) {   /* a copy cannot scale */
         static int _r = 0;
         if (PS3_LOG_FIRST(_r, 4)) fprintf(stderr, "[blit-rt] 0x%X -> 0x%X: drawn at different scales, not copied%c", rs->off, rd->off, 10);
@@ -17067,6 +17156,7 @@ static void rf_vp_begin(void)
             D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
+            s_rt_sub_bound = -1;
             int ib_bound = 0;                      /* vp_ib bound for indexed records */
             int raw_bound = 0;                     /* vp_vb bound as raw bytes (t8) */
             float vp_last_w = 0, vp_last_h = 0;    /* for DRAWARGS */
@@ -17201,16 +17291,27 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                  * without one (and for display targets, as before). */
                 const int wantz = (dr->zeta_off && (want >= 0 || dr->no_color))
                                 ? off_ds_find(dr->zeta_off) : -1;
+                const int want_sub = want >= 0 && wantm[0] < 0 && wantz < 0 && rt_sub_draw(want, dr);
+                const int cur_sub = cur_rt >= 0 && cur_rt == s_rt_sub_bound;
                 if (want != cur_rt || wantm[0] != cur_m[0] ||
                     wantm[1] != cur_m[1] || wantm[2] != cur_m[2] ||
-                    wantz != cur_z || dr->no_color != cur_nc || force_rebind) {
+                    wantz != cur_z || dr->no_color != cur_nc || force_rebind || want_sub != cur_sub) {
                     D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
                     UINT nrt = 1;
                     rh[0] = rtv_handle;
                     D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
+                    s_rt_sub_bound = -1;
                     if (want >= 0) {
-                        off_rt_transition(want, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                        rh[0] = off_rt_rtv(want);
+                        if (want_sub && rt_sub_make(want)) {   /* a region of a post-chain target: its twin */
+                            rt_sub_transition(want, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            rh[0] = rt_sub_rtv(want);
+                            s_rt_sub_bound = want;
+                            s_d3d.off_rt[want].sub_cur = 1;
+                        } else {
+                            off_rt_transition(want, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            rh[0] = off_rt_rtv(want);
+                            s_d3d.off_rt[want].sub_cur = 0;
+                        }
                         vp.Width  = (float)s_d3d.off_rt[want].w;
                         vp.Height = (float)s_d3d.off_rt[want].h;
                     }
@@ -17309,7 +17410,7 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 }
                 if (dr->is_clear) {
                     D3D12_CPU_DESCRIPTOR_HANDLE rh =
-                        (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
+                        (cur_rt >= 0) ? (cur_rt == s_rt_sub_bound ? rt_sub_rtv(cur_rt) : off_rt_rtv(cur_rt)) : rtv_handle;
                     /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
                      * than the guest colour. "0.000% nonzero" cannot tell an
                      * untouched surface from one written black, and that
@@ -17486,6 +17587,12 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                  * one of the currently-bound colour targets). */
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     int rt = dr->tex_rt[_u];
+                    if (rt >= 0 && dr->tex_cv[_u] < 0 && dr->tex_ds[_u] < 0 && s_d3d.off_rt[rt].sub_cur &&
+                        s_d3d.off_rt[rt].sub && rt != s_rt_sub_bound) {   /* its twin has the last draw */
+                        rt_sub_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        srv_write(DRAW_SRV_BASE + dr->srv_win * VP_TEX_UNITS + (u32)_u, s_d3d.off_rt[rt].sub,
+                                  (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    } else
                     if (rt >= 0 && rt != cur_rt &&
                         rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2])
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -17768,6 +17875,7 @@ static void fg_objects(void)
     pp_barrier(s_fg.obj_rt, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     if (s_rf.cur_rt < 0) s_rf.cur_rt = 0;   /* rf_vp_end binds the display target again */
     s_rf.force_rebind = 1;
+    s_rt_sub_bound = -1;
 }
 
 /* The end of the VP pass: the display target bound again. */

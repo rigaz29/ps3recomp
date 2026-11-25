@@ -504,6 +504,8 @@ static int s_rec_hud_cam;      /* recording: this frame's camera draws after the
  * guest goes on seeing its own sizes. TS_ON: some surface is drawn larger than the guest made it. */
 static float s_shadow = 1.0f;
 static int s_post_full;
+static int s_ao;        /* graphics.ambient_occlusion: 0 off, 1 on, 2 high (ao_draw) */
+static int s_ao_done;   /* drawn this frame */
 static int s_rt_sub_bound = -1;   /* the target whose twin is bound now (rt_sub_draw), drawn 1:1 */
 #define TS_ON (RS_ON || s_shadow > 1.0f)
 /* A target a batch has bound or sampled grows only when the next batch first takes it. The prepass
@@ -528,7 +530,8 @@ static int grow_later(void)
 /* Per-draw SRV windows: each VP draw gets VP_TEX_UNITS consecutive
  * descriptors (t0-t15) so multi-unit fragment programs see all their
  * textures. */
-#define DRAW_SRV_BASE ((DS_SRV_BASE + 2 * MAX_OFF_DS + 31) & ~31)
+#define AO_SRV       (DS_SRV_BASE + 2 * MAX_OFF_DS)   /* then ambient occlusion's own target (ao_draw) */
+#define DRAW_SRV_BASE ((AO_SRV + 1 + 31) & ~31)
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
 
 #define TEX_CSUM_PARTS 8u   /* see tex_changed */
@@ -1341,7 +1344,12 @@ static void fg_dlssg_frame(const rsx_fsr3_frame* f)
 /* Every presented frame, before the list closes. */
 static void fg_frame(void)
 {
-    if (!s_fg_mode && !s_up.want) return;
+    if (!s_fg_mode && !s_up.want) {   /* ambient occlusion alone: the frame's camera and marks start again */
+        s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.depth_ok = s_fg.ready = 0;
+        s_ao_done = 0;
+        s_fg.obj_n = 0;
+        return;
+    }
     if (s_fg_dlssg && !s_fg_ready) {
         s_fg_ready = 1;
         printf("[D3D12] frame generation on, NVIDIA DLSS: %ux%u from %ux%u%c", s_d3d.bb_w, s_d3d.bb_h, s_d3d.pw, s_d3d.ph, 10);
@@ -1368,6 +1376,7 @@ static void fg_frame(void)
     }
     s_fg_last = now;
     s_fg.cam_ok = s_fg.marked = s_fg.copied = s_fg.depth_ok = s_fg.ready = 0;
+    s_ao_done = 0;
     s_fg.obj_n = 0;
     s_fg.obj_drawn = 0;
     if (s_up.ready) {
@@ -3943,6 +3952,8 @@ static void rs_init(void)
     if (s_post_full && RS_ON)
         printf("[D3D12] effects (bloom, blur, depth of field): at the internal resolution, %.3gx%c",
                (float)s_d3d.ph / (float)s_d3d.height, 10);
+    const char* ao = ps3_settings_str("graphics", "ambient_occlusion", "D3D12_AO", "off");
+    s_ao = ps3_settings_ieq(ao, "high") ? 2 : ps3_settings_ieq(ao, "on") ? 1 : 0;
 }
 
 static int off_ds_find(u32 off);
@@ -7557,6 +7568,8 @@ static void fg_hudless(D3D12_CPU_DESCRIPTOR_HANDLE tmp_rtv)
 }
 
 static void fg_unmarked(ID3D12Resource* bb);
+static int ao_draw(int zi, D3D12_CPU_DESCRIPTOR_HANDLE target);
+static int ao_debug(void);
 
 static void present_to_backbuffer(u32 fi)
 {
@@ -13231,7 +13244,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             dr->tex[0].off && dr->tex[0].off < 0xC0000000u && dr->tex[0].w == s_d3d.width && dr->tex[0].h == s_d3d.height)
             vpx[7] = -1.0f;
     }
-    if (FG_INPUTS() && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
+    if ((FG_INPUTS() || s_ao) && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
         vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) {
         const float* m = c + s_fg.cam_reg * 4;
         if (m[3] != 0.0f || m[7] != 0.0f || m[11] != 0.0f) {
@@ -14626,21 +14639,349 @@ static void fg_copy_depth(int zi)
     off_ds_transition(zi, zs);
 }
 
+/* graphics.ambient_occlusion = on or high (D3D12_AO): ambient occlusion over the finished scene, before its HUD. At the
+ * HUD's clear (fg_marker) or, in a frame with no HUD, before the frame is scaled (present_to_backbuffer): the scene's
+ * depth back to the world through the inverse of the title's world-to-clip (the camera FSR's inputs take), a normal from
+ * the nearer of each pair of neighbours, then samples on a disc of a world radius around each pixel: what stands above
+ * the surface, nearer than the radius, darkens it (Alchemy/SAO-like obscurance). On: at half the render's size, 8
+ * samples; high: at its size, 16. Then a 4x4 blur that keeps to the depth (its noise is a 4x4 pattern), multiplied into
+ * the colour. Faded out with distance (the title's fog), none on the sky; transparent things drawn after the depth are
+ * darkened as what is behind them. Off with an ultrawide picture, whose projection is not the title's. */
+static int ao_debug(void)   /* D3D12_AO_DEBUG: set, where it was drawn is logged; 1 the occlusion alone, 2 the depth */
+{
+    static int v = -2;
+    if (v == -2) { const char* e = getenv("D3D12_AO_DEBUG"); v = e ? atoi(e) : -1; }
+    return v;
+}
+static ID3D12RootSignature* s_ao_rs;
+static ID3D12PipelineState* s_ao_pso[3];   /* the occlusion, its blur into the colour, the blur alone (D3D12_AO_DEBUG) */
+static ID3D12Resource* s_ao_raw;
+static ID3D12DescriptorHeap* s_ao_rtv;
+static u32 s_ao_w, s_ao_h;
+
+static int ao_init(void)
+{
+    if (s_ao_pso[2]) return 1;
+    static int failed;
+    if (failed) return 0;
+    failed = 1;
+    static const char vs[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "    float2 p = float2((id << 1) & 2, id & 2);\n"
+        "    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "}\n";
+    static const char common[] =
+        "Texture2D<float> dep : register(t0);\n"
+        "Texture2D<float> occ : register(t1);\n"
+        "SamplerState sp : register(s0);\n"
+        "cbuffer C : register(b0) { float4 iv0, iv1, iv2, iv3, m3, k0, k1, k2, k3, k4; };\n"
+        "float dat(float2 uv) { return dep.SampleLevel(sp, uv * k4.zw, 0); }\n"
+        "float3 wp(float2 uv, float d) {\n"
+        "    float4 n = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (d - k0.y) / k0.x, 1.0);\n"
+        "    float4 p = float4(dot(iv0, n), dot(iv1, n), dot(iv2, n), dot(iv3, n));\n"
+        "    return p.xyz / p.w;\n"
+        "}\n";
+    static const char ps_occ[] =
+        "static const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
+        "float main(float4 pos : SV_Position) : SV_Target {\n"
+        "    float2 uv = pos.xy * k3.xy;\n"
+        "    float3 P = wp(uv, dat(uv));\n"
+        "    float w = dot(m3, float4(P, 1.0));\n"
+        "    float vz = w / k3.z;\n"
+        "    if (!(w > 0.0) || !(vz < k1.w)) return 1.0;\n"
+        "    float2 ex = float2(k0.z, 0.0), ey = float2(0.0, k0.w);\n"
+        "    float3 a = wp(uv + ex, dat(uv + ex)) - P, b = P - wp(uv - ex, dat(uv - ex));\n"
+        "    float3 c = wp(uv + ey, dat(uv + ey)) - P, e = P - wp(uv - ey, dat(uv - ey));\n"
+        "    float3 N = normalize(cross(dot(a, a) < dot(b, b) ? a : b, dot(c, c) < dot(e, e) ? c : e));\n"
+        "    if (dot(N, float3(k2.w, k3.w, k4.x) - P) < 0.0) N = -N;\n"   /* toward the camera */
+        "    uint2 q = uint2(pos.xy) & 3;\n"
+        "    float rot = (bayer[q.y * 4 + q.x] + 0.5) * (6.2831853 / 16.0);\n"
+        "    float R = k1.x;\n"
+        "    float2 ruv = 0.5 * R * k2.xy / w;\n"
+        "    int S = (int)k2.z;\n"
+        "    float o = 0.0;\n"
+        "    [loop] for (int i = 0; i < S; i++) {\n"
+        "        float t = (i + 0.5) / S;\n"
+        "        float an = rot + i * 2.3999632;\n"
+        "        float2 su = uv + float2(cos(an), sin(an)) * ruv * t;\n"
+        "        float3 v = wp(su, dat(su)) - P;\n"
+        "        float vv = dot(v, v);\n"
+        "        o += max(dot(v, N) * rsqrt(vv + 1e-6) - 0.15, 0.0) * saturate(1.0 - vv / (R * R));\n"
+        "    }\n"
+        "    float ao = saturate(1.0 - k1.y * o / S);\n"
+        "    return lerp(ao, 1.0, saturate((vz - k1.z) / (k1.w - k1.z)));\n"
+        "}\n";
+    static const char ps_apply[] =
+        "float vzat(float2 uv) { return dot(m3, float4(wp(uv, dat(uv)), 1.0)); }\n"
+        "float4 main(float4 pos : SV_Position) : SV_Target {\n"
+        "    float2 uv = pos.xy * k0.zw;\n"
+        "    float z0 = vzat(uv);\n"
+        "    if (!(z0 > 0.0) || !(z0 < 1e30)) return float4(1, 1, 1, 1);\n"
+        "    float2 rp = floor(uv / k3.xy);\n"
+        "    float s = 0.0, ws = 0.0;\n"
+        "    [unroll] for (int j = -2; j < 2; j++)\n"
+        "    [unroll] for (int i = -2; i < 2; i++) {\n"
+        "        float2 tu = (rp + float2(i, j) + 0.5) * k3.xy;\n"
+        "        float z = vzat(tu);\n"
+        "        float wt = saturate(1.0 - abs(z - z0) / (0.04 * z0)) + 1e-4;\n"
+        "        s += occ.SampleLevel(sp, tu, 0) * wt;\n"
+        "        ws += wt;\n"
+        "    }\n"
+        "    float ao = s / ws;\n"
+        "    if (k4.y == 2.0) return float4(frac(z0 / k3.z / 10.0), saturate(z0 / k3.z / 100.0), 0.0, 1.0);\n"
+        "    return float4(ao, ao, ao, 1.0);\n"
+        "}\n";
+    char src[2][4096];
+    snprintf(src[0], sizeof src[0], "%s%s", common, ps_occ);
+    snprintf(src[1], sizeof src[1], "%s%s", common, ps_apply);
+    ID3DBlob *vb = NULL, *pb[2] = { NULL, NULL }, *err = NULL;
+    if (FAILED(rsx_compile_own(vs, sizeof vs - 1, "ao_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+        FAILED(rsx_compile_own(src[0], strlen(src[0]), "ao_occ", NULL, NULL, "main", "ps_5_0", 0, 0, &pb[0], &err)) ||
+        FAILED(rsx_compile_own(src[1], strlen(src[1]), "ao_apply", NULL, NULL, "main", "ps_5_0", 0, 0, &pb[1], &err))) {
+        printf("[D3D12] ambient occlusion's shaders: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
+        return 0;
+    }
+    D3D12_DESCRIPTOR_RANGE rg[2] = {0};
+    rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1; rg[0].BaseShaderRegister = 0;
+    rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[1].NumDescriptors = 1; rg[1].BaseShaderRegister = 1;
+    D3D12_ROOT_PARAMETER rp[3] = {0};
+    for (int i = 0; i < 2; i++) {
+        rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[i].DescriptorTable.NumDescriptorRanges = 1;
+        rp[i].DescriptorTable.pDescriptorRanges = &rg[i];
+        rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[2].Constants.ShaderRegister = 0;
+    rp[2].Constants.Num32BitValues = 40;
+    rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC ss = {0};
+    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD = D3D12_FLOAT32_MAX;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 3; rd.pParameters = rp;
+    rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
+    ID3DBlob* sig = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
+               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_ao_rs)))
+        return 0;
+    for (int k = 0; k < 3; k++) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_ao_rs;
+        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+        pd.PS.pShaderBytecode = pb[k ? 1 : 0]->lpVtbl->GetBufferPointer(pb[k ? 1 : 0]);
+        pd.PS.BytecodeLength  = pb[k ? 1 : 0]->lpVtbl->GetBufferSize(pb[k ? 1 : 0]);
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        D3D12_RENDER_TARGET_BLEND_DESC* b = &pd.BlendState.RenderTarget[0];
+        if (k == 1) {   /* the colour times the occlusion; its alpha kept */
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D12_BLEND_ZERO; b->DestBlend = D3D12_BLEND_SRC_COLOR; b->BlendOp = D3D12_BLEND_OP_ADD;
+            b->SrcBlendAlpha = D3D12_BLEND_ZERO; b->DestBlendAlpha = D3D12_BLEND_ONE; b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN |
+                                       D3D12_COLOR_WRITE_ENABLE_BLUE;
+        } else {
+            b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        pd.SampleMask = UINT_MAX;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = k == 0 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+                s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_ao_pso[k])))
+            return 0;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 1;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_ao_rtv)))
+        return 0;
+    failed = 0;
+    return 1;
+}
+
+/* The occlusion's own target, w x h, R8: made again for another size. */
+static int ao_target(u32 w, u32 h)
+{
+    if (s_ao_raw && s_ao_w == w && s_ao_h == h) return 1;
+    if (s_ao_raw) { wait_for_gpu(); rf_release(s_ao_raw); s_ao_raw = NULL; }
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_ao_raw))) {
+        s_ao_raw = NULL;
+        return 0;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE rh;
+    s_ao_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_ao_rtv, &rh);
+    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_ao_raw, NULL, rh);
+    srv_write(AO_SRV, s_ao_raw, DXGI_FORMAT_R8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    s_ao_w = w; s_ao_h = h;
+    printf("[D3D12] ambient occlusion: %s, %ux%u%c", s_ao == 2 ? "high" : "on", w, h, 10);
+    return 1;
+}
+
+/* 4x4 inverse, Gauss-Jordan in doubles. */
+static int ao_m4_inverse(const double a[4][4], double out[4][4])
+{
+    double t[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) { t[r][c] = a[r][c]; t[r][c + 4] = r == c ? 1.0 : 0.0; }
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(t[r][c]) > fabs(t[p][c])) p = r;
+        if (fabs(t[p][c]) < 1e-20) return 0;
+        if (p != c) for (int k = 0; k < 8; k++) { const double x = t[p][k]; t[p][k] = t[c][k]; t[c][k] = x; }
+        const double d = 1.0 / t[c][c];
+        for (int k = 0; k < 8; k++) t[c][k] *= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            const double f = t[r][c];
+            for (int k = 0; k < 8; k++) t[r][k] -= f * t[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r][c] = t[r][c + 4];
+    return 1;
+}
+
+/* Ambient occlusion from depth surface zi into the colour target `target` (R8G8B8A8, at the render's size, in
+ * RENDER_TARGET). Once a frame. Leaves the guest path's root signature, heaps and targets unbound; 1 if it drew. */
+static int ao_draw(int zi, D3D12_CPU_DESCRIPTOR_HANDLE target)
+{
+    if (!s_ao || s_ao_done || !s_fg.cam_ok || zi < 0 || !s_d3d.off_ds[zi].res) return 0;
+    if (s_wide != 1.0f) {
+        static int said;
+        if (!said++) printf("[D3D12] ambient occlusion: off with an ultrawide picture%c", 10);
+        return 0;
+    }
+    if (!ao_init()) return 0;
+    const u32 w = s_ao == 2 ? s_d3d.pw : (s_d3d.pw + 1) / 2, h = s_ao == 2 ? s_d3d.ph : (s_d3d.ph + 1) / 2;
+    if (!ao_target(w, h)) return 0;
+    double M[4][4], I[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) M[r][k] = s_fg.cam[k * 4 + r];
+    if (!ao_m4_inverse(M, I)) return 0;
+    /* The camera: where the planes of rows 0, 1 and 3 (x, y and w = 0) meet. */
+    double pos[3] = { 0.0, 0.0, 0.0 };
+    {
+        const double a[3][3] = { { M[0][0], M[0][1], M[0][2] }, { M[1][0], M[1][1], M[1][2] }, { M[3][0], M[3][1], M[3][2] } };
+        const double b[3] = { -M[0][3], -M[1][3], -M[3][3] };
+        const double det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                           a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if (fabs(det) < 1e-20) return 0;
+        for (int i = 0; i < 3; i++) {
+            double m[3][3];
+            memcpy(m, a, sizeof m);
+            for (int r = 0; r < 3; r++) m[r][i] = b[r];
+            pos[i] = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                      m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+        }
+    }
+    const double lx = sqrt(M[0][0] * M[0][0] + M[0][1] * M[0][1] + M[0][2] * M[0][2]);
+    const double ly = sqrt(M[1][0] * M[1][0] + M[1][1] * M[1][1] + M[1][2] * M[1][2]);
+    const double lw = sqrt(M[3][0] * M[3][0] + M[3][1] * M[3][1] + M[3][2] * M[3][2]);
+    if (lw <= 0.0) return 0;
+    const OffDS* z = &s_d3d.off_ds[zi];
+    float c[40];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) c[r * 4 + k] = (float)I[r][k];
+    for (int k = 0; k < 4; k++) c[16 + k] = (float)M[3][k];
+    c[20] = s_fg.z_scale; c[21] = s_fg.z_offset; c[22] = 1.0f / (float)s_d3d.pw; c[23] = 1.0f / (float)s_d3d.ph;
+    c[24] = 1.2f;                     /* the radius, in the world's units (~a metre) */
+    c[25] = 2.4f;                     /* how dark */
+    c[26] = 25.0f; c[27] = 50.0f;     /* faded out over these view depths */
+    c[28] = (float)lx; c[29] = (float)ly; c[30] = s_ao == 2 ? 16.0f : 8.0f; c[31] = (float)pos[0];
+    c[32] = 1.0f / (float)w; c[33] = 1.0f / (float)h; c[34] = (float)lw; c[35] = (float)pos[1];
+    const int dbg = ao_debug() > 0 ? ao_debug() : 0;   /* 1 the occlusion alone, 2 view depth: bands of 10 red, 0-100 green */
+    c[36] = (float)pos[2]; c[37] = (float)dbg;
+    c[38] = (float)s_d3d.pw / (float)(z->pw ? z->pw : s_d3d.pw); c[39] = (float)s_d3d.ph / (float)(z->ph ? z->ph : s_d3d.ph);
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const D3D12_RESOURCE_STATES zs = z->st;
+    off_ds_transition(zi, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    pp_barrier(s_ao_raw, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE rh;
+    s_ao_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_ao_rtv, &rh);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rh, FALSE, NULL);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)w, (LONG)h };
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_ao_rs);
+    ID3D12DescriptorHeap* hp[] = { s_d3d.srv_heap };
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, hp);
+    D3D12_GPU_DESCRIPTOR_HANDLE g0, g1;
+    s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g0);
+    g1 = g0;
+    g0.ptr += (u64)(DS_SRV_BASE + zi * 2) * s_d3d.srv_inc;
+    g1.ptr += (u64)AO_SRV * s_d3d.srv_inc;
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g0);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, g1);
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 2, 40, c, 0);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->SetPipelineState(cl, s_ao_pso[0]);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    pp_barrier(s_ao_raw, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &target, FALSE, NULL);
+    vp.Width = (float)s_d3d.pw; vp.Height = (float)s_d3d.ph;
+    sc.right = (LONG)s_d3d.pw; sc.bottom = (LONG)s_d3d.ph;
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->SetPipelineState(cl, s_ao_pso[dbg ? 2 : 1]);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    off_ds_transition(zi, zs);
+    s_ao_done = 1;
+    return 1;
+}
+
 /* A clear of depth alone on a display surface, in the depth surface the scene drew with: the
  * picture is finished and the HUD comes next (God of War: Ascension, when it has a HUD to
  * draw), and the clear is about to wipe the scene's depth. Both are copied here. Nothing
  * else of the draw pass changes: the surfaces go back to the states they were in. */
-static void fg_marker(const D3D12DrawRecord* dr)
+static int fg_marker(const D3D12DrawRecord* dr)
 {
-    if (!FG_INPUTS() || !s_fg.cam_ok || dr->zeta_off != s_fg.depth_off) return;
+    int drew = 0;
+    /* Ambient occlusion: the scene is whole and its HUD next. From the scene's own depth, which may be another surface
+     * than the one this clears (God of War: Ascension draws its scene with 0x11B0000 and clears 0x2B20000 for the
+     * HUD), before FG's copies take the picture. */
+    if (s_ao && s_fg.cam_ok && !s_ao_done) {
+        const int ri = off_rt_find(dr->rt_off), zs = off_ds_find(s_fg.depth_off);
+        if (ri >= 0 && zs >= 0) {
+            OffRT* rt = &s_d3d.off_rt[ri];
+            const OffDS* z = &s_d3d.off_ds[zs];
+            if (rt->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM && rt->w == s_d3d.width && rt->h == s_d3d.height &&
+                z->w == s_d3d.width && z->h == s_d3d.height) {
+                const D3D12_RESOURCE_STATES was = rt->st;
+                off_rt_transition(ri, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                drew = ao_draw(zs, off_rt_rtv(ri));
+                off_rt_transition(ri, was);
+                if (drew && ao_debug() >= 0) {
+                    static int said;
+                    if (said++ < 4) fprintf(stderr, "[ao-dbg] at the HUD's clear, frame %llu%c",
+                                            (unsigned long long)s_d3d.frame_count, 10);
+                }
+            }
+        }
+    }
+    if (!FG_INPUTS() || !s_fg.cam_ok || dr->zeta_off != s_fg.depth_off) return drew;
     s_fg.marked = 1;
     const int ri = off_rt_find(dr->rt_off), zi = off_ds_find(dr->zeta_off);
-    if (ri < 0 || zi < 0) return;
+    if (ri < 0 || zi < 0) return drew;
     OffRT* rt = &s_d3d.off_rt[ri];
     const OffDS* z = &s_d3d.off_ds[zi];
     if (rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM || rt->w != s_d3d.width || rt->h != s_d3d.height ||
         z->w != s_d3d.width || z->h != s_d3d.height || !fg_targets())
-        return;
+        return drew;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     const D3D12_RESOURCE_STATES rs = rt->st;
     off_rt_transition(ri, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -14650,6 +14991,7 @@ static void fg_marker(const D3D12DrawRecord* dr)
     off_rt_transition(ri, rs);
     fg_copy_depth(zi);
     s_fg.copied = s_fg.depth_ok = 1;
+    return drew;
 }
 
 /* A scene with no HUD to draw has no marker: its depth is whole at the frame's end (see
@@ -17224,7 +17566,14 @@ static u32 rf_vp_draws(u32 from, u32 to, int ahead)
                 }
                 if (dr->zq_op) { zq_op_replay(dr); continue; }
                 if (dr->wide_cam) s_wide_scene++;
-                if (dr->is_clear && dr->clear_mask == 1u && (dr->rt_off & DISP_RT_TAG)) fg_marker(dr);
+                if (dr->is_clear && dr->clear_mask == 1u && (dr->rt_off & DISP_RT_TAG) && fg_marker(dr)) {
+                    s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
+                    { ID3D12DescriptorHeap* hp2[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+                      s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, hp2); }
+                    for (int _s = 0; _s < VP_TEX_UNITS; _s++) samp_bound[_s] = -1;
+                    raw_bound = 0;
+                    force_rebind = 1;
+                }
                 if (!dr->is_clear) zq_before_draw();
                 /* The targets and depth surface this draw binds (as the retarget
                  * below picks them): a copy of one of those is not refreshed here
@@ -18180,6 +18529,21 @@ static void render_frame(void)
 skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
+    /* No HUD's clear took the occlusion this frame (a scene with no HUD): it goes on the frame as it stands, in
+     * RENDER_TARGET here, before a shot or a dump takes it and the frame is scaled. */
+    if (s_present_this_frame && s_ao && !s_ao_done && s_fg.cam_ok) {
+        const int zi = off_ds_find(s_fg.depth_off);
+        if (zi >= 0 && s_d3d.off_ds[zi].w == s_d3d.width && s_d3d.off_ds[zi].h == s_d3d.height) {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+            s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv);
+            rtv.ptr += fi * s_d3d.rtv_descriptor_size;
+            if (ao_draw(zi, rtv) && ao_debug() >= 0) {
+                static int said;
+                if (said++ < 4) fprintf(stderr, "[ao-dbg] at the frame's end, frame %llu%c",
+                                        (unsigned long long)s_d3d.frame_count, 10);
+            }
+        }
+    }
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     /* A shot of the title's frame needs the readback buffer; one of the

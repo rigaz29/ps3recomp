@@ -15105,18 +15105,23 @@ static int ao_init(void)
         "    float4 n = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (d - k0.y) / k0.x, 1.0);\n"
         "    float4 p = float4(dot(iv0, n), dot(iv1, n), dot(iv2, n), dot(iv3, n));\n"
         "    return p.xyz / p.w;\n"
-        "}\n";
+        "}\n"
+        /* A point of the depth where it was drawn: the middle of the render's pixel the depth is read from. A half-size
+         * pixel's middle is the edge of two of the render's, so its depth was one pixel's put half a pixel away, and on
+         * a floor seen at a low angle the error took turns row by row: stripes (On). */
+        "float2 mid(float2 uv) { return (floor(uv / k0.zw - 0.25) + 0.5) * k0.zw; }\n"
+        "float3 wpat(float2 uv) { uv = mid(uv); return wp(uv, dat(uv)); }\n";
     static const char ps_occ[] =
         "static const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
         "float main(float4 pos : SV_Position) : SV_Target {\n"
-        "    float2 uv = pos.xy * k3.xy;\n"
+        "    float2 uv = mid(pos.xy * k3.xy);\n"
         "    float3 P = wp(uv, dat(uv));\n"
         "    float w = dot(m3, float4(P, 1.0));\n"
         "    float vz = w / k3.z;\n"
         "    if (!(w > 0.0) || !(vz < k1.w)) return 1.0;\n"
         "    float2 ex = float2(k0.z, 0.0), ey = float2(0.0, k0.w);\n"
-        "    float3 a = wp(uv + ex, dat(uv + ex)) - P, b = P - wp(uv - ex, dat(uv - ex));\n"
-        "    float3 c = wp(uv + ey, dat(uv + ey)) - P, e = P - wp(uv - ey, dat(uv - ey));\n"
+        "    float3 a = wpat(uv + ex) - P, b = P - wpat(uv - ex);\n"
+        "    float3 c = wpat(uv + ey) - P, e = P - wpat(uv - ey);\n"
         "    float3 N = normalize(cross(dot(a, a) < dot(b, b) ? a : b, dot(c, c) < dot(e, e) ? c : e));\n"
         "    if (dot(N, float3(k2.w, k3.w, k4.x) - P) < 0.0) N = -N;\n"   /* toward the camera */
         "    uint2 q = uint2(pos.xy) & 3;\n"
@@ -15129,7 +15134,7 @@ static int ao_init(void)
         "        float t = (i + 0.5) / S;\n"
         "        float an = rot + i * 2.3999632;\n"
         "        float2 su = uv + float2(cos(an), sin(an)) * ruv * t;\n"
-        "        float3 v = wp(su, dat(su)) - P;\n"
+        "        float3 v = wpat(su) - P;\n"
         "        float vv = dot(v, v);\n"
         "        o += max(dot(v, N) * rsqrt(vv + 1e-6) - 0.15, 0.0) * saturate(1.0 - vv / (R * R));\n"
         "    }\n"
@@ -15137,7 +15142,7 @@ static int ao_init(void)
         "    return lerp(ao, 1.0, saturate((vz - k1.z) / (k1.w - k1.z)));\n"
         "}\n";
     static const char ps_apply[] =
-        "float vzat(float2 uv) { return dot(m3, float4(wp(uv, dat(uv)), 1.0)); }\n"
+        "float vzat(float2 uv) { return dot(m3, float4(wpat(uv), 1.0)); }\n"
         "float4 main(float4 pos : SV_Position) : SV_Target {\n"
         "    float2 uv = pos.xy * k0.zw;\n"
         "    float z0 = vzat(uv);\n"
@@ -15156,7 +15161,7 @@ static int ao_init(void)
         "    if (k4.y == 2.0) return float4(frac(z0 / k3.z / 10.0), saturate(z0 / k3.z / 100.0), 0.0, 1.0);\n"
         "    return float4(ao, ao, ao, 1.0);\n"
         "}\n";
-    char src[2][4096];
+    char src[2][8192];
     snprintf(src[0], sizeof src[0], "%s%s", common, ps_occ);
     snprintf(src[1], sizeof src[1], "%s%s", common, ps_apply);
     ID3DBlob *vb = NULL, *pb[2] = { NULL, NULL }, *err = NULL;

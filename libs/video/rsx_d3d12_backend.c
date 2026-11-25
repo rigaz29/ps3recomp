@@ -505,6 +505,7 @@ static int s_rec_hud_cam;      /* recording: this frame's camera draws after the
 static float s_shadow = 1.0f;
 static int s_post_full;
 static int s_ao;        /* graphics.ambient_occlusion: 0 off, 1 on, 2 high (ao_draw) */
+static void post_settings(void);
 static int s_ao_done;   /* drawn this frame */
 static int s_rt_sub_bound = -1;   /* the target whose twin is bound now (rt_sub_draw), drawn 1:1 */
 #define TS_ON (RS_ON || s_shadow > 1.0f)
@@ -4078,6 +4079,7 @@ static void rs_init(void)
     if (s_post_full && RS_ON)
         printf("[D3D12] effects (bloom, blur, depth of field): at the internal resolution, %.3gx%c",
                (float)s_d3d.ph / (float)s_d3d.height, 10);
+    post_settings();
     const char* ao = ps3_settings_str("graphics", "ambient_occlusion", "D3D12_AO", "off");
     s_ao = ps3_settings_ieq(ao, "high") ? 2 : ps3_settings_ieq(ao, "on") ? 1 : 0;
 }
@@ -7801,6 +7803,190 @@ static void hdr_encode(u32 fi)
     cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, hp);
 }
 
+/* The picture's last pass before the overlay, at the swap chain's size (post_final), when either is on:
+ * - graphics.deband = on (D3D12_DEBAND): where the picture is flat, steps of up to 1.5/255 are smoothed (four samples at
+ *   a random angle and distance up to ~16 pixels at 1080p: all of them within that of the pixel, their mean takes its
+ *   place, per channel), then a triangular dither of one step. Edges and texture, past the threshold, stay as they are.
+ *   God of War: Ascension's fog and skies are 8-bit and band in the dark.
+ * - graphics.cas = low, medium, high, max (D3D12_CAS): contrast adaptive sharpening (AMD FidelityFX CAS's method: a 3x3
+ *   neighbourhood's soft minimum and maximum set how much each pixel is pushed from its four neighbours), where the
+ *   scaling sharpened nothing of its own: bilinear, sharp bilinear, DLSS, FSR 1 without upscaling. AMD FSR's own
+ *   sharpening (graphics.sharpening) is left to FSR. Flat areas take the deband's mean, so banding is not sharpened. */
+static int s_deband;
+static float s_cas;                  /* CAS's sharpness, 0 off, 0.2 to 1 */
+static ID3D12Resource* s_pf_tmp;     /* a copy of the picture, read by the pass */
+static u32 s_pf_w, s_pf_h;
+static ID3D12DescriptorHeap* s_pf_srv;
+static ID3D12RootSignature* s_pf_rs;
+static ID3D12PipelineState* s_pf_pso;
+
+static void post_settings(void)
+{
+    s_deband = ps3_settings_ieq(ps3_settings_str("graphics", "deband", "D3D12_DEBAND", "off"), "on");
+    static const struct { const char* name; float v; } k[] = {
+        { "off", 0.0f }, { "low", 0.2f }, { "medium", 0.4f }, { "high", 0.6f }, { "max", 1.0f } };
+    const char* c = ps3_settings_str("graphics", "cas", "D3D12_CAS", "off");
+    s_cas = 0.0f;
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (ps3_settings_ieq(c, k[i].name)) s_cas = k[i].v;
+    if (s_deband || s_cas > 0.0f)
+        printf("[D3D12] last pass: deband %s, CAS %s%c", s_deband ? "on" : "off", c ? c : "off", 10);
+}
+
+static int pf_init(void)
+{
+    if (s_pf_pso) return 1;
+    static int failed;
+    if (failed) return 0;
+    failed = 1;
+    static const char vs[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "    float2 p = float2((id << 1) & 2, id & 2);\n"
+        "    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "}\n";
+    static const char ps[] =
+        "Texture2D<float4> src : register(t0);\n"
+        "cbuffer C : register(b0) { float sharp; float deband; float thr; float range; };\n"
+        "static int2 sz;\n"
+        "float3 L(int2 q) { return src.Load(int3(clamp(q, int2(0, 0), sz - 1), 0)).rgb; }\n"
+        "float ign(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }\n"
+        "float4 main(float4 pos : SV_Position) : SV_Target {\n"
+        "    uint w, h;\n"
+        "    src.GetDimensions(w, h);\n"
+        "    sz = int2(w, h);\n"
+        "    int2 q = int2(pos.xy);\n"
+        "    float4 e4 = src.Load(int3(q, 0));\n"
+        "    float3 e = e4.rgb, o = e;\n"
+        "    if (sharp > 0.0) {\n"
+        "        float3 a = L(q + int2(-1, -1)), b = L(q + int2(0, -1)), c = L(q + int2(1, -1));\n"
+        "        float3 d = L(q + int2(-1, 0)), f = L(q + int2(1, 0));\n"
+        "        float3 g = L(q + int2(-1, 1)), hh = L(q + int2(0, 1)), i = L(q + int2(1, 1));\n"
+        "        float3 mn = min(min(min(d, e), min(f, b)), hh);\n"
+        "        float3 mx = max(max(max(d, e), max(f, b)), hh);\n"
+        "        mn += min(mn, min(min(a, c), min(g, i)));\n"
+        "        mx += max(mx, max(max(a, c), max(g, i)));\n"
+        "        float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
+        "        float3 wt = amp * (-1.0 / lerp(8.0, 5.0, sharp));\n"
+        "        o = saturate(((b + d + f + hh) * wt + e) / (1.0 + 4.0 * wt));\n"
+        "    }\n"
+        "    if (deband > 0.0) {\n"
+        "        float an = ign(pos.xy) * 6.2831853, r = (0.25 + 0.75 * ign(pos.yx + 31.7)) * range;\n"
+        "        int2 v = int2(round(float2(cos(an), sin(an)) * r));\n"
+        "        float3 s1 = L(q + v), s2 = L(q - v), s3 = L(q + int2(-v.y, v.x)), s4 = L(q + int2(v.y, -v.x));\n"
+        "        float3 dm = max(max(abs(s1 - e), abs(s2 - e)), max(abs(s3 - e), abs(s4 - e)));\n"
+        "        float3 m = (s1 + s2 + s3 + s4) * 0.25;\n"
+        "        o = dm < thr ? m : o;\n"
+        "        o += (ign(pos.xy + 13.1) - ign(pos.xy + 71.9)) / 255.0;\n"
+        "    }\n"
+        "    return float4(saturate(o), e4.a);\n"
+        "}\n";
+    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+    if (FAILED(rsx_compile_own(vs, sizeof vs - 1, "post_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+        FAILED(rsx_compile_own(ps, sizeof ps - 1, "post_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
+        printf("[D3D12] the last pass's shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
+        return 0;
+    }
+    D3D12_DESCRIPTOR_RANGE rg = {0};
+    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rg.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {0};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &rg;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 4;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 2; rd.pParameters = rp;
+    ID3DBlob* sig = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
+               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_pf_rs)))
+        return 0;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_pf_rs;
+    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+    pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                                 (void**)&s_pf_pso)))
+        return 0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 1;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_pf_srv)))
+        return 0;
+    failed = 0;
+    return 1;
+}
+
+/* The last pass on bb (R8G8B8A8, in RENDER_TARGET, the swap chain's size): its copy into s_pf_tmp, then through the
+ * pass back into it. sharpened: the scaling sharpened the picture itself (FSR 1's RCAS, FSR's upscaler). */
+static void post_final(ID3D12Resource* bb, D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, int sharpened)
+{
+    const float cas = sharpened ? 0.0f : s_cas;
+    if (!s_deband && cas <= 0.0f) return;
+    if (s_fg_mode) {   /* frame generation finds the HUD by what differs from the picture without it: none of this */
+        static int said;
+        if (!said++) printf("[D3D12] last pass (deband, CAS): off with frame generation%c", 10);
+        return;
+    }
+    if (!pf_init()) return;
+    if (!s_pf_tmp || s_pf_w != s_d3d.bb_w || s_pf_h != s_d3d.bb_h) {
+        if (s_pf_tmp) { wait_for_gpu(); s_pf_tmp->lpVtbl->Release(s_pf_tmp); s_pf_tmp = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = s_d3d.bb_w; rd.Height = s_d3d.bb_h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&s_pf_tmp))) {
+            s_pf_tmp = NULL;
+            return;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        s_pf_srv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_pf_srv, &h);
+        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_pf_tmp, NULL, h);
+        s_pf_w = s_d3d.bb_w; s_pf_h = s_d3d.bb_h;
+    }
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pp_barrier(s_pf_tmp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->lpVtbl->CopyResource(cl, s_pf_tmp, bb);
+    pp_barrier(s_pf_tmp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    pp_barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &bb_rtv, FALSE, NULL);
+    const D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)s_d3d.bb_w, (float)s_d3d.bb_h, 0.0f, 1.0f };
+    const D3D12_RECT sc = { 0, 0, (LONG)s_d3d.bb_w, (LONG)s_d3d.bb_h };
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_pf_rs);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_pf_srv);
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    s_pf_srv->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_pf_srv, &g);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    const float k[4] = { cas, s_deband ? 1.0f : 0.0f, 1.5f / 255.0f, 16.0f * (float)s_d3d.bb_h / 1080.0f };
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
+    cl->lpVtbl->SetPipelineState(cl, s_pf_pso);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    pp_barrier(s_pf_tmp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    ID3D12DescriptorHeap* hp[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+    cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, hp);
+}
+
 static void present_to_backbuffer(u32 fi)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, tmp_rtv;
@@ -7834,6 +8020,14 @@ static void present_to_backbuffer(u32 fi)
         fg_hudless(tmp_rtv);
         pp_chain(fi, PP_SLOT_AA_E(fi), PP_SLOT_AA_N(fi), bb_rtv, tmp_rtv, bb, D3D12_RESOURCE_STATE_PRESENT);
         fg_unmarked(bb);
+    }
+    {   /* the scaling's own sharpening: FSR's upscaler, or FSR 1's RCAS when it scaled up */
+        int sharpened = s_d3d.pp_stops >= 0.0f &&
+                        (up ? 1 : s_d3d.pp_mode == 2 && s_d3d.bb_w > s_d3d.pw && s_d3d.bb_h > s_d3d.ph && s_d3d.pp_tmp != NULL);
+#ifdef PS3RECOMP_DLSS
+        if (up && s_up.dlss) sharpened = 0;
+#endif
+        post_final(bb, bb_rtv, sharpened);
     }
     ov_draw(fi, bb_rtv);
     if (s_d3d.aa_on && !up) aa_finish();

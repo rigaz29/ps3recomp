@@ -3859,6 +3859,132 @@ static int pp_init(void);
 static void ov_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 static int aa_init(D3D12_GRAPHICS_PIPELINE_STATE_DESC pd);
 
+/* display.hdr = on (D3D12_HDR): HDR10 output where Windows has HDR on for the window's display. The swap chain becomes
+ * R10G10B10A2 in the PQ / BT.2020 colour space (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020), and backbuffers[] become
+ * R8G8B8A8 targets of the swap chain's size that every pass draws into as before (the scaling, SMAA, the overlay, a
+ * screenshot of the output); before the present, hdr_encode takes that SDR picture into the swap chain's own buffer:
+ * gamma 2.2 to linear, the highlights above a knee raised toward the peak (display.hdr_peak, nits; auto = what the
+ * display reports, 400 to 2000) while the rest sits at paper white (display.hdr_paper_white, nits), BT.709 to BT.2020,
+ * then PQ. Off with frame generation, whose swap chain is FSR's or Streamline's. */
+static int s_hdr;
+static float s_hdr_peak = 1000.0f, s_hdr_paper = 200.0f;
+static ID3D12Resource* s_hdr_swap[FRAME_COUNT];   /* the swap chain's own buffers while s_hdr */
+static ID3D12DescriptorHeap* s_hdr_rtv;           /* their RTVs */
+static ID3D12DescriptorHeap* s_hdr_srv;           /* SRVs of backbuffers[] (the SDR picture), shader visible */
+static ID3D12RootSignature* s_hdr_rs;
+static ID3D12PipelineState* s_hdr_pso;
+
+static void hdr_start(void)
+{
+    float maxlum = 0.0f;
+    int on_display = 0;
+    {
+        IDXGIOutput* out = NULL;
+        IDXGIOutput6* o6 = NULL;
+        DXGI_OUTPUT_DESC1 d1;
+        memset(&d1, 0, sizeof d1);
+        if (SUCCEEDED(s_d3d.swap_chain->lpVtbl->GetContainingOutput(s_d3d.swap_chain, &out)) && out) {
+            if (SUCCEEDED(out->lpVtbl->QueryInterface(out, &IID_IDXGIOutput6, (void**)&o6)) && o6) {
+                if (SUCCEEDED(o6->lpVtbl->GetDesc1(o6, &d1))) {
+                    on_display = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                    maxlum = d1.MaxLuminance;
+                }
+                o6->lpVtbl->Release(o6);
+            }
+            out->lpVtbl->Release(out);
+        }
+    }
+    printf("[D3D12] display: HDR %s in Windows, %.0f nits at most as it reports%c", on_display ? "on" : "off",
+           (double)maxlum, 10);
+    if (!ps3_settings_ieq(ps3_settings_str("display", "hdr", "D3D12_HDR", "off"), "on")) return;
+    if (!on_display) {
+        const char* force = getenv("D3D12_HDR_FORCE");   /* for a test: the encoding where no HDR display shows it */
+        if (!(force && *force == '1')) {
+            printf("[D3D12] HDR: off, Windows has HDR off for this display (Settings, System, Display, Use HDR)%c", 10);
+            return;
+        }
+        printf("[D3D12] HDR: Windows has it off, D3D12_HDR_FORCE=1 makes it anyway%c", 10);
+    }
+    const char* fg = ps3_settings_str("graphics", "frame_generation", "D3D12_FRAME_GENERATION", "off");
+    if (fg && !ps3_settings_ieq(fg, "off")) {
+        printf("[D3D12] HDR: off with frame generation%c", 10);
+        return;
+    }
+    const UINT flags = s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, s_bufs, s_d3d.bb_w, s_d3d.bb_h,
+                                                         DXGI_FORMAT_R10G10B10A2_UNORM, flags);
+    UINT sup = 0;
+    if (SUCCEEDED(hr))
+        hr = s_d3d.swap_chain->lpVtbl->CheckColorSpaceSupport(s_d3d.swap_chain, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &sup);
+    if (FAILED(hr) || !(sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) ||
+        FAILED(s_d3d.swap_chain->lpVtbl->SetColorSpace1(s_d3d.swap_chain, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))) {
+        printf("[D3D12] HDR: off, the swap chain does not take HDR10 (0x%08lX)%c", (unsigned long)hr, 10);
+        s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, s_bufs, s_d3d.bb_w, s_d3d.bb_h,
+                                                DXGI_FORMAT_R8G8B8A8_UNORM, flags);
+        return;
+    }
+    const char* pk = ps3_settings_str("display", "hdr_peak", "D3D12_HDR_PEAK", "auto");
+    float peak = (float)atof(pk ? pk : "0");
+    if (peak <= 0.0f) peak = maxlum > 0.0f ? maxlum : 1000.0f;
+    s_hdr_peak = peak < 400.0f ? 400.0f : peak > 2000.0f ? 2000.0f : peak;
+    float paper = (float)atof(ps3_settings_str("display", "hdr_paper_white", "D3D12_HDR_PAPER", "200"));
+    s_hdr_paper = paper < 80.0f ? 80.0f : paper > 400.0f ? 400.0f : paper;
+    if (s_hdr_paper > s_hdr_peak) s_hdr_paper = s_hdr_peak;
+    s_hdr = 1;
+    printf("[D3D12] HDR: on, HDR10, peak %.0f nits, paper white %.0f nits%c", (double)s_hdr_peak, (double)s_hdr_paper, 10);
+}
+
+/* Buffer i of the swap chain: into backbuffers[i], or with HDR into s_hdr_swap[i], with backbuffers[i] an R8G8B8A8
+ * target of its size, its RTV in s_hdr_rtv and the SDR one's SRV in s_hdr_srv. */
+static HRESULT bb_get(u32 i)
+{
+    if (!s_hdr)
+        return s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
+    HRESULT hr = s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_hdr_swap[i]);
+    if (FAILED(hr)) return hr;
+    if (!s_hdr_rtv) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = FRAME_COUNT;
+        if (FAILED(hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_hdr_rtv)))
+            return hr;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_hdr_srv)))
+            return hr;
+    }
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = s_d3d.bb_w; rd.Height = s_d3d.bb_h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = {0};
+    cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    cv.Color[3] = 1.0f;
+    if (FAILED(hr = s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, &cv, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i])))
+        return hr;
+    const UINT rinc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const UINT sinc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_hdr_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_hdr_rtv, &h);
+    h.ptr += (SIZE_T)i * rinc;
+    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_hdr_swap[i], NULL, h);
+    s_hdr_srv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_hdr_srv, &h);
+    h.ptr += (SIZE_T)i * sinc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.backbuffers[i], NULL, h);
+    return S_OK;
+}
+
+static void bb_release(void)
+{
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        if (s_d3d.backbuffers[i]) { s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]); s_d3d.backbuffers[i] = NULL; }
+        if (s_hdr_swap[i]) { s_hdr_swap[i]->lpVtbl->Release(s_hdr_swap[i]); s_hdr_swap[i] = NULL; }
+    }
+}
+
 /* The device (s_d3d.device), 0 on success. On a dual-GPU laptop a NULL adapter
  * usually lands on the integrated GPU; explicitly pick the high-performance
  * (discrete) adapter via IDXGIFactory6. graphics.gpu = integrated (D3D12_GPU)
@@ -4198,6 +4324,7 @@ static int init_d3d12(u32 width, u32 height)
         }
     }
 
+    hdr_start();
     fg_start();
     rs_init();
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
@@ -4218,8 +4345,7 @@ static int init_d3d12(u32 width, u32 height)
     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
 
     for (u32 i = 0; i < s_bufs; i++) {
-        hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
-            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
+        hr = bb_get(i);
         if (FAILED(hr)) return -1;
 
         D3D12_HEAP_PROPERTIES hp = {0};
@@ -5394,8 +5520,7 @@ static void bb_resize(void)
     }
     if (w == s_d3d.bb_w && h == s_d3d.bb_h) return;
     wait_for_gpu();
-    for (u32 i = 0; i < FRAME_COUNT; i++)
-        if (s_d3d.backbuffers[i]) { s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]); s_d3d.backbuffers[i] = NULL; }
+    bb_release();
     if (s_up.ready) {
 #ifdef PS3RECOMP_DLSS
         if (s_up.dlss) rsx_dlss_up_destroy();
@@ -5413,13 +5538,12 @@ static void bb_resize(void)
             if (s_fg.hud_out[i]) { s_fg.hud_out[i]->lpVtbl->Release(s_fg.hud_out[i]); s_fg.hud_out[i] = NULL; }
     }
     HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, s_bufs, w, h,
-                                                         DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                         s_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                          s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (SUCCEEDED(hr)) { s_d3d.bb_w = w; s_d3d.bb_h = h; }
     else printf("[D3D12] swap chain resize to %ux%u failed (0x%08lX)\n", w, h, hr);
     if (s_d3d.pp_tmp) pp_tmp_create();
-    for (u32 i = 0; i < s_bufs; i++)
-        s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.backbuffers[i]);
+    for (u32 i = 0; i < s_bufs; i++) bb_get(i);
     bb_views();
     /* The buffer index may have moved. The GPU is idle: every fence value is
      * complete, and the new frame signals one past the highest. */
@@ -7571,6 +7695,112 @@ static void fg_unmarked(ID3D12Resource* bb);
 static int ao_draw(int zi, D3D12_CPU_DESCRIPTOR_HANDLE target);
 static int ao_debug(void);
 
+/* With HDR: the frame's SDR picture (backbuffers[fi], in PRESENT) into the swap chain's buffer, HDR10 (hdr_start). */
+static int hdr_init(void)
+{
+    if (s_hdr_pso) return 1;
+    static int failed;
+    if (failed) return 0;
+    failed = 1;
+    static const char vs[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "    float2 p = float2((id << 1) & 2, id & 2);\n"
+        "    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "}\n";
+    static const char ps[] =
+        "Texture2D<float4> sdr : register(t0);\n"
+        "cbuffer C : register(b0) { float paper; float peak; float knee; float pad; };\n"
+        "float3 pq(float3 n) {\n"
+        "    float3 l = pow(saturate(n), 0.1593017578125);\n"
+        "    return pow((0.8359375 + 18.8515625 * l) / (1.0 + 18.6875 * l), 78.84375);\n"
+        "}\n"
+        "float4 main(float4 pos : SV_Position) : SV_Target {\n"
+        "    float3 c = pow(saturate(sdr.Load(int3(pos.xy, 0)).rgb), 2.2);\n"
+        "    float y = dot(c, float3(0.2126, 0.7152, 0.0722));\n"
+        "    float t = saturate((y - knee) / (1.0 - knee));\n"
+        "    c *= 1.0 + (peak / paper - 1.0) * t * t;\n"
+        "    float3 w = float3(dot(c, float3(0.6274, 0.3293, 0.0433)), dot(c, float3(0.0691, 0.9195, 0.0114)),\n"
+        "                      dot(c, float3(0.0164, 0.0880, 0.8956)));\n"
+        "    return float4(pq(w * (paper / 10000.0)), 1.0);\n"
+        "}\n";
+    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+    if (FAILED(rsx_compile_own(vs, sizeof vs - 1, "hdr_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+        FAILED(rsx_compile_own(ps, sizeof ps - 1, "hdr_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
+        printf("[D3D12] HDR's shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
+        return 0;
+    }
+    D3D12_DESCRIPTOR_RANGE rg = {0};
+    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rg.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {0};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &rg;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 4;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 2; rd.pParameters = rp;
+    ID3DBlob* sig = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
+               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_hdr_rs)))
+        return 0;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_hdr_rs;
+    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+    pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                                 (void**)&s_hdr_pso)))
+        return 0;
+    failed = 0;
+    return 1;
+}
+
+static void hdr_encode(u32 fi)
+{
+    if (!s_hdr || !s_hdr_swap[fi] || !s_d3d.backbuffers[fi] || !hdr_init()) return;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    ID3D12Resource* sdr = s_d3d.backbuffers[fi];
+    pp_barrier(sdr, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    pp_barrier(s_hdr_swap[fi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    s_hdr_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_hdr_rtv, &rtv);
+    rtv.ptr += (SIZE_T)fi * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    const D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)s_d3d.bb_w, (float)s_d3d.bb_h, 0.0f, 1.0f };
+    const D3D12_RECT sc = { 0, 0, (LONG)s_d3d.bb_w, (LONG)s_d3d.bb_h };
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_hdr_rs);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_hdr_srv);
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    s_hdr_srv->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_hdr_srv, &g);
+    g.ptr += (u64)fi * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    const float k[4] = { s_hdr_paper, s_hdr_peak, 0.5f, 0.0f };
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
+    cl->lpVtbl->SetPipelineState(cl, s_hdr_pso);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    pp_barrier(s_hdr_swap[fi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    pp_barrier(sdr, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    ID3D12DescriptorHeap* hp[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+    cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, hp);
+}
+
 static void present_to_backbuffer(u32 fi)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, tmp_rtv;
@@ -7609,6 +7839,7 @@ static void present_to_backbuffer(u32 fi)
     if (s_d3d.aa_on && !up) aa_finish();
     pp_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     pp_barrier(disp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    hdr_encode(fi);
 }
 
 static double s_rf_last_submit;   /* RF_WAITLOG: when the last batch was submitted */
@@ -22338,6 +22569,7 @@ void rsx_d3d12_backend_shutdown(void)
         if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
         if (s_d3d.backbuffers[i]) s_d3d.backbuffers[i]->lpVtbl->Release(s_d3d.backbuffers[i]);
+        if (s_hdr_swap[i]) s_hdr_swap[i]->lpVtbl->Release(s_hdr_swap[i]);
     }
     {
         if (s_d3d.pp_pso) s_d3d.pp_pso->lpVtbl->Release(s_d3d.pp_pso);

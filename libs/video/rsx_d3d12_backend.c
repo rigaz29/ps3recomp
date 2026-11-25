@@ -10471,9 +10471,21 @@ static void fp_dyn_state(const D3D12DrawRecord* dr, float* ts)
     const u64 any = dr_shadow_descs(dr, sd);
     for (int u = 0; u < VP_TEX_UNITS; u++) {
         u32 st = (u32)dr_unit_view(dr, u) & 3u;
-        if (any && u < 16 && sd[u].enabled == 1)
+        if (any && u < 16 && sd[u].enabled == 1) {
             st |= 4u | (u32)(sd[u].func & 7u) << 3 | (u32)(sd[u].linear & 1u) << 6 |
                   (u32)(sd[u].unnormalized & 1u) << 7;
+            /* The corner of a larger depth surface (its coordinate scale, ts[u].xy, below 1): the guest's sampler
+             * clamps or gives its border at the corner's edge, not at the surface's (_rsx_shadow_tapN). Bit 8 and
+             * the border's red in bits 10-17 for BORDER on either axis, bit 9 for the others. RSX_SHADOW_REGION=0
+             * reads past the corner, as before. */
+            static int region = -1;
+            if (region < 0) { const char* e = getenv("RSX_SHADOW_REGION"); region = !(e && *e == '0'); }
+            if (region && !sd[u].unnormalized && (ts[u * 4 + 0] < 0.999f || ts[u * 4 + 1] < 0.999f)) {
+                const u32 ws = dr->tex[u].addr & 15u, wt = (dr->tex[u].addr >> 8) & 15u;
+                if (ws == 4u || wt == 4u) st |= 256u | ((dr->tex[u].border >> 16) & 0xFFu) << 10;
+                else st |= 512u;
+            }
+        }
         memcpy(&ts[u * 4 + 3], &st, 4);
     }
     u32 flags = (dr->fp_ctrl & FP_CTRL_SRGB_OUT) ? 1u : 0u;
@@ -18982,6 +18994,13 @@ skip_dump_consider: ;
     if (s_shot_pending && (d3d12_shot_game() ? s_d3d.readback_buf != NULL : s_present_this_frame))
         shot = InterlockedExchange(&s_shot_pending, 0) != 0;
     s_shot_cap = shot;
+    /* RENDERDOC_ON_SHOT=1 (with RENDERDOC_DLL): a screenshot also captures the next frame, so a script that takes
+     * pictures of a moment gets that moment in RenderDoc too. */
+    if (shot) {
+        static int ros = -1;
+        if (ros < 0) { const char* e = getenv("RENDERDOC_ON_SHOT"); ros = e && *e == '1'; }
+        if (ros) rdoc_request();
+    }
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
                        mind2 = e ? atoi(e) : 0; }

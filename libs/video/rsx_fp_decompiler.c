@@ -729,6 +729,23 @@ static void fp_dyn_tex_helpers(Out* p, u32 tex, u32 txp, u32 txb, u32 txl, u32 s
             "           f == 7u ? 1.0 : 0.0;\n}\n");
     for (u32 u = 0; u < 16; u++) {
         if ((cmp >> u) & 1u) {
+            /* One tap. A depth texture that is the corner of a larger surface (fp_tcscale[u].xy below 1: the title's
+             * shadow maps of each light in one surface) ends at that corner, where the guest's sampler clamps or gives
+             * its border: bit 8 of the state, a tap outside reads the border's red (bits 10-17); bit 9, a tap is
+             * clamped to the corner's last texel. Without them a tap past the corner read what another light left
+             * there: God of War: Ascension's floors under Megaera went black in squares and triangles. */
+            snprintf(t, sizeof t,
+                "float _rsx_shadow_tap%u(float2 t, float2 size, uint st, uint f, float reference) {\n"
+                "    float2 region = fp_tcscale[%u].xy;\n"
+                "    [branch] if (st & 256u) {\n"
+                "        if (any(t < 0.0) || any(t > region))\n"
+                "            return _rsx_shadow_cmpd(f, reference, (float)((st >> 10) & 255u) / 255.0);\n"
+                "    } else if (st & 512u) {\n"
+                "        t = clamp(t, 0.5 / size, region - 0.5 / size);\n"
+                "    }\n"
+                "    return _rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], t, 0.0).r);\n}\n",
+                u, u, u, u);
+            out_puts(p, t);
             snprintf(t, sizeof t,
                 "float4 _rsx_shadow_d%u(float3 coordinate, uint st) {\n"
                 "    float reference = saturate(coordinate.z);\n"
@@ -737,15 +754,15 @@ static void fp_dyn_tex_helpers(Out* p, u32 tex, u32 txp, u32 txb, u32 txl, u32 s
                 "    float2 uv = (st & 128u) ? coordinate.xy / size : coordinate.xy * fp_tcscale[%u].xy;\n"
                 "    uint f = (st >> 3) & 7u;\n"
                 "    [branch] if (!(st & 64u))\n"
-                "        return (float4)_rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], uv, 0.0).r);\n"
+                "        return (float4)_rsx_shadow_tap%u(uv, size, st, f, reference);\n"
                 "    float2 position = uv * size - 0.5;\n"
                 "    float2 base = floor(position); float2 fraction = position - base;\n"
-                "    float c0 = _rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], (base + float2(0.5, 0.5)) / size, 0.0).r);\n"
-                "    float c1 = _rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], (base + float2(1.5, 0.5)) / size, 0.0).r);\n"
-                "    float c2 = _rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], (base + float2(0.5, 1.5)) / size, 0.0).r);\n"
-                "    float c3 = _rsx_shadow_cmpd(f, reference, rsx_tex[%u].SampleLevel(rsx_samp[%u], (base + float2(1.5, 1.5)) / size, 0.0).r);\n"
+                "    float c0 = _rsx_shadow_tap%u((base + float2(0.5, 0.5)) / size, size, st, f, reference);\n"
+                "    float c1 = _rsx_shadow_tap%u((base + float2(1.5, 0.5)) / size, size, st, f, reference);\n"
+                "    float c2 = _rsx_shadow_tap%u((base + float2(0.5, 1.5)) / size, size, st, f, reference);\n"
+                "    float c3 = _rsx_shadow_tap%u((base + float2(1.5, 1.5)) / size, size, st, f, reference);\n"
                 "    return (float4)lerp(lerp(c0, c1, fraction.x), lerp(c2, c3, fraction.x), fraction.y);\n}\n",
-                u, u, u, u, u, u, u, u, u, u, u, u, u);
+                u, u, u, u, u, u, u, u);
             out_puts(p, t);
         }
         for (int k = 0; k < 2; k++) {   /* TEX, then TXP (a projective divide, but not for a cube) */

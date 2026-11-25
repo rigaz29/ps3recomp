@@ -13469,6 +13469,7 @@ static void fp_snapshot(D3D12DrawRecord* dr, const u8* prog)
     fp_snapshot_fill(dr, half, slot);
 }
 
+static int wide_is_snapshot(u32 ea, u32 w, u32 h);
 static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -13676,9 +13677,13 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
         }
         if (s_wide_3d && (dr->rt_off & DISP_RT_TAG)) vpx[7] = 1.0f;   /* over a scene: see "the screen's edges" */
         /* A picture in main memory at the display's size, drawn on the display through no camera: the title's studio
-         * logos and notices, made for 16:9 and drawn over the whole screen. Its edges come in to the 16:9's. */
+         * logos and notices, made for 16:9 and drawn over the whole screen. Its edges come in to the 16:9's. Not a copy
+         * of the display the title made itself (a blit snapshot, "Blit snapshots"): that is the picture as drawn here,
+         * at the screen's width -- the frame through MLAA's order, the title screen, a tutorial's frozen frame (issue
+         * #48: squeezed into the 16:9 since 0.3.1 kept MLAA's order, its sides the edges stretched). */
         if ((dr->rt_off & DISP_RT_TAG) && !(vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].uses_cam) &&
-            dr->tex[0].off && dr->tex[0].off < 0xC0000000u && dr->tex[0].w == s_d3d.width && dr->tex[0].h == s_d3d.height)
+            dr->tex[0].off && dr->tex[0].off < 0xC0000000u && dr->tex[0].w == s_d3d.width && dr->tex[0].h == s_d3d.height &&
+            !wide_is_snapshot(dr->tex[0].off, dr->tex[0].w, dr->tex[0].h))
             vpx[7] = -1.0f;
     }
     if ((FG_INPUTS() || s_ao) && !s_fg.cam_ok && dr && dr->zeta_off && dr->rt_w == s_d3d.width && dr->rt_h == s_d3d.height &&
@@ -16172,6 +16177,17 @@ static int blit_snap_find(u32 ea, u32 w, u32 h)
             s_bsnap[i].last_frame + 1 >= s_d3d.frame_count)
             return i;
     return -1;
+}
+
+/* Whether a main-memory address is a copy of the display the title made: a snapshot kept here, or a blit to it in the
+ * batch so far (the snapshot is taken at the replay). For display.ultrawide's 16:9 pictures (vp_record_cb). */
+static int wide_is_snapshot(u32 ea, u32 w, u32 h)
+{
+    if (blit_snap_find(ea, w, h) >= 0) return 1;
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    for (u32 i = 0; i < n; i++)
+        if (s_d3d.draws[i].snap_ea == ea) return 1;
+    return 0;
 }
 
 /* The op, in the VP pass: the backbuffer as drawn so far into the snapshot. */

@@ -130,6 +130,30 @@ int main(void)
         const u8 row[12] = { 10, 20, 30, 255,  30, 40, 50, 255,  200, 200, 200, 255 };
         rsx_tex_mip_down(row, 3, 1, one);   /* 3 x 1 to 1 x 1: the first two */
         CHECK(px(one, 1, 0, 0, 20, 30, 40, 255));
+        /* An AG normal map's level: its alpha is the normal's x, not coverage; each channel its own plain mean. */
+        const u8 ag[16] = { 255, 100, 0, 40,  255, 200, 0, 240,  255, 100, 0, 40,  255, 200, 0, 240 };
+        rsx_tex_mip_down_plain(ag, 2, 2, one);
+        CHECK(px(one, 1, 0, 0, 255, 150, 0, 140));
+        rsx_tex_mip_down(ag, 2, 2, one);   /* weighted, the green leans to the texels with more alpha */
+        CHECK(one[1] > 150);
+    }
+
+    /* BC pictures: a level's bytes in 4x4 blocks (8 for BC1, 16 for the others), and a chain's. */
+    CHECK(rsx_tex_bc_level_bytes(RSX_TEXPIC_BC1, 8, 8) == 32 && rsx_tex_bc_level_bytes(RSX_TEXPIC_BC7, 8, 8) == 64);
+    CHECK(rsx_tex_bc_level_bytes(RSX_TEXPIC_BC3, 2, 1) == 16 && rsx_tex_bc_level_bytes(RSX_TEXPIC_BC1, 6, 4) == 16);
+    CHECK(rsx_tex_bc_chain_bytes(RSX_TEXPIC_BC1, 8, 8, 4) == 32 + 8 + 8 + 8);
+    CHECK(rsx_tex_bc_chain_bytes(RSX_TEXPIC_BC7, 16, 4, 5) == 64 + 32 + 16 + 16 + 16);
+
+    /* Pictures read later: the count the backend watches moves on with each one ready; the size of the pictures. */
+    {
+        const u32 g = rsx_tex_pictures_gen();
+        rsx_tex_pictures_ready();
+        rsx_tex_pictures_ready();
+        CHECK(rsx_tex_pictures_gen() == g + 2);
+        CHECK(rsx_tex_pictures_bytes() == 0);
+        rsx_tex_set_pictures_bytes(123u << 20);
+        CHECK(rsx_tex_pictures_bytes() == (123ull << 20));
+        rsx_tex_set_pictures_bytes(0);
     }
 
     /* The hooks: set, then taken away. */

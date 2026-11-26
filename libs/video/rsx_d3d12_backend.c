@@ -578,6 +578,9 @@ typedef struct {
     u32 res_fmt;        /* res's DXGI format when repl */
     int pic;            /* res is a shared picture's (s_tex_pics, + 1), held with every other slot of that picture:
                          * its heap block and bytes are the picture's, never this slot's; 0 = res is its own */
+    u8 pic_wait;        /* the port is reading a picture for it (RSX_TEXPIC_LATER): res is the guest's own until */
+    u32 pic_gen;        /* rsx_tex_pictures_gen() as last asked; ready() is asked when it moves on */
+    u64 pic_id;         /* the texture's id, for ready() */
 } VPTexSlot;
 /* Textures held at once. Four was enough for a UI/atlas-style frame but not for
  * a scene: every draw past the fourth got slot -1 from vp_upload_tex_slot and
@@ -12198,7 +12201,7 @@ typedef struct {
     u64 bytes;          /* counted against vp_tex_budget() once */
     int refs;           /* the slots holding it */
 } VPTexPic;
-#define VP_TEX_PICS 1024
+#define VP_TEX_PICS 4096   /* a pack of upscaled textures has a picture for each */
 static VPTexPic s_tex_pics[VP_TEX_PICS];
 static u64 s_ts_share;  /* texture stats: binds that took a picture another texture holds */
 
@@ -12207,13 +12210,27 @@ static void tex_pics_reset(void)
     memset(s_tex_pics, 0, sizeof s_tex_pics);
 }
 
-static int tex_pic_find(u64 key, u32 kind, u32 w, u32 h, u32 levels)
+static int tex_pic_find(u64 key, u32 kind, u32 w, u32 h, u32 levels, DXGI_FORMAT fmt)
 {
     for (int i = 0; i < VP_TEX_PICS; i++) {
         const VPTexPic* p = &s_tex_pics[i];
-        if (p->key == key && p->res && p->kind == kind && p->w == w && p->h == h && p->levels == levels) return i;
+        if (p->key == key && p->res && p->kind == kind && p->w == w && p->h == h && p->levels == levels &&
+            p->fmt == fmt)
+            return i;
     }
     return -1;
+}
+
+/* A picture's DXGI format: its own blocks (a DDS's), else RGBA8 or the texture's own one or two channels. */
+static DXGI_FORMAT tex_pic_dxgi(u32 form)
+{
+    switch (form) {
+    case RSX_TEXPIC_BC1: return DXGI_FORMAT_BC1_UNORM;
+    case RSX_TEXPIC_BC2: return DXGI_FORMAT_BC2_UNORM;
+    case RSX_TEXPIC_BC3: return DXGI_FORMAT_BC3_UNORM;
+    case RSX_TEXPIC_BC7: return DXGI_FORMAT_BC7_UNORM;
+    default:             return DXGI_FORMAT_UNKNOWN;
+    }
 }
 
 /* Release a slot's resources. Only ever a slot this batch has not bound: the
@@ -12252,7 +12269,10 @@ static void vp_tex_drop(VPTexSlot* t)
 
 /* TEX_CACHE_MB=<n>: what the cached textures may take. Default: a third of the
  * adapter's VRAM (an integrated GPU's: with the memory it shares) within
- * 256-2048 MB, 512 MB when that is not known. */
+ * 256-2048 MB, 512 MB when that is not known; with mods' pictures, that and
+ * what the port says they take (rsx_tex_set_pictures_bytes), within half the
+ * VRAM: a pack of upscaled textures over the 2 GB let them go and uploaded
+ * them again every frame (0.2-0.5 flips a second, 2026-11-26). */
 static u64 vp_tex_budget(void)
 {
     static u64 b;
@@ -12264,6 +12284,14 @@ static u64 vp_tex_budget(void)
             mb = s_vram_mb ? s_vram_mb / 3u : 512u;
             if (mb < 256) mb = 256;
             if (mb > 2048) mb = 2048;
+            const u64 pics = rsx_tex_pictures_bytes() >> 20;
+            if (pics) {
+                const u64 base = mb, half = s_vram_mb ? s_vram_mb / 2u : mb;
+                mb += pics + 64u;
+                if (mb > half) mb = half > base ? half : base;
+                fprintf(stderr, "[tex] texture cache: %llu MB (%llu, and the mods' pictures take about %llu)%c",
+                        (unsigned long long)mb, (unsigned long long)base, (unsigned long long)pics, 10);
+            }
         }
         b = mb << 20;
     }
@@ -12460,15 +12488,31 @@ static void tex_decode_volume(u8* mapped, const D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
 }
 
+/* Whether a picture the port gave can be uploaded for a texture of this format: its size, and a BC picture's
+ * blocks (only for a texture decoded to RGBA, whose view maps its channels as a BC's decode has them). */
+static int tex_picture_fits(const rsx_tex_picture* p, u32 fmt)
+{
+    if (!p->w || !p->h || p->w > 16384u || p->h > 16384u) return 0;
+    if (p->form == RSX_TEXPIC_RGBA8) return p->rgba != NULL;
+    if (tex_pic_dxgi(p->form) == DXGI_FORMAT_UNKNOWN || rsx_tex_channels(fmt) != RSX_TEXREP_RGBA8) return 0;
+    if ((p->w & 3u) || (p->h & 3u) || !p->data || !p->levels || p->levels > rsx_tex_chain_levels(p->w, p->h))
+        return 0;   /* D3D12 takes a BC texture whose level 0 is whole blocks */
+    return p->data_bytes >= rsx_tex_bc_chain_bytes(p->form, p->w, p->h, p->levels);
+}
+
 /* A port's picture in this texture's place (rsx_tex_replace.h), asked at each upload of a 2D texture of a format
  * it can name: its id worked out only while the hooks are set, its level 0 decoded to RGBA only for a picture made
- * over the guest's own or for the dump. 1 with *pic when there is one. */
-static int tex_take_picture(const u8* src, u32 w, u32 h, u32 fmt, const rsx_tex_layout* tl, rsx_tex_picture* pic)
+ * over the guest's own or for the dump. 1 with *pic when there is one, 0 none, RSX_TEXPIC_LATER while the port
+ * reads it (*id and *gen then say what to ask ready() for, and from when). */
+static int tex_take_picture(const u8* src, u32 w, u32 h, u32 fmt, const rsx_tex_layout* tl, rsx_tex_picture* pic,
+                            u64* id_out, u32* gen_out)
 {
     const rsx_tex_hooks* hk = rsx_tex_get_hooks();
     if (!hk || !rsx_tex_replaceable(fmt) || w > 8192u || h > 8192u) return 0;
     const double t0 = perf_now();
     const u64 id = rsx_tex_id(src, w, h, fmt, tl);
+    *id_out = id;
+    *gen_out = rsx_tex_pictures_gen();   /* before the ask: a picture made ready after it moves this on */
     const int has = hk->has ? hk->has(id) : 0;
     u8* base = NULL;
     if (has == 2 || hk->dump) {
@@ -12477,16 +12521,26 @@ static int tex_take_picture(const u8* src, u32 w, u32 h, u32 fmt, const rsx_tex_
     }
     if (hk->dump && base) hk->dump(id, w, h, fmt, base);
     int got = 0;
-    if (has && hk->picture && (has != 2 || base))
-        got = hk->picture(id, w, h, has == 2 ? base : NULL, pic) && pic->rgba && pic->w && pic->h &&
-              pic->w <= 16384u && pic->h <= 16384u;
+    if (has && hk->picture && (has != 2 || base)) {
+        got = hk->picture(id, w, h, has == 2 ? base : NULL, pic);
+        if (got == 1 && !tex_picture_fits(pic, fmt)) {
+            static int bad = 0;
+            if (PS3_LOG_FIRST(bad, 8))
+                fprintf(stderr, "[tex] %016llx %ux%u fmt %02X: its picture (%ux%u, form %u, %u levels) cannot be "
+                        "uploaded for it: the game's own%c", (unsigned long long)id, w, h, fmt, pic->w, pic->h,
+                        pic->form, pic->levels, 10);
+            got = 0;
+        }
+        if (got != 1 && got != RSX_TEXPIC_LATER) got = 0;
+        if (got == RSX_TEXPIC_LATER && !hk->ready) got = 0;
+    }
     free(base);
     s_tex_decode_s += perf_now() - t0;
-    if (got) {
+    if (got == 1) {
         static int n = 0;
         if (PS3_LOG_FIRST(n, 32))
-            fprintf(stderr, "[tex] %016llx %ux%u fmt %02X: a picture in its place, %ux%u%c", (unsigned long long)id,
-                    w, h, fmt, pic->w, pic->h, 10);
+            fprintf(stderr, "[tex] %016llx %ux%u fmt %02X: a picture in its place, %ux%u%s%c", (unsigned long long)id,
+                    w, h, fmt, pic->w, pic->h, pic->form ? " (its own blocks and chain)" : "", 10);
     }
     return got;
 }
@@ -12530,16 +12584,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         if (c->used) { s_ts_out = TS_HIT; return slot; }   /* already bound this frame */
         static int nocache = -1;                 /* TEX_NOCACHE=1: always re-upload */
         if (nocache < 0) { const char* e = getenv("TEX_NOCACHE"); nocache = e ? atoi(e) : 0; }
+        /* A picture the port was reading for it may be ready: asked only when the port says some picture is. Its
+         * upload then is not a change of the guest's bytes, and not counted as one. */
+        int recheck = 0;
+        if (c->pic_wait) {
+            const u32 g = rsx_tex_pictures_gen();
+            if (g != c->pic_gen) {
+                const rsx_tex_hooks* hk = rsx_tex_get_hooks();
+                c->pic_gen = g;
+                recheck = !hk || !hk->ready || hk->ready(c->pic_id);
+                if (!hk) c->pic_wait = 0;
+            }
+        }
         /* Held from an earlier frame: re-upload only if the guest bytes
          * changed. Most of this scene's textures are static, and converting
          * every one of them every frame was ~70% of the frame's CPU time. */
-        if (!nocache && !tex_changed(c, vm_base + c->off)) {
+        if (!nocache && !recheck && !tex_changed(c, vm_base + c->off)) {
             c->used = 1;
             s_ts_out = TS_SAME;
             return slot;
         }
         /* stale: uploaded again below, in its own slot */
-        if (c->churn < 255) c->churn++;
+        if (!recheck && c->churn < 255) c->churn++;
     }
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
@@ -12670,7 +12736,12 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     rsx_tex_picture pic;
     memset(&pic, 0, sizeof pic);
     const int churny = slot >= 0 && s_d3d.vp_tex[slot].churn >= 4;   /* a copy of the frame, a video: not asked */
-    const int repl = !is_cube && !vol && !churny && tex_take_picture(vm_base + off, w, h, fmt, &tl, &pic);
+    u64 pic_id = 0;
+    u32 pic_gen = 0;
+    const int took = !is_cube && !vol && !churny ? tex_take_picture(vm_base + off, w, h, fmt, &tl, &pic, &pic_id,
+                                                                    &pic_gen) : 0;
+    const int repl = took == 1;
+    const int pic_later = took == RSX_TEXPIC_LATER;   /* the guest's own now, the picture once the port has read it */
     const u32 repl_kind = repl ? rsx_tex_channels(fmt) : 0u;
     static rsx_tex_level s_lv[RSX_MAX_TEXTURE_LEVELS];
     static D3D12_PLACED_SUBRESOURCE_FOOTPRINT s_lay[6 * RSX_MAX_TEXTURE_LEVELS];
@@ -12692,16 +12763,18 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             o += s_lv[l].tl.face_bytes;
         }
     }
-    /* The resource: the guest's size, format and chain, or the picture's. */
+    /* The resource: the guest's size, format and chain, or the picture's: its own blocks and chain (a DDS), or a
+     * full chain made from its RGBA8. */
     const u32 res_w = repl ? pic.w : w, res_h = repl ? pic.h : h;
-    const u32 res_lev = repl ? rsx_tex_chain_levels(pic.w, pic.h) : nlev;
+    const u32 res_lev = !repl ? nlev : pic.form ? pic.levels : rsx_tex_chain_levels(pic.w, pic.h);
     /* RGBA8, or the texture's own one or two channels (R8, R8G8, R16) filled from the picture's R and G. */
-    const DXGI_FORMAT res_fmt = repl_kind == RSX_TEXREP_RGBA8 ? DXGI_FORMAT_R8G8B8A8_UNORM : dxfmt;
+    const DXGI_FORMAT res_fmt = repl && pic.form ? tex_pic_dxgi(pic.form)
+                              : repl_kind == RSX_TEXREP_RGBA8 ? DXGI_FORMAT_R8G8B8A8_UNORM : dxfmt;
     /* A picture another texture already holds (the port's key for it): this texture takes that resource. Nothing
      * staged, no chain made, no bytes counted again, so the slot is asked for with none. */
     int alloc_new = 0;   /* a slot given here for a picture whose last holder that then let go: new to this texture */
     if (repl && pic.key) {
-        int pi = tex_pic_find(pic.key, repl_kind, res_w, res_h, res_lev);
+        int pi = tex_pic_find(pic.key, repl_kind, res_w, res_h, res_lev, res_fmt);
         const int sh_new = slot < 0;
         if (pi >= 0 && slot < 0) {
             slot = vp_tex_alloc(0, w, h, fmt, cube, nlev);
@@ -12721,6 +12794,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
             t->cube = cube; t->used = 1; t->levels = nlev; t->last_frame = s_d3d.frame_count;
             t->repl = 1; t->res_w = res_w; t->res_h = res_h; t->res_fmt = (u32)res_fmt;
+            t->pic_wait = 0;
             if (sh_new) t->churn = 0;
             if (!t->linked) vp_tex_link(slot);
             /* The guest's bytes it stands for, checked at each bind as an upload's are (src_bytes below). */
@@ -12914,8 +12988,26 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     for (u32 i = 0; i < TEX_CSUM_PARTS; i++)
         csum_pre[i] = tex_csum_part(vm_base + off, src_bytes, i);
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
-    if (repl) {   /* the picture and the chain made from it, each level at its footprint */
+    if (repl && pic.form) {   /* its own blocks and chain (a DDS): each level's rows of blocks at its footprint */
         const double dr0 = perf_now();
+        const u8* sp = pic.data;
+        u32 lw = res_w, lh = res_h;
+        for (u32 l = 0; l < res_lev; l++) {
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* fp = &s_lay[l];
+            const u32 rows = (lh + 3) / 4;
+            const size_t row = (size_t)(rsx_tex_bc_level_bytes(pic.form, lw, lh) / rows);
+            for (u32 r = 0; r < rows; r++)
+                memcpy(_map0 + fp->Offset + (size_t)r * fp->Footprint.RowPitch, sp + (size_t)r * row, row);
+            sp += (size_t)rows * row;
+            lw = lw > 1 ? lw >> 1 : 1u;
+            lh = lh > 1 ? lh >> 1 : 1u;
+        }
+        s_tex_decode_s += perf_now() - dr0;
+    } else if (repl) {   /* the picture and the chain made from it, each level at its footprint */
+        const double dr0 = perf_now();
+        /* A plain mean where its alpha is not coverage (an AG normal map's x): weighted by it, the normals drifted. */
+        void (*down)(const u8*, u32, u32, u8*) =
+            (pic.flags & RSX_TEXPIC_PLAIN_CHAIN) ? rsx_tex_mip_down_plain : rsx_tex_mip_down;
         u32 lw = res_w, lh = res_h;
         u8* lvl = (u8*)malloc((size_t)lw * lh * 4u);
         if (lvl) memcpy(lvl, pic.rgba, (size_t)lw * lh * 4u);
@@ -12927,7 +13019,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             if (l + 1 < res_lev) {
                 const u32 nw = lw > 1 ? lw >> 1 : 1u, nh = lh > 1 ? lh >> 1 : 1u;
                 u8* next = (u8*)malloc((size_t)nw * nh * 4u);
-                if (next) rsx_tex_mip_down(lvl, lw, lh, next);
+                if (next) down(lvl, lw, lh, next);
                 free(lvl);
                 lvl = next;
                 lw = nw; lh = nh;
@@ -13261,6 +13353,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1; t->levels = nlev;
     t->repl = (u8)repl; t->res_w = res_w; t->res_h = res_h; t->res_fmt = (u32)res_fmt;
+    t->pic_wait = (u8)pic_later;   /* the guest's own until the port has read its picture */
+    if (pic_later) { t->pic_id = pic_id; t->pic_gen = pic_gen; }
     if (ts_new) t->churn = 0;   /* a slot new to this texture */
     if (!t->linked) vp_tex_link(slot);
     /* A picture with a key: its resource becomes the picture's, for the next texture it stands in for. The slot's

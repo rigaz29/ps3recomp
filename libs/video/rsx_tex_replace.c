@@ -26,6 +26,47 @@ void rsx_tex_set_hooks(const rsx_tex_hooks* hooks)
 
 const rsx_tex_hooks* rsx_tex_get_hooks(void) { return s_hooks_set ? &s_hooks : NULL; }
 
+static volatile long s_pictures_gen;
+static u64 s_pictures_bytes;
+
+void rsx_tex_pictures_ready(void)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    _InterlockedIncrement(&s_pictures_gen);
+#else
+    __atomic_add_fetch(&s_pictures_gen, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+u32 rsx_tex_pictures_gen(void)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (u32)_InterlockedOr(&s_pictures_gen, 0);
+#else
+    return (u32)__atomic_load_n(&s_pictures_gen, __ATOMIC_ACQUIRE);
+#endif
+}
+
+void rsx_tex_set_pictures_bytes(u64 bytes) { s_pictures_bytes = bytes; }
+u64 rsx_tex_pictures_bytes(void) { return s_pictures_bytes; }
+
+u64 rsx_tex_bc_level_bytes(u32 form, u32 w, u32 h)
+{
+    const u64 block = form == RSX_TEXPIC_BC1 ? 8u : 16u;
+    return (u64)((w + 3) / 4) * ((h + 3) / 4) * block;
+}
+
+u64 rsx_tex_bc_chain_bytes(u32 form, u32 w, u32 h, u32 levels)
+{
+    u64 n = 0;
+    for (u32 l = 0; l < levels; l++) {
+        n += rsx_tex_bc_level_bytes(form, w, h);
+        w = w > 1 ? w >> 1 : 1;
+        h = h > 1 ? h >> 1 : 1;
+    }
+    return n;
+}
+
 int rsx_tex_replaceable(u32 rsx_fmt)
 {
     return rsx_tex_channels(rsx_fmt) != 0;
@@ -246,5 +287,24 @@ void rsx_tex_mip_down(const u8* src, u32 w, u32 h, u8* dst)
             u8* d = dst + ((size_t)y * nw + x) * 4;
             for (int c = 0; c < 3; c++) d[c] = (u8)(a ? (rgb[c] + a / 2) / a : (rgb_plain[c] + n / 2) / n);
             d[3] = (u8)((a + n / 2) / n);
+        }
+}
+
+void rsx_tex_mip_down_plain(const u8* src, u32 w, u32 h, u8* dst)
+{
+    const u32 nw = w > 1 ? w >> 1 : 1, nh = h > 1 ? h >> 1 : 1;
+    for (u32 y = 0; y < nh; y++)
+        for (u32 x = 0; x < nw; x++) {
+            u32 sum[4] = { 0, 0, 0, 0 }, n = 0;
+            for (u32 dy = 0; dy < 2; dy++)
+                for (u32 dx = 0; dx < 2; dx++) {
+                    const u32 sx = x * 2 + dx, sy = y * 2 + dy;
+                    if (sx >= w || sy >= h) continue;
+                    const u8* p = src + ((size_t)sy * w + sx) * 4;
+                    for (int c = 0; c < 4; c++) sum[c] += p[c];
+                    n++;
+                }
+            u8* d = dst + ((size_t)y * nw + x) * 4;
+            for (int c = 0; c < 4; c++) d[c] = (u8)((sum[c] + n / 2) / n);
         }
 }

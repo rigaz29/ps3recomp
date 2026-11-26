@@ -25,14 +25,33 @@
 extern "C" {
 #endif
 
+/* A picture's form: RGBA8 texels whose chain the backend makes, or blocks of a compressed GPU format with the chain
+ * the picture brings (a DDS), uploaded as they are. */
+enum { RSX_TEXPIC_RGBA8 = 0, RSX_TEXPIC_BC1 = 1, RSX_TEXPIC_BC2 = 2, RSX_TEXPIC_BC3 = 3, RSX_TEXPIC_BC7 = 7 };
+/* flags: its chain made with a plain mean, not one weighted by alpha: the alpha is not coverage (an AG normal map's
+ * x). */
+enum { RSX_TEXPIC_PLAIN_CHAIN = 1 };
+
 /* A picture: RGBA8, rows top down and tightly packed. key: the same for the same texels (w, h and rgba alike),
  * whichever id asked; the backend then uploads it once and every texture it stands in for draws from that one
- * upload. 0: no key, uploaded for each texture (a picture made over the guest's own, which differs with it). */
+ * upload. 0: no key, uploaded for each texture (a picture made over the guest's own, which differs with it).
+ * With form one of the BCs, data holds levels levels of w x h and down (each half the one above, at least 1),
+ * level 0 first, each level its rows of 4x4 blocks tightly packed; rgba is not read, and w and h are multiples of
+ * 4. A picture zeroed but for w, h, rgba and key is the RGBA8 one. */
 typedef struct {
     u32 w, h;
     const u8* rgba;
     u64 key;
+    u32 form;
+    u32 levels;
+    const u8* data;
+    u64 data_bytes;
+    u32 flags;
 } rsx_tex_picture;
+
+/* picture()'s answer for a picture being read: the guest's own is drawn meanwhile, and the backend asks again once
+ * ready() says so. */
+#define RSX_TEXPIC_LATER (-1)
 
 typedef struct {
     /* What the port has for this id: 0 nothing, 1 a picture to take as it is,
@@ -40,17 +59,34 @@ typedef struct {
     int (*has)(u64 id);
     /* The picture for id. base: the guest's level 0 as RGBA8, w x h, when
      * has() said 2, else NULL. The picture stays the port's until the next
-     * call. 1 = given. */
+     * call. 1 = given, 0 = none, RSX_TEXPIC_LATER = being read. */
     int (*picture)(u64 id, u32 w, u32 h, const u8* base, rsx_tex_picture* out);
     /* Every texture the backend can name, once a run for each id, with its
      * level 0 as RGBA8: for those who make the pictures. NULL: none. */
     void (*dump)(u64 id, u32 w, u32 h, u32 fmt, const u8* base);
+    /* After a picture() of RSX_TEXPIC_LATER: 1 once asking again gives an answer (the picture, or that there is none).
+     * Asked only after rsx_tex_pictures_ready(). NULL: picture() never says later. */
+    int (*ready)(u64 id);
 } rsx_tex_hooks;
 
 /* The port's hooks; NULL takes them away. Set before the first frame. */
 void rsx_tex_set_hooks(const rsx_tex_hooks* hooks);
 /* The hooks while they are set, else NULL. */
 const rsx_tex_hooks* rsx_tex_get_hooks(void);
+
+/* The port, from any thread: pictures asked for later are ready. The count moves on; the backend asks ready() for
+ * the textures that wait when it has. */
+void rsx_tex_pictures_ready(void);
+u32 rsx_tex_pictures_gen(void);
+
+/* What the mods' pictures take on the GPU, about (the port, before the first frame): the texture cache is that much
+ * bigger, within half the adapter's memory. */
+void rsx_tex_set_pictures_bytes(u64 bytes);
+u64 rsx_tex_pictures_bytes(void);
+
+/* The bytes of one level of a BC picture of w x h (form RSX_TEXPIC_BC*), and of its first levels levels. */
+u64 rsx_tex_bc_level_bytes(u32 form, u32 w, u32 h);
+u64 rsx_tex_bc_chain_bytes(u32 form, u32 w, u32 h, u32 levels);
 
 /* Whether textures of this format byte can be named and replaced. */
 int rsx_tex_replaceable(u32 rsx_fmt);
@@ -79,8 +115,11 @@ int rsx_tex_base_rgba(u8* out, const u8* src, u32 w, u32 h, const rsx_tex_layout
 /* The levels of a full mip chain for w x h, and level k's size. */
 u32 rsx_tex_chain_levels(u32 w, u32 h);
 /* The next level of an RGBA8 image, (w >> 1) x (h >> 1) at least 1 x 1, each
- * texel the mean of the two by two (or fewer) above it. */
+ * texel the mean of the two by two (or fewer) above it: the colour weighted by
+ * alpha, or with plain all four channels on their own (alpha that is not
+ * coverage: an AG normal map's x). */
 void rsx_tex_mip_down(const u8* src, u32 w, u32 h, u8* dst);
+void rsx_tex_mip_down_plain(const u8* src, u32 w, u32 h, u8* dst);
 
 #ifdef __cplusplus
 }

@@ -184,6 +184,19 @@ void spurs_policy_peek(uint32_t ea, uint32_t wid, uint32_t lane, const char* tag
             c->gpr[1]._u32[0] & 0x3FFFFu, c->gpr[2]._u32[0], c->gpr[3]._u32[0], c->gpr[4]._u32[0], c->gpr[5]._u32[0],
             c->gpr[6]._u32[0], c->gpr[14]._u32[0], c->gpr[15]._u32[0], c->gpr[16]._u32[0], c->gpr[17]._u32[0],
             c->gpr[18]._u32[0], c->gpr[19]._u32[0]);
+    /* What a stuck job manager could be waiting for: an event it never gets (the
+     * lock-line reservation lost, 0x400, is polled by snapshot and misses an
+     * A-B-A write), an interrupt not taken, or a DMA list parked at a stall and
+     * never acknowledged (its tag never completes). */
+    extern uint8_t* vm_base;
+    const char* line = !c->resv_valid || !c->resv_ea || !vm_base ? "" :
+                       memcmp(vm_base + c->resv_ea, c->resv_line, 128) ? ", the line changed since" :
+                       ", the line as taken";
+    fprintf(stderr, "%s spu interrupts %s, events %03X of mask %03X, srr0 %05X%s, depth %u | list stalls parked %X "
+                    "notify %X | tags done %X of mask %X | reservation %s %08X%s\n", tag,
+            c->int_enable ? "on" : "off", c->event_status, c->event_mask, c->srr0 & 0x3FFFFu,
+            c->irq_saved ? " (in its handler)" : "", c->host_depth, c->list_stall_mask, c->list_stall_stat,
+            c->mfc_tag_status, c->mfc_tag_mask, c->resv_valid ? "on" : "off", c->resv_ea, line);
     const uint32_t p = c->gpr[2]._u32[0] & 0x3FFF8u;
     uint32_t q = p, steps = 0;
     while (steps < 0x8000u && !PEEK_W(q)) { q = (q + 8) & 0x3FFF8u; steps++; }

@@ -485,6 +485,10 @@ struct SpursPmSlot {
     CONDITION_VARIABLE cv;
     int boosted;    /* host thread raised for a SPURS_BOOST_WID workload */
     int lane;       /* SPURS_LANE: which of its workers this is (from 1), 0 for the SPU's own */
+    /* SPURS_LONG_RUN_MS: when the run going on began (GetTickCount64, 0 between
+     * runs), and whether the long-run check has told of it. */
+    volatile ULONGLONG run_ms;
+    volatile LONG long_said;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -2401,8 +2405,17 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         const u64 ws_t0 = wid_slow_on() ? wid_prof_now_ns() : 0;
         if (now_i < PM_NOW_MAX) s_pm_now_wid[now_i] = (LONG)slot->wid;
+        slot->long_said = 0;
+        slot->run_ms = GetTickCount64();
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        {   /* SPURS_LONG_RUN_MS: a run the check told of has ended */
+            const ULONGLONG began = slot->run_ms;
+            slot->run_ms = 0;
+            if (slot->long_said)
+                fprintf(stderr, "[spurs-long] w%u on spu %u: that run ended after %.2f s\n", slot->wid,
+                        slot->spu_num, (double)(GetTickCount64() - began) / 1000.0);
+        }
         if (ws_t0 && slot->wid < WID_PROF_MAX && s_wid_slow[slot->wid]) {
             const u64 t = wid_prof_now_ns(), until = t + (t - ws_t0) * (u64)s_wid_slow[slot->wid] / 100;
             while (wid_prof_now_ns() < until) YieldProcessor();
@@ -2641,6 +2654,8 @@ static u32 spurs_claim(const struct SpursInst* si, u32 wid, u32 sn, int lane, u3
  * the idle back-off, its priority on each SPU, and how often a worker took it
  * and how long ago. Read without locks: a diagnostic, called when something
  * has already stood still for seconds. */
+static void spurs_long_run_report(struct SpursInst* si, struct SpursPmSlot* sl, ULONGLONG ms, const char* tag);
+
 void spurs_debug_dump(const char* why)
 {
     const ULONGLONG now = GetTickCount64();
@@ -2654,6 +2669,11 @@ void spurs_debug_dump(const char* why)
             const struct SpursPmSlot* sl = &si->slots[k];
             fprintf(stderr, "[spurs-dump]   slot %u spu %u busy %d wid %u last %u polls %u\n",
                     k, sl->spu_num, sl->busy, sl->wid, sl->last_wid, sl->last_polls);
+        }
+        for (u32 k = 0; k < si->nslots; k++) {   /* what each run of a second or more is doing */
+            struct SpursPmSlot* sl = &si->slots[k];
+            const ULONGLONG t0 = sl->run_ms;
+            if (t0 && now >= t0 + 1000) spurs_long_run_report(si, sl, now - t0, "[spurs-dump]    ");
         }
         const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
         const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
@@ -2685,6 +2705,123 @@ void spurs_debug_dump(const char* why)
     for (LONG i = 0; i < n; i++) fprintf(stderr, " %ld:w%ld", (long)s_pm_now_tid[i], (long)s_pm_now_wid[i]);
     fprintf(stderr, "\n");
     fflush(stderr);
+}
+
+/* Where a worker's host thread is: rip sampled 32 times a millisecond apart,
+ * as module+offset with how many samples each, the most first. A spinning
+ * policy module shows its loop; the lifted code's link map names it. */
+static void spurs_sample_host(HANDLE th, const char* tag)
+{
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    enum { N = 32 };
+    DWORD64 ip[N];
+    int got = 0;
+    for (int s = 0; s < N && th; s++) {
+        if (SuspendThread(th) == (DWORD)-1) break;
+        CONTEXT c;
+        memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_CONTROL;
+        const BOOL ok = GetThreadContext(th, &c);
+        ResumeThread(th);
+        if (ok) ip[got++] = c.Rip;
+        Sleep(1);
+    }
+    char line[512];
+    int o = snprintf(line, sizeof line, "%s host code, %d samples:", tag, got);
+    for (int shown = 0; shown < 6; shown++) {
+        int best = -1, best_n = 0;
+        for (int i = 0; i < got; i++) {
+            if (!ip[i]) continue;
+            int n = 0;
+            for (int j = i; j < got; j++) n += ip[j] == ip[i];
+            if (n > best_n) { best = i; best_n = n; }
+        }
+        if (best < 0) break;
+        const DWORD64 at = ip[best];
+        for (int j = 0; j < got; j++) if (ip[j] == at) ip[j] = 0;
+        HMODULE m = NULL;
+        char path[MAX_PATH] = "?";
+        const char* name = path;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)(uintptr_t)at, &m) && m && GetModuleFileNameA(m, path, sizeof path)) {
+            const char* b = strrchr(path, '\\');
+            name = b ? b + 1 : path;
+        }
+        if (o > 0 && o < (int)sizeof line)
+            o += snprintf(line + o, sizeof line - (size_t)o, " %s+0x%llX x%d", name,
+                          (unsigned long long)(at - (DWORD64)(uintptr_t)m), best_n);
+    }
+    fprintf(stderr, "%s\n", line);
+#else
+    (void)th; (void)tag;
+#endif
+}
+
+/* SPURS_LONG_RUN_MS=<ms> (default 2000, 0 = off): a policy-module run that has
+ * gone on this long is told of once -- the host code it is in, sampled, the
+ * SPU's registers and the local store its job-list walk reads
+ * (spurs_policy_peek), and the head of its job list in memory -- and again when
+ * it ends. A run takes about a millisecond. God of War: Ascension's audio
+ * (workload 7, BrBDblBufWrkld) once stayed in one for 98 s (issue #50): the
+ * sound went, and later the game froze. The freeze dump tells the same of each
+ * busy slot. At most 24 such reports. */
+static ULONGLONG spurs_long_run_ms(void)
+{
+    static LONG64 v = -1;
+    if (v < 0) {
+        const char* e = getenv("SPURS_LONG_RUN_MS");
+        v = e ? (LONG64)strtoll(e, NULL, 10) : 2000;
+        if (v < 0) v = 0;
+    }
+    return (ULONGLONG)v;
+}
+
+static void spurs_long_run_report(struct SpursInst* si, struct SpursPmSlot* sl, ULONGLONG ms, const char* tag)
+{
+    const u32 wid = sl->wid, list = (u32)sl->data;
+    fprintf(stderr, "%s w%u on spu %u (slot %d) in one run for %.2f s, its data 0x%08X_%08X (the job list at "
+                    "the low half, an audit buffer at the high one)\n", tag, wid, sl->spu_num, (int)(sl - si->slots),
+            (double)ms / 1000.0, (u32)(sl->data >> 32), list);
+    spurs_sample_host(sl->thread, tag);
+    spurs_policy_peek(si->ea, wid, sl->spu_num, tag);
+    if (list && list < 0xF0000000u)
+        for (u32 a = list; a < list + 0x40; a += 0x20)
+            fprintf(stderr, "%s list %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", tag, a, vm_read32(a),
+                    vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12), vm_read32(a + 16), vm_read32(a + 20),
+                    vm_read32(a + 24), vm_read32(a + 28));
+    fflush(stderr);
+}
+
+static DWORD WINAPI spurs_long_run_watch(LPVOID unused)
+{
+    (void)unused;
+    ps3_thread_name("spurs long runs");
+    static LONG told;
+    for (;;) {
+        Sleep(500);
+        const ULONGLONG lim = spurs_long_run_ms(), now = GetTickCount64();
+        for (int i = 0; i < MAX_SPURS_INST; i++) {
+            struct SpursInst* si = &s_inst[i];
+            if (!si->ea) continue;
+            for (u32 k = 0; k < si->nslots; k++) {
+                struct SpursPmSlot* sl = &si->slots[k];
+                const ULONGLONG t0 = sl->run_ms;
+                if (!t0 || now < t0 + lim || sl->long_said || told >= 24) continue;
+                sl->long_said = 1;
+                told++;
+                spurs_long_run_report(si, sl, now - t0, "[spurs-long]");
+            }
+        }
+    }
+    return 0;
+}
+
+static void spurs_long_run_watch_start(void)
+{
+    static volatile LONG started;
+    if (!spurs_long_run_ms() || InterlockedCompareExchange(&started, 1, 0)) return;
+    HANDLE h = CreateThread(NULL, 1u << 18, spurs_long_run_watch, NULL, 0, NULL);
+    if (h) CloseHandle(h);
 }
 
 /* SPURS_BOOST_WID=<wid>[,<wid>...]: the worker running one of these workloads
@@ -2929,6 +3066,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
+    spurs_long_run_watch_start();
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);

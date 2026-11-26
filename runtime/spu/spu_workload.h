@@ -93,6 +93,8 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
 /* Retire resident policy contexts after the owning scheduler has joined. */
 void spurs_policy_release_instance(uint32_t spurs_ea);
 int spurs_policy_release_workload(uint32_t spurs_ea, uint32_t wid);
+/* A long run's SPU state (registers, the job-list words it reads) to stderr. */
+void spurs_policy_peek(uint32_t spurs_ea, uint32_t wid, uint32_t lane, const char* tag);
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,

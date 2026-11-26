@@ -153,6 +153,52 @@ void spurs_policy_release_instance(uint32_t ea)
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
+/* For a policy-module run that has gone on for seconds (cellSpurs's long-run
+ * check and its freeze dump): the registers of its resident context and the
+ * local store its job-list walk reads -- the word at r2 and, on the walk's
+ * 8-byte step, the next one that is not zero -- and the job manager's state
+ * lines (0x12A0..0x12FF, the queue line cache at 0x14B0). Read while the run
+ * goes on, without the slot's lock (the run holds it): a snapshot, not a
+ * consistent one. The directory lock, only tried, keeps the context from being
+ * freed meanwhile. Writes lines starting with tag to stderr. */
+void spurs_policy_peek(uint32_t ea, uint32_t wid, uint32_t lane, const char* tag)
+{
+    if (wid >= 32 || lane >= 6) return;
+    if (!TryAcquireSRWLockShared(&s_pm_directory_lock)) {
+        fprintf(stderr, "%s no look at the SPU: the policy directory is locked\n", tag);
+        return;
+    }
+    const spu_context* c = NULL;
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++)
+        if (s_pm_instances[i].used && s_pm_instances[i].ea == ea) { c = s_pm_instances[i].slots[wid][lane].ctx; break; }
+    if (!c || !c->ls) {
+        ReleaseSRWLockShared(&s_pm_directory_lock);
+        fprintf(stderr, "%s no resident context for w%u on spu %u\n", tag, wid, lane);
+        return;
+    }
+    const uint8_t* ls = c->ls;
+#define PEEK_W(a) ((uint32_t)ls[(a) & 0x3FFFCu] << 24 | (uint32_t)ls[((a) & 0x3FFFCu) + 1] << 16 | \
+                   (uint32_t)ls[((a) & 0x3FFFCu) + 2] << 8 | (uint32_t)ls[((a) & 0x3FFFCu) + 3])
+    fprintf(stderr, "%s spu pc %05X r0 %05X r1 %05X | r2..r6 %08X %08X %08X %08X %08X | r14..r19 %08X %08X %08X "
+                    "%08X %08X %08X\n", tag, c->pc & 0x3FFFFu, c->gpr[0]._u32[0] & 0x3FFFFu,
+            c->gpr[1]._u32[0] & 0x3FFFFu, c->gpr[2]._u32[0], c->gpr[3]._u32[0], c->gpr[4]._u32[0], c->gpr[5]._u32[0],
+            c->gpr[6]._u32[0], c->gpr[14]._u32[0], c->gpr[15]._u32[0], c->gpr[16]._u32[0], c->gpr[17]._u32[0],
+            c->gpr[18]._u32[0], c->gpr[19]._u32[0]);
+    const uint32_t p = c->gpr[2]._u32[0] & 0x3FFF8u;
+    uint32_t q = p, steps = 0;
+    while (steps < 0x8000u && !PEEK_W(q)) { q = (q + 8) & 0x3FFF8u; steps++; }
+    fprintf(stderr, "%s LS at r2 %05X: %08X %08X %08X %08X %08X %08X %08X %08X; the next word not zero on its "
+                    "8-byte step at %05X (%u steps)\n", tag, p, PEEK_W(p), PEEK_W(p + 4), PEEK_W(p + 8), PEEK_W(p + 12),
+            PEEK_W(p + 16), PEEK_W(p + 20), PEEK_W(p + 24), PEEK_W(p + 28), q, steps);
+    for (uint32_t a = 0x12A0; a < 0x1300; a += 0x20)
+        fprintf(stderr, "%s LS %05X: %08X %08X %08X %08X %08X %08X %08X %08X\n", tag, a, PEEK_W(a), PEEK_W(a + 4),
+                PEEK_W(a + 8), PEEK_W(a + 12), PEEK_W(a + 16), PEEK_W(a + 20), PEEK_W(a + 24), PEEK_W(a + 28));
+    fprintf(stderr, "%s LS 014B0: %08X %08X %08X %08X\n", tag, PEEK_W(0x14B0), PEEK_W(0x14B4), PEEK_W(0x14B8),
+            PEEK_W(0x14BC));
+#undef PEEK_W
+    ReleaseSRWLockShared(&s_pm_directory_lock);
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
